@@ -1,0 +1,262 @@
+# dfs5 再開用の状況メモ（`TODO.md`）
+
+この文書は **2026-11-12 時点**で作業を中断したときの記録である。再開する人は、
+まずここを読んで「どこまで動いていて、次に何をするか」を掴んでほしい。
+
+- リポジトリ: `~/src/dfs5`（`/Volumes/ExtSSD/src/dfs5` へのシンボリックリンク）
+- 最終コミット: `122afcf fix(l2): 名簿を信頼しない検証 (root アンカーによる委譲チェーンの検証)`
+- テスト: **69 件パス**（`~/dfs-venv/bin/python -m pytest tests -q`。実行に約 38 秒）
+- 作業ツリー: クリーン
+
+---
+
+## 1. 今どうなっているか（動くもの）
+
+### 1.1 層の実装
+
+| 層 | 状態 | 実体 |
+|---|---|---|
+| L1 委譲 | 実装済み・検証済み | `l1_delegation.py`（5 不変条件、チェーン検証） |
+| L2 名簿 | 実装済み | `l2_registry.py`（署名付きロケータ、CAS 追記、root へチェーン復元） |
+| L3 データ平面 | 実装済み・WAN 計測済み | `l3_ost_adapter.py`（TLS/TCP、batch_has / put / get） |
+| L4 一貫性 | 実装済み・evil 試験済み | `l4_log.py`（追記ログ、Merkle 塊、HeadPin、B6/B7 防御） |
+| L5 実体化 | 実装済み | `l5_clayfs.py`（スナップショット連携） |
+
+### 1.2 2 つの CLI
+
+| コマンド | 役割 | 実体 |
+|---|---|---|
+| `./dfs5cli` | ローカル CLI（rclone ライク）。`ls` / `cat` / `copy` / `sync` / `pull` / `rm` / `mkdir` など | `dfs5/cli_main.py` |
+| `./dfs5svc` | ローカルにサーバを立てる（空きポート 2 つ + 委譲まで自動） | `dfs5/svc.py` |
+| `python -m dfs5.cli` | サーバ側の生の操作（`serve` / `delegate` / `push` / `pull`） | `dfs5/cli.py` |
+
+**注意**: 以前の名前は `dfs5r` / `rclone_cli.py` だった。`122afcf` より前のメモや
+手順書にある `./dfs5r` は `./dfs5cli` に読み替える。
+
+### 1.3 できること（実機で確認済み）
+
+- ローカルにサーバを立てて、ファイルを push / pull できる（Mac）
+- LAN（Mac ↔ Pi5）と WAN（Mac / Sakura / Scaleway の 3 拠点）で同期できる
+- 同一の親版からの同時 push を CAS で拒否する（衝突コピー 0 件）
+- 通信断でハングせず `ServiceUnavailableError` になる
+
+### 1.4 速さ（計測済み）
+
+| 場面 | 往復 | 根拠 |
+|---|---|---|
+| push | **1 往復**（チャンク数に依らない） | `specs/e2e_wan.md`、`specs/l3_data_plane.md` |
+| pull（平らな構造） | **2 往復**（根 1 + ファイル 1） | 同上。500 ファイルでもローカルで 2 往復 |
+| pull（入れ子） | 階層数 + 1 | 同上 |
+
+WAN（RTT 285ms、20 × 128KB）で push 4.3 秒 / pull 4.0 秒。batch 系の導入前は
+pull が 8.0 秒（21 往復）だった。
+
+---
+
+## 2. 次にやること（優先順）
+
+### 2.1 最優先: A（読み取りの可用性）
+
+**なぜ**: L2 名簿が落ちると**全停止**する（単一障害点）。`specs/l2_comparison.md` §2.5。
+`ls` / `cat` / `pull` が名簿に届かないだけで止まる。
+
+**前提は整っている**: `122afcf` で「名簿を信頼しない検証」を実装した。名簿が偽の委譲を
+返しても拒否する（root アンカーからチェーンを検証）。だから**名簿を複数立てても、どの
+答えでも安全**に扱える。
+
+**やること**:
+
+1. リモート定義で名簿を複数持てるようにする。案: `registry` を配列にする、または
+   `registry` + `registry_alternates` を持つ。
+2. `resolve` / `paths` / `ost` を**順に試し、最初に読めたものを使う**。全応答は root 公開鍵で
+   検証するので、どの名簿の答えでもよい。
+3. 書き込み（`announce`）は 1 つの「主」に送る。主が落ちたら失敗させる（昇格は B）。
+4. 試験: 名簿を 2 つ立て、片方を止めても `ls` / `cat` / `pull` が続くこと。
+   `dfs5svc` を別ポートで 2 つ立てれば、1 台で試せる（下の §4 参照）。
+
+**設計上の注意**:
+
+- root 公開鍵は**名簿から取って信頼してはいけない**（`specs/delegation.md` §3.5.1）。
+  初回だけ TOFU で取り、以降は手元の記録（`remotes.json` の `root_pubkey`）を使う。
+- 名簿の選択で「どれが正しいか」を比べる必要はない。署名で検証できるため。
+
+### 2.2 B（書き込みの複製と昇格）
+
+A の結果を見てから。主従で複製し、主が落ちたら従を昇格させる。「主はどれか」の決め方
+（固定設定 / 委譲レコードに書く / 選挙）を決める必要がある。
+C（合意形成）は当面やらない（単一書き手なので同時に書くのは 1 人）。
+
+### 2.3 CLI の追加（使い勝手）
+
+利用者から要望が出ている。実装は小さめ。
+
+| コマンド | 内容 | 補足 |
+|---|---|---|
+| `mv` | 移動・改名。今は `copy` + `rm` で代用 | 1 版で済ませたいなら要実装 |
+| `--exclude` / `--include` | `sync` / `copy` のフィルタ | 部分同期 |
+| `lsd` | ディレクトリだけの一覧（rclone と同じ） | 今は `ls` で代用 |
+
+### 2.4 配置（完成時）
+
+`./dfs5cli` と `./dfs5svc` は今はリポジトリ直下から使う。完成したら PATH の通った場所に
+置く。両方のモジュールの docstring に TODO を書いてある。
+
+- 案 1: `/usr/local/bin` にシンボリックリンクを張る（ラッパーは `dirname` から自分の位置を
+  決めるので動く）
+- 案 2: pip の console_scripts として配る
+  （`dfs5cli = dfs5.cli_main:main`、`dfs5svc = dfs5.svc:main`）
+
+### 2.5 root アンカーの配布（大規模運用のとき）
+
+現状は TOFU（初回に名簿から取って指紋を記録）と `--root-pubkey` の明示。大規模では
+**DNSSEC** から取るのが候補。小規模はローカル設定、中・大規模は DNSSEC、という方針
+（利用者の判断）。`DESIGN.md` §10 の問い 1 は引き続き未回答。
+
+### 2.6 検証が足りていないもの
+
+| 項目 | 状況 | やり方 |
+|---|---|---|
+| 3 台以上の同時参加 | 未実施 | 1 台で複数起動（§4）。足りなければ Docker |
+| 長時間運用・連続 push/pull の劣化 | 未実施 | — |
+| WAN での 100 塊以上の実測 | 未実施 | 20 ファイルのみ。ローカルで 500 は確認 |
+| 実効スループット | 未計測 | 所要時間とバイト数からの概算のみ |
+| 高遅延の追加注入（`tc qdisc`） | 未実施 | Scaleway の実測 285ms を代用 |
+| LAN 越しの 2 OST（ストライピング） | 未実施 | ローカル検証のみ（`TestL3Striping`） |
+| 1,000 塊以上の再計測 | 未実施 | — |
+| Pi5 での pytest | 未実施 | Mac のみ |
+
+### 2.7 未実装（必要になったとき）
+
+| 項目 | 状況 |
+|---|---|
+| mini_lustre との RPC アダプタ | 未実装。そもそも mini_lustre 自体が試作なので、必要なら載せ替えを検討 |
+| DHT によるノード発見 | 未実装。`specs/delegation.md` §3.5.5 に、発見後の排除の設計を書いた |
+| 名簿のキャッシュ | 未実装（DHT を足すときに必要） |
+| 過去の版の取り出し（ロールバック） | 未実装。dfs5 は履歴を持つので版指定の取り出しは足せる |
+
+---
+
+## 3. 設計の要点（再開時に効く知識）
+
+### 3.1 名簿を信頼しない
+
+信頼の根は **root アンカーの公開鍵 1 つ**。`resolve` は末端の委譲に**チェーン全体**と
+`root_anchor` を足して返し、クライアントは `verify_delegation_chain` で root から検証する。
+署名を検証する鍵は「**検証で確定した writer**」だけを使う（名簿が名乗った writer は使わない）。
+
+```
+名簿が root 公開鍵として攻撃者の鍵を返す → 手元の記録と食い違うので拒否
+```
+
+`specs/delegation.md` §3.5 に詳細。試験は `tests/test_root_anchor.py`（7 件）。
+
+**限界**: TOFU 前（root 未設定）は、初回に欺かれると通る（SSH の `known_hosts` と同じ）。
+本番は `--root-pubkey` で初回から固定する。この「通ってしまう」こともテストに残してある。
+
+### 3.2 空のディレクトリも版に残る
+
+ディレクトリ塊は `{"entries": [], "format": "dfs5-dir-v1"}` として表現され、読み出し側は
+それを見て実体を作る。`rm` でファイルを消してもディレクトリは残り、`pull` すると空の
+ディレクトリごと降りてくる。片付けるには `rm --rmdirs` か `sync --delete`。
+`specs/cli.md` §3.4。
+
+### 3.3 送信元ポートを固定する
+
+WireGuard のスポーク（Scaleway）は `ListenPort` を固定してある。エフェメラルだと送信元
+ポートが変わり、ハブ（Sakura）側が最後に受信したポートから学習する都合で一時的に不通に
+なる。ハブ側の keepalive も対称に揃えてある（`specs/e2e_wan.md`）。
+
+### 3.4 ハマったところ
+
+| 症状 | 原因 | 対処 |
+|---|---|---|
+| `ls` が「先に touch しろ」と言う | 参照系を `create=False` で呼んでいた | 参照系も作業ディレクトリを作る |
+| `create` したのに「委譲が無い」と言う | `dfs5svc start` が委譲を登録していなかった | `start` に含めた |
+| 空きポートを見落とす | `SO_REUSEADDR` 付き bind が `0.0.0.0:N` を素通り | 接続を試す 2 段判定に |
+| 多段委譲が時刻のずれで落ちる | 中間と末端の有効期間が同じ | 中間を 1 日長く |
+| 委譲失敗でサーバが孤児に残る | `start` が例外時に止めていなかった | 失敗時は必ず止める |
+| テストでサーバが残る | `addCleanup` の順序 | `tearDown` で記録を全部止める |
+
+---
+
+## 4. 検証の仕方（1 台で複数ノード）
+
+`dfs5svc` を別ポートで複数立てれば、1 台で「複数の拠点」を模擬できる。
+
+```bash
+cd ~/src/dfs5
+
+# 名簿を 2 つ立てる（A の試験用。別ポートになる）
+./dfs5svc start --name node-a --port 20000
+./dfs5svc start --name node-b --port 20010
+./dfs5svc list
+
+# やめる
+./dfs5svc stop node-a --forget
+./dfs5svc stop node-b --forget
+```
+
+- `--port` は「この番号から連続した空きを探す」起点。L2 が 1 つ目、L3 が 2 つ目。
+- 名前ごとに状態ディレクトリ（`~/dfs5svc/<名前>/`）と鍵が分かれる。
+- `--advertise` で広告するホストを変えられる（既定は `--host` から推定）。
+- ネットワーク分断や遅延も試すなら Docker（`docker network create` + 各コンテナに
+  `tc netem`）を使う。ポート違いでは再現しない。
+
+サーバ側のタイムアウトは環境変数で変えられる（`DFS5_L2_TIMEOUT`、`DFS5_OST_SOCKET_TIMEOUT`、
+`DFS5_OST_CONNECT_TIMEOUT`）。`dfs5cli` も `dfs5svc` も `os.environ` をそのまま見る。
+
+---
+
+## 5. 環境の現状（2026-11-12）
+
+### 5.1 手元（Mac）
+
+| もの | 状態 |
+|---|---|
+| launchd のサーバ | `com.example.dfs5-local`（L2 19440 / L3 19443、`~/dfs5-local/`）**稼働中** |
+| `dfs5svc` のサービス | `local`（L2 19441 / L3 19442、`~/dfs5svc/local/`）**稼働中** |
+| `dfs5cli` のリモート | `local`（`http://127.0.0.1:19441`）のみ |
+| Python | `~/dfs-venv/bin/python`（3.12、`cryptography` 入り） |
+
+**注意**: 上記の 2 つのサーバは `122afcf` より前のコードで起動している。root 公開鍵を
+返すのは新しいコードなので、`root_pubkey` を使う試験をする前に再起動が要る
+（`launchctl bootout` → `bootstrap`、`./dfs5svc stop local` → `start`）。
+
+### 5.2 遠隔（WireGuard）
+
+| 拠点 | 接続 | 備考 |
+|---|---|---|
+| Scaleway | `ubuntu@172.16.1.60`（公開 `51.15.35.162`） | RTT 約 285ms。`ListenPort` 固定済み |
+| Sakura | `ubuntu@yashiki.top`（172.16.1.254） | ハブ。RTT 約 21ms。keepalive 対称 |
+| Pi5 | `yy@192.168.0.7` | RTT 約 0.5ms |
+
+**注意**: WireGuard の経路は不安定なときがある。テスト中に Mac → Scaleway が数分不通に
+なった（公開 IP と Sakura 経由では到達できた）。断が起きたら時刻を控えると追いやすい。
+
+dfs5 のサーバは**どの拠点でも止めてある**（確認済み）。再開時に立て直す。
+
+---
+
+## 6. 再開の手順
+
+```bash
+cd ~/src/dfs5
+
+# 1. 状態の確認
+git log --oneline -3
+git status --short          # 空ならクリーン
+~/dfs-venv/bin/python -m pytest tests -q   # 69 件パス（約 38 秒）
+
+# 2. サーバを立てる（新コードで）
+./dfs5svc list               # 既存のサービスを確認
+./dfs5svc start --name work --port 20000
+./dfs5svc env work           # dfs5cli の設定行が出る
+
+# 3. つないで使う
+./dfs5cli create work --registry http://127.0.0.1:20001 \
+    --key ~/dfs5svc/work/keys/writer --secret <tree_secret>
+./dfs5cli ls work:
+./dfs5cli config show work   # root_fingerprint が記録されているはず
+```
+
+そのあと §2.1（A: 読み取りの可用性）に進む。

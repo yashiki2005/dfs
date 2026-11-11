@@ -180,6 +180,40 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
 ```text
 dfs5/
 ├── DESIGN.md                  # 本設計書
+├── DESIGN-ANSWER.md           # 段階 0〜5 の検証結果と確定設計（本文書）
+├── PLAN.md                    # 段階ごとの計画と判定
+├── TODO.md                    # 再開用の状況メモ（未実装・未検証・次の手）
+├── specs/
+│   ├── delegation.md          # L1 権威の委譲仕様（root アンカー検証・TOFU を含む）
+│   ├── l2_comparison.md       # L2 3方式の計測比較表
+│   ├── l3_data_plane.md       # L3 の計測と判断（batch 系、WAN の往復）
+│   ├── e2e_lan.md             # Mac ↔ Pi5 の実機統合（LAN）
+│   ├── e2e_wan.md             # 3 拠点の WAN 実機と遅延耐性
+│   ├── cli.md                 # dfs5cli（ローカル CLI）
+│   └── svc.md                 # dfs5svc（ローカルサーバの起動）
+├── dfs5/
+│   ├── crypto.py              # 署名 + 内容アドレス + 標準 AEAD + 指紋 (L1/L3/L4共通)
+│   ├── l1_delegation.py       # 委譲チェーン検証 (5 Invariants)
+│   ├── l2_registry.py         # 名簿サービス & 署名済みロケータ (root へのチェーン復元)
+│   ├── l3_ost_adapter.py      # 内容アドレス型のチャンク保管 (batch_has / batch_put / batch_get)
+│   ├── l4_log.py              # 単一書き手追記ログ・Merkle塊・HeadPin (B6/B7防御)
+│   ├── l5_clayfs.py           # clayfs スナップショット連携アダプタ (NFC正規化・非再帰)
+│   ├── cli.py                 # サーバ側 CLI (serve / delegate / init / push / pull / status)
+│   ├── remotes.py             # dfs5cli のリモート定義（名前 -> 接続情報、root アンカー）
+│   ├── cli_main.py            # dfs5cli 本体（ls/cat/copy/sync/pull/rm/mkdir など）
+│   └── svc.py                 # ローカルにサーバを立てる（空きポート 2 つ + serve 起動）
+├── dfs5cli                      # dfs5cli のエントリポイント
+├── dfs5svc                    # dfs5svc のエントリポイント
+├── bench/                     # 計測ハーネス（l2_bench / l3_bench / e2e_lan / e2e_wan）と生データ
+└── tests/
+    ├── test_evil_suite.py     # A2, A5, B6, B7 + 単一書き手排他 + 委譲失効の回帰試験
+    ├── test_integration.py    # 2ノード共有・往復削減の回帰試験
+    ├── test_root_anchor.py    # root アンカーによるチェーン検証（名簿を信頼しない）
+    ├── test_cli_main.py       # dfs5cli の回帰試験
+    └── test_svc_cli.py        # dfs5svc の回帰試験
+```
+dfs5/
+├── DESIGN.md                  # 本設計書
 ├── specs/
 │   ├── delegation.md          # L1 権威の委譲仕様（確定版）
 │   └── l2_comparison.md       # L2 3方式の計測比較表
