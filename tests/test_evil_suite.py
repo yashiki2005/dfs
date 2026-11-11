@@ -19,7 +19,7 @@ from dfs5.l1_delegation import (
     verify_delegation_chain,
 )
 from dfs5.l2_registry import ConflictError, DirectoryRegistryService
-from dfs5.l3_ost_adapter import MiniLustreOSTServer
+from dfs5.l3_store import ChunkStoreServer
 from dfs5.l4_log import RollbackDetectedError, SilentDropDetectedError
 from dfs5.l5_clayfs import DFS5Node
 
@@ -75,8 +75,8 @@ class TestEvilSuite(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.tmpdir.cleanup()
 
-    def _create_env(self, test_id: str) -> tuple[MiniLustreOSTServer, DirectoryRegistryService, DFS5Node]:
-        ost = MiniLustreOSTServer(self.cert, self.key)
+    def _create_env(self, test_id: str) -> tuple[ChunkStoreServer, DirectoryRegistryService, DFS5Node]:
+        ost = ChunkStoreServer(self.cert, self.key)
         reg = DirectoryRegistryService("/example.com", self.root_pub)
         del_env = create_delegation_envelope(
             self.root_priv,

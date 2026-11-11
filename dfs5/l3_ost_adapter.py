@@ -22,9 +22,12 @@ ZERO_WIRE_ID = b"0" * 64
 QUIT_FRAME = b"Q" + ZERO_WIRE_ID + struct.pack(">I", 0)
 
 
-class MiniLustreOSTServer:
+class ChunkStoreServer:
     """
-    TLS/TCP チャンク保管サーバ (L3 OST)。
+    内容アドレス (wire_id) でチャンクを保管する TLS/TCP サーバ (L3 OST)。
+
+    DFS5 が自前で実装したものであり、mini_lustre の OST とは
+    フレーム形式も塊の識別子も異なる（同一のポート上で TLS/TCP を使う点のみ共通）。
     """
 
     def __init__(self, certfile: Path | str, keyfile: Path | str, host: str = "127.0.0.1", port: int = 0):
@@ -356,3 +359,7 @@ class OSTClient:
 
     def get(self, wire_id: str) -> bytes:
         return self.batch_get([wire_id])[wire_id]
+
+
+# 後方互換: 旧名。実体は ChunkStoreServer（mini_lustre の API ではない）。
+MiniLustreOSTServer = ChunkStoreServer

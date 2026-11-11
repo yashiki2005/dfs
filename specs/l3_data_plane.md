@@ -98,7 +98,7 @@ OST 側で同じ塊を共有させることはできない。
 
 ### 4.3 現行の独自 L3 を維持する
 
-初期実装では `dfs5/l3_ost_adapter.py` の TLS/TCP をそのまま使う。
+初期実装では `dfs5/l3_ost_adapter.py`（クラス名は `ChunkStoreServer`、モジュール別名 `dfs5/l3_store.py`）の TLS/TCP を使う。
 
 理由:
 
@@ -120,3 +120,29 @@ OST 側で同じ塊を共有させることはできない。
 | mini_lustre との RPC アダプタ | **未実装**（必要になったとき） |
 | libtorrent | **導入しない**（規模が小さいうち） |
 | 大規模（1,000 塊以上）の再計測 | **未実施** |
+
+---
+
+## 6. ストライピング
+
+複数の OST に塊を分散できる。**既定は 1 OST** で、2 個以上を渡したときだけ分散する。
+
+```python
+# 既定（1 OST）
+builder = MerkleTreeBuilder(crypto, ost0)
+
+# 分散（round-robin）
+builder = MerkleTreeBuilder(crypto, ost0, stores={"ost0": c0, "ost1": c1})
+```
+
+| 項目 | 挙動 |
+|---|---|
+| 割り当て | `stores` の順に round-robin。1 個なら常に既定 |
+| 配置の記録 | ディレクトリ塊の各エントリに `store` を持たせる。既定の OST のときは省略する（旧リーダーとの互換） |
+| 読み出し | エントリの `store` を見て該当 OST から取得する。根の塊は `root_store` で渡す（省略時は既定） |
+| 重複排除 | `plain_id -> (wire_id, store_id)` を索引に持つ。旧形式の `str` も読める |
+
+**実測（ローカル、2 OST、10 ファイル）**: OST0 に 6 個、OST1 に 5 個の塊が置かれ、
+互いに重複しない。索引なしの新しい読み手でも全体を復元できた。
+
+回帰テストは `TestL3Striping`（1 OST 既定、2 OST 分散、復元）にある。

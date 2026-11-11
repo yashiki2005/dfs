@@ -35,7 +35,7 @@ if __package__ in (None, ""):
         RegistryError,
         ServiceUnavailableError,
     )
-    from dfs5.l3_ost_adapter import MiniLustreOSTServer
+    from dfs5.l3_store import ChunkStoreServer
     from dfs5.l4_log import RollbackDetectedError, SilentDropDetectedError
     from dfs5.l5_clayfs import DFS5Node
 else:
@@ -47,7 +47,7 @@ else:
         RegistryError,
         ServiceUnavailableError,
     )
-    from .l3_ost_adapter import MiniLustreOSTServer
+    from .l3_store import ChunkStoreServer
     from .l4_log import RollbackDetectedError, SilentDropDetectedError
     from .l5_clayfs import DFS5Node
 
@@ -153,18 +153,18 @@ class PersistentRegistryState:
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
         tmp.replace(self.state_file)
 
-    def load_ost_chunks(self, ost: MiniLustreOSTServer) -> None:
+    def load_ost_chunks(self, ost: ChunkStoreServer) -> None:
         for f in self.chunks_dir.glob("*.blk"):
             ost.store[f.stem] = f.read_bytes()
 
-    def save_ost_chunks(self, ost: MiniLustreOSTServer) -> None:
+    def save_ost_chunks(self, ost: ChunkStoreServer) -> None:
         for wid, blob in list(ost.store.items()):
             p = self.chunks_dir / f"{wid}.blk"
             if not p.exists():
                 p.write_bytes(blob)
 
 
-def make_registry_http_handler(pstate: PersistentRegistryState, ost: MiniLustreOSTServer):
+def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreServer):
     class RegistryHTTPHandler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
             sys.stderr.write(f"[L2-HTTP] {self.address_string()} - {fmt % args}\n")
@@ -270,7 +270,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
             capture_output=True,
         )
 
-    ost = MiniLustreOSTServer(cert, key, host=args.bind, port=args.ost_port)
+    ost = ChunkStoreServer(cert, key, host=args.bind, port=args.ost_port)
     pstate = PersistentRegistryState(state_dir, args.root_anchor, root_pubkey)
     pstate.load_ost_chunks(ost)
 

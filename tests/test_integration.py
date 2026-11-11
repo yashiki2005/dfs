@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfs5.l1_delegation import DelegationError, create_delegation_envelope
 from dfs5.l2_registry import ConflictError, DirectoryRegistryService, ServiceUnavailableError
-from dfs5.l3_ost_adapter import MiniLustreOSTServer
+from dfs5.l3_store import ChunkStoreServer
 from dfs5.l5_clayfs import DFS5Node
 
 
@@ -36,7 +36,7 @@ class TestL3ContentDedup(unittest.TestCase):
     def test_same_content_is_not_reencrypted_inside_one_upload(self) -> None:
         import subprocess as sp
         from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_ost_adapter import MiniLustreOSTServer, OSTClient
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
         from dfs5.l4_log import MerkleTreeBuilder
 
         with tempfile.TemporaryDirectory(prefix="dfs5_l3_") as tmpdir:
@@ -45,7 +45,7 @@ class TestL3ContentDedup(unittest.TestCase):
             sp.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
                     "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=l"],
                    check=True, capture_output=True)
-            ost = MiniLustreOSTServer(cert, key)
+            ost = ChunkStoreServer(cert, key)
             try:
                 tree = base / "tree"
                 tree.mkdir()
@@ -69,6 +69,80 @@ class TestL3ContentDedup(unittest.TestCase):
                 )
             finally:
                 ost.close()
+
+
+class TestL3Striping(unittest.TestCase):
+    """段階 4: 複数 OST へのストライピング。既定は 1 OST。"""
+
+    @staticmethod
+    def _cert(base: Path):
+        cert, key = base / "c.pem", base / "k.pem"
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
+             "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=l"],
+            check=True, capture_output=True,
+        )
+        return cert, key
+
+    def test_single_store_is_the_default(self) -> None:
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_str1_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                for i in range(5):
+                    (tree / f"f{i}.txt").write_text(f"x{i}\n" * 20)
+                client = OSTClient("127.0.0.1", ost.port)
+                builder = MerkleTreeBuilder(ContentAddressedCrypto("s1"), client)
+                pid, wid = builder.upload_directory(tree)
+                self.assertEqual(list(builder.stores), ["ost0"])
+                self.assertGreater(len(ost.store), 0)
+                out = base / "out"
+                MerkleTreeBuilder(ContentAddressedCrypto("s1"), client).download_directory(pid, wid, out)
+                self.assertEqual((out / "f0.txt").read_text(), "x0\n" * 20)
+            finally:
+                ost.close()
+
+    def test_two_stores_receive_disjoint_chunks(self) -> None:
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_str2_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            a = ChunkStoreServer(cert, key)
+            b = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                for i in range(10):
+                    (tree / f"f{i}.txt").write_text(f"content {i}\n" * 50)
+                ca, cb = OSTClient("127.0.0.1", a.port), OSTClient("127.0.0.1", b.port)
+                stores = {"ost0": ca, "ost1": cb}
+                builder = MerkleTreeBuilder(ContentAddressedCrypto("s2"), ca, stores=stores)
+                pid, wid = builder.upload_directory(tree)
+
+                # 両方の OST に塊が置かれ、同じ塊が二重に置かれていない
+                self.assertGreater(len(a.store), 0, "OST0 に塊がない")
+                self.assertGreater(len(b.store), 0, "OST1 に塊がない")
+                self.assertEqual(len(set(a.store) & set(b.store)), 0)
+
+                # 索引なしの新しい読み手でも全体を復元できる
+                out = base / "out"
+                reader = MerkleTreeBuilder(ContentAddressedCrypto("s2"), ca, stores=stores)
+                reader.download_directory(pid, wid, out, root_store=getattr(builder, "root_store", "ost0"))
+                for i in range(10):
+                    self.assertEqual((out / f"f{i}.txt").read_text(), f"content {i}\n" * 50)
+            finally:
+                a.close()
+                b.close()
 
 
 class TestStage5Integration(unittest.TestCase):
@@ -101,7 +175,7 @@ class TestStage5Integration(unittest.TestCase):
                 capture_output=True,
             )
 
-            ost = MiniLustreOSTServer(cert, key)
+            ost = ChunkStoreServer(cert, key)
             reg = DirectoryRegistryService("/example.com", root_pub)
             now = 1763000000
             sub_path = "/example.com/alice/notes"

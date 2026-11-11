@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from dfs5.crypto import ContentAddressedCrypto  # noqa: E402
-from dfs5.l3_ost_adapter import MiniLustreOSTServer, OSTClient  # noqa: E402
+from dfs5.l3_store import ChunkStoreServer, OSTClient  # noqa: E402
 from dfs5.l4_log import MerkleTreeBuilder  # noqa: E402
 
 
@@ -53,7 +53,7 @@ def measure_transfer(cases: list[tuple[int, int]]) -> dict:
     with tempfile.TemporaryDirectory(prefix="l3bench_") as tmp:
         base = Path(tmp)
         cert, key = _cert(base)
-        server = MiniLustreOSTServer(cert, key)
+        server = ChunkStoreServer(cert, key)
         try:
             for count, size in cases:
                 tree = base / f"t{count}_{size}"
@@ -87,7 +87,7 @@ def measure_dedup() -> dict:
     with tempfile.TemporaryDirectory(prefix="l3dedup_") as tmp:
         base = Path(tmp)
         cert, key = _cert(base)
-        server = MiniLustreOSTServer(cert, key)
+        server = ChunkStoreServer(cert, key)
         try:
             tree = base / "tree"
             tree.mkdir()

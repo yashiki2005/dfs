@@ -64,6 +64,11 @@ class MerkleTreeBuilder:
     """
     ローカルディレクトリ（またはメモリ辞書）と L3 OST の間で Merkle ディレクトリ塊 (`dfs5-dir-v1`) を読み書きする。
     再委譲された境界 (`delegated_mounts`) はシンボリック参照として記録し、親のハッシュ計算から切り離す。
+
+    ストライピング:
+      複数の OST を `stores` に渡すと、塊を round-robin で分散させる。
+      現在の既定は 1 OST（`stores={"ost0": client}`）であり、2 個以上渡せば分散する。
+      各エントリには配置先の `store` を持たせる（既定の OST のときは省略する）。
     """
 
     IGNORED_NAMES = {".clayfs", ".DS_Store"}
@@ -72,32 +77,44 @@ class MerkleTreeBuilder:
         self,
         crypto: ContentAddressedCrypto,
         ost: OSTClient,
-        index: Optional[Dict[str, str]] = None,
+        stores: Optional[Dict[str, OSTClient]] = None,
+        default_store: str = "ost0",
+        index: Optional[Dict[str, Any]] = None,
     ):
         self.crypto = crypto
+        # 後方互換: ost は既定の OST を指す
         self.ost = ost
-        # (plain_id -> wire_id) の書き手側索引。署名済み履歴から復元できるキャッシュ。
-        # 単一書き手なので、重複排除の判断はこの索引と OST の存在確認だけで足りる。
-        self.index: Dict[str, str] = dict(index or {})
+        self.stores: Dict[str, OSTClient] = dict(stores) if stores else {default_store: ost}
+        self.default_store = default_store if default_store in self.stores else next(iter(self.stores))
+        self.stripe_order: list[str] = list(self.stores.keys())
+        self._next_stripe = 0
+        # (plain_id -> (wire_id, store_id)) の書き手側索引。古い形式（str）も読める。
+        self.index: Dict[str, Any] = dict(index or {})
 
-    def _reuse_or_pack(self, plaintext: bytes) -> Tuple[str, str, Optional[bytes]]:
-        """平文から plain_id を求め、索引にあって OST に現存すれば再利用する。
+    # ---- ストア選択 -------------------------------------------------------
+    def _store_for_new_chunk(self) -> str:
+        """新しい塊の配置先を round-robin で決める。現在 1 OST なら常に既定。"""
+        if len(self.stripe_order) == 1:
+            return self.stripe_order[0]
+        sid = self.stripe_order[self._next_stripe % len(self.stripe_order)]
+        self._next_stripe += 1
+        return sid
 
-        Returns (plain_id, wire_id, blob_or_None)。blob が None なら再暗号化・再送不要。
-        """
-        plain_id = self.crypto.compute_plain_id(plaintext).hex()
-        known_wire = self.index.get(plain_id)
-        if known_wire is not None:
-            try:
-                if self.ost.batch_has([known_wire]).get(known_wire, False):
-                    return plain_id, known_wire, None
-            except Exception:
-                pass  # 存在確認に失敗したら安全側に倒して再送する
-        pack_pid, wire_id, blob = self.crypto.pack_chunk(plaintext)
-        assert pack_pid == plain_id
-        self.index[plain_id] = wire_id
-        return plain_id, wire_id, blob
+    def _client(self, store_id: str) -> OSTClient:
+        return self.stores.get(store_id, self.ost)
 
+    @staticmethod
+    def _index_get(entry: Any) -> Optional[Tuple[str, str]]:
+        """索引の値を (wire_id, store_id) に正規化する。旧形式の str も受ける。"""
+        if entry is None:
+            return None
+        if isinstance(entry, str):
+            return entry, ""
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            return str(entry[0]), str(entry[1])
+        return None
+
+    # ---- 書き込み ---------------------------------------------------------
     def upload_directory(
         self,
         source_dir: Path,
@@ -109,30 +126,33 @@ class MerkleTreeBuilder:
         再暗号化も再送もしない（Nonce がランダムでも重複排除率は落ちない）。
         """
         delegated_mounts = delegated_mounts or {}
-        entries: list = []
-        # 収集した (plain_id -> blob) はディレクトリ全体でまとめて1往復で送る
-        pending: Dict[str, bytes] = {}
-        plain_to_wire: Dict[str, str] = {}
+        pending: Dict[str, Dict[str, bytes]] = {sid: {} for sid in self.stores}
 
-        def _stage(plaintext: bytes) -> Tuple[str, str]:
+        def _stage(plaintext: bytes) -> Tuple[str, str, str]:
             plain_id = self.crypto.compute_plain_id(plaintext).hex()
-            known_wire = self.index.get(plain_id)
-            if known_wire is not None:
-                # このバッチで送信待ちなら、そのまま同じ wire_id を共有する
-                if known_wire in pending:
-                    return plain_id, known_wire
+            known = self._index_get(self.index.get(plain_id))
+            if known is not None:
+                known_wire, known_store = known
+                store_id = known_store or self.default_store
+                if known_wire in pending.get(store_id, {}):
+                    return plain_id, known_wire, store_id
                 try:
-                    if self.ost.batch_has([known_wire]).get(known_wire, False):
-                        return plain_id, known_wire
+                    if self._client(store_id).batch_has([known_wire]).get(known_wire, False):
+                        return plain_id, known_wire, store_id
                 except Exception:
                     pass
+            store_id = self._store_for_new_chunk()
             pack_pid, wire_id, blob = self.crypto.pack_chunk(plaintext)
-            self.index[plain_id] = wire_id
-            pending[wire_id] = blob
-            plain_to_wire[plain_id] = wire_id
-            return plain_id, wire_id
+            assert pack_pid == plain_id
+            self.index[plain_id] = (wire_id, store_id)
+            pending.setdefault(store_id, {})[wire_id] = blob
+            return plain_id, wire_id, store_id
 
-        def _walk(directory: Path, mounts: Dict[str, str]) -> Tuple[str, str]:
+        def _entry(store_id: str) -> Dict[str, Any]:
+            # 既定の OST のときは store を書かない（旧リーダーとの互換）
+            return {} if store_id == self.default_store else {"store": store_id}
+
+        def _walk(directory: Path, mounts: Dict[str, str]) -> Tuple[str, str, str]:
             items: list = []
             for item in sorted(directory.iterdir(), key=lambda q: q.name):
                 if item.name in self.IGNORED_NAMES or item.name.startswith("._"):
@@ -148,39 +168,50 @@ class MerkleTreeBuilder:
                     )
                 elif item.is_file():
                     raw_data = item.read_bytes()
-                    pid, wid = _stage(raw_data)
-                    items.append(
-                        {
-                            "name": norm_name,
-                            "plain_id": pid,
-                            "size": len(raw_data),
-                            "type": "file",
-                            "wire_id": wid,
-                        }
-                    )
+                    pid, wid, sid = _stage(raw_data)
+                    item_entry = {
+                        "name": norm_name,
+                        "plain_id": pid,
+                        "size": len(raw_data),
+                        "type": "file",
+                        "wire_id": wid,
+                    }
+                    item_entry.update(_entry(sid))
+                    items.append(item_entry)
                 elif item.is_dir():
-                    sub_pid, sub_wid = _walk(item, {})
-                    items.append(
-                        {
-                            "name": norm_name,
-                            "plain_id": sub_pid,
-                            "type": "dir",
-                            "wire_id": sub_wid,
-                        }
-                    )
+                    sub_pid, sub_wid, sub_sid = _walk(item, {})
+                    item_entry = {
+                        "name": norm_name,
+                        "plain_id": sub_pid,
+                        "type": "dir",
+                        "wire_id": sub_wid,
+                    }
+                    item_entry.update(_entry(sub_sid))
+                    items.append(item_entry)
             items.sort(key=lambda e: e["name"])
             dir_bytes = canonical_json({"entries": items, "format": "dfs5-dir-v1"})
             return _stage(dir_bytes)
 
-        root_pid, root_wid = _walk(source_dir, delegated_mounts)
-        if pending:
-            self.ost.batch_put_if_absent(pending)
+        root_pid, root_wid, root_sid = _walk(source_dir, delegated_mounts)
+        for sid, chunks in pending.items():
+            if chunks:
+                self._client(sid).batch_put_if_absent(chunks)
+        # 根の配置先を呼び出し側が知れるよう、既定と異なるときは属性に残す
+        self.root_store = root_sid
         return root_pid, root_wid
 
-    def download_directory(self, root_plain_id: str, root_wire_id: str, dest_dir: Path) -> None:
+    # ---- 読み込み ---------------------------------------------------------
+    def download_directory(
+        self,
+        root_plain_id: str,
+        root_wire_id: str,
+        dest_dir: Path,
+        root_store: Optional[str] = None,
+    ) -> None:
         """(root_plain_id, root_wire_id) から再帰的に塊を取得・検証・復号して dest_dir に展開する。"""
         dest_dir.mkdir(parents=True, exist_ok=True)
-        blob = self.ost.get(root_wire_id)
+        store_id = root_store or self.default_store
+        blob = self._client(store_id).get(root_wire_id)
         dir_bytes = self.crypto.unpack_chunk(root_plain_id, root_wire_id, blob)
         dir_obj = json.loads(dir_bytes.decode("utf-8"))
 
@@ -191,17 +222,17 @@ class MerkleTreeBuilder:
             name = normalize_name(entry["name"])
             target = dest_dir / name
             etype = entry["type"]
+            entry_store = entry.get("store") or self.default_store
 
             if etype == "file":
-                f_blob = self.ost.get(entry["wire_id"])
+                f_blob = self._client(entry_store).get(entry["wire_id"])
                 f_data = self.crypto.unpack_chunk(entry["plain_id"], entry["wire_id"], f_blob)
                 if len(f_data) != entry.get("size", len(f_data)):
                     raise ChunkIntegrityError(f"File size mismatch for {name}")
                 target.write_bytes(f_data)
             elif etype == "dir":
-                self.download_directory(entry["plain_id"], entry["wire_id"], target)
+                self.download_directory(entry["plain_id"], entry["wire_id"], target, root_store=entry_store)
             elif etype == "delegated_mount":
-                # 委譲境界は空ディレクトリ（マウントポイント）として作成
                 target.mkdir(parents=True, exist_ok=True)
             else:
                 raise ChunkIntegrityError(f"Unknown directory entry type: {etype!r}")

@@ -228,7 +228,7 @@ dfs3 形式4 の Merkle ツリーを土台にする。
 [Mac]                                      [Linux / Pi5]
 clayfs (L5) ←→ L4 追記ログ ←→ L2 名簿 ←→ L4 追記ログ ←→ clayfs (L5)
                                    ↕
-                              L3 データ (mini_lustre の OST)
+                              L3 データ (ChunkStore)
 ```
 
 **手順**
