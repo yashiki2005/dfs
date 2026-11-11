@@ -10,7 +10,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import ContentAddressedCrypto
 from .l2_registry import DirectoryRegistryService
@@ -116,3 +116,85 @@ class DFS5Node:
             self.clayfs.replace_work_tree(staging_dir)
 
         return self.clayfs.take_snapshot(f"v{p['version']}")
+
+    # ---- 参照のみ（rclone ライク CLI 用） ---------------------------------
+    def _head_root(self, expected_writer_pubkey: Optional[str] = None) -> Tuple[str, str, Optional[str], int]:
+        """先頭版の root 3 つ組と版番号を返す。ピン（local_head.json）も更新する。
+
+        リモートにまだ版が無ければ root を空文字で返す（呼び出し側が「空」を判断する）。
+        """
+        head_env = self.l4.sync_head(self.registry, expected_writer_pubkey=expected_writer_pubkey)
+        if head_env is None:
+            return "", "", getattr(self, "root_store", None), 0
+        p = head_env["payload"]
+        return p["root_plain_id"], p["root_wire_id"], getattr(self, "root_store", None), int(p["version"])
+
+    def list_remote(self, prefix: str = "") -> List[Dict[str, Any]]:
+        """リモートのツリーを一覧する（内容は取らない）。1 階層 = 1 往復。
+
+        リモートにまだ版が無ければ空の一覧を返す（最初の push の前でも一覧できる）。
+        """
+        self.ost.reset_metrics()
+        head = self.l4.sync_head(self.registry)
+        if head is None:
+            return []
+        p = head["payload"]
+        root_store = getattr(self, "root_store", None)
+        with self.ost.session():
+            return self.builder.list_tree(
+                p["root_plain_id"], p["root_wire_id"], root_store=root_store, prefix=prefix
+            )
+
+    def read_remote(self, rel_path: str) -> bytes:
+        """リモートの 1 ファイルだけを取得する（ツリー全体は落とさない）。"""
+        self.ost.reset_metrics()
+        root_pid, root_wid, root_store, ver = self._head_root()
+        if ver == 0 or not root_wid:
+            raise FileNotFoundError(f"Remote has no versions yet: {rel_path}")
+        with self.ost.session():
+            return self.builder.read_remote_file(root_pid, root_wid, rel_path, root_store=root_store)
+
+    def remote_version(self) -> int:
+        """リモート先頭版の版番号（取得は 1 往復、内容は取らない）。"""
+        return self._head_root()[3]
+
+    def local_files(self, root: Optional[Path] = None) -> Dict[str, dict]:
+        """作業ツリー配下のファイルとディレクトリを、相対パス -> 情報の辞書で返す。"""
+        base = Path(root) if root is not None else self.clayfs.work_tree
+        out: Dict[str, dict] = {}
+        if not base.exists():
+            return out
+        base = base.resolve()
+        for item in sorted(base.rglob("*")):
+            rel = item.relative_to(base).as_posix()
+            if any(part == ".clayfs" for part in Path(rel).parts):
+                continue
+            if item.name in (".DS_Store",) or item.name.startswith("._"):
+                continue
+            if item.is_dir():
+                out[rel] = {"type": "dir", "size": 0}
+            elif item.is_file():
+                st = item.stat()
+                out[rel] = {
+                    "type": "file",
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                }
+        return out
+
+    def write_files(self, items: Dict[str, bytes], now: int, epoch: Optional[int] = None) -> Tuple[dict, Path, int]:
+        """作業ツリーにファイルを書いて push する（親ディレクトリは自動作成）。
+
+        ``items`` は作業ツリーからの相対パス -> 中身。``remote copyto`` / ``sync`` の
+        取り込み側で使う。push の前後で内容アドレス索引が効くため、変更のない塊は送らない。
+        """
+        work_tree = self.clayfs.work_tree
+        for rel, data in items.items():
+            rel = str(rel).replace("\\", "/").lstrip("/")
+            if any(part in ("", ".", "..") for part in rel.split("/")):
+                raise ValueError(f"Invalid relative path for write: {rel!r}")
+            target = work_tree / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        delegation_epoch = int(epoch) if epoch is not None else int(self.l4.pin.delegation_epoch or 1)
+        return self.push(delegation_epoch=delegation_epoch, now=now)

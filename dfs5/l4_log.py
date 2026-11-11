@@ -392,6 +392,110 @@ class MerkleTreeBuilder:
             target.write_bytes(f_data)
 
 
+    # ---- 参照のみ（rclone ライク CLI 用） ---------------------------------
+    def _dir_entries(self, plain_id: str, wire_id: str, store_id: str) -> list:
+        """ディレクトリ塊を 1 つ取得して entries を返す（1 往復）。"""
+        blob = self._client(store_id).get(wire_id)
+        dir_bytes = self.crypto.unpack_chunk(plain_id, wire_id, blob)
+        dir_obj = json.loads(dir_bytes.decode("utf-8"))
+        if dir_obj.get("format") != "dfs5-dir-v1":
+            raise ChunkIntegrityError("Invalid directory chunk format")
+        return dir_obj["entries"]
+
+    def list_tree(
+        self,
+        root_plain_id: str,
+        root_wire_id: str,
+        root_store: Optional[str] = None,
+        prefix: str = "",
+    ) -> List[Dict[str, Any]]:
+        """ツリーを走査して ``path`` 付きのエントリ一覧を返す（内容は取得しない）。
+
+        取得は「1 階層 = 1 往復」。ファイルの中身は取らないので、``ls`` や ``find`` の
+        ような一覧表示は構造の階層数だけで決まる。返り値の各要素は
+        ``{"path", "type", "wire_id", "plain_id", "store", "size"?}``。
+        """
+        results: List[Dict[str, Any]] = []
+        # (plain_id, wire_id, store_id, そのディレクトリのパス)
+        queue: List[Tuple[str, str, str, str]] = [
+            (root_plain_id, root_wire_id, root_store or self.default_store, prefix)
+        ]
+        seen: set = set()
+        visited = 0
+        while queue:
+            plain_id, wire_id, store_id, base = queue.pop(0)
+            key = (wire_id, base)
+            if key in seen:
+                continue
+            seen.add(key)
+            visited += 1
+            if visited > 100000:
+                raise ChunkIntegrityError("Directory tree is too large or cyclic")
+
+            for entry in self._dir_entries(plain_id, wire_id, store_id):
+                name = normalize_name(entry["name"])
+                child = f"{base}/{name}" if base else name
+                etype = entry["type"]
+                child_store = entry.get("store") or self.default_store
+                row = {
+                    "path": child,
+                    "type": etype,
+                    "wire_id": entry.get("wire_id", ""),
+                    "plain_id": entry.get("plain_id", ""),
+                    "store": child_store,
+                }
+                if etype == "file":
+                    row["size"] = int(entry.get("size", 0))
+                results.append(row)
+                if etype == "dir":
+                    queue.append((entry["plain_id"], entry["wire_id"], child_store, child))
+        results.sort(key=lambda r: r["path"])
+        return results
+
+    def read_remote_file(
+        self,
+        root_plain_id: str,
+        root_wire_id: str,
+        rel_path: str,
+        root_store: Optional[str] = None,
+    ) -> bytes:
+        """``rel_path`` のファイル 1 つだけを取得・検証して返す。
+
+        ディレクトリ塊をパスの深さぶん（= 1 段 1 往復）だけ辿る。ファイル塊は 1 往復。
+        ツリー全体を落とさずに 1 ファイルを読める（rclone の ``cat`` 用）。
+        """
+        parts = [p for p in rel_path.replace("\\", "/").split("/") if p not in ("", ".")]
+        if not parts:
+            raise IsADirectoryError(f"{rel_path!r} is a directory, not a file")
+        plain_id, wire_id, store_id = root_plain_id, root_wire_id, root_store or self.default_store
+        for i, part in enumerate(parts):
+            want = normalize_name(part)
+            entries = self._dir_entries(plain_id, wire_id, store_id)
+            entry = None
+            for e in entries:
+                if normalize_name(e["name"]) == want:
+                    entry = e
+                    break
+            if entry is None:
+                raise FileNotFoundError(f"No such entry in the tree: {'/'.join(parts[: i + 1])}")
+            last = i == len(parts) - 1
+            if last:
+                if entry["type"] != "file":
+                    raise IsADirectoryError(f"{rel_path!r} is a directory, not a file")
+                f_store = entry.get("store") or self.default_store
+                blob = self._client(f_store).get(entry["wire_id"])
+                data = self.crypto.unpack_chunk(entry["plain_id"], entry["wire_id"], blob)
+                if len(data) != entry.get("size", len(data)):
+                    raise ChunkIntegrityError(f"File size mismatch for {rel_path}")
+                return data
+            if entry["type"] != "dir":
+                raise NotADirectoryError(f"{'/'.join(parts[: i + 1])!r} is not a directory")
+            plain_id = entry["plain_id"]
+            wire_id = entry["wire_id"]
+            store_id = entry.get("store") or self.default_store
+        raise FileNotFoundError(rel_path)
+
+
 class L4LogClient:
     """
     単一書き手追記ログの生成・署名・Read-after-Write (B7 防御)・巻き戻し検知 (B6 防御) を担う L4 クライアント。

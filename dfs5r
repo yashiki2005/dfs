@@ -1,0 +1,30 @@
+#!/bin/sh
+# dfs5r: dfs5 を rclone ライクに扱う CLI の起動ラッパー。
+#
+# `cryptography` の入った Python を探して dfs5/rclone_cli.py を呼ぶ。
+# 環境変数 DFS5R_PYTHON で明示してもよい。
+set -eu
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ -n "${DFS5R_PYTHON:-}" ]; then
+    exec "$DFS5R_PYTHON" -m dfs5.rclone_cli "$@"
+fi
+
+for candidate in \
+    "$HOME/dfs-venv/bin/python" \
+    "$SELF_DIR/.venv/bin/python" \
+    "$SELF_DIR/../.venv/bin/python" \
+    "$(command -v python3 2>/dev/null || true)"
+do
+    [ -n "$candidate" ] || continue
+    [ -x "$candidate" ] || continue
+    if "$candidate" -c 'import cryptography' >/dev/null 2>&1; then
+        cd "$SELF_DIR"
+        exec "$candidate" -m dfs5.rclone_cli "$@"
+    fi
+done
+
+echo "dfs5r: 'cryptography' の入った Python が見つかりません。" >&2
+echo "        DFS5R_PYTHON=/path/to/python を指定してください。" >&2
+exit 127

@@ -136,7 +136,10 @@ dfs5/
 │   ├── l2_registry.py         # 署名付きロケータ名簿クライアント & サーバ
 │   ├── l3_ost_adapter.py      # 内容アドレス型のチャンク保管 (batch_has / batch_put / batch_get)
 │   ├── l4_log.py              # 単一書き手追記ログ・Merkle塊・HeadPin (B6/B7防御)
-│   └── l5_clayfs.py           # clayfs スナップショット連携アダプタ (NFC正規化・非再帰)
+│   ├── l5_clayfs.py           # clayfs スナップショット連携アダプタ (NFC正規化・非再帰)
+│   ├── remotes.py             # rclone ライク CLI のリモート定義（名前 -> 接続情報）
+│   └── rclone_cli.py          # rclone ライク CLI 本体（ls/cat/copy/sync/pull/check）
+├── dfs5r                      # rclone ライク CLI のエントリポイント
 └── tests/
     ├── test_evil_suite.py     # A2, A5, B6, B7 + 単一書き手排他 + 委譲失効の回帰試験
     └── test_integration.py    # 2ノード共有・最終5指標の自動計測テスト

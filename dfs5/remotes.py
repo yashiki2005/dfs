@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""
+dfs5/remotes.py
+rclone ライク CLI のためのリモート定義の保存と取り出し。
+
+`~/.config/dfs5/remotes.json` に「名前 -> 接続情報」を置く。1 つのリモートは
+L2 名簿の URL・L3 OST の host:port・サブツリーのパス・書き手鍵・tree_secret・
+作業ディレクトリを持つ。`remote:path` の形で参照する。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from .crypto import normalize_path
+
+CONFIG_ENV = "DFS5_CONFIG"
+DEFAULT_CONFIG = "~/.config/dfs5/remotes.json"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+REQUIRED_FIELDS = ("registry", "ost", "path", "key", "secret")
+
+
+class RemoteError(Exception):
+    """リモート定義の誤り"""
+
+
+@dataclass
+class Remote:
+    """1 つのリモート（= 1 つの書き込み境界）の定義。"""
+
+    name: str
+    registry: str                       # L2 名簿 URL（例: http://172.16.1.60:19440）
+    ost: str                            # L3 OST の host:port（例: 172.16.1.60:19443）
+    path: str                           # サブツリーのパス（例: /example.com/alice/notes）
+    key: str                            # 書き手の OpenSSH Ed25519 秘密鍵
+    secret: str                         # tree_secret（Convergent AEAD）
+    workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs5/<name>）
+    epoch: int = 1                      # 委譲のエポック
+    node_name: str = ""                 # 端末名（既定: リモート名）
+
+    def resolved_workdir(self) -> Path:
+        if self.workdir:
+            return Path(self.workdir).expanduser()
+        return Path("~/.cache/dfs5").expanduser() / self.name
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["node_name"] = self.node_name or self.name
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Remote":
+        missing = [f for f in ("name",) + REQUIRED_FIELDS if not data.get(f)]
+        if missing:
+            raise RemoteError(f"Remote definition is missing fields: {', '.join(missing)}")
+        return cls(
+            name=str(data["name"]),
+            registry=str(data["registry"]),
+            ost=str(data["ost"]),
+            path=normalize_path(str(data["path"])),
+            key=str(data["key"]),
+            secret=str(data["secret"]),
+            workdir=str(data.get("workdir", "")),
+            epoch=int(data.get("epoch", 1)),
+            node_name=str(data.get("node_name", "") or data["name"]),
+        )
+
+
+def config_path() -> Path:
+    raw = os.environ.get(CONFIG_ENV)
+    if raw:
+        return Path(raw).expanduser()
+    return Path(DEFAULT_CONFIG).expanduser()
+
+
+class RemoteStore:
+    """リモート定義の集合。JSON 1 ファイルに保存する。"""
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = Path(path) if path is not None else config_path()
+        self.remotes: Dict[str, Remote] = {}
+        self.load()
+
+    def load(self) -> None:
+        self.remotes = {}
+        if not self.path.is_file():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise RemoteError(f"Config file {self.path} is not valid JSON: {e}") from e
+        for name, item in (raw.get("remotes") or {}).items():
+            data = dict(item)
+            data.setdefault("name", name)
+            self.remotes[name] = Remote.from_dict(data)
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": "dfs5-remotes-v1",
+            "remotes": {name: r.to_dict() for name, r in sorted(self.remotes.items())},
+        }
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(self.path)
+
+    def get(self, name: str) -> Remote:
+        if name not in self.remotes:
+            known = ", ".join(sorted(self.remotes)) or "(none)"
+            raise RemoteError(f"Unknown remote {name!r}. Known remotes: {known}")
+        return self.remotes[name]
+
+    def set(self, remote: Remote) -> None:
+        if not NAME_RE.match(remote.name):
+            raise RemoteError(
+                f"Invalid remote name {remote.name!r}: use letters, digits, '_', '.', '-'"
+            )
+        self.remotes[remote.name] = remote
+        self.save()
+
+    def delete(self, name: str) -> bool:
+        if name in self.remotes:
+            del self.remotes[name]
+            self.save()
+            return True
+        return False
+
+    def names(self) -> List[str]:
+        return sorted(self.remotes)
+
+
+def split_remote_spec(spec: str, default_remote: Optional[str] = None) -> tuple[str, str]:
+    """``remote:path`` を (リモート名, パス) に分ける。
+
+    ``:path`` だけなら ``default_remote`` を使う。``remote:`` はパスが空。
+    """
+    if ":" in spec:
+        name, _, sub = spec.partition(":")
+        name = name or (default_remote or "")
+        if not name:
+            raise RemoteError(f"Remote name is required in {spec!r} (or pass --remote)")
+        return name, sub.lstrip("/")
+    if not default_remote:
+        raise RemoteError(
+            f"Cannot tell if {spec!r} is a remote or a local path. "
+            "Use 'remote:path' or pass --remote."
+        )
+    return default_remote, spec.lstrip("/")

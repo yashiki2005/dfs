@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+dfs5/tests/test_rclone_cli.py
+rclone ライク CLI (`dfs5/rclone_cli.py`) の試験。
+
+ローカルに L2 名簿 (HTTP) と L3 OST (TLS) を 1 つ立て、`dfs5r` の主要な操作を
+実際に呼ぶ。サーバは既存の `cli.py` の部品をそのまま使う。
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from dfs5 import cli as cli_mod
+from dfs5.crypto import ContentAddressedCrypto
+from dfs5.l1_delegation import create_delegation_envelope
+from dfs5.l3_store import ChunkStoreServer
+from dfs5.l4_log import MerkleTreeBuilder
+from dfs5.l5_clayfs import DFS5Node
+from dfs5.rclone_cli import main as rclone_main
+from dfs5.remotes import Remote, RemoteStore
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _keypair(base: Path, name: str) -> Path:
+    priv = base / name
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"{name}@example.com", "-f", str(priv)],
+        check=True, capture_output=True,
+    )
+    return priv
+
+
+class LocalServer:
+    """L2 (HTTP) と L3 (TLS) を 1 組だけ立てる試験用のサーバ。"""
+
+    def __init__(self, base: Path, root_pub: str):
+        self.base = base
+        cert, key = base / "ost_cert.pem", base / "ost_key.pem"
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
+             "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=dfs5-test"],
+            check=True, capture_output=True,
+        )
+        self.ost = ChunkStoreServer(cert, key)
+        self.pstate = cli_mod.PersistentRegistryState(base / "state", "/example.com", root_pub)
+        handler = cli_mod.make_registry_http_handler(self.pstate, self.ost)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def registry_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def ost_endpoint(self) -> str:
+        return f"127.0.0.1:{self.ost.port}"
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.ost.close()
+
+
+class RcloneCase(unittest.TestCase):
+    """共通の準備（鍵・委譲・サーバ・リモート定義・データ）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5r_test_")
+        self.base = Path(self._tmp.name)
+        self.root_key = _keypair(self.base, "root")
+        self.alice_key = _keypair(self.base, "alice")
+        self.root_pub = (self.base / "root.pub").read_text(encoding="utf-8").strip()
+        self.alice_pub = (self.base / "alice.pub").read_text(encoding="utf-8").strip()
+
+        self.server = LocalServer(self.base, self.root_pub)
+        self.addCleanup(self.server.close)
+
+        now = int(time.time())
+        env = create_delegation_envelope(
+            parent_priv_key=self.root_key, parent="/example.com",
+            path="/example.com/alice/notes", writer_pubkey=self.alice_pub,
+            epoch=1, base_version=0, issued_at=now - 60, expires_at=now + 86400,
+        )
+        self.server.pstate.service.register_delegation(env, now=now)
+
+        self.config_file = self.base / "remotes.json"
+        self.old_config_env = os.environ.get("DFS5_CONFIG")
+        os.environ["DFS5_CONFIG"] = str(self.config_file)
+
+        self.workdir = self.base / "wd"
+        store = RemoteStore(self.config_file)
+        store.set(Remote(
+            name="t", registry=self.server.registry_url, ost=self.server.ost_endpoint,
+            path="/example.com/alice/notes", key=str(self.alice_key), secret="s3cret",
+            workdir=str(self.workdir),
+        ))
+
+        self.local = self.base / "local"
+        (self.local / "docs" / "sub").mkdir(parents=True)
+        (self.local / "a.txt").write_text("hello world\n", encoding="utf-8")
+        (self.local / "b.bin").write_bytes(b"B" * 4096)
+        (self.local / "docs" / "readme.md").write_text("readme\n", encoding="utf-8")
+        (self.local / "docs" / "sub" / "deep.txt").write_text("deep\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        if self.old_config_env is None:
+            os.environ.pop("DFS5_CONFIG", None)
+        else:
+            os.environ["DFS5_CONFIG"] = self.old_config_env
+        self._tmp.cleanup()
+
+    def run_cli(self, *argv: str) -> int:
+        """`dfs5r` を同じプロセスで実行する（出力はそのまま出る）。"""
+        return rclone_main(list(argv))
+
+    # ---- config ----
+    def test_config_roundtrip(self) -> None:
+        store = RemoteStore(self.config_file)
+        self.assertEqual(store.names(), ["t"])
+        r = store.get("t")
+        self.assertEqual(r.path, "/example.com/alice/notes")
+        self.assertEqual(r.resolved_workdir(), self.workdir)
+        # モードが 600 であること（秘密を置くため）
+        self.assertEqual(oct(self.config_file.stat().st_mode & 0o777), "0o600")
+
+    def test_unknown_remote_is_an_error(self) -> None:
+        with self.assertRaises(Exception):
+            RemoteStore(self.config_file).get("nope")
+
+    # ---- copy / ls / cat ----
+    def test_copy_ls_cat_pull(self) -> None:
+        rc = self.run_cli("copy", str(self.local), "t:")
+        self.assertEqual(rc, 0)
+
+        # copy は src の中身を宛先へ展開するので、root 直下は a.txt / b.bin / docs/
+        rc = self.run_cli("cat", "t:docs/readme.md")
+        self.assertEqual(rc, 0)
+
+        # 取り出して内容が一致すること
+        out = self.base / "out"
+        rc = self.run_cli("pull", "t:", str(out))
+        self.assertEqual(rc, 0)
+        self.assertEqual((out / "a.txt").read_text(encoding="utf-8"), "hello world\n")
+        self.assertEqual((out / "docs" / "sub" / "deep.txt").read_text(encoding="utf-8"), "deep\n")
+        self.assertEqual((out / "b.bin").read_bytes(), b"B" * 4096)
+
+    def test_copy_is_idempotent(self) -> None:
+        """2 回目の copy は変更なしで、新しい版を作らない。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        v1 = node.l4.pin.version
+
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertEqual(node2.l4.pin.version, v1, "無変更の copy が新しい版を作っている")
+
+    def test_copyto_and_checksum(self) -> None:
+        one = self.base / "one.txt"
+        one.write_text("one file\n", encoding="utf-8")
+        self.assertEqual(self.run_cli("copyto", str(one), "t:docs/one.txt"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        v1 = node.l4.pin.version
+        # 同じ内容をもう一度 copyto しても版が増えない
+        self.assertEqual(self.run_cli("copyto", str(one), "t:docs/one.txt"), 0)
+        node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertEqual(node2.l4.pin.version, v1, "同じ内容の copyto が版を作っている")
+
+    def test_sync_delete(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        (self.local / "docs" / "readme.md").unlink()
+        rc = self.run_cli("sync", str(self.local), "t:", "--delete")
+        self.assertEqual(rc, 0)
+
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        paths = {e["path"] for e in node.list_remote()}
+        self.assertNotIn("docs/readme.md", paths)
+        self.assertIn("a.txt", paths)
+
+    def test_sync_without_delete_keeps_remote_only_files(self) -> None:
+        one = self.base / "one.txt"
+        one.write_text("remote only\n", encoding="utf-8")
+        self.assertEqual(self.run_cli("copyto", str(one), "t:keep.txt"), 0)
+        self.assertEqual(self.run_cli("sync", str(self.local), "t:"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        paths = {e["path"] for e in node.list_remote()}
+        self.assertIn("keep.txt", paths, "--delete なしの sync がリモートのファイルを消した")
+
+    def test_dry_run_does_not_write(self) -> None:
+        rc = self.run_cli("copy", str(self.local), "t:", "--dry-run")
+        self.assertEqual(rc, 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertEqual(node.list_remote(), [], "dry-run がリモートに書いた")
+
+    def test_check_reports_difference(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        rc = self.run_cli("check", "t:", str(self.local))
+        self.assertEqual(rc, 0, "一致しているのに check が失敗した")
+        (self.local / "extra.txt").write_text("extra\n", encoding="utf-8")
+        rc2 = self.run_cli("check", "t:", str(self.local))
+        self.assertEqual(rc2, 1, "差分があるのに check が成功した")
+
+    def test_ls_prefix_only_lists_direct_children(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        entries = node.list_remote()
+        top = {e["path"] for e in entries if "/" not in e["path"]}
+        self.assertEqual(top, {"a.txt", "b.bin", "docs"})
+
+    def test_no_default_remote_is_reported(self) -> None:
+        """`path` だけを渡して --remote も無いときは、使い方の誤り（終了コード 2）。"""
+        rc = self.run_cli("ls", "just-a-path")
+        self.assertEqual(rc, 2)
+
+    def test_remote_error_exit_code(self) -> None:
+        """知らないリモートは終了コード 2 で返る（例外を投げない）。"""
+        rc = self.run_cli("ls", "nope:")
+        self.assertEqual(rc, 2)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
