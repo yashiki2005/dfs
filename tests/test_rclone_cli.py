@@ -163,6 +163,67 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(self.run_cli("cat", "t:a.txt"), 0)
         self.assertEqual(self.run_cli("about", "t:"), 0)
 
+    def test_registry_host_only_gets_default_port(self) -> None:
+        """--registry はホスト名だけでよい（ポートを補う）。"""
+        from dfs5.rclone_cli import normalize_registry
+
+        self.assertEqual(normalize_registry("172.16.1.60"), "http://172.16.1.60:9440")
+        self.assertEqual(normalize_registry("http://host:1234"), "http://host:1234")
+        self.assertEqual(normalize_registry("host", 19440), "http://host:19440")
+        self.assertEqual(normalize_registry("https://host/"), "https://host:9440")
+
+    def test_config_create_makes_key_when_omitted(self) -> None:
+        """--key を省くと、その場で Ed25519 の鍵を作る。"""
+        store = RemoteStore(self.config_file)
+        store.remotes.pop("t", None)
+        store.save()
+        key_dir = self.base / "auto_keys"
+        rc = self.run_cli(
+            "config", "create", "t",
+            "--registry", self.server.registry_url,
+            "--key-dir", str(key_dir),
+            "--secret", "s3cret",
+            "--workdir", str(self.workdir),
+        )
+        self.assertEqual(rc, 0)
+        created = key_dir / "t_ed25519"
+        self.assertTrue(created.is_file(), "鍵が作られていない")
+        self.assertTrue(Path(f"{created}.pub").is_file(), ".pub が無い")
+        # OpenSSH 形式であること
+        self.assertIn("BEGIN OPENSSH PRIVATE KEY", created.read_text(encoding="utf-8"))
+        # 600 であること
+        self.assertEqual(oct(created.stat().st_mode & 0o777), "0o600")
+        # 定義にも反映されている
+        saved = RemoteStore(self.config_file).get("t")
+        self.assertEqual(saved.key, str(created))
+
+    def test_explicit_missing_key_is_refused(self) -> None:
+        """--key で存在しないパスを渡したら断る（勝手に作らない）。"""
+        store = RemoteStore(self.config_file)
+        store.remotes.pop("t", None)
+        store.save()
+        rc = self.run_cli(
+            "config", "create", "t",
+            "--registry", self.server.registry_url,
+            "--key", str(self.base / "nope"),
+            "--secret", "s3cret",
+        )
+        self.assertEqual(rc, 2, "存在しない --key を受け入れた")
+
+    def test_no_prompt_keeps_secret_empty(self) -> None:
+        """--no-prompt なら端末から読まず、secret は空のままになる。"""
+        store = RemoteStore(self.config_file)
+        store.remotes.pop("t", None)
+        store.save()
+        rc = self.run_cli(
+            "config", "create", "t",
+            "--registry", self.server.registry_url,
+            "--key-dir", str(self.base / "k2"),
+            "--no-prompt",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(RemoteStore(self.config_file).get("t").secret, "")
+
     def test_path_without_leading_slash_is_accepted(self) -> None:
         """--path は / で始まらなくてもよい。"""
         store = RemoteStore(self.config_file)

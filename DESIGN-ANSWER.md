@@ -55,10 +55,15 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
 （`dfs5r`）。`dfs5/cli.py` の部品（L2 名簿クライアント、サーバ、ノード構築）をそのまま使い、
 リモート名で場所を指す操作体系を被せたものである。
 
-- リモート = 書き込み境界（サブツリー）。核は L2 URL と書き手鍵だけで、**L3 OST とサブパスは
+- リモート = 書き込み境界（サブツリー）。核は L2 名簿だけで、**L3 OST とサブパスは
   L2 に問い合わせて解決する**（ロケータの `endpoints` と、委譲レコードの書き手公開鍵）。
-  最小の登録は `--registry` と `--key`。`tree_secret` だけはサーバに置かない共有秘密なので、
-  書く前に別途設定する（空なら使い方の誤りとして止める）。`--path` は `/` で始まらなくてよい。
+  最小の登録は `--registry`（ホスト名だけでよい。既定ポート 9440 を補う）。
+  - 書き手の鍵は `--key` を省くとその場で作る（`~/.config/dfs5/keys/<名前>_ed25519`、
+    OpenSSH 形式）。渡したパスが無ければ断る（打ち間違いで新規作成しない）。
+  - `tree_secret` はサーバに置かない共有秘密なので、`--secret` を省くと端末から
+    エコーなしで読む（Python の `getpass`。macOS に pinentry/dialog が無いため）。
+    空のまま書こうとすると使い方の誤りとして止める。
+  - `--path` は `/` で始まらなくてよい。
 - 読み出し（`ls` / `lsl` / `lsjson` / `size` / `cat` / `check`）は版を進めない。一覧は
   ディレクトリ塊だけを辿り、ファイルの中身を取らない（`l4_log.py::list_tree`）。
 - 削除は `rm` / `rmdir` / `purge`、ディレクトリ作成は `mkdir`。dfs5 は**空のディレクトリも
@@ -70,9 +75,9 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
 - `--key` は OpenSSH 形式の Ed25519 秘密鍵（`crypto.py` の署名経路が OpenSSH 形式前提）。
 - 実測（Mac ローカル）: 4 ファイル 4,027B の copy が 69.9 ms。`--ost` / `--path` を省いて
   `config create` → `touch` → `copy` → `cat` → `pull` が通り、`pull` の内容は `diff` で一致した。
-- 回帰は `tests/test_rclone_cli.py` の 25 件（冪等・dry-run・`--delete` の有無・終了コード・
+- 回帰は `tests/test_rclone_cli.py` の 29 件（冪等・dry-run・`--delete` の有無・終了コード・
   一覧が直下だけであること・`--ost`/`--path` の省略・`tree_secret` 空の拒否・削除と空
-  ディレクトリの往復）。
+  ディレクトリの往復・ホスト名だけの registry・鍵の自動作成・`--no-prompt`）。
 
 #### 2.0.3 ローカルにサーバを立てる（`dfs5svc`）
 
@@ -83,6 +88,7 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
 - **連続した空きポートを 2 つ探し**、1 つ目を L2、2 つ目を L3 に割り当てる。
 - root の Ed25519 鍵と**書き手の鍵**を用意し、状態ディレクトリを作って `dfs5 serve` を起動し、
   書き手への委譲（途中の階層も含む）を登録する。`start` 1 回で `dfs5r` が使える。
+  多段の委譲は有効期間を揃えると時刻のずれで Invariant 3 に落ちるため、中間を 1 日長くする。
 - 起動を待って L2 の応答を確かめ、接続に必要な値を `~/.config/dfs5/services.json`（600）に記録する。
 - `stop` / `list` / `status` / `env` / `logs` で後始末と確認ができる。`stop` は SIGTERM →
   10 秒 → SIGKILL。

@@ -23,24 +23,81 @@
 dfs5 の単一書き手の境界は「サブツリーのパス」である（`/example.com/alice/notes`）。
 rclone のリモートはこれに対応させた。**ホスト名ではない。**
 
-1 つのリモートは次の 6 つをまとめて持つ。だからコマンドのたびに長い URL や鍵のパスを
-書かなくて済む。
+1 つのリモートが持つ情報のうち、**L2 名簿に問い合わせれば分かるものは書かなくてよい**。
 
-| 項目 | 例 |
-|---|---|
-| L2 名簿 URL | `http://172.16.1.60:19440` |
-| L3 OST の host:port | `172.16.1.60:19443` |
-| サブツリーのパス | `/example.com/alice/notes` |
-| 書き手の OpenSSH Ed25519 秘密鍵 | `~/.ssh/alice` |
-| `tree_secret`（Convergent AEAD の共有秘密） | — |
-| 作業ディレクトリ | `~/.cache/dfs5/<名前>`（`--workdir` で変更） |
+| 項目 | 例 | 省略したとき |
+|---|---|---|
+| L2 名簿 | `172.16.1.60` | **必須**（出発点。ホスト名だけでよい） |
+| 書き手の OpenSSH Ed25519 秘密鍵 | `~/.ssh/alice` | その場で作る（`~/.config/dfs5/keys/<名前>_ed25519`） |
+| L3 OST の host:port | `172.16.1.60:19443` | L2 のロケータ（`endpoints`）から解決する |
+| サブツリーのパス | `/example.com/alice/notes` | L2 で書き手公開鍵から探す |
+| `tree_secret`（共有秘密） | — | 端末からエコーなしで読む |
+| 作業ディレクトリ | `~/.cache/dfs5/<名前>` | 既定（`--workdir` で変更） |
 
-定義は `~/.config/dfs5/remotes.json`（`DFS5_CONFIG` で変更）に置く。秘密を含むため
-パーミッションは 600 にする。
+最小の登録はこうなる。
+
+```bash
+# ホスト名だけ。鍵は作り、secret は端末から読む
+dfs5r config create scw --registry 172.16.1.60
+```
+
+#### レジストリはホスト名だけでよい
+
+L2 の既定ポートは **9440**。`--registry` に `172.16.1.60` のようにホスト名（または IP）だけ
+を渡すと、`http://` と `:9440` を補う。別のポートなら `--registry-port` で変えるか、
+`host:port` をそのまま書く。
+
+```
+172.16.1.60                -> http://172.16.1.60:9440
+http://host:1234           -> http://host:1234        （そのまま）
+host --registry-port 19440 -> http://host:19440
+```
+
+`urlparse` で判定するので、`host:port` と `host` を取り違えない。
+
+**L2 が OST の場所とパスを知っている理由**: L2 のロケータ（`dfs5-l2-locator-v1`）は
+`endpoints` を持ち、そこに L3 の場所（`tls://172.16.1.60:19443`）が入る。これは版を
+書くたびに更新される。委譲レコードは書き手の公開鍵（`writer`）を持つので、「この鍵が
+書くのはどのサブツリーか」を L2 に聞ける。最初の版を書く前はロケータがまだ無いため、
+L2 は `--advertise`（または bind から推定したホスト）で自分の L3 の場所を広告する。
+
+#### 書き手の鍵はその場で作る
+
+`--key` を省くと、`~/.config/dfs5/keys/<名前>_ed25519` に Ed25519 の鍵を作る
+（`--key-dir` で場所を変えられる）。OpenSSH 形式で、パーミッションは 600。
+
+`--key` を**渡した**のにそのパスが無い場合は、勝手に作らず使い方の誤り（終了コード 2）で
+止める。既存の鍵を使いたい人が、打ち間違いで新しい鍵を作ってしまうのを避けるため。
+
+#### tree_secret は端末から読む
+
+`tree_secret` は L2 から引けない（サーバに置かない共有秘密だから）。**書く前に**必要になる。
+`--secret` を省くと、端末から**エコーなし**で読む。
+
+```
+$ dfs5r config create scw --registry 172.16.1.60
+scw の tree_secret:          ← 入力は画面に出ない
+[dfs5r] リモート 'scw' を保存しました: ~/.config/dfs5/remotes.json
+  registry    : http://172.16.1.60:9440
+  書き手の鍵  : ~/.config/dfs5/keys/scw_ed25519（作った。OpenSSH 形式の Ed25519）
+  tree_secret : *** （端末から読みました）
+```
+
+実装は Python の `getpass`（標準ライブラリ）。`/dev/tty` からエコーなしで読む。
+パイプやリダイレクトの中では端末が無いので読まず、`--secret` を渡すよう促す。
+`--no-prompt` を付けると、端末があっても読まない（スクリプト用）。
+
+空のまま書こうとすると、黙って弱い暗号にせず使い方の誤り（終了コード 2）で止める。
+
+#### なぜ pinentry を使わないか
+
+パスフレーズを端末から安全に読む Unix の標準部品は **`pinentry`（`pinentry-curses`）** で、
+`dialog` / `whiptail` も同種である。ただし macOS には既定で入っていないため、外部コマンドに
+頼らず `getpass` で済ませている。
 
 ### 1.2 鍵の形式
 
-`--key` は **OpenSSH 形式の Ed25519 秘密鍵**。PEM ではない。
+`--key` は **OpenSSH 形式の Ed25519 秘密鍵**。PEM ではない（省略時はこの形式で作る）。
 
 - `crypto.py` はまず `cryptography` の `load_ssh_private_key` で読み、復号できない鍵は
   `ssh-keygen -Y sign` に委ねる。どちらも OpenSSH 形式を前提にする。
@@ -53,14 +110,17 @@ rclone のリモートはこれに対応させた。**ホスト名ではない�
 
 ```text
 dfs5r listremotes
-# 最小（L2 が OST とパスを知っているので、この 3 つだけでよい）
-dfs5r config create NAME --registry URL --key <Ed25519 秘密鍵>
+# 最小（ホスト名だけ。鍵を作り、secret は端末から読む）
+dfs5r config create NAME --registry HOST
 
-# 書くなら tree_secret も渡す
-dfs5r config create NAME --registry URL --key <Ed25519 秘密鍵> --secret <tree_secret>
-
-# 明示したいときだけ --ost / --path / --workdir / --epoch / --node-name を足す
-dfs5r config create NAME --registry URL --key <鍵> --ost HOST:PORT --path /sub/path \
+# 省略したくないときだけ足す
+#   --registry-port N  ポートを補う番号（既定 9440）
+#   --key FILE         既存の Ed25519 秘密鍵（無ければ断る）
+#   --key-dir DIR      鍵を作る場所（既定 ~/.config/dfs5/keys）
+#   --secret VALUE     tree_secret（省くと端末から読む）
+#   --no-prompt        端末から読まない
+#   --ost / --path / --workdir / --epoch / --node-name
+dfs5r config create NAME --registry HOST --key FILE --ost HOST:PORT --path /sub/path \
                           [--workdir DIR] [--epoch N] [--node-name NAME]
 dfs5r config show|delete|list [NAME]
 
@@ -255,6 +315,10 @@ srv/
 | `test_no_default_remote_is_reported` | `--remote` 無しのパスを終了コード 2 で弾く |
 | `test_remote_error_exit_code` | 知らないリモートが終了コード 2 で返る |
 | `test_config_can_omit_ost_and_path` | `--ost` / `--path` を省いても L2 から解決して読み書きできる |
+| `test_registry_host_only_gets_default_port` | `--registry` はホスト名だけでよく、ポートを補う |
+| `test_config_create_makes_key_when_omitted` | `--key` を省くと OpenSSH 形式の鍵を作る（600） |
+| `test_explicit_missing_key_is_refused` | `--key` の打ち間違いでは鍵を作らない |
+| `test_no_prompt_keeps_secret_empty` | `--no-prompt` なら端末から読まない |
 | `test_path_without_leading_slash_is_accepted` | `--path` は `/` で始まらなくてよい |
 | `test_empty_secret_is_refused_on_write` | `tree_secret` が空のまま書こうとすると止まる |
 | `test_registry_advertises_ost_and_paths` | L2 が L3 の場所と登録済みパスを返す |
@@ -272,6 +336,10 @@ srv/
 - **`purge` は取り消せない。** 指定パスの中身を全部消し、ディレクトリも消す。`-n` で確認する。
 - **空ディレクトリは既定で残る。** ローカルに合わせたいときは `rm --rmdirs` か
   `sync --delete` を使う。
+- **`--key` を省くと鍵を作る。** 既存の鍵を使いたいときは必ず `--key` で渡す。渡したパスが
+  無ければ断る（打ち間違いで新しい鍵を作らないため）。
+- **`--secret` を省くと端末から読む。** パイプの中で使うなら `--secret` か `--no-prompt` を
+  明示する。
 - **`tree_secret` はリモートごとに独立**。WAN 試験のツリー（`dfs5-wan-shared-secret`）と
   別の秘密で `config create` すれば、別のツリーとして扱われる。共有したい場合は同じ秘密を使う。
   L2 からは引けない（サーバに置かない共有秘密）ので、書く前に必ず設定する。

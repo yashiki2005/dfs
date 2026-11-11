@@ -45,6 +45,13 @@ CONFIG_FILENAME = "services.json"
 DEFAULT_START_PORT = 19440
 DEFAULT_NAME = "local"
 DEFAULT_ROOT_ANCHOR = "/example.com"
+
+# 委譲の有効期間（日）。L1 は ``child.expires_at <= parent.expires_at`` を要求する。
+# 親子は**別のプロセス**で署名するため、同じ日数だと実行時刻が 1 秒ずれただけで子が親を
+# 超えて Invariant 3 に落ちる（テストで実際に起きた）。中間を 1 日長くして必ず親 > 子に
+# なるようにする。日単位の粗さで足りる（ずれは高々数秒）。
+LEAF_TTL_DAYS = 365
+INTERMEDIATE_TTL_DAYS = LEAF_TTL_DAYS + 1
 BASE_DIR_NAME = "dfs5svc"
 
 
@@ -256,10 +263,16 @@ def ensure_writer_key(path: Path) -> Path:
     return path
 
 
-def register_delegation(root_key: Path, writer_pub: Path, sub_path: str, registry_url: str) -> None:
+def register_delegation(
+    root_key: Path, writer_pub: Path, sub_path: str, registry_url: str,
+    ttl_days: int = LEAF_TTL_DAYS,
+) -> None:
     """root 鍵で書き手への委譲を署名し、L2 に登録する。
 
     すでに同じ書き手・同じパスの委譲があれば何もしない（再起動で作り直さない）。
+
+    ``ttl_days`` は末端（書き手への委譲）の有効期間。中間の委譲はこれより長くする
+    （``LEAF_TTL_DAYS`` と ``INTERMEDIATE_TTL_DAYS`` の関係を参照）。
     """
     import urllib.error
     import urllib.request
@@ -291,6 +304,7 @@ def register_delegation(root_key: Path, writer_pub: Path, sub_path: str, registr
         "--signing-key", str(root_key),
         "--writer-pubkey", str(writer_pub),
         "--registry", registry_url,
+        "--ttl-days", str(int(ttl_days)),
     ]
     res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:
@@ -326,6 +340,7 @@ def _ensure_parent_delegations(
 
 def register_delegation_chain_step(
     root_key: Path, root_pub: Path, parent: str, child: str, registry_url: str,
+    ttl_days: int = INTERMEDIATE_TTL_DAYS,
 ) -> None:
     """親のパスから子のパスへの委譲を、root 鍵で署名して登録する（中間の層）。"""
     import urllib.error
@@ -355,6 +370,7 @@ def register_delegation_chain_step(
         "--signing-key", str(root_key),
         "--writer-pubkey", str(root_pub),
         "--registry", registry_url,
+        "--ttl-days", str(int(ttl_days)),
     ]
     res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:

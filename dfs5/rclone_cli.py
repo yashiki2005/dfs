@@ -33,7 +33,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -41,6 +44,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import cli as cli_mod
+
+# L2 名簿の既定ポート。ホスト名だけで済むようにする（例: --registry 172.16.1.60）。
+DEFAULT_REGISTRY_PORT = 9440
+# dfs5svc が立てるサーバの既定。こちらは連続した空きを選ぶので 19440 から。
+DEFAULT_LOCAL_REGISTRY_PORT = 19440
 from .l2_registry import ConflictError, ServiceUnavailableError
 from .l4_log import (
     RollbackDetectedError,
@@ -465,6 +473,64 @@ def cmd_listremotes(args: argparse.Namespace) -> int:
     return 0
 
 
+def normalize_registry(value: str, default_port: int = DEFAULT_REGISTRY_PORT) -> str:
+    """``--registry`` を URL に正規化する。
+
+    ``172.16.1.60`` のようにホスト名（または IP）だけでも受け、足りない部分を補う。
+
+    - スキームが無ければ ``http://`` を付ける
+    - ポートが無ければ ``default_port`` を付ける
+    - 末尾の ``/`` は落とす
+
+    ``urlparse`` で判定するので、``host:port`` と ``host`` を取り違えない。
+    """
+    text = (value or "").strip()
+    if not text:
+        raise UsageError("--registry が空です")
+    if "://" not in text:
+        text = "http://" + text
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(text)
+    if not parts.hostname:
+        raise UsageError(f"--registry のホスト名が読み取れません: {value!r}")
+    netloc = parts.hostname
+    if parts.port is None:
+        netloc = f"{netloc}:{default_port}"
+    else:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme or "http", netloc, parts.path.rstrip("/"), "", ""))
+
+
+def prompt_secret(prompt: str = "tree_secret: ") -> str:
+    """``--secret`` が無いときに、端末からエコーなしで読む。
+
+    標準の ``getpass`` を使う。macOS には ``pinentry`` / ``dialog`` / ``whiptail``
+    が無いので、外部コマンドに頼らずこれで足りる。``getpass.getpass`` は
+    ``/dev/tty`` から読み、入力は画面に出ない。パイプやリダイレクトの中では
+    端末が無いため読めないので、そのときは空を返して「--secret を渡す」ように促す。
+    """
+    import getpass
+    import warnings
+
+    # 端末が無い（パイプ・リダイレクト・テスト）ときは読まない。
+    # getpass は端末を制御しようとして GetPassWarning を出すので、ここで止める。
+    if not sys.stdin.isatty() or not Path("/dev/tty").exists():
+        return ""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            return getpass.getpass(prompt).strip()
+    except getpass.GetPassWarning:
+        # 端末を制御できない（テストなど）。黙って空を返し、--secret を促す。
+        return ""
+    except (EOFError, KeyboardInterrupt):
+        print("", file=sys.stderr)
+        return ""
+    except Exception:  # noqa: BLE001 - 端末が無いときは黙って空を返す
+        return ""
+
+
 def _normalize_path_arg(value: Optional[str]) -> str:
     """``--path`` を正規化する。``/`` 始まりでも、無くても受ける。
 
@@ -491,28 +557,75 @@ def normalize_subtree_path(text: str) -> str:
 def cmd_config(args: argparse.Namespace) -> int:
     store = RemoteStore()
     if args.action == "create":
-        if not args.registry or not args.key:
-            raise UsageError("config create には --registry と --key が必要です")
+        if not args.registry:
+            raise UsageError("config create には --registry が必要です")
+
+        registry = normalize_registry(args.registry, args.registry_port)
+
+        # --key が無ければ、その場で Ed25519 の鍵を作る。
+        # 書き手の鍵は dfs5r が初めて使うものなので、利用者に用意させない。
+        key_path: Path
+        created_key = False
+        if args.key:
+            key_path = Path(args.key).expanduser()
+            if not key_path.is_file():
+                raise UsageError(f"指定された書き手鍵がありません: {key_path}")
+        else:
+            key_dir = Path(args.key_dir).expanduser() if args.key_dir else (
+                Path.home() / ".config" / "dfs5" / "keys"
+            )
+            key_dir.mkdir(parents=True, exist_ok=True)
+            key_path = key_dir / f"{args.name}_ed25519"
+            if not key_path.is_file():
+                res = subprocess.run(
+                    ["ssh-keygen", "-t", "ed25519", "-N", "",
+                     "-C", f"dfs5r-{args.name}@{socket.gethostname()}", "-f", str(key_path)],
+                    capture_output=True, text=True,
+                )
+                if res.returncode != 0:
+                    raise UsageError(f"鍵を作れませんでした: {res.stderr.strip()}")
+                os.chmod(key_path, 0o600)
+                created_key = True
+
+        # --secret が無ければ端末から読む（エコーなし）。
+        secret = args.secret
+        secret_from_prompt = False
+        if not secret and not args.no_prompt:
+            secret = prompt_secret(f"{args.name} の tree_secret: ")
+            secret_from_prompt = bool(secret)
+
         remote = Remote(
             name=args.name,
-            registry=args.registry,
-            key=args.key,
+            registry=registry,
+            key=str(key_path),
             ost=args.ost or "",
             path=_normalize_path_arg(args.path),
-            secret=args.secret or "",
+            secret=secret or "",
             workdir=args.workdir or "",
             epoch=int(args.epoch),
             node_name=args.node_name or args.name,
         )
         store.set(remote)
         print(f"[dfs5r] リモート {remote.name!r} を保存しました: {store.path}")
+        print(f"  registry    : {remote.registry}")
+        if created_key:
+            print(f"  書き手の鍵  : {key_path}（作った。OpenSSH 形式の Ed25519）")
+        else:
+            print(f"  書き手の鍵  : {key_path}")
         print(f"  作業ディレクトリ: {remote.resolved_workdir()}")
-        if not remote.ost:
+        if remote.ost:
+            print(f"  L3 OST      : {remote.ost}")
+        else:
             print("  L3 OST      : （未指定。使うときに L2 のロケータから解決します）")
-        if not remote.path:
+        if remote.path:
+            print(f"  サブツリー  : {remote.path}")
+        else:
             print("  サブツリー  : （未指定。使うときに L2 で書き手鍵から探します）")
-        if not remote.secret:
-            print("  tree_secret : （未指定。暗号化に必要なので、書く前に --secret を設定してください）")
+        if remote.secret:
+            how = "端末から読みました" if secret_from_prompt else "指定どおり"
+            print(f"  tree_secret : *** （{how}）")
+        else:
+            print("  tree_secret : （未指定。書く前に設定してください）")
         return 0
 
     if args.action == "delete":
@@ -1061,11 +1174,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf = sub.add_parser("config", help="リモート定義の作成・表示・削除")
     p_conf.add_argument("action", choices=["create", "show", "delete", "list"])
     p_conf.add_argument("name", nargs="?", default="")
-    p_conf.add_argument("--registry", help="L2 名簿 URL（例: http://172.16.1.60:19440）")
+    p_conf.add_argument(
+        "--registry",
+        help=f"L2 名簿。ホスト名だけでよい（例: 172.16.1.60）。"
+             f"ポートを省くと {DEFAULT_REGISTRY_PORT} を補う",
+    )
+    p_conf.add_argument(
+        "--registry-port", type=int, default=DEFAULT_REGISTRY_PORT,
+        help=f"--registry にポートが無いときに補う番号（既定 {DEFAULT_REGISTRY_PORT}）",
+    )
     p_conf.add_argument("--ost", help="L3 OST の host:port（例: 172.16.1.60:19443）")
     p_conf.add_argument("--path", help="サブツリーのパス（例: /example.com/alice/notes）")
-    p_conf.add_argument("--key", help="書き手の OpenSSH Ed25519 秘密鍵")
-    p_conf.add_argument("--secret", help="tree_secret（Convergent AEAD の共有秘密）")
+    p_conf.add_argument("--key", help="書き手の OpenSSH Ed25519 秘密鍵（省略すると作る）")
+    p_conf.add_argument(
+        "--key-dir",
+        help="--key を省いたときに鍵を置く場所（既定 ~/.config/dfs5/keys）",
+    )
+    p_conf.add_argument(
+        "--secret",
+        help="tree_secret（Convergent AEAD の共有秘密）。省略すると端末からエコーなしで読む",
+    )
+    p_conf.add_argument(
+        "--no-prompt", action="store_true",
+        help="--secret を省いても端末から読まない（パイプで使うとき）",
+    )
     p_conf.add_argument("--workdir", help="作業ディレクトリ（既定 ~/.cache/dfs5/<name>）")
     p_conf.add_argument("--epoch", type=int, default=1, help="委譲のエポック（既定 1）")
     p_conf.add_argument("--node-name", help="端末名（既定はリモート名）")
