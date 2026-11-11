@@ -326,10 +326,19 @@ class Harness:
         client_mount = f"{local_work}/client_mount" if not args.client_ssh else f"{self.remote_work}/client_mount"
         reader_mount = f"{local_work}/reader_mount" if not args.client_ssh else f"{self.remote_work}/reader_mount"
         if args.client_ssh:
-            self.server_exec(
+            # 消すのは「クライアント側」のマウント。ssh 先（Sakura など）で実行する。
+            # サーバ側に対して消すと、クライアントに古い pin が残り CAS 競合になる。
+            rc, out, ms = self.client_exec(
                 f"mkdir -p {qpath(self.remote_work)} && "
-                f"rm -rf {qpath(client_mount)} {qpath(reader_mount)} && echo CLEAN_OK",
-                expect="CLEAN_OK", name="クライアント作業ディレクトリ初期化")
+                f"rm -rf {qpath(client_mount)} {qpath(reader_mount)} && echo CLEAN_OK")
+            self.step("クライアント作業ディレクトリ初期化", rc == 0 and "CLEAN_OK" in out, out, ms)
+            # 鍵もクライアント側の作業ディレクトリ配下に置き直す（--reset で消えているため）
+            r, o = ssh_run(args.client_key, args.client_ssh,
+                           f"mkdir -p {qpath(self.remote_work)}/keys && echo MKDIR_OK")
+            if r == 0 and "MKDIR_OK" in o:
+                for fname in ("root.pub", "alice", "alice.pub"):
+                    scp_to(args.client_key, self.work / "keys" / fname, args.client_ssh,
+                           f"{self.remote_work}/keys/{fname}")
 
         self._init_mount("クライアント init", client_mount, "wan-client")
         self._generate_data(client_mount)

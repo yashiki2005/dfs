@@ -67,7 +67,8 @@ LAN の計測（§2）だけでは往復回数の問題が見えなかった。R
 |---|---|---|
 | push（索引ヒットしたチャンクが N 個） | N 回の `batch_has` + 1 回の PUT | **1 回の `batch_has`（まとめて）+ 1 回の PUT** |
 | push（新規チャンクが N 個） | — | **1 回の `batch_has` + 1 回の PUT**（`assume_absent=True`） |
-| pull（ファイル N 個） | 根 1 + ファイル N | 根 1 + ファイル N（**未改善**。`batch_get` を塊ごとに呼んでいる） |
+| pull（ファイル N 個、平ら） | 根 1 + ファイル N | **根 1 + ファイル 1 = 2 往復** |
+| pull（入れ子 D 階層 + ファイル） | ディレクトリ塊 + ファイルごと | **D 往復 + ファイル 1 往復** |
 
 実装の要点:
 
@@ -76,6 +77,10 @@ LAN の計測（§2）だけでは往復回数の問題が見えなかった。R
   で内部の `batch_has` を省略し、1 往復で PUT する。
 - 一括 HAS で「サーバから消えていた」塊が見つかった場合だけ、もう 1 回走査して作り直す
   （ディレクトリ塊は子の `wire_id` を含むため、部分差し替えでは整合しない）。
+- 読み出しは `download_directory` を 2 段に分ける。**ディレクトリ塊は幅優先で 1 階層 1 往復**、
+  **ファイル塊は最後に store ごと・上限ごとに一括取得**する。1 回の応答が大きくなりすぎないよう、
+  マニフェストの `size` から先に分かる見積りで組を切る（`DFS5_BATCH_CHUNKS` = 既定 1024、
+  `DFS5_BATCH_BYTES` = 既定 16 MiB）。同じ `wire_id` は 1 回しか取りに行かない。
 
 WAN 実測（20 × 128KB、RTT 278〜285ms、`specs/e2e_wan.md`）:
 
@@ -86,8 +91,18 @@ WAN 実測（20 × 128KB、RTT 278〜285ms、`specs/e2e_wan.md`）:
 | Mac → Sakura（22.4ms） | **1** | 923ms | **21** | 953ms |
 
 push は往復が固定なので、所要時間はほぼ RTT と転送量で決まる。
-pull は往復がファイル数に比例するため、高遅延ではファイル数がそのまま効く。
-`batch_get` の一括化が次の課題である（§5）。
+pull も batch 系の導入後は往復がファイル数に依存しなくなった（下記）。
+
+batch 導入の前後（20 × 128KB = 2.13MB）:
+
+| 経路 | RTT | pull 往復 | pull 所要 |
+|---|---|---|---|
+| Mac → Scaleway | 275.8ms | **21 → 2** | **8,025 → 4,010ms** |
+| Sakura → Scaleway | 275.1ms | **23 → 2** | **7,692 → 3,644ms** |
+| Mac → Sakura | 22.1ms | **21 → 2** | **953 → 534ms** |
+
+ローカルの回帰では、500 ファイルの平らな構造でも 2 往復、入れ子 3 階層 + 53 ファイルで 4 往復。
+残るのは転送量そのもので、往復の回数はもう支配的でない。
 
 回帰テスト:
 
@@ -96,6 +111,11 @@ pull は往復がファイル数に比例するため、高遅延ではファイ
 - `TestWanRoundTrips::test_ost_timeout_env_vars_are_honored` — タイムアウトが環境変数で変わる。
 - `TestWanRoundTrips::test_server_socket_timeout_is_actually_applied` — サーバのソケットに実際に効く。
 - `TestWanRoundTrips::test_l2_timeout_env_var_is_honored` — L2 HTTP のタイムアウトが変わる。
+- `TestPullBatch::test_flat_pull_is_two_round_trips` — 100 ファイルの pull が 2 往復。
+- `TestPullBatch::test_nested_pull_is_one_round_trip_per_level` — 入れ子は 1 階層 1 往復。
+- `TestPullBatch::test_same_chunk_fetched_once` — 同一内容の塊は 1 回しか取らない。
+- `TestPullBatch::test_batch_get_split_by_size_cap` — `DFS5_BATCH_CHUNKS` で組を絞れる。
+- `TestPullBatch::test_missing_chunk_is_reported` — 欠落は黙って欠けず例外になる。
 
 ---
 
@@ -162,8 +182,8 @@ OST 側で同じ塊を共有させることはできない。
 | mini_lustre との RPC アダプタ | **未実装**（必要になったとき） |
 | libtorrent | **導入しない**（規模が小さいうち） |
 | 大規模（1,000 塊以上）の再計測 | **未実施** |
-| WAN（RTT 285ms）での実機計測 | **実施済み**（push 1 往復。`specs/e2e_wan.md`） |
-| pull の往復削減（`batch_get` の一括化） | **未実装**（往復がファイル数に比例） |
+| WAN（RTT 285ms）での実機計測 | **実施済み**（push 1 往復、pull 2 往復。`specs/e2e_wan.md`） |
+| pull の往復削減（`batch_get` の一括化） | **実装済み**（平らな構造で 2 往復） |
 
 ---
 

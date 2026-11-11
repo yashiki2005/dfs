@@ -7,9 +7,10 @@ L4 (一貫性・単一書き手追記ログ・Merkle ディレクトリ塊・evi
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .crypto import (
     EMPTY_SHA256,
@@ -31,6 +32,18 @@ from .l3_ost_adapter import OSTClient
 
 class RollbackDetectedError(Exception):
     """evil B6: リモートの先頭版またはハッシュがローカルピンより古い・不一致"""
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """環境変数から正の整数を読む。未設定・不正値・0 以下は既定に戻す。"""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 class SilentDropDetectedError(Exception):
@@ -258,6 +271,52 @@ class MerkleTreeBuilder:
         return root_pid, root_wid
 
     # ---- 読み込み ---------------------------------------------------------
+    # 一括取得の分割。往復を減らすため件数の上限は大きめに取り、1 回の応答サイズは
+    # バイト数の上限で抑える。ファイル塊の大きさはマニフェストの size から分かるので、
+    # 先頭の組から正確に見積もれる（測ってから合わせる必要がない）。
+    DEFAULT_BATCH_CHUNKS = 1024
+    DEFAULT_BATCH_BYTES = 16 * 1024 * 1024
+    # 大きさの分からない塊（ディレクトリ塊など）の見積り。小さめに倒して安全側に置く。
+    UNKNOWN_CHUNK_ESTIMATE = 4096
+
+    def _fetch_grouped(self, wanted: Sequence[Tuple[str, str, Optional[int]]]) -> Dict[str, bytes]:
+        """``(store_id, wire_id, size_hint)`` の並びを、store ごとにまとめて ``batch_get`` する。
+
+        往復回数は「store ごとの組の数」だけで決まる。同じ ``wire_id`` が複数回現れても
+        1 回しか取りに行かない。``size_hint`` があるものは 1 回の応答がバイト数の上限を
+        超えないよう組を切る。返り値は ``wire_id -> blob``。
+        """
+        by_store: Dict[str, Dict[str, Optional[int]]] = {}
+        for store_id, wire_id, hint in wanted:
+            prev = by_store.setdefault(store_id, {})
+            # 同じ塊が複数回出たら、大きい方の見積りを採る（安全側）
+            if wire_id not in prev or (hint or 0) > (prev[wire_id] or 0):
+                prev[wire_id] = hint
+
+        chunk_cap = _env_positive_int("DFS5_BATCH_CHUNKS", self.DEFAULT_BATCH_CHUNKS)
+        byte_cap = _env_positive_int("DFS5_BATCH_BYTES", self.DEFAULT_BATCH_BYTES)
+
+        result: Dict[str, bytes] = {}
+        for store_id, id_to_hint in by_store.items():
+            client = self._client(store_id)
+            items = list(id_to_hint.items())
+            i = 0
+            while i < len(items):
+                group: List[str] = []
+                est = 0
+                # 件数と見積りバイト数の両方の上限まで詰める。1 件だけの組は必ず許す。
+                while i < len(items) and len(group) < chunk_cap:
+                    wid, hint = items[i]
+                    size = hint if hint is not None else self.UNKNOWN_CHUNK_ESTIMATE
+                    if group and est + size > byte_cap:
+                        break
+                    group.append(wid)
+                    est += size
+                    i += 1
+                got = client.batch_get(group)
+                result.update(got)
+        return result
+
     def download_directory(
         self,
         root_plain_id: str,
@@ -265,34 +324,72 @@ class MerkleTreeBuilder:
         dest_dir: Path,
         root_store: Optional[str] = None,
     ) -> None:
-        """(root_plain_id, root_wire_id) から再帰的に塊を取得・検証・復号して dest_dir に展開する。"""
+        """(root_plain_id, root_wire_id) から再帰的に塊を取得・検証・復号して dest_dir に展開する。
+
+        WAN 向けの往復回数:
+          - ディレクトリ塊は幅優先で回り、**1 階層ぶんを 1 回の ``batch_get``** にまとめる。
+          - ファイル塊は最後に store ごと・上限ごとに ``batch_get`` でまとめて取得する。
+        したがって平らなディレクトリ（N ファイル）は 2 往復（根 1 + ファイル 1）で済む。
+        塊ごとに ``get`` を撃つ実装では往復がファイル数に比例していた。
+        """
         dest_dir.mkdir(parents=True, exist_ok=True)
-        store_id = root_store or self.default_store
-        blob = self._client(store_id).get(root_wire_id)
-        dir_bytes = self.crypto.unpack_chunk(root_plain_id, root_wire_id, blob)
-        dir_obj = json.loads(dir_bytes.decode("utf-8"))
+        root_store_id = root_store or self.default_store
 
-        if dir_obj.get("format") != "dfs5-dir-v1":
-            raise ChunkIntegrityError("Invalid directory chunk format")
+        # 1) ディレクトリ塊を幅優先で一括取得し、あわせてファイルの一覧を作る。
+        level: List[Tuple[str, str, str, Path]] = [
+            (root_plain_id, root_wire_id, root_store_id, dest_dir)
+        ]
+        files: List[Tuple[str, str, str, Path, Optional[int]]] = []
+        depth = 0
+        while level:
+            depth += 1
+            if depth > 10000:
+                raise ChunkIntegrityError("Directory tree is too deep (possible cycle)")
+            blobs = self._fetch_grouped([(sid, wid, None) for _pid, wid, sid, _ in level])
+            next_level: List[Tuple[str, str, str, Path]] = []
+            for plain_id, wire_id, _store_id, target in level:
+                blob = blobs.get(wire_id)
+                if blob is None:
+                    raise ChunkIntegrityError(f"Missing directory chunk during download: {wire_id}")
+                dir_bytes = self.crypto.unpack_chunk(plain_id, wire_id, blob)
+                dir_obj = json.loads(dir_bytes.decode("utf-8"))
+                if dir_obj.get("format") != "dfs5-dir-v1":
+                    raise ChunkIntegrityError("Invalid directory chunk format")
 
-        for entry in dir_obj["entries"]:
-            name = normalize_name(entry["name"])
-            target = dest_dir / name
-            etype = entry["type"]
-            entry_store = entry.get("store") or self.default_store
-
-            if etype == "file":
-                f_blob = self._client(entry_store).get(entry["wire_id"])
-                f_data = self.crypto.unpack_chunk(entry["plain_id"], entry["wire_id"], f_blob)
-                if len(f_data) != entry.get("size", len(f_data)):
-                    raise ChunkIntegrityError(f"File size mismatch for {name}")
-                target.write_bytes(f_data)
-            elif etype == "dir":
-                self.download_directory(entry["plain_id"], entry["wire_id"], target, root_store=entry_store)
-            elif etype == "delegated_mount":
+                # 各階層の対象ディレクトリは、塊を取る前に必ず用意する
                 target.mkdir(parents=True, exist_ok=True)
-            else:
-                raise ChunkIntegrityError(f"Unknown directory entry type: {etype!r}")
+                for entry in dir_obj["entries"]:
+                    name = normalize_name(entry["name"])
+                    child = target / name
+                    etype = entry["type"]
+                    entry_store = entry.get("store") or self.default_store
+
+                    if etype == "file":
+                        files.append(
+                            (entry["plain_id"], entry["wire_id"], entry_store, child, entry.get("size"))
+                        )
+                    elif etype == "dir":
+                        # 空のディレクトリも含めて、ここで実体を作る
+                        child.mkdir(parents=True, exist_ok=True)
+                        next_level.append((entry["plain_id"], entry["wire_id"], entry_store, child))
+                    elif etype == "delegated_mount":
+                        child.mkdir(parents=True, exist_ok=True)
+                    else:
+                        raise ChunkIntegrityError(f"Unknown directory entry type: {etype!r}")
+            level = next_level
+
+        # 2) ファイル塊を store ごと・上限ごとに一括取得して書き出す。
+        file_blobs = self._fetch_grouped(
+            [(sid, wid, size) for _pid, wid, sid, _t, size in files]
+        )
+        for plain_id, wire_id, _store_id, target, size in files:
+            f_blob = file_blobs.get(wire_id)
+            if f_blob is None:
+                raise ChunkIntegrityError(f"Missing file chunk during download: {wire_id}")
+            f_data = self.crypto.unpack_chunk(plain_id, wire_id, f_blob)
+            if size is not None and len(f_data) != size:
+                raise ChunkIntegrityError(f"File size mismatch for {target.name}")
+            target.write_bytes(f_data)
 
 
 class L4LogClient:

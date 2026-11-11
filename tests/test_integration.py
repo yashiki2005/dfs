@@ -145,6 +145,188 @@ class TestL3Striping(unittest.TestCase):
                 b.close()
 
 
+class TestPullBatch(unittest.TestCase):
+    """batch 系の導入: pull の往復をファイル数から切り離す。"""
+
+    @staticmethod
+    def _cert(base: Path):
+        cert, key = base / "c.pem", base / "k.pem"
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
+             "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=l"],
+            check=True, capture_output=True,
+        )
+        return cert, key
+
+    def test_flat_pull_is_two_round_trips(self) -> None:
+        """平らなディレクトリ 100 ファイルの pull は 2 往復（根 1 + ファイル 1）。"""
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_pull_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                for i in range(100):
+                    (tree / f"f{i:03d}.bin").write_bytes(f"payload-{i}".encode() * 50)
+
+                writer = OSTClient("127.0.0.1", ost.port)
+                pid, wid = MerkleTreeBuilder(ContentAddressedCrypto("pull-secret"), writer).upload_directory(tree)
+
+                reader = OSTClient("127.0.0.1", ost.port)
+                reader.reset_metrics()
+                dest = base / "out"
+                MerkleTreeBuilder(ContentAddressedCrypto("pull-secret"), reader).download_directory(pid, wid, dest)
+                self.assertLessEqual(
+                    reader.round_trips, 2,
+                    f"pull の往復がファイル数に比例している: {reader.round_trips}",
+                )
+                self.assertEqual(len(list(dest.rglob("*.bin"))), 100)
+                self.assertEqual((dest / "f000.bin").read_bytes(), (tree / "f000.bin").read_bytes())
+            finally:
+                ost.close()
+
+    def test_nested_pull_is_one_round_trip_per_level(self) -> None:
+        """入れ子は「1 階層 = 1 往復」。root/d1/d2 に 3 ファイルなら 3 往復。"""
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_nest_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                (tree / "d1" / "d2").mkdir(parents=True)
+                (tree / "top.txt").write_bytes(b"top\n" * 100)
+                (tree / "d1" / "mid.txt").write_bytes(b"mid\n" * 100)
+                (tree / "d1" / "d2" / "deep.txt").write_bytes(b"deep\n" * 100)
+
+                writer = OSTClient("127.0.0.1", ost.port)
+                pid, wid = MerkleTreeBuilder(ContentAddressedCrypto("nest-secret"), writer).upload_directory(tree)
+
+                reader = OSTClient("127.0.0.1", ost.port)
+                reader.reset_metrics()
+                dest = base / "out"
+                MerkleTreeBuilder(ContentAddressedCrypto("nest-secret"), reader).download_directory(pid, wid, dest)
+                # 根 -> d1 -> d2 の 3 階層 + 最下層のファイル取得 1 = 4 以下
+                self.assertLessEqual(
+                    reader.round_trips, 4,
+                    f"入れ子の往復が多い: {reader.round_trips}",
+                )
+                self.assertEqual((dest / "d1" / "d2" / "deep.txt").read_bytes(), b"deep\n" * 100)
+                self.assertEqual((dest / "top.txt").read_bytes(), b"top\n" * 100)
+            finally:
+                ost.close()
+
+    def test_same_chunk_fetched_once(self) -> None:
+        """同一内容のファイルが 2 つあっても、塊は 1 回しか取りに行かない。"""
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_dup_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                body = b"same-body\n" * 500
+                (tree / "a.bin").write_bytes(body)
+                (tree / "b.bin").write_bytes(body)
+
+                writer = OSTClient("127.0.0.1", ost.port)
+                pid, wid = MerkleTreeBuilder(ContentAddressedCrypto("dup-secret"), writer).upload_directory(tree)
+
+                reader = OSTClient("127.0.0.1", ost.port)
+                reader.reset_metrics()
+                dest = base / "out"
+                MerkleTreeBuilder(ContentAddressedCrypto("dup-secret"), reader).download_directory(pid, wid, dest)
+                self.assertLessEqual(reader.round_trips, 2, f"往復が多い: {reader.round_trips}")
+                # get_count は「受け取った塊の数」。根のディレクトリ塊 1 + 同一内容のファイル塊 1 = 2。
+                # 重複排除が効かないとファイル塊を 2 つ取るので 3 になる。
+                self.assertEqual(
+                    reader.get_count, 2,
+                    f"同一内容の塊を二重に取りに行っている: get_count={reader.get_count}",
+                )
+                self.assertEqual((dest / "a.bin").read_bytes(), body)
+                self.assertEqual((dest / "b.bin").read_bytes(), body)
+            finally:
+                ost.close()
+
+    def test_batch_get_split_by_size_cap(self) -> None:
+        """DFS5_BATCH_CHUNKS で 1 回の batch_get の件数を絞れる（組が分かれる）。"""
+        import os
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_cap_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            old = os.environ.get("DFS5_BATCH_CHUNKS")
+            os.environ["DFS5_BATCH_CHUNKS"] = "4"
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                for i in range(10):
+                    (tree / f"f{i}.bin").write_bytes(f"cap-{i}".encode() * 20)
+
+                writer = OSTClient("127.0.0.1", ost.port)
+                pid, wid = MerkleTreeBuilder(ContentAddressedCrypto("cap-secret"), writer).upload_directory(tree)
+
+                reader = OSTClient("127.0.0.1", ost.port)
+                reader.reset_metrics()
+                dest = base / "out"
+                MerkleTreeBuilder(ContentAddressedCrypto("cap-secret"), reader).download_directory(pid, wid, dest)
+                # 根 1 + ファイル 3 組（4+4+2）= 4 往復
+                self.assertGreaterEqual(reader.round_trips, 2, "上限が効かず 1 往復になっている")
+                self.assertLessEqual(reader.round_trips, 5, f"往復が多い: {reader.round_trips}")
+                self.assertEqual(len(list(dest.rglob("*.bin"))), 10)
+            finally:
+                ost.close()
+                if old is None:
+                    os.environ.pop("DFS5_BATCH_CHUNKS", None)
+                else:
+                    os.environ["DFS5_BATCH_CHUNKS"] = old
+
+    def test_missing_chunk_is_reported(self) -> None:
+        """サーバから塊が消えていたら、黙って欠けずに ChunkIntegrityError になる。"""
+        from dfs5.crypto import ContentAddressedCrypto, ChunkIntegrityError
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_miss_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                (tree / "a.bin").write_bytes(b"A" * 4096)
+                (tree / "b.bin").write_bytes(b"B" * 4096)
+
+                writer = OSTClient("127.0.0.1", ost.port)
+                pid, wid = MerkleTreeBuilder(ContentAddressedCrypto("miss-secret"), writer).upload_directory(tree)
+                # ファイル塊を 1 つ消す（根は残す）
+                victim = next(k for k, v in ost.store.items() if v != ost.store[wid])
+                del ost.store[victim]
+
+                reader = OSTClient("127.0.0.1", ost.port)
+                dest = base / "out"
+                with self.assertRaises(ChunkIntegrityError):
+                    MerkleTreeBuilder(ContentAddressedCrypto("miss-secret"), reader).download_directory(pid, wid, dest)
+            finally:
+                ost.close()
+
+
 class TestWanRoundTrips(unittest.TestCase):
     """WAN 対応: 往復回数をチャンク数から切り離し、タイムアウトを環境変数で変えられる。"""
 
