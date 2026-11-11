@@ -138,10 +138,15 @@ def verify_delegation_chain(
     root_anchor_pubkey: str,
     chain: List[Dict[str, Any]],
     now: int,
+    requested_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     ルートアンカーから対象パスに至る委譲チェーン [D_1, D_2, ..., D_n] を検証し、
     末端 D_n の検証済み payload を返す（不変条件 1〜5 すべてを検証）。
+
+    ``requested_path`` を渡した場合は、末端の委譲がそのパスに一致することも検証する。
+    名簿が別サブツリーのチェーンを返しても、クライアントがそれを要求パスとして
+    受け入れないための束縛になる。
     """
     if not chain:
         raise DelegationError("Delegation chain cannot be empty (Invariant 5)")
@@ -176,4 +181,11 @@ def verify_delegation_chain(
         last_payload = verified_p
 
     assert last_payload is not None
+    if requested_path is not None:
+        norm_requested = normalize_path(requested_path)
+        if last_payload["path"] != norm_requested:
+            raise DelegationError(
+                f"Delegation chain leaf path mismatch: expected {norm_requested!r}, "
+                f"got {last_payload['path']!r}"
+            )
     return last_payload

@@ -11,6 +11,7 @@ import os
 import socket
 import ssl
 import struct
+import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,6 +22,11 @@ from .l2_registry import ServiceUnavailableError
 
 ZERO_WIRE_ID = b"0" * 64
 QUIT_FRAME = b"Q" + ZERO_WIRE_ID + struct.pack(">I", 0)
+
+# 1 フレームで受け付ける上限。クライアント側の実装（batch_has / batch_put /
+# batch_get）は十分小さい単位に分割しているので、通常運用では引っかからない。
+MAX_BATCH_ITEMS = 65_536
+MAX_BLOB_BYTES = 256 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +132,9 @@ class ChunkStoreServer:
                 if op == "H":
                     ssl_conn.sendall(b"1" if wire_id in self.store else b"0")
                 elif op == "P":
+                    if val > MAX_BLOB_BYTES:
+                        ssl_conn.sendall(b"E")
+                        break
                     data = self._recv_exact(ssl_conn, val)
                     if sha256_hex(data) != wire_id:
                         ssl_conn.sendall(b"E")
@@ -141,6 +150,9 @@ class ChunkStoreServer:
 
                 # --- バッチオペコード ---
                 elif op == "B":  # Batch HAS
+                    if val > MAX_BATCH_ITEMS:
+                        ssl_conn.sendall(b"E")
+                        break
                     raw_ids = self._recv_exact(ssl_conn, val * 64)
                     bitmap = bytearray(b"O")
                     for i in range(val):
@@ -149,12 +161,18 @@ class ChunkStoreServer:
                     ssl_conn.sendall(bytes(bitmap))
 
                 elif op == "M":  # Multi-PUT
+                    if val > MAX_BATCH_ITEMS:
+                        ssl_conn.sendall(b"E")
+                        break
                     ok = True
                     staged: Dict[str, bytes] = {}
                     for _ in range(val):
                         item_hdr = self._recv_exact(ssl_conn, 68)
                         wid = item_hdr[:64].decode("ascii")
                         blen = struct.unpack(">I", item_hdr[64:68])[0]
+                        if blen > MAX_BLOB_BYTES:
+                            ssl_conn.sendall(b"E")
+                            return
                         blob = self._recv_exact(ssl_conn, blen)
                         if sha256_hex(blob) != wid:
                             ok = False
@@ -167,6 +185,9 @@ class ChunkStoreServer:
                         ssl_conn.sendall(b"E")
 
                 elif op == "F":  # Batch GET
+                    if val > MAX_BATCH_ITEMS:
+                        ssl_conn.sendall(b"E")
+                        break
                     raw_ids = self._recv_exact(ssl_conn, val * 64)
                     out = bytearray(b"O")
                     for i in range(val):
@@ -176,8 +197,13 @@ class ChunkStoreServer:
                     ssl_conn.sendall(bytes(out))
                 else:
                     break
-        except Exception:
+        except OSError:
             pass
+        except Exception as e:
+            print(
+                f"[L3-OST] client handler error: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
         finally:
             if ssl_conn is not None:
                 try:

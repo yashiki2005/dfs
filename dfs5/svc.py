@@ -45,6 +45,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .paths import config_dir, dfs5_home, restrict_to_owner
+
 CONFIG_FILENAME = "services.json"
 DEFAULT_START_PORT = 19440
 DEFAULT_NAME = "local"
@@ -128,12 +130,89 @@ def find_consecutive_free_ports(
     raise ServiceError(f"{start} から連続した空きポート {count} 個が見つかりませんでした")
 
 
+def _port_listening(port: int, host: str = "127.0.0.1", timeout: float = 0.4) -> bool:
+    """そのポートに接続できるか（= 誰かが待ち受けているか）。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _process_alive(pid: int) -> bool:
+    """その PID のプロセスが生きているか。
+
+    Windows の ``os.kill(pid, 0)`` は「存在確認」にならない（TerminateProcess 相当）
+    ため、OpenProcess + GetExitCodeProcess で調べる。
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+        )
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _windows_pid_owns_port(pid: int, port: int) -> bool:
+    """``netstat -ano`` で「その PID がそのポートを待ち受けている」ことを確かめる。"""
+    try:
+        res = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return _port_listening(port)
+    needle = f":{port}"
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        if not parts[1].endswith(needle):
+            continue
+        if parts[-1] == str(pid):
+            return True
+    return False
+
+
 def _port_in_use_by_us(pid: int, port: int) -> bool:
-    """その pid が port を掴んでいるか（lsof があれば見る）。"""
-    res = subprocess.run(
-        ["lsof", "-nP", "-a", "-p", str(pid), f"-iTCP:{port}", "-sTCP:LISTEN"],
-        capture_output=True, text=True,
-    )
+    """その pid が port を掴んでいるか。"""
+    if sys.platform == "win32":
+        return _windows_pid_owns_port(pid, port)
+    try:
+        res = subprocess.run(
+            ["lsof", "-nP", "-a", "-p", str(pid), f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # lsof が無い環境向けの保険。ポートが生きていれば掴んでいるとみなす。
+        return _port_listening(port)
     return res.returncode == 0 and str(port) in res.stdout
 
 
@@ -172,11 +251,11 @@ class Service:
         return f"{host}:{self.ost_port}"
 
     def is_running(self) -> bool:
-        if self.pid <= 0:
-            return False
-        try:
-            os.kill(self.pid, 0)
-        except OSError:
+        """プロセスが生きていて、その pid が L2/L3 のポートを掴んでいるか。
+
+        Windows の ``os.kill(pid, 0)`` は存在確認にならないので使わない。
+        """
+        if not _process_alive(self.pid):
             return False
         return _port_in_use_by_us(self.pid, self.registry_port) or _port_in_use_by_us(
             self.pid, self.ost_port
@@ -194,7 +273,7 @@ class ServiceStore:
     """`~/.config/dfs5/services.json` の読み書き。"""
 
     def __init__(self, path: Optional[Path] = None):
-        self.path = path or (Path.home() / ".config" / "dfs5" / CONFIG_FILENAME)
+        self.path = path or (config_dir() / CONFIG_FILENAME)
         self.services: Dict[str, Service] = {}
         self.load()
 
@@ -222,7 +301,7 @@ class ServiceStore:
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        os.chmod(tmp, 0o600)
+        restrict_to_owner(tmp)
         tmp.replace(self.path)
 
     def get(self, name: str) -> Service:
@@ -247,7 +326,7 @@ def ensure_root_key(path: Path) -> Path:
     )
     if res.returncode != 0:
         raise ServiceError(f"root 鍵を作れませんでした: {res.stderr.strip()}")
-    os.chmod(path, 0o600)
+    restrict_to_owner(path)
     return path
 
 
@@ -263,7 +342,7 @@ def ensure_writer_key(path: Path) -> Path:
     )
     if res.returncode != 0:
         raise ServiceError(f"書き手の鍵を作れませんでした: {res.stderr.strip()}")
-    os.chmod(path, 0o600)
+    restrict_to_owner(path)
     return path
 
 
@@ -409,7 +488,26 @@ def wait_for_l2(registry_url: str, timeout: float = 30.0) -> bool:
 # コマンド
 # --------------------------------------------------------------------------
 def _base_dir(name: str) -> Path:
-    return Path.home() / BASE_DIR_NAME / name
+    return dfs5_home() / BASE_DIR_NAME / name
+
+
+def _read_serve_pid(state_dir: Path, timeout: float = 5.0) -> int:
+    """サーバが書いた ``serve.pid`` を読む。無ければ 0。
+
+    Windows の venv 版 ``python.exe`` は本体を子プロセスで起動するため、
+    起動側の ``Popen.pid`` はサーバ本体ではない。サーバ自身に書かせる。
+    """
+    path = Path(state_dir) / "serve.pid"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            raw = ""
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+        time.sleep(0.1)
+    return 0
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -491,8 +589,12 @@ def cmd_start(args: argparse.Namespace) -> int:
         if proc.poll() is not None:
             tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
             raise ServiceError(f"サーバが起動しませんでした（終了コード {proc.returncode}）:\n{tail}")
-        proc.terminate()
+        _terminate(proc)
         raise ServiceError(f"L2 ({registry_url}) が {args.wait:.0f} 秒以内に応答しませんでした")
+
+    # サーバ本体の PID を state_dir/serve.pid から取る（Windows の venv 版
+    # python.exe は本体を子プロセスで起動するので proc.pid は当てにならない）。
+    server_pid = _read_serve_pid(state_dir) or proc.pid
 
     # サービスが空のままでは使い道が無いので、書き手への委譲まで登録する。
     # --no-delegate を付けたときだけ省く（自分で委譲を組む場合）。
@@ -527,7 +629,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         bind=host,
         advertise=advertised,
         root_anchor=args.root_anchor,
-        pid=proc.pid,
+        pid=server_pid,
         started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         config_path=str(store.path),
         log_path=str(log_path),
@@ -632,6 +734,20 @@ def _terminate(proc: subprocess.Popen, timeout: float = 10.0) -> None:
     """起動したばかりのサーバを確実に止める（記録に載せる前の後始末）。"""
     if proc.poll() is not None:
         return
+    if sys.platform == "win32":
+        # venv 版 python.exe は本体を子プロセスで動かすので、木ごと止める。
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        return
     try:
         proc.terminate()
         proc.wait(timeout=timeout)
@@ -647,24 +763,74 @@ def _terminate(proc: subprocess.Popen, timeout: float = 10.0) -> None:
         pass
 
 
+def _signal_terminate(pid: int) -> None:
+    """プロセスに終了を頼む（Windows は taskkill、POSIX は SIGTERM）。"""
+    if pid <= 0:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T"],
+                capture_output=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def _signal_kill(pid: int) -> None:
+    """プロセスを強制終了する（Windows は taskkill /F、POSIX は SIGKILL）。"""
+    if pid <= 0:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _request_stop(state_dir: Path) -> bool:
+    """サーバに「止まれ」と伝える（``stop.request`` を見張っている）。"""
+    try:
+        (Path(state_dir) / "stop.request").write_text("stop\n", encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
 def _stop_process(s: Service) -> bool:
     if not s.is_running():
         return False
-    try:
-        os.kill(s.pid, signal.SIGTERM)
-    except OSError:
-        return False
+    # まずは穏当に。サーバは stop.request を見て httpd.shutdown() し、
+    # finally で状態とチャンクを保存してから終了する（データを落とさない）。
+    _request_stop(Path(s.state_dir))
     deadline = time.time() + 10
     while time.time() < deadline:
-        if not s.is_running():
+        if not _process_alive(s.pid):
             return True
         time.sleep(0.3)
-    try:
-        os.kill(s.pid, signal.SIGKILL)
-    except OSError:
-        pass
+    # 応答が無ければ強制終了に切り替える。
+    _signal_terminate(s.pid)
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if not _process_alive(s.pid):
+            return True
+        time.sleep(0.3)
+    _signal_kill(s.pid)
     time.sleep(0.5)
-    return not s.is_running()
+    return not _process_alive(s.pid)
 
 
 def cmd_env(args: argparse.Namespace) -> int:

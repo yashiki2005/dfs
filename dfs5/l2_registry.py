@@ -7,6 +7,7 @@ specs/l2_comparison.md に基づく署名付きロケータ (`dfs5-l2-locator-v1
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -102,6 +103,9 @@ class DirectoryRegistryService:
         self.logs: Dict[str, List[Dict[str, Any]]] = {}
         self.locators: Dict[str, Dict[str, Any]] = {}
         self.online: bool = True
+        # 単一書き手境界の CAS は「head 読み取り -> 検証 -> append」を原子的に行う。
+        # HTTP サーバは ThreadingHTTPServer なので、サービス側でも排他する。
+        self._lock = threading.RLock()
 
         # evil B6 / B7 試験用シミュレーションフラグ
         self.simulate_silent_drop_b7: bool = False
@@ -111,41 +115,47 @@ class DirectoryRegistryService:
         if not self.online:
             raise ServiceUnavailableError("L2 DirectoryRegistryService is offline")
 
+    @property
+    def lock(self) -> threading.RLock:
+        """HTTP ハンドラが state 保存まで同じ排他区間に入れるためのロック。"""
+        return self._lock
+
     def register_delegation(self, envelope: Dict[str, Any], now: int) -> Dict[str, Any]:
         """L1 委譲レコードを検証・登録する（多段委譲・エポック更新による即時失効に対応）。"""
-        self._ensure_online()
-        p = envelope.get("payload", {})
-        parent = p.get("parent", "")
-        path = p.get("path", "")
+        with self._lock:
+            self._ensure_online()
+            p = envelope.get("payload", {})
+            parent = p.get("parent", "")
+            path = p.get("path", "")
 
-        if parent == self.root_anchor_path:
-            parent_pub = self.root_anchor_pubkey
-            parent_exp = None
-        elif parent in self.delegations:
-            parent_del = self.delegations[parent]["payload"]
-            if not (parent_del["issued_at"] <= now < parent_del["expires_at"]):
-                raise DelegationError(f"Parent delegation {parent!r} has expired")
-            parent_pub = parent_del["writer"]
-            parent_exp = parent_del["expires_at"]
-        else:
-            raise DelegationError(f"Unknown or unverified parent path: {parent!r} (Invariant 5)")
+            if parent == self.root_anchor_path:
+                parent_pub = self.root_anchor_pubkey
+                parent_exp = None
+            elif parent in self.delegations:
+                parent_del = self.delegations[parent]["payload"]
+                if not (parent_del["issued_at"] <= now < parent_del["expires_at"]):
+                    raise DelegationError(f"Parent delegation {parent!r} has expired")
+                parent_pub = parent_del["writer"]
+                parent_exp = parent_del["expires_at"]
+            else:
+                raise DelegationError(f"Unknown or unverified parent path: {parent!r} (Invariant 5)")
 
-        curr_active = self.delegations.get(path)
-        curr_epoch = curr_active["payload"]["epoch"] if curr_active else None
+            curr_active = self.delegations.get(path)
+            curr_epoch = curr_active["payload"]["epoch"] if curr_active else None
 
-        log_list = self.logs.get(path, [])
-        curr_head_ver = log_list[-1]["payload"]["version"] if log_list else 0
+            log_list = self.logs.get(path, [])
+            curr_head_ver = log_list[-1]["payload"]["version"] if log_list else 0
 
-        verified = verify_single_delegation(
-            envelope=envelope,
-            parent_pubkey=parent_pub,
-            now=now,
-            parent_expires_at=parent_exp,
-            current_active_epoch=curr_epoch,
-            current_head_version=curr_head_ver,
-        )
-        self.delegations[path] = envelope
-        return verified
+            verified = verify_single_delegation(
+                envelope=envelope,
+                parent_pubkey=parent_pub,
+                now=now,
+                parent_expires_at=parent_exp,
+                current_active_epoch=curr_epoch,
+                current_head_version=curr_head_ver,
+            )
+            self.delegations[verified["path"]] = envelope
+            return verified
 
     def announce_and_append(
         self,
@@ -157,63 +167,73 @@ class DirectoryRegistryService:
         """
         単一書き手の CAS 検証を行った上で L4 ログを追記し、L2 ロケータを更新する。
         """
-        self._ensure_online()
-        norm_path = normalize_path(path)
-        del_env = self.delegations.get(norm_path)
-        if not del_env:
-            raise DelegationError(f"No active delegation registered for {norm_path!r}")
+        with self._lock:
+            self._ensure_online()
+            norm_path = normalize_path(path)
+            del_env = self.delegations.get(norm_path)
+            if not del_env:
+                raise DelegationError(f"No active delegation registered for {norm_path!r}")
 
-        del_p = del_env["payload"]
-        if not (del_p["issued_at"] <= now < del_p["expires_at"]):
-            raise DelegationError(f"Active delegation for {norm_path!r} has expired")
+            del_p = del_env["payload"]
+            if not (del_p["issued_at"] <= now < del_p["expires_at"]):
+                raise DelegationError(f"Active delegation for {norm_path!r} has expired")
 
-        log_p = log_envelope["payload"]
-        raw_log = canonical_json(log_p)
-        if sha256_hex(raw_log) != log_envelope.get("entry_hash"):
-            raise ChunkIntegrityError("L4 log entry_hash does not match canonical payload")
+            log_p = log_envelope["payload"]
+            try:
+                log_path = normalize_path(log_p["path"])
+            except (KeyError, TypeError, ValueError) as e:
+                raise DelegationError(f"Invalid path in L4 log payload: {e}") from e
+            if log_path != norm_path:
+                raise DelegationError(
+                    f"L4 log path mismatch: request={norm_path!r}, payload={log_path!r}"
+                )
 
-        # specs/delegation.md §3.1: エポック一致検証（旧鍵の即時失効）
-        if log_p["delegation_epoch"] != del_p["epoch"]:
-            raise DelegationError(
-                f"Stale or mismatched delegation_epoch: got {log_p['delegation_epoch']}, active is {del_p['epoch']}"
-            )
+            raw_log = canonical_json(log_p)
+            if sha256_hex(raw_log) != log_envelope.get("entry_hash"):
+                raise ChunkIntegrityError("L4 log entry_hash does not match canonical payload")
 
-        # specs/delegation.md §3.2: base_version 引き継ぎ境界検証
-        if log_p["version"] <= del_p["base_version"]:
-            raise DelegationError(
-                f"Version ({log_p['version']}) must be > base_version ({del_p['base_version']})"
-            )
+            # specs/delegation.md §3.1: エポック一致検証（旧鍵の即時失効）
+            if log_p["delegation_epoch"] != del_p["epoch"]:
+                raise DelegationError(
+                    f"Stale or mismatched delegation_epoch: got {log_p['delegation_epoch']}, active is {del_p['epoch']}"
+                )
 
-        log_list = self.logs.setdefault(norm_path, [])
-        head_ver = log_list[-1]["payload"]["version"] if log_list else 0
-        head_hash = log_list[-1]["entry_hash"] if log_list else EMPTY_SHA256
+            # specs/delegation.md §3.2: base_version 引き継ぎ境界検証
+            if log_p["version"] <= del_p["base_version"]:
+                raise DelegationError(
+                    f"Version ({log_p['version']}) must be > base_version ({del_p['base_version']})"
+                )
 
-        # 単一書き手境界 (CAS) および evil A5 (リプレイ攻撃防止)
-        if (
-            log_p["version"] != head_ver + 1
-            or log_p["parent_version"] != head_ver
-            or log_p["parent_hash"] != head_hash
-        ):
-            raise ConflictError(
-                f"CAS conflict on {norm_path!r}: expected version {head_ver + 1} (parent {head_ver}, {head_hash[:10]}...), "
-                f"got version {log_p['version']} (parent {log_p['parent_version']}, {log_p['parent_hash'][:10]}...)"
-            )
+            log_list = self.logs.setdefault(norm_path, [])
+            head_ver = log_list[-1]["payload"]["version"] if log_list else 0
+            head_hash = log_list[-1]["entry_hash"] if log_list else EMPTY_SHA256
 
-        # L4 ログ署名検証
-        if not ssh_verify(del_p["writer"], norm_path, NS_L4_LOG, raw_log, log_envelope["signature"]):
-            raise DelegationError("Invalid L4 log signature by writer")
+            # 単一書き手境界 (CAS) および evil A5 (リプレイ攻撃防止)
+            if (
+                log_p["version"] != head_ver + 1
+                or log_p["parent_version"] != head_ver
+                or log_p["parent_hash"] != head_hash
+            ):
+                raise ConflictError(
+                    f"CAS conflict on {norm_path!r}: expected version {head_ver + 1} (parent {head_ver}, {head_hash[:10]}...), "
+                    f"got version {log_p['version']} (parent {log_p['parent_version']}, {log_p['parent_hash'][:10]}...)"
+                )
 
-        # L2 ロケータ署名検証と整合確認
-        loc_p = verify_locator_envelope(locator_envelope, norm_path, del_p["writer"], now)
-        if loc_p["head_version"] != log_p["version"] or loc_p["head_hash"] != log_envelope["entry_hash"]:
-            raise RegistryError("Locator head_version/head_hash does not match L4 log entry")
+            # L4 ログ署名検証
+            if not ssh_verify(del_p["writer"], norm_path, NS_L4_LOG, raw_log, log_envelope["signature"]):
+                raise DelegationError("Invalid L4 log signature by writer")
 
-        # evil B7 シミュレーション（成功したふりをして黙って破棄）
-        if self.simulate_silent_drop_b7:
-            return
+            # L2 ロケータ署名検証と整合確認
+            loc_p = verify_locator_envelope(locator_envelope, norm_path, del_p["writer"], now)
+            if loc_p["head_version"] != log_p["version"] or loc_p["head_hash"] != log_envelope["entry_hash"]:
+                raise RegistryError("Locator head_version/head_hash does not match L4 log entry")
 
-        log_list.append(log_envelope)
-        self.locators[norm_path] = locator_envelope
+            # evil B7 シミュレーション（成功したふりをして黙って破棄）
+            if self.simulate_silent_drop_b7:
+                return
+
+            log_list.append(log_envelope)
+            self.locators[norm_path] = locator_envelope
 
     def delegation_chain(self, path: str) -> List[Dict[str, Any]]:
         """``path`` に至る委譲チェーンを、root 直下から末端まで順に組み立てる。
@@ -221,24 +241,25 @@ class DirectoryRegistryService:
         名簿は末端の委譲しか索引していないので、``parent`` をたどって並べる。
         クライアントはこれを root アンカー公開鍵から検証する（名簿を信頼しない）。
         """
-        norm_path = normalize_path(path)
-        chain: List[Dict[str, Any]] = []
-        cur = norm_path
-        seen = set()
-        while cur:
-            if cur in seen:
-                raise RegistryError(f"Delegation chain for {norm_path!r} has a cycle at {cur!r}")
-            seen.add(cur)
-            env = self.delegations.get(cur)
-            if env is None:
-                break
-            chain.append(env)
-            parent = env.get("payload", {}).get("parent", "")
-            if parent == self.root_anchor_path:
-                break
-            cur = parent
-        chain.reverse()
-        return chain
+        with self._lock:
+            norm_path = normalize_path(path)
+            chain: List[Dict[str, Any]] = []
+            cur = norm_path
+            seen = set()
+            while cur:
+                if cur in seen:
+                    raise RegistryError(f"Delegation chain for {norm_path!r} has a cycle at {cur!r}")
+                seen.add(cur)
+                env = self.delegations.get(cur)
+                if env is None:
+                    break
+                chain.append(env)
+                parent = env.get("payload", {}).get("parent", "")
+                if parent == self.root_anchor_path:
+                    break
+                cur = parent
+            chain.reverse()
+            return chain
 
     def resolve(
         self, path: str
@@ -249,25 +270,26 @@ class DirectoryRegistryService:
         ``delegation_envelope`` には、末端の委譲に **チェーンの組** と **root アンカー** を
         足したものを返す。クライアントはこれで root から検証できる（名簿を信頼しない）。
         """
-        self._ensure_online()
-        norm_path = normalize_path(path)
-        del_env = self.delegations.get(norm_path)
-        loc_env = self.locators.get(norm_path)
-        log_list = self.logs.get(norm_path, [])
+        with self._lock:
+            self._ensure_online()
+            norm_path = normalize_path(path)
+            del_env = self.delegations.get(norm_path)
+            loc_env = self.locators.get(norm_path)
+            log_list = self.logs.get(norm_path, [])
 
-        # 末端の委譲に、チェーンと root アンカーの情報を足して返す。
-        # クライアントはこの組で root から検証する（名簿を信頼しない）。
-        if del_env is not None:
-            del_env = dict(del_env)
-            del_env["chain"] = self.delegation_chain(norm_path)
-            del_env["root_anchor"] = self.root_anchor_path
+            # 末端の委譲に、チェーンと root アンカーの情報を足して返す。
+            # クライアントはこの組で root から検証する（名簿を信頼しない）。
+            if del_env is not None:
+                del_env = dict(del_env)
+                del_env["chain"] = self.delegation_chain(norm_path)
+                del_env["root_anchor"] = self.root_anchor_path
 
-        if not log_list:
-            return del_env, loc_env, None
+            if not log_list:
+                return del_env, loc_env, None
 
-        # evil B6 シミュレーション（古いログエントリを先頭と見せかける）
-        if 0 <= self.simulate_rollback_b6_to_index < len(log_list):
-            stale_head = log_list[self.simulate_rollback_b6_to_index]
-            return del_env, loc_env, stale_head
+            # evil B6 シミュレーション（古いログエントリを先頭と見せかける）
+            if 0 <= self.simulate_rollback_b6_to_index < len(log_list):
+                stale_head = log_list[self.simulate_rollback_b6_to_index]
+                return del_env, loc_env, stale_head
 
-        return del_env, loc_env, log_list[-1]
+            return del_env, loc_env, log_list[-1]

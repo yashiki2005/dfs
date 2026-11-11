@@ -157,6 +157,9 @@ class RcloneCase(unittest.TestCase):
         )
         self.assertEqual(cfg["sub_path"], "/example.com/alice/notes")
         self.assertEqual(int(cfg["ost_port"]), self.server.ost.port)
+        cfg_path = self.workdir / ".clayfs" / "dfs5_config.json"
+        if sys.platform != "win32":
+            self.assertEqual(oct(cfg_path.stat().st_mode & 0o777), "0o600")
 
         # 読み書きも通る
         self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
@@ -192,7 +195,10 @@ class RcloneCase(unittest.TestCase):
         # OpenSSH 形式であること
         self.assertIn("BEGIN OPENSSH PRIVATE KEY", created.read_text(encoding="utf-8"))
         # 600 であること
-        self.assertEqual(oct(created.stat().st_mode & 0o777), "0o600")
+        # Windows は chmod の mode bit ではなく ACL で守るため、常に 0o666 に見える。
+        # (この差は既知の未対応点。鍵はユーザープロファイル配下の ACL に依存する)
+        if sys.platform != "win32":
+            self.assertEqual(oct(created.stat().st_mode & 0o777), "0o600")
         # 定義にも反映されている
         saved = RemoteStore(self.config_file).get("t")
         self.assertEqual(saved.key, str(created))
@@ -232,6 +238,9 @@ class RcloneCase(unittest.TestCase):
 
         擬似端末で「1 回目と 2 回目が違う」「一致する」を順に試す。
         """
+        if sys.platform == "win32":
+            # Windows に pty / termios は無い
+            self.skipTest("pty は Windows に無い")
         import pty
         import select
         import warnings
@@ -370,7 +379,9 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(r.path, "/example.com/alice/notes")
         self.assertEqual(r.resolved_workdir(), self.workdir)
         # モードが 600 であること（秘密を置くため）
-        self.assertEqual(oct(self.config_file.stat().st_mode & 0o777), "0o600")
+        # Windows は ACL 管理で、chmod の mode bit は常に 0o666 に見える（既知の差）。
+        if sys.platform != "win32":
+            self.assertEqual(oct(self.config_file.stat().st_mode & 0o777), "0o600")
 
     def test_unknown_remote_is_an_error(self) -> None:
         with self.assertRaises(Exception):
@@ -392,6 +403,16 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual((out / "a.txt").read_text(encoding="utf-8"), "hello world\n")
         self.assertEqual((out / "docs" / "sub" / "deep.txt").read_text(encoding="utf-8"), "deep\n")
         self.assertEqual((out / "b.bin").read_bytes(), b"B" * 4096)
+
+    def test_pull_rejects_parent_prefix(self) -> None:
+        """``remote:../../outside`` で作業ツリー外を読めないこと。"""
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "LEAK.txt").write_text("OUTSIDE-SECRET", encoding="utf-8")
+        out = self.base / "escaped_out"
+        rc = self.run_cli("pull", "t:../../outside", str(out))
+        self.assertEqual(rc, 2)
+        self.assertFalse((out / "LEAK.txt").exists())
 
     def test_copy_is_idempotent(self) -> None:
         """2 回目の copy は変更なしで、新しい版を作らない。"""

@@ -96,7 +96,9 @@ class ServiceRecordTests(unittest.TestCase):
                 root_anchor="/example.com", pid=0, started_at="2026-01-01T00:00:00+00:00",
             )
             store.save()
-            self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+            # Windows の chmod は mode bit を変えるだけで、実際は ACL が守る。
+            if sys.platform != "win32":
+                self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
             again = ServiceStore(path)
             self.assertEqual(list(again.services), ["a"])
             self.assertEqual(again.get("a").ost_port, 19441)
@@ -113,9 +115,13 @@ class StartStopTests(unittest.TestCase):
         self.base = Path(self._tmp.name)
         self.home = self.base / "home"
         self.home.mkdir()
-        # HOME を差し替えて、記録と状態をこの試験の中に閉じる
+        # HOME を差し替えて、記録と状態をこの試験の中に閉じる。
+        # Windows の Path.home() は HOME を見ない（USERPROFILE を見る）ので、
+        # dfs5 独自の DFS5_HOME も併せて差し替える。
         self.old_home = os.environ.get("HOME")
+        self.old_dfs5_home = os.environ.get("DFS5_HOME")
         os.environ["HOME"] = str(self.home)
+        os.environ["DFS5_HOME"] = str(self.home)
         self.service: Service | None = None
 
     def tearDown(self) -> None:
@@ -139,6 +145,10 @@ class StartStopTests(unittest.TestCase):
             os.environ.pop("HOME", None)
         else:
             os.environ["HOME"] = self.old_home
+        if self.old_dfs5_home is None:
+            os.environ.pop("DFS5_HOME", None)
+        else:
+            os.environ["DFS5_HOME"] = self.old_dfs5_home
         self._tmp.cleanup()
 
     def test_start_then_stop(self) -> None:

@@ -42,7 +42,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -64,6 +63,10 @@ from .l4_log import (
 )
 from .l5_clayfs import DFS5Node
 from .crypto import normalize_path, ssh_key_fingerprint
+from .fs.core import remove_tree
+from .path_safety import UnsafePathError, copyfile_no_follow, safe_target
+from .paths import config_dir, restrict_to_owner
+from .private_io import ensure_private_dir, write_private_json
 from .remotes import Remote, RemoteError, RemoteStore, split_remote_spec
 
 CACHE_VERSION_FILENAME = "cache_version"
@@ -169,6 +172,10 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
     """
     mount_root = remote.resolved_workdir().expanduser()
     cfg_path = mount_root / ".clayfs" / cli_mod.CONFIG_FILENAME
+    if cfg_path.parent.exists():
+        ensure_private_dir(cfg_path.parent)
+    if cfg_path.is_file():
+        restrict_to_owner(cfg_path)
 
     if not cfg_path.is_file():
         if not create:
@@ -194,7 +201,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             raise UsageError(f"Cannot parse L3 OST endpoint {ost_value!r} for remote {remote.name!r}")
         mount_root.mkdir(parents=True, exist_ok=True)
         (mount_root / "tree").mkdir(exist_ok=True)
-        (mount_root / ".clayfs").mkdir(exist_ok=True)
+        ensure_private_dir(mount_root / ".clayfs")
         cfg = {
             "delegation_epoch": int(remote.epoch),
             "node_name": remote.node_name or remote.name,
@@ -206,19 +213,14 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             "sub_path": sub_path,
             "tree_secret": remote.secret,
         }
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(
-            json.dumps(cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        write_private_json(cfg_path, cfg)
 
     node, cfg, _reg = cli_mod.load_node_from_mount(mount_root)
     # 作業ディレクトリの config に root_pubkey が無い（古い形式）なら、リモート定義から
     # 補って書き戻す。信頼の根はリモート定義（remotes.json）が持つ。
     if not cfg.get("root_pubkey") and remote.root_pubkey:
         cfg["root_pubkey"] = remote.root_pubkey
-        cfg_path.write_text(
-            json.dumps(cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        write_private_json(cfg_path, cfg)
         node.l4.root_pubkey = remote.root_pubkey.strip()
     return node
 
@@ -254,7 +256,7 @@ def refresh_cache(node: DFS5Node, force: bool = False) -> int:
         # リモートは空。作業ツリーを空にして、最初の push に備える。
         work_tree = node.clayfs.work_tree
         if work_tree.exists():
-            shutil.rmtree(work_tree)
+            remove_tree(work_tree)
         work_tree.mkdir(parents=True, exist_ok=True)
         _save_cached_version(node, 0)
         return 0
@@ -290,7 +292,12 @@ def _push(node: DFS5Node, remote: Remote, delegated_mounts: Optional[Dict[str, s
 # ==========================================
 def _norm_prefix(prefix: str) -> str:
     prefix = (prefix or "").strip().strip("/")
-    return prefix
+    if not prefix:
+        return ""
+    parts = [part for part in prefix.replace("\\", "/").split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise UsageError(f"Invalid remote path (contains '..'): {prefix!r}")
+    return "/".join(parts)
 
 
 def _join_prefix(prefix: str, rel: str) -> str:
@@ -327,9 +334,23 @@ def _collect_local(src: Path, include_root_name: bool = False) -> Dict[str, Path
 
 
 def _tree_path(node: DFS5Node, rel: str) -> Path:
-    if any(part in ("", ".", "..") for part in rel.split("/")):
-        raise UsageError(f"Invalid path in tree: {rel!r}")
-    return node.clayfs.work_tree / rel
+    try:
+        return safe_target(node.clayfs.work_tree, rel)
+    except UnsafePathError as e:
+        raise UsageError(f"Invalid path in tree: {rel!r} ({e})") from e
+
+
+def _validate_snapshot_id(snap_id: str) -> str:
+    """snapshot ID を単一のパス要素に限定する（``..`` や区切りを拒否）。"""
+    if (
+        not snap_id
+        or snap_id in (".", "..")
+        or "/" in snap_id
+        or "\\" in snap_id
+        or "\x00" in snap_id
+    ):
+        raise UsageError(f"Invalid snapshot ID: {snap_id!r}")
+    return snap_id
 
 
 def plan_changes(
@@ -381,9 +402,14 @@ def apply_writes(node: DFS5Node, writes: List[Tuple[str, Path, str]]) -> None:
     """``plan_changes`` の「書くもの」を、作業ツリーへ反映する。"""
     for path, src, _kind in writes:
         relative = path
-        target = _tree_path(node, relative)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, target)
+        try:
+            target = safe_target(node.clayfs.work_tree, relative, create_parents=True)
+        except UnsafePathError as e:
+            raise UsageError(f"Invalid path in tree: {relative!r} ({e})") from e
+        try:
+            copyfile_no_follow(src, target)
+        except UnsafePathError as e:
+            raise UsageError(f"Refusing symlink write: {relative!r} ({e})") from e
 
 
 def apply_deletes(node: DFS5Node, paths: List[str], prune_empty: bool = True) -> None:
@@ -431,7 +457,10 @@ def _remove_from_tree(node: DFS5Node, paths: List[str]) -> None:
     for rel in sorted(paths, key=lambda p: len(p.split("/")), reverse=True):
         victim = _tree_path(node, rel)
         if victim.is_dir():
-            shutil.rmtree(victim, ignore_errors=True)
+            try:
+                remove_tree(victim)
+            except OSError:
+                pass
         elif victim.exists():
             victim.unlink()
 
@@ -625,7 +654,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                 raise UsageError(f"指定された書き手鍵がありません: {key_path}")
         else:
             key_dir = Path(args.key_dir).expanduser() if args.key_dir else (
-                Path.home() / ".config" / "dfs5" / "keys"
+                config_dir() / "keys"
             )
             key_dir.mkdir(parents=True, exist_ok=True)
             key_path = key_dir / f"{args.name}_ed25519"
@@ -637,7 +666,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                 )
                 if res.returncode != 0:
                     raise UsageError(f"鍵を作れませんでした: {res.stderr.strip()}")
-                os.chmod(key_path, 0o600)
+                restrict_to_owner(key_path)
                 created_key = True
 
         # root アンカーの公開鍵を決める（信頼の根）。
@@ -956,7 +985,12 @@ def cmd_pull(args: argparse.Namespace) -> int:
     node = open_remote(remote, create=True)
     version = refresh_cache(node, force=args.force)
 
-    src_root = node.clayfs.work_tree if not prefix else node.clayfs.work_tree / prefix
+    work_root = node.clayfs.work_tree.resolve(strict=False)
+    src_root = work_root if not prefix else work_root / prefix
+    try:
+        src_root.resolve(strict=False).relative_to(work_root)
+    except ValueError as e:
+        raise UsageError(f"Remote path escapes the work tree: {prefix!r}") from e
     if not src_root.exists():
         raise UsageError(f"Remote path does not exist: {remote.name}:{prefix}")
 
@@ -970,12 +1004,20 @@ def cmd_pull(args: argparse.Namespace) -> int:
             continue
         if item.name in (".DS_Store",) or item.name.startswith("._"):
             continue
-        target = dest / rel
+        if item.is_symlink():
+            print(f"[dfs5cli] warning: skipping symlink: {item}", file=sys.stderr)
+            continue
+        try:
+            target = safe_target(dest, rel.as_posix(), create_parents=True)
+        except UnsafePathError as e:
+            raise UsageError(f"Invalid pull destination: {rel.as_posix()!r} ({e})") from e
         if item.is_dir():
             target.mkdir(parents=True, exist_ok=True)
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(item, target)
+        try:
+            copyfile_no_follow(item, target)
+        except UnsafePathError as e:
+            raise UsageError(f"Refusing symlink write: {rel.as_posix()!r} ({e})") from e
         count += 1
 
     print(f"[dfs5cli] pull OK <- v{version} | {count} ファイル -> {dest}")
@@ -1072,7 +1114,8 @@ def cmd_fs(args: argparse.Namespace) -> int:
         return 0
     if args.action == "snapshot":
         f = FileSystem(root, backend=args.backend)
-        result = f.take_snapshot(args.snap_id)
+        snap_id = _validate_snapshot_id(args.snap_id)
+        result = f.take_snapshot(snap_id)
         print(f"snapshot    : {result.snapshot_id}")
         print(f"path        : {result.path}")
         print(f"backend     : {result.backend}")
@@ -1082,10 +1125,11 @@ def cmd_fs(args: argparse.Namespace) -> int:
             print(f"warning     : {w}", file=sys.stderr)
         return 0
     if args.action == "materialize":
+        snap_id = _validate_snapshot_id(args.snap_id) if args.snap_id else None
         if args.src:
             src = Path(args.src).expanduser()
-        elif args.snap_id:
-            src = root / ".clayfs" / "snapshots" / args.snap_id
+        elif snap_id:
+            src = root / ".clayfs" / "snapshots" / snap_id
         else:
             raise UsageError("materialize には --src か snap_id が必要")
         if not args.dst:

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .crypto import normalize_path
+from .paths import cache_dir, config_dir, restrict_to_owner
 
 CONFIG_ENV = "DFS5_CONFIG"
 DEFAULT_CONFIG = "~/.config/dfs5/remotes.json"
@@ -52,7 +53,7 @@ class Remote:
     def resolved_workdir(self) -> Path:
         if self.workdir:
             return Path(self.workdir).expanduser()
-        return Path("~/.cache/dfs5").expanduser() / self.name
+        return cache_dir() / self.name
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -93,7 +94,7 @@ def config_path() -> Path:
     raw = os.environ.get(CONFIG_ENV)
     if raw:
         return Path(raw).expanduser()
-    return Path(DEFAULT_CONFIG).expanduser()
+    return config_dir() / "remotes.json"
 
 
 class RemoteStore:
@@ -125,7 +126,7 @@ class RemoteStore:
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        os.chmod(tmp, 0o600)
+        restrict_to_owner(tmp)
         tmp.replace(self.path)
 
     def get(self, name: str) -> Remote:

@@ -102,6 +102,8 @@ class MerkleTreeBuilder:
         self.default_store = default_store if default_store in self.stores else next(iter(self.stores))
         self.stripe_order: list[str] = list(self.stores.keys())
         self._next_stripe = 0
+        # アップロード時に読み飛ばした項目（symlink など）を呼び出し側へ知らせる。
+        self.warnings: List[str] = []
         # (plain_id -> (wire_id, store_id)) の書き手側索引。古い形式（str）も読める。
         self.index: Dict[str, Any] = dict(index or {})
 
@@ -145,6 +147,7 @@ class MerkleTreeBuilder:
         （サーバ側から塊が消えていた場合のみ 2 回目の走査が入る）。
         """
         delegated_mounts = delegated_mounts or {}
+        self.warnings = []
 
         def _entry(store_id: str) -> Dict[str, Any]:
             # 既定の OST のときは store を書かない（旧リーダーとの互換）
@@ -192,6 +195,11 @@ class MerkleTreeBuilder:
                 items: list = []
                 for item in sorted(directory.iterdir(), key=lambda q: q.name):
                     if item.name in self.IGNORED_NAMES or item.name.startswith("._"):
+                        continue
+                    if item.is_symlink():
+                        # dfs5-dir-v1 に symlink 型はない。リンク先を読むとツリー外の
+                        # ファイルをアップロードしてしまうため、明示的に飛ばす。
+                        self.warnings.append(f"skipping symlink: {item}")
                         continue
                     norm_name = normalize_name(item.name)
                     if norm_name in mounts:
@@ -549,6 +557,7 @@ class L4LogClient:
                 root_anchor_pubkey=self.root_pubkey,
                 chain=chain,
                 now=int(time.time()),
+                requested_path=self.sub_path,
             )
             return str(leaf["writer"])
 
@@ -572,6 +581,14 @@ class L4LogClient:
             return None
 
         p = head_env["payload"]
+        try:
+            head_path = normalize_path(p["path"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ChunkIntegrityError(f"Remote head has invalid path: {e}") from e
+        if head_path != self.sub_path:
+            raise ChunkIntegrityError(
+                f"Remote head path mismatch: expected {self.sub_path!r}, got {head_path!r}"
+            )
         raw_p = canonical_json(p)
         if sha256_hex(raw_p) != head_env.get("entry_hash"):
             raise ChunkIntegrityError("Remote head entry_hash corrupted")

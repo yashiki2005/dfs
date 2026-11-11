@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +40,8 @@ if __package__ in (None, ""):
     from dfs5.l3_store import ChunkStoreServer
     from dfs5.l4_log import RollbackDetectedError, SilentDropDetectedError
     from dfs5.l5_clayfs import DFS5Node
+    from dfs5.paths import restrict_to_owner
+    from dfs5.private_io import ensure_private_dir, write_private_json
 else:
     from .crypto import ChunkIntegrityError, normalize_path
     from .l1_delegation import DelegationError, create_delegation_envelope
@@ -51,6 +54,8 @@ else:
     from .l3_store import ChunkStoreServer
     from .l4_log import RollbackDetectedError, SilentDropDetectedError
     from .l5_clayfs import DFS5Node
+    from .paths import restrict_to_owner
+    from .private_io import ensure_private_dir, write_private_json
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +63,9 @@ else:
 # 上書きできるようにする。既定は RTT 300ms 級を想定した 10 秒。
 # ---------------------------------------------------------------------------
 DEFAULT_L2_TIMEOUT = 10.0
+# L2 の JSON-RPC は小さなエンベロープだけを扱う。巨大な body で
+# サーバのメモリを消費させないよう、読み込み前に上限を設ける。
+MAX_REGISTRY_BODY_BYTES = 8 * 1024 * 1024
 
 
 def l2_timeout() -> float:
@@ -125,6 +133,7 @@ class RemoteRegistryClient:
             raise ServiceUnavailableError(f"L2 registry timed out or is unreachable at {self.registry_url}: {e}") from e
 
     def register_delegation(self, envelope: Dict[str, Any], now: int) -> Dict[str, Any]:
+        # now は旧サーバとの互換用。現行サーバは認可判定に自分の時計を使う。
         res = self._post("/v1/delegate", {"envelope": envelope, "now": int(now)})
         return res["verified"]
 
@@ -135,6 +144,7 @@ class RemoteRegistryClient:
         locator_envelope: Dict[str, Any],
         now: int,
     ) -> None:
+        # now は旧サーバとの互換用。現行サーバは認可判定に自分の時計を使う。
         self._post(
             "/v1/announce",
             {
@@ -196,6 +206,8 @@ class PersistentRegistryState:
         # root アンカーの公開鍵。クライアントの初回（TOFU）が取得する。
         # ここから取った値をクライアントが記録し、以降は記録した値だけを信頼する。
         self.root_pubkey = root_pubkey.strip()
+        # 書き込み系 API は「サービス更新 -> state 保存」まで同じ排他区間に入れる。
+        self.lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
@@ -212,9 +224,7 @@ class PersistentRegistryState:
             "locators": self.service.locators,
             "logs": self.service.logs,
         }
-        tmp = self.state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
-        tmp.replace(self.state_file)
+        write_private_json(self.state_file, data)
 
     def load_ost_chunks(self, ost: ChunkStoreServer) -> None:
         for f in self.chunks_dir.glob("*.blk"):
@@ -240,67 +250,111 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
             self.end_headers()
             self.wfile.write(raw)
 
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+        def _read_json_body(self) -> Optional[Dict[str, Any]]:
+            raw_length = self.headers.get("Content-Length", "0")
             try:
-                if self.path == "/v1/delegate":
-                    verified = pstate.service.register_delegation(req["envelope"], now=int(req["now"]))
-                    pstate.save()
-                    self._send_json(200, {"ok": True, "verified": verified})
-                elif self.path == "/v1/announce":
-                    pstate.service.announce_and_append(
-                        path=req["path"],
-                        log_envelope=req["log_envelope"],
-                        locator_envelope=req["locator_envelope"],
-                        now=int(req["now"]),
-                    )
-                    pstate.save()
-                    pstate.save_ost_chunks(ost)
-                    self._send_json(200, {"ok": True})
-                elif self.path == "/v1/resolve":
-                    del_env, loc_env, head_env = pstate.service.resolve(req["path"])
-                    self._send_json(
-                        200,
-                        {
-                            "delegation": del_env,
-                            "head_log": head_env,
-                            "locator": loc_env,
-                        },
-                    )
-                elif self.path == "/v1/paths":
-                    # 登録済みのサブツリーと、その書き手公開鍵を返す。
-                    # CLI が --path を省略したとき、鍵の指紋から自分のパスを探すのに使う。
-                    rows = []
-                    for path, env in sorted(pstate.service.delegations.items()):
-                        p = env.get("payload", {})
-                        head = pstate.service.logs.get(path) or []
-                        rows.append({
-                            "path": path,
-                            "writer": p.get("writer", ""),
-                            "epoch": p.get("epoch"),
-                            "base_version": p.get("base_version"),
-                            "head_version": head[-1]["payload"]["version"] if head else 0,
+                length = int(raw_length)
+            except (TypeError, ValueError):
+                self._send_json(
+                    400,
+                    {"error_type": "RegistryError", "message": "Invalid Content-Length"},
+                )
+                return None
+            if length < 0 or length > MAX_REGISTRY_BODY_BYTES:
+                self._send_json(
+                    413,
+                    {
+                        "error_type": "RegistryError",
+                        "message": f"Request body exceeds {MAX_REGISTRY_BODY_BYTES} bytes",
+                    },
+                )
+                return None
+            raw = self.rfile.read(length) if length else b""
+            if not raw:
+                return {}
+            try:
+                req = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                self._send_json(
+                    400,
+                    {"error_type": "RegistryError", "message": f"Invalid JSON body: {e}"},
+                )
+                return None
+            if not isinstance(req, dict):
+                self._send_json(
+                    400,
+                    {"error_type": "RegistryError", "message": "JSON body must be an object"},
+                )
+                return None
+            return req
+
+        def do_POST(self) -> None:
+            req = self._read_json_body()
+            if req is None:
+                return
+            # 認可時刻は必ずサーバ側の時計で決める。リクエストの "now" は使わない。
+            now = int(time.time())
+            try:
+                with pstate.lock:
+                    if self.path == "/v1/delegate":
+                        verified = pstate.service.register_delegation(req["envelope"], now=now)
+                        pstate.save()
+                        self._send_json(200, {"ok": True, "verified": verified})
+                    elif self.path == "/v1/announce":
+                        pstate.service.announce_and_append(
+                            path=req["path"],
+                            log_envelope=req["log_envelope"],
+                            locator_envelope=req["locator_envelope"],
+                            now=now,
+                        )
+                        pstate.save()
+                        pstate.save_ost_chunks(ost)
+                        self._send_json(200, {"ok": True})
+                    elif self.path == "/v1/resolve":
+                        del_env, loc_env, head_env = pstate.service.resolve(req["path"])
+                        self._send_json(
+                            200,
+                            {
+                                "delegation": del_env,
+                                "head_log": head_env,
+                                "locator": loc_env,
+                            },
+                        )
+                    elif self.path == "/v1/paths":
+                        # 登録済みのサブツリーと、その書き手公開鍵を返す。
+                        # CLI が --path を省略したとき、鍵の指紋から自分のパスを探すのに使う。
+                        rows = []
+                        for path, env in sorted(pstate.service.delegations.items()):
+                            p = env.get("payload", {})
+                            head = pstate.service.logs.get(path) or []
+                            rows.append({
+                                "path": path,
+                                "writer": p.get("writer", ""),
+                                "epoch": p.get("epoch"),
+                                "base_version": p.get("base_version"),
+                                "head_version": head[-1]["payload"]["version"] if head else 0,
+                            })
+                        self._send_json(200, {
+                            "root_anchor": pstate.root_anchor,
+                            "root_pubkey": pstate.root_pubkey,
+                            "paths": rows,
                         })
-                    self._send_json(200, {
-                        "root_anchor": pstate.root_anchor,
-                        "root_pubkey": pstate.root_pubkey,
-                        "paths": rows,
-                    })
-                elif self.path == "/v1/ost":
-                    # L3 の場所を返す。ロケータ（endpoints）がまだ無い初回でも引けるように、
-                    # サーバ自身が把握している endpoint を返す。
-                    self._send_json(200, {
-                        "endpoint": pstate.ost_endpoint,
-                        "locators": {
-                            path: (env.get("payload", {}).get("endpoints") or [None])[0]
-                            for path, env in pstate.service.locators.items()
-                        },
-                    })
-                else:
-                    self._send_json(404, {"error_type": "RegistryError", "message": f"Unknown path {self.path}"})
+                    elif self.path == "/v1/ost":
+                        # L3 の場所を返す。ロケータ（endpoints）がまだ無い初回でも引けるように、
+                        # サーバ自身が把握している endpoint を返す。
+                        self._send_json(200, {
+                            "endpoint": pstate.ost_endpoint,
+                            "locators": {
+                                path: (env.get("payload", {}).get("endpoints") or [None])[0]
+                                for path, env in pstate.service.locators.items()
+                            },
+                        })
+                    else:
+                        self._send_json(404, {"error_type": "RegistryError", "message": f"Unknown path {self.path}"})
             except (ConflictError, DelegationError, ChunkIntegrityError, ServiceUnavailableError, RegistryError) as e:
                 self._send_json(400, {"error_type": type(e).__name__, "message": str(e)})
+            except (KeyError, TypeError, ValueError) as e:
+                self._send_json(400, {"error_type": "RegistryError", "message": f"Invalid request: {e}"})
             except Exception as e:
                 self._send_json(500, {"error_type": "RegistryError", "message": f"Internal error: {e}"})
 
@@ -319,6 +373,8 @@ def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], Rem
     if not cfg_path.is_file():
         raise SystemExit(f"Error: {mount_root} is not initialized (missing {cfg_path}). Run 'dfs5 init' first.")
 
+    ensure_private_dir(cfg_path.parent)
+    restrict_to_owner(cfg_path)
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     priv_key = Path(cfg["priv_key"]).expanduser().resolve()
     pub_key_path = Path(cfg.get("pub_key") or f"{priv_key}.pub").expanduser().resolve()
@@ -345,7 +401,7 @@ def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], Rem
 # ==========================================
 def cmd_serve(args: argparse.Namespace) -> None:
     state_dir = Path(args.state_dir).expanduser().resolve()
-    state_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(state_dir)
 
     root_pub_path = Path(args.root_pubkey).expanduser().resolve()
     root_pubkey = root_pub_path.read_text(encoding="utf-8").strip()
@@ -374,6 +430,29 @@ def cmd_serve(args: argparse.Namespace) -> None:
     handler = make_registry_http_handler(pstate, ost)
     httpd = ThreadingHTTPServer((args.bind, args.registry_port), handler)
 
+    # 実際にサーバを動かしているプロセスの PID を残す。
+    # Windows の venv 版 python.exe は本体を子プロセスで起動するため、
+    # 起動側が Popen で得る PID はサーバ本体とは限らない。
+    pid_file = state_dir / "serve.pid"
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+    # 停止要求ファイルを見張る。SIGTERM / taskkill に頼らず、どの OS でも
+    # httpd.shutdown() 経由で finally（状態とチャンクの保存）を通すため。
+    stop_request = state_dir / "stop.request"
+
+    def _watch_stop() -> None:
+        while True:
+            if stop_request.exists():
+                try:
+                    stop_request.unlink()
+                except OSError:
+                    pass
+                httpd.shutdown()
+                return
+            time.sleep(0.5)
+
+    threading.Thread(target=_watch_stop, daemon=True).start()
+
     print(f"[dfs5 serve] Root Anchor : {args.root_anchor}")
     print(f"[dfs5 serve] State Dir   : {state_dir}")
     print(f"[dfs5 serve] L2 Registry : http://{args.bind}:{args.registry_port}")
@@ -383,9 +462,14 @@ def cmd_serve(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         print("\n[dfs5 serve] Shutting down...")
     finally:
-        pstate.save()
-        pstate.save_ost_chunks(ost)
+        with pstate.lock:
+            pstate.save()
+            pstate.save_ost_chunks(ost)
         ost.close()
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
         httpd.server_close()
 
 
@@ -422,7 +506,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     mount_root = Path(args.mount).expanduser().resolve()
     clayfs_dir = mount_root / ".clayfs"
     tree_dir = mount_root / "tree"
-    clayfs_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(clayfs_dir)
     tree_dir.mkdir(parents=True, exist_ok=True)
 
     host, port_str = args.ost.split(":", 1)
@@ -437,7 +521,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         "tree_secret": args.secret,
     }
     cfg_path = clayfs_dir / CONFIG_FILENAME
-    cfg_path.write_text(json.dumps(cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_private_json(cfg_path, cfg)
     print(f"[dfs5 init] Initialized mount at {mount_root}")
     print(f"  Working tree : {tree_dir}")
     print(f"  Snapshots    : {clayfs_dir / 'snapshots'}")
@@ -523,9 +607,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
     pin = node.l4.pin
     if cfg.get("delegation_epoch") != pin.delegation_epoch:
         cfg["delegation_epoch"] = pin.delegation_epoch
-        (node.clayfs.clayfs_meta / CONFIG_FILENAME).write_text(
-            json.dumps(cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        write_private_json(node.clayfs.clayfs_meta / CONFIG_FILENAME, cfg)
     print(
         f"[dfs5 pull] OK v{pin.version} (epoch={pin.delegation_epoch}) "
         f"| recv={node.ost.bytes_received} B | {elapsed_ms:.1f} ms"

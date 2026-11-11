@@ -7,6 +7,7 @@ L5 (clayfs ローカル実体化 & スナップショット連携) アダプタ�
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,7 +16,9 @@ from .crypto import ContentAddressedCrypto
 from .l2_registry import DirectoryRegistryService
 from .l3_ost_adapter import OSTClient
 from .fs import FileSystem
+from .fs.core import remove_tree
 from .l4_log import L4LogClient, MerkleTreeBuilder
+from .path_safety import safe_target, write_bytes_no_follow
 
 
 class ClayFSAdapter:
@@ -51,13 +54,17 @@ class ClayFSAdapter:
     def take_snapshot(self, snap_id: str) -> Path:
         return self.fs.take_snapshot(snap_id).path
 
+    def snapshot_result(self, snap_id: str):
+        """``SnapshotResult`` ごと返す（skipped / warnings を呼び出し側で見るため）。"""
+        return self.fs.take_snapshot(snap_id)
+
     def replace_work_tree(self, source_dir: Path) -> None:
         source_dir = Path(source_dir)
         if self.work_tree.exists() or self.work_tree.is_symlink():
             if self.work_tree.is_symlink() or self.work_tree.is_file():
                 self.work_tree.unlink()
             else:
-                shutil.rmtree(self.work_tree)
+                remove_tree(self.work_tree)
         shutil.copytree(
             source_dir,
             self.work_tree,
@@ -105,10 +112,22 @@ class DFS5Node:
     ) -> Tuple[dict, Path, int]:
         self.ost.reset_metrics()
         next_ver = self.l4.pin.version + 1
-        snap_dir = self.clayfs.take_snapshot(f"v{next_ver}")
+        snapshot = self.clayfs.snapshot_result(f"v{next_ver}")
+        snap_dir = snapshot.path
+        if snapshot.skipped:
+            # ジャンクション等はツリー外を指し得るので入れない。黙って欠けさせない。
+            preview = ", ".join(snapshot.skipped[:3])
+            more = "" if len(snapshot.skipped) <= 3 else f" 他 {len(snapshot.skipped) - 3} 件"
+            print(
+                f"[dfs5] スナップショットから {len(snapshot.skipped)} 件を除外しました"
+                f"（ジャンクション / 特殊ファイル）: {preview}{more}",
+                file=sys.stderr,
+            )
 
         with self.ost.session():
             root_pid, root_wid = self.builder.upload_directory(snap_dir, delegated_mounts=delegated_mounts)
+        for warning in self.builder.warnings:
+            print(f"[dfs5] warning: {warning}", file=sys.stderr)
 
         log_env = self.l4.commit(
             registry=self.registry,
@@ -190,6 +209,8 @@ class DFS5Node:
                 continue
             if item.name in (".DS_Store",) or item.name.startswith("._"):
                 continue
+            if item.is_symlink():
+                continue
             if item.is_dir():
                 out[rel] = {"type": "dir", "size": 0}
             elif item.is_file():
@@ -209,11 +230,7 @@ class DFS5Node:
         """
         work_tree = self.clayfs.work_tree
         for rel, data in items.items():
-            rel = str(rel).replace("\\", "/").lstrip("/")
-            if any(part in ("", ".", "..") for part in rel.split("/")):
-                raise ValueError(f"Invalid relative path for write: {rel!r}")
-            target = work_tree / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+            target = safe_target(work_tree, rel, create_parents=True)
+            write_bytes_no_follow(target, data)
         delegation_epoch = int(epoch) if epoch is not None else int(self.l4.pin.delegation_epoch or 1)
         return self.push(delegation_epoch=delegation_epoch, now=now)
