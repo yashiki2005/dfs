@@ -7,10 +7,11 @@
 `dfs5svc` はその入口で、次を肩代わりする。
 
 1. **連続した空きポートを 2 つ探し**、1 つ目を L2（名簿）、2 つ目を L3（OST）に割り当てる。
-2. root の鍵（L1 権威の Ed25519）が無ければ作る。
+2. root の鍵（L1 権威の Ed25519）と、**書き手の鍵**（L4 のログに署名する人）が無ければ作る。
 3. 状態ディレクトリを用意し、`dfs5 serve` を起動する。
-4. 立ち上がりを待って確認し、接続に必要な値を記録する（`~/.config/dfs5/services.json`）。
-5. `stop` / `list` / `status` / `env` / `logs` で後始末と確認ができる。
+4. 立ち上がりを待って確認し、**書き手への委譲を登録する**。
+5. 接続に必要な値を記録する（`~/.config/dfs5/services.json`）。
+6. `stop` / `list` / `status` / `env` / `logs` で後始末と確認ができる。
 
 - 実装: `dfs5/svc.py`
 - エントリポイント: `./dfs5svc`
@@ -70,6 +71,9 @@ dfs5svc logs   [NAME] [-n LINES]
 | `--state-dir` | `~/dfs5svc/<name>/server` | サーバの状態（チャンクと名簿） |
 | `--root-key` | `~/dfs5svc/<name>/keys/root` | L1 権威の Ed25519 鍵（無ければ作る） |
 | `--root-anchor` | `/example.com` | 根のパス |
+| `--writer-key` | `~/dfs5svc/<name>/keys/writer` | 書き手の Ed25519 鍵（無ければ作る） |
+| `--path` | `<root-anchor>/<name>` | 委譲するサブツリー。`dfs5r` は鍵から引く |
+| `--no-delegate` | — | 委譲を登録しない（サーバだけ立てる） |
 | `--wait` | `30` | 起動を待つ秒数 |
 | `--foreground` | — | 前面で動かす（Ctrl-C で停止） |
 | `--force` | — | 同じ名前の記録を上書きする |
@@ -91,6 +95,8 @@ dfs5svc logs   [NAME] [-n LINES]
       "advertise": "127.0.0.1",
       "state_dir": "~/dfs5svc/dev/server",
       "root_key": "~/dfs5svc/dev/keys/root",
+      "writer_key": "~/dfs5svc/dev/keys/writer",
+      "sub_path": "/example.com/dev",
       "pid": 12345
     }
   }
@@ -99,6 +105,19 @@ dfs5svc logs   [NAME] [-n LINES]
 
 `registry_url` と `ost_endpoint` は記録に書かず、読むときに組み立てる（重複を避け、
 書き換えで食い違わないように）。
+
+### 2.3 委譲まで自動で登録する
+
+`dfs5 serve` を上げただけでは、リモートは空である（`/v1/paths` が空）。そのため
+`dfs5r` はサブツリーを解決できない。`dfs5svc start` はここまで面倒を見る。
+
+- 書き手の Ed25519 鍵を `~/dfs5svc/<name>/keys/writer` に用意する。
+- 根から見て途中の階層にも委譲を張る（L1 は多段を要求する）。`/example.com/team/notes` なら
+  `/example.com/team` を経て末端へ至る。中間は root の書き手で作る。
+- 末端は書き手の鍵へ委譲する。
+- 同じ書き手・同じパスの委譲が既にあれば登録しない（再起動で作り直さない）。
+
+`--no-delegate` を付けると、サーバだけ立てて委譲は自分で組む。
 
 ---
 
@@ -109,30 +128,19 @@ dfs5svc logs   [NAME] [-n LINES]
 ```bash
 cd ~/src/dfs5
 
-# 1. サーバを立てる（連続した空きポートを自動で選ぶ）
+# 1. サーバを立てる（連続した空きポートを選び、鍵と委譲まで用意する）
 ./dfs5svc start --name dev
 
-# 2. 書き手の鍵を作る（Ed25519。OpenSSH 形式）
-ssh-keygen -t ed25519 -N "" -f ~/dfs5svc/dev/keys/alice
-
-# 3. L1 委譲を登録する（root 鍵で署名する）
-python -m dfs5.cli delegate \
-    --parent /example.com --path /example.com/alice/notes \
-    --signing-key ~/dfs5svc/dev/keys/root \
-    --writer-pubkey ~/dfs5svc/dev/keys/alice.pub \
-    --registry http://127.0.0.1:19441
-
-# 4. dfs5r につなぐ。L3 の場所は L2 が広告するので --ost は不要
+# 2. dfs5r につなぐ。L3 もサブツリーも L2 が知っているので --ost も --path も不要
 ./dfs5r config create dev \
     --registry http://127.0.0.1:19441 \
-    --key ~/dfs5svc/dev/keys/alice \
-    --secret dev-secret \
-    --workdir ~/dfs5svc/dev/wd
+    --key ~/dfs5svc/dev/keys/writer \
+    --secret dev-secret
 
-# 5. 使う
-mkdir -p ~/dfs5svc/dev/sample
-echo "hello" > ~/dfs5svc/dev/sample/hello.txt
-./dfs5r copy ~/dfs5svc/dev/sample dev:
+# 3. 使う
+mkdir -p /tmp/sample
+echo "hello" > /tmp/sample/hello.txt
+./dfs5r copy /tmp/sample dev:
 ./dfs5r ls   dev:
 ./dfs5r cat  dev:hello.txt
 ```
@@ -142,10 +150,12 @@ echo "hello" > ~/dfs5svc/dev/sample/hello.txt
 ```
 $ ./dfs5svc env dev
 # dev に接続する（L3 は L2 が広告するので --ost は不要）
-dfs5r config create dev --registry http://127.0.0.1:19441 --key <書き手の Ed25519 秘密鍵> --secret <tree_secret>
+dfs5r config create dev --registry http://127.0.0.1:19441 --key ~/dfs5svc/dev/keys/writer --secret <tree_secret>
 
 # 参考: このサーバの L3 は tls://127.0.0.1:19442
-#        L1 委譲の root 鍵は ~/dfs5svc/dev/keys/root（--signing-key に使う）
+#        書き手の鍵 : ~/dfs5svc/dev/keys/writer（--key にそのまま使える）
+#        サブツリー : /example.com/dev（L2 が鍵から引くので --path は不要）
+#        L1 の root : ~/dfs5svc/dev/keys/root（--signing-key に使う）
 ```
 
 ### 3.2 確認と後始末
@@ -176,6 +186,10 @@ dfs5r config create dev --registry http://127.0.0.1:19441 --key <書き手の Ed
 | `test_start_then_stop` | 起動 → 稼働中 → L2 が応答 → stop で落ちる |
 | `test_same_name_without_force_is_refused` | 同じ名前を `--force` 無しで上書きしない |
 | `test_two_services_get_different_ports` | 2 つ目は別の連続ペアを取る |
+| `test_start_registers_delegation` | start が書き手の鍵と委譲まで用意する |
+| `test_ls_works_before_any_write` | 何も書いていないリモートでも `ls` が通る |
+| `test_no_delegate_leaves_registry_empty` | `--no-delegate` なら委譲を作らない |
+| `test_explicit_path_is_used` | `--path` の末端と中間の両方に委譲が張られる |
 
 試験は `HOME` を一時ディレクトリに差し替え、その中に状態と記録を閉じる。
 `tearDown` で記録に残ったサービスを全部止める（`addCleanup` は一時ディレクトリの
@@ -192,3 +206,15 @@ dfs5r config create dev --registry http://127.0.0.1:19441 --key <書き手の Ed
 - **`stop` は記録を残す。** 同じ名前で立て直すと `--force` が要る。消すなら `--forget`。
 - **root 鍵は使い回す。** 同じ `--name` で立て直すと、以前の委譲がそのまま使える。
   作り直したいときは `--root-key` を別の場所にする。
+- **`dfs5r` の参照系は作業ディレクトリを自動で作る。** `ls` / `cat` / `size` / `check` などは
+  リモートの版を読むだけだが、接続情報（解決した ost と sub_path）と HeadPin を置く場所が
+  要る。`touch` を先に打たせず、その場で作る。
+
+## 6. 落とし穴の記録
+
+- **参照系に `touch` を要求していた。** 最初、`open_remote(create=False)` で実装したため、
+  `dfs5r ls` が「not initialized、先に touch を打て」と返していた。読み取り専用なのに
+  初期化を求めるのは筋が悪いので、参照系も `create=True` にした。
+- **`dfs5svc start` が委譲を登録していなかった。** サーバは立てば動くが、リモートが空なので
+  `ls` に出せるものが無く、`dfs5r` はサブツリーを解決できない。start に含めた。
+- **`SO_REUSEADDR` の bind で空きを誤判定していた。** §1.1 の 2 段判定に直した。

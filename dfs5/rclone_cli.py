@@ -508,7 +508,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 def cmd_ls(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    node = open_remote(store.get(name))
+    node = open_remote(store.get(name), create=True)
     for e in _rel_entries(node, _norm_prefix(sub)):
         if e["type"] == "dir":
             print(e["rel"] + "/")
@@ -520,7 +520,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
 def cmd_lsl(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    node = open_remote(store.get(name))
+    node = open_remote(store.get(name), create=True)
     for e in _rel_entries(node, _norm_prefix(sub)):
         rel = e["rel"] + ("/" if e["type"] == "dir" else "")
         size = e.get("size", 0)
@@ -531,7 +531,7 @@ def cmd_lsl(args: argparse.Namespace) -> int:
 def cmd_lsjson(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    node = open_remote(store.get(name))
+    node = open_remote(store.get(name), create=True)
     rows = []
     for e in _all_entries(node, _norm_prefix(sub)):
         row = {
@@ -550,7 +550,7 @@ def cmd_lsjson(args: argparse.Namespace) -> int:
 def cmd_size(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    node = open_remote(store.get(name))
+    node = open_remote(store.get(name), create=True)
     files = [e for e in _all_entries(node, _norm_prefix(sub)) if e["type"] == "file"]
     total = sum(int(e.get("size", 0)) for e in files)
     print(f"Total objects: {len(files)}")
@@ -564,7 +564,7 @@ def cmd_cat(args: argparse.Namespace) -> int:
     name, sub = split_remote_spec(args.remote, args.remote_name)
     if not sub:
         raise UsageError("cat にはファイルのパスが必要です（例: remote:dir/file.txt）")
-    node = open_remote(store.get(name))
+    node = open_remote(store.get(name), create=True)
     try:
         data = node.read_remote(sub)
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
@@ -714,7 +714,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     name, sub = split_remote_spec(args.src, args.remote_name)
     remote = store.get(name)
     prefix = _norm_prefix(sub)
-    node = open_remote(remote)
+    node = open_remote(remote, create=True)
     version = refresh_cache(node, force=args.force)
 
     src_root = node.clayfs.work_tree if not prefix else node.clayfs.work_tree / prefix
@@ -749,7 +749,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     name, sub = split_remote_spec(args.remote, args.remote_name)
     remote = store.get(name)
     prefix = _norm_prefix(sub)
-    node = open_remote(remote)
+    node = open_remote(remote, create=True)
 
     remote_files = {
         e["path"][len(prefix) + 1 if prefix else 0:]: int(e.get("size", 0))
@@ -788,7 +788,7 @@ def cmd_about(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
     remote = store.get(name)
-    node = open_remote(remote)
+    node = open_remote(remote, create=True)
     pin = node.l4.pin
     # 定義に書かれていない ost / path は、実際に使った値（作業ディレクトリの設定）を出す。
     cfg = json.loads((node.clayfs.clayfs_meta / cli_mod.CONFIG_FILENAME).read_text(encoding="utf-8"))

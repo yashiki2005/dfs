@@ -144,6 +144,9 @@ class Service:
     root_anchor: str
     pid: int
     started_at: str
+    writer_key: str = ""
+    writer_pub: str = ""
+    sub_path: str = ""
     config_path: str = ""
     log_path: str = ""
 
@@ -237,6 +240,130 @@ def ensure_root_key(path: Path) -> Path:
     return path
 
 
+def ensure_writer_key(path: Path) -> Path:
+    """書き手（L4 のログに署名する人）の Ed25519 鍵を用意する。"""
+    if path.exists() and Path(f"{path}.pub").exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    res = subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"dfs5svc-writer@{socket.gethostname()}",
+         "-f", str(path)],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        raise ServiceError(f"書き手の鍵を作れませんでした: {res.stderr.strip()}")
+    os.chmod(path, 0o600)
+    return path
+
+
+def register_delegation(root_key: Path, writer_pub: Path, sub_path: str, registry_url: str) -> None:
+    """root 鍵で書き手への委譲を署名し、L2 に登録する。
+
+    すでに同じ書き手・同じパスの委譲があれば何もしない（再起動で作り直さない）。
+    """
+    import urllib.error
+    import urllib.request
+
+    writer_line = writer_pub.read_text(encoding="utf-8").strip()
+
+    # 既にこの書き手の委譲があるか
+    body = json.dumps({}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{registry_url}/v1/paths", data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read().decode("utf-8")).get("paths", [])
+    except Exception:  # noqa: BLE001 - 未登録なら無いものとして進める
+        rows = []
+    if any(r.get("path") == sub_path and r.get("writer", "").strip() == writer_line for r in rows):
+        return
+
+    repo = _repo_root()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    parent = sub_path.rsplit("/", 1)[0] or "/"
+    cmd = [
+        sys.executable, "-m", "dfs5.cli", "delegate",
+        "--parent", parent,
+        "--path", sub_path,
+        "--signing-key", str(root_key),
+        "--writer-pubkey", str(writer_pub),
+        "--registry", registry_url,
+    ]
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        raise ServiceError(
+            "委譲の登録に失敗しました: " + (res.stderr.strip() or res.stdout.strip())
+        )
+
+
+def _ensure_parent_delegations(
+    root_key: Path, root_pub: Path, root_anchor: str, sub_path: str, registry_url: str,
+) -> None:
+    """``sub_path`` の途中のディレクトリにも委譲を張る（L1 は多段を要求する）。
+
+    ``/example.com/a/b`` なら ``/example.com/a`` を経て ``/example.com/a/b`` に至る。
+    親の委譲は root の書き手（= root 公開鍵）で作る。
+    """
+    anchor = root_anchor.rstrip("/")
+    if not sub_path.startswith(anchor + "/"):
+        return
+    rel = sub_path[len(anchor) + 1:]
+    parts = [p for p in rel.split("/") if p]
+    if len(parts) <= 1:
+        return  # 根の直下は 1 段で届く
+    # 途中の各階層に委譲を張る（parent -> child）
+    current = anchor
+    for i, part in enumerate(parts):
+        child = f"{current}/{part}"
+        if i == len(parts) - 1:
+            break  # 最後は書き手への委譲なので呼び出し側がやる
+        register_delegation_chain_step(root_key, root_pub, current, child, registry_url)
+        current = child
+
+
+def register_delegation_chain_step(
+    root_key: Path, root_pub: Path, parent: str, child: str, registry_url: str,
+) -> None:
+    """親のパスから子のパスへの委譲を、root 鍵で署名して登録する（中間の層）。"""
+    import urllib.error
+    import urllib.request
+
+    writer_line = root_pub.read_text(encoding="utf-8").strip()
+    body = json.dumps({}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{registry_url}/v1/paths", data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read().decode("utf-8")).get("paths", [])
+    except Exception:  # noqa: BLE001
+        rows = []
+    if any(r.get("path") == child and r.get("writer", "").strip() == writer_line for r in rows):
+        return
+
+    repo = _repo_root()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    cmd = [
+        sys.executable, "-m", "dfs5.cli", "delegate",
+        "--parent", parent,
+        "--path", child,
+        "--signing-key", str(root_key),
+        "--writer-pubkey", str(root_pub),
+        "--registry", registry_url,
+    ]
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        raise ServiceError(
+            f"中間の委譲 ({child}) の登録に失敗しました: "
+            + (res.stderr.strip() or res.stdout.strip())
+        )
+
+
 def wait_for_l2(registry_url: str, timeout: float = 30.0) -> bool:
     """L2 が resolve に答えるようになるまで待つ。"""
     import urllib.error
@@ -292,12 +419,15 @@ def cmd_start(args: argparse.Namespace) -> int:
     base = _base_dir(name)
     state_dir = Path(args.state_dir).expanduser() if args.state_dir else base / "server"
     root_key = Path(args.root_key).expanduser() if args.root_key else base / "keys" / "root"
+    writer_key = Path(args.writer_key).expanduser() if args.writer_key else base / "keys" / "writer"
     log_path = base / "serve.log"
 
     state_dir.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_root_key(root_key)
+    ensure_writer_key(writer_key)
     root_pub = Path(f"{root_key}.pub")
+    writer_pub = Path(f"{writer_key}.pub")
 
     advertised = args.advertise or ("127.0.0.1" if host in ("0.0.0.0", "::") else host)
     registry_url = f"http://{advertised}:{registry_port}"
@@ -344,11 +474,27 @@ def cmd_start(args: argparse.Namespace) -> int:
         proc.terminate()
         raise ServiceError(f"L2 ({registry_url}) が {args.wait:.0f} 秒以内に応答しませんでした")
 
+    # サービスが空のままでは使い道が無いので、書き手への委譲まで登録する。
+    # --no-delegate を付けたときだけ省く（自分で委譲を組む場合）。
+    sub_path = ""
+    if not args.no_delegate:
+        raw_path = (args.path or "").strip()
+        sub_path = raw_path.rstrip("/") if raw_path else f"{args.root_anchor}/{name}"
+        if not sub_path.startswith("/"):
+            sub_path = "/" + sub_path
+        # 根の直下でなければ、親のパスも委譲が要る（L1 は多段）
+        _ensure_parent_delegations(root_key, root_pub, args.root_anchor, sub_path, registry_url)
+        register_delegation(root_key, writer_pub, sub_path, registry_url)
+        print(f"[dfs5svc] 委譲を登録: {sub_path}（書き手 {writer_key.name}）")
+
     service = Service(
         name=name,
         state_dir=str(state_dir),
         root_key=str(root_key),
         root_pub=str(root_pub),
+        writer_key=str(writer_key),
+        writer_pub=str(writer_pub),
+        sub_path=sub_path,
         registry_port=registry_port,
         ost_port=ost_port,
         bind=host,
@@ -370,11 +516,15 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(f"  L3 OST      : tls://{service.ost_endpoint}")
         print()
         print("[dfs5svc] dfs5r につなぐには:")
+        key_hint = service.writer_key or "<書き手の Ed25519 秘密鍵>"
         print(
             f"  dfs5r config create {name} --registry {service.registry_url} "
-            f"--key <書き手の Ed25519 秘密鍵> --secret <tree_secret>"
+            f"--key {key_hint} --secret <tree_secret>"
         )
-        print(f"  # L3 の場所は L2 が広告するので --ost は不要です（この場合は {service.ost_endpoint}）")
+        print(f"  # L3 の場所もサブツリーも L2 が知っているので --ost も --path も不要です")
+        if service.sub_path:
+            print(f"  # このサーバのサブツリー: {service.sub_path}")
+        print(f"  # 書き手の鍵: {key_hint}" if service.writer_key else "")
     return 0
 
 
@@ -407,6 +557,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"L2 Registry : {s.registry_url}")
     print(f"L3 OST      : tls://{s.ost_endpoint}")
     print(f"Root Anchor : {s.root_anchor}")
+    if s.sub_path:
+        print(f"Subtree     : {s.sub_path}")
+    if s.writer_key:
+        print(f"Writer Key  : {s.writer_key}")
     print(f"State Dir   : {s.state_dir}")
     print(f"Root Pubkey : {s.root_pub}")
     print(f"Log         : {s.log_path}")
@@ -471,15 +625,19 @@ def cmd_env(args: argparse.Namespace) -> int:
     """dfs5r につなぐための設定行を出す。"""
     store = ServiceStore()
     s = store.get(args.name)
+    writer = s.writer_key or "<書き手の Ed25519 秘密鍵>"
     print(f"# {s.name} に接続する（L3 は L2 が広告するので --ost は不要）")
     print(
         f"dfs5r config create {s.name} --registry {s.registry_url} "
-        f"--key <書き手の Ed25519 秘密鍵> --secret <tree_secret>"
+        f"--key {writer} --secret <tree_secret>"
         f"{f' --workdir {args.workdir}' if args.workdir else ''}"
     )
     print()
     print(f"# 参考: このサーバの L3 は tls://{s.ost_endpoint}")
-    print(f"#        L1 委譲の root 鍵は {s.root_key}（--signing-key に使う）")
+    print(f"#        書き手の鍵 : {writer}" + (f"（--key にそのまま使える）" if s.writer_key else ""))
+    if s.sub_path:
+        print(f"#        サブツリー : {s.sub_path}（L2 が鍵から引くので --path は不要）")
+    print(f"#        L1 の root : {s.root_key}（--signing-key に使う）")
     return 0
 
 
@@ -517,6 +675,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--state-dir", help="状態ディレクトリ（既定 ~/dfs5svc/<name>/server）")
     p.add_argument("--root-key", help="root の Ed25519 鍵（既定 ~/dfs5svc/<name>/keys/root）")
     p.add_argument("--root-anchor", default=DEFAULT_ROOT_ANCHOR, help=f"根のパス（既定 {DEFAULT_ROOT_ANCHOR}）")
+    p.add_argument("--writer-key", help="書き手の Ed25519 鍵（既定 ~/dfs5svc/<name>/keys/writer）")
+    p.add_argument(
+        "--path",
+        help=f"委譲するサブツリー（既定 {DEFAULT_ROOT_ANCHOR}/<name>）。"
+             "dfs5r は書き手の鍵からこのパスを引く",
+    )
+    p.add_argument("--no-delegate", action="store_true",
+                   help="委譲を登録しない（サーバだけ立てる）")
     p.add_argument("--wait", type=float, default=30.0, help="起動を待つ秒数（既定 30）")
     p.add_argument("--foreground", action="store_true", help="前面で動かす（Ctrl-C で停止）")
     p.add_argument("--force", action="store_true", help="同じ名前の記録を上書きする")

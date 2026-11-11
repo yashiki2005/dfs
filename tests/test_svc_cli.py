@@ -163,6 +163,99 @@ class StartStopTests(unittest.TestCase):
         self.assertFalse(service.is_running(), "stop したのに動いている")
         self.service = None
 
+    def test_start_registers_delegation(self) -> None:
+        """start は書き手の鍵と委譲まで用意する（dfs5r がそのまま使える）。"""
+        start_port, _ = find_consecutive_free_ports(23000, 2, "127.0.0.1")
+        self.assertEqual(svc_main(["start", "--name", "d", "--port", str(start_port)]), 0)
+        service = ServiceStore().get("d")
+        self.service = service
+
+        # 書き手の鍵が作られている
+        writer = Path(service.writer_key)
+        self.assertTrue(writer.is_file(), "書き手の鍵が無い")
+        self.assertTrue(Path(f"{writer}.pub").is_file(), ".pub が無い")
+
+        # L2 に、その書き手の委譲が登録されている
+        pub = Path(f"{writer}.pub").read_text(encoding="utf-8").strip()
+        import urllib.request
+
+        body = json.dumps({}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{service.registry_url}/v1/paths", data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))["paths"]
+        self.assertTrue(
+            any(r["path"] == service.sub_path and r["writer"].strip() == pub for r in rows),
+            f"委譲が見つからない: {rows}",
+        )
+        self.assertEqual(service.sub_path, "/example.com/d")
+
+    def test_ls_works_before_any_write(self) -> None:
+        """まだ何も書いていないリモートでも ls が通る（初期化を先に求めない）。"""
+        start_port, _ = find_consecutive_free_ports(24000, 2, "127.0.0.1")
+        self.assertEqual(svc_main(["start", "--name", "e", "--port", str(start_port)]), 0)
+        service = ServiceStore().get("e")
+        self.service = service
+
+        # リモートを定義して、touch せずに ls する
+        from dfs5.remotes import Remote, RemoteStore
+
+        remotes = RemoteStore()
+        remotes.set(Remote(
+            name="e", registry=service.registry_url, key=service.writer_key,
+            secret="test-secret", workdir=str(self.home / "wd-e"),
+        ))
+        from dfs5.rclone_cli import main as rclone_main
+
+        self.assertEqual(rclone_main(["ls", "e:"]), 0, "ls が初期化を要求して失敗した")
+
+    def test_no_delegate_leaves_registry_empty(self) -> None:
+        """--no-delegate なら委譲を登録しない（自分で組む場合）。"""
+        start_port, _ = find_consecutive_free_ports(25000, 2, "127.0.0.1")
+        rc = svc_main(["start", "--name", "nd", "--port", str(start_port), "--no-delegate"])
+        self.assertEqual(rc, 0)
+        service = ServiceStore().get("nd")
+        self.service = service
+        self.assertEqual(service.sub_path, "")
+
+        import urllib.request
+
+        body = json.dumps({}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{service.registry_url}/v1/paths", data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))["paths"]
+        self.assertEqual(rows, [], "--no-delegate なのに委譲がある")
+
+    def test_explicit_path_is_used(self) -> None:
+        """--path を渡すとそのサブツリーに委譲する（親も自動で張る）。"""
+        start_port, _ = find_consecutive_free_ports(26000, 2, "127.0.0.1")
+        rc = svc_main([
+            "start", "--name", "p", "--port", str(start_port),
+            "--path", "/example.com/team/notes",
+        ])
+        self.assertEqual(rc, 0)
+        service = ServiceStore().get("p")
+        self.service = service
+        self.assertEqual(service.sub_path, "/example.com/team/notes")
+
+        import urllib.request
+
+        body = json.dumps({}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{service.registry_url}/v1/paths", data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            paths = {r["path"] for r in json.loads(resp.read().decode("utf-8"))["paths"]}
+        # 中間の /example.com/team と、末端の /example.com/team/notes の両方がある
+        self.assertIn("/example.com/team", paths, "中間の委譲が無い")
+        self.assertIn("/example.com/team/notes", paths, "末端の委譲が無い")
+
     def test_same_name_without_force_is_refused(self) -> None:
         start_port, _ = find_consecutive_free_ports(21000, 2, "127.0.0.1")
         self.assertEqual(svc_main(["start", "--name", "dup", "--port", str(start_port)]), 0)
