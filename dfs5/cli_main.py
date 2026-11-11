@@ -1057,6 +1057,46 @@ def cmd_about(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fs(args: argparse.Namespace) -> int:
+    """ローカルディレクトリの CoW 検出とスナップショット (リモート不要)。"""
+    from .fs import FileSystem, detect_backends
+
+    root = Path(args.path).expanduser()
+    if args.action == "info":
+        for info in detect_backends(root):
+            mark = "*" if info.available else " "
+            print(f"{mark} {info.name:<10} {info.capability.value:<10} {info.detail}")
+        f = FileSystem(root, backend=args.backend)
+        print()
+        print(f"selected    : {f.backend.name} (cow={f.is_cow})")
+        return 0
+    if args.action == "snapshot":
+        f = FileSystem(root, backend=args.backend)
+        result = f.take_snapshot(args.snap_id)
+        print(f"snapshot    : {result.snapshot_id}")
+        print(f"path        : {result.path}")
+        print(f"backend     : {result.backend}")
+        print(f"files       : {result.files}")
+        print(f"bytes       : {result.bytes_copied}")
+        for w in result.warnings:
+            print(f"warning     : {w}", file=sys.stderr)
+        return 0
+    if args.action == "materialize":
+        if args.src:
+            src = Path(args.src).expanduser()
+        elif args.snap_id:
+            src = root / ".clayfs" / "snapshots" / args.snap_id
+        else:
+            raise UsageError("materialize には --src か snap_id が必要")
+        if not args.dst:
+            raise UsageError("materialize には出力先が必要")
+        f = FileSystem(root, backend=args.backend)
+        out = f.materialize(src, Path(args.dst).expanduser())
+        print(f"materialize : {out}")
+        return 0
+    raise UsageError(f"unknown fs action: {args.action}")
+
+
 def cmd_mkdir(args: argparse.Namespace) -> int:
     """リモートにディレクトリを作る（空のディレクトリも版に残る）。"""
     store = RemoteStore()
@@ -1362,6 +1402,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("dest", help="ローカルのディレクトリ")
     p.add_argument("--force", action="store_true", help="写しが同じ版でも取り直す")
     p.set_defaults(func=cmd_pull)
+
+    p_fs = sub.add_parser("fs", help="ローカルの CoW 検出・スナップショット（リモート不要）")
+    p_fs.add_argument("action", choices=["info", "snapshot", "materialize"])
+    p_fs.add_argument("path", help="対象ディレクトリ")
+    p_fs.add_argument("snap_id", nargs="?", help="snapshot の ID (例: v1)")
+    p_fs.add_argument("dst", nargs="?", help="materialize の出力先")
+    p_fs.add_argument(
+        "--src", dest="src",
+        help="materialize の入力 (省略時は path/.clayfs/snapshots/<snap_id>)",
+    )
+    p_fs.add_argument(
+        "--backend", default="auto",
+        help="copy / reflink / fast_clone / auto (既定 auto)",
+    )
+    p_fs.set_defaults(func=cmd_fs)
 
     p = sub.add_parser("mkdir", help="リモートにディレクトリを作る")
     p.add_argument("remote", help="remote:dir")

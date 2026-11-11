@@ -20,7 +20,8 @@
 | L2 名簿 | 実装済み | `l2_registry.py`（署名付きロケータ、CAS 追記、root へチェーン復元） |
 | L3 データ平面 | 実装済み・WAN 計測済み | `l3_ost_adapter.py`（TLS/TCP、batch_has / put / get） |
 | L4 一貫性 | 実装済み・evil 試験済み | `l4_log.py`（追記ログ、Merkle 塊、HeadPin、B6/B7 防御） |
-| L5 実体化 | 実装済み | `l5_clayfs.py`（スナップショット連携） |
+| L5 実体化 | 実装済み | `l5_clayfs.py`（`dfs5.fs` 経由のスナップショット連携） |
+| L5 CoW 抽象 | 実装済み | `dfs5/fs/`（CoW があれば CoW、無ければ実コピー） |
 
 ### 1.2 2 つの CLI
 

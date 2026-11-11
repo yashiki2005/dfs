@@ -15,7 +15,7 @@
 | **L2** | 所在地解決 | 署名付きロケータ (`dfs5-l2-locator-v1`)。<br>初期実装は **名簿（MDSAnnouncer 型）** とし、将来 DHT を足す際は 2 段キャッシュとする | ロケータ内に L4 先頭版 (`head_version`, `head_hash`) を含め、解決と先頭確認を **1 RTT** で完結させる |
 | **L3** | データ平面 | 独自 TLS/TCP OST（`ChunkStoreServer`、`l3_store.py`）。`mini_lustre` の OST とはプロトコルが異なり、**無改造流用は不可**（`specs/l3_data_plane.md` §3）。<br>塊の暗号化は **標準 AEAD（ChaCha20-Poly1305、Nonce は毎回ランダム）** | 重複排除は暗号化の前に平文アドレス `plain_id = HMAC(K_addr, P)` で判定し、主体は書き手自身の索引（署名済み履歴から復元可能）。OST は `wire_id = SHA256(C)` のみを検証 |
 | **L4** | 一貫性と追記ログ | 部分木単位の単一書き手追記ログ (`dfs5-l4-log-v1`) + ディレクトリ塊 (`dfs5-dir-v1`) | 先頭版の **CAS（Compare-And-Swap）** による同時書き込み拒否（三方向マージの排除）、`HeadPin` による B6 防御、Read-after-Write による B7 防御 |
-| **L5** | ローカル実体化 | `clayfs` を無改造で使用し、外側の薄いアダプタ (`ClayFSAdapter`) で接続 | スナップショット (`/.clayfs/snapshots/<id>/`) を L4 の入出力境界とし、`.clayfs` 自身の再帰混入と OS 固有メタデータ（NFD/NFC 揺れ、`.DS_Store`）を境界で正規化・除外 |
+| **L5** | ローカル実体化 | `dfs5.fs`（`dfs5/fs/`）が OS の CoW を自動検出して使い、無ければ実コピー。`ClayFSAdapter` はその薄い結線 | スナップショット (`/.clayfs/snapshots/<id>/`) を L4 の入出力境界とし、`.clayfs` 自身の再帰混入と OS 固有メタデータ（NFD/NFC 揺れ、`.DS_Store`）を境界で正規化・除外。CoW の有無に依存せずスナップショットを独立 inode にする |
 
 ---
 
@@ -164,8 +164,10 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
   - したがって、重複排除と機密性は直交する。Nonce の再利用は発生せず、既知平文の辞書攻撃も他人の部分木に対しては成立しない（`K_addr` を持つ書き手の範囲に閉じる）。
 
 ### 問い 6: clayfs をそのまま使うか？
-- **回答: 本体には一切手を入れず、無改造でそのまま使う。**
-- **詳細**: `clayfs` のスナップショットディレクトリ（`/.clayfs/snapshots/<id>/`）が通常の POSIX ディレクトリとして外部から直接読める性質を利用する。L4 との接点となる薄いアダプタで「`.clayfs` ディレクトリ自体をスナップショット対象から除外する（非再帰保証）」「ファイル名を UTF-8 NFC に正規化する」の 2 点のみを吸収する。
+- **回答: 本体は移植せず、スナップショット入出力だけを `dfs5.fs` として再実装する。**
+- **理由**: `clayfs` 本体は Swift 製で macOS の APFS sparsebundle / Linux の Btrfs を前提にしている。Windows では動かず、かといって ReFS は一般 PC にほぼ普及していない（Windows 11 では Dev Drive 限定、block clone は 24H2 以降）。「Python さえ動けば動く」を満たすには、CoW を **最適化** として扱い、無い環境では実コピーへ落ちる必要がある。
+- **詳細**: `dfs5/fs/core.py` が 1 ルートを `root/tree` と `root/.clayfs/snapshots` に分割し、`snapshot()` / `clone()` / `materialize()` を提供する。backend は `copy`（既定・どこでも動く）/ `reflink`（macOS `clonefile(2)`・Linux `FICLONE`）/ `fast_clone`（Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE`）。検出は実際に 1 ファイルを複製して確かめるため、NFS や exFAT では自動的に `copy` へ落ちる。`ClayFSAdapter` はこの `FileSystem` を呼ぶだけの薄い結線になった。
+- **旧実装の不具合**: スナップショットを `shutil.copytree(..., copy_function=os.link)` で作っていたため、作業ツリーとスナップショットが同じ inode を共有し、元ファイルを上書きするとスナップショットも書き換わっていた（ロールバックの安全性が崩れていた）。`copy` / `reflink` のどちらでも独立 inode になることを `tests/test_fs_cow.py` で固定した。
 
 ### 問い 7: 経済・モデレーション・初回接触を範囲外でよいか？
 - **回答: 範囲外とする（設計として持ち込まない）。**
@@ -186,6 +188,7 @@ dfs5/
 ├── specs/
 │   ├── delegation.md          # L1 権威の委譲仕様（root アンカー検証・TOFU を含む）
 │   ├── l2_comparison.md       # L2 3方式の計測比較表
+│   ├── fs-cow.md              # L5 CoW 抽象 (backend 選択と非対応環境)
 │   ├── l3_data_plane.md       # L3 の計測と判断（batch 系、WAN の往復）
 │   ├── e2e_lan.md             # Mac ↔ Pi5 の実機統合（LAN）
 │   ├── e2e_wan.md             # 3 拠点の WAN 実機と遅延耐性
@@ -198,6 +201,7 @@ dfs5/
 │   ├── l3_ost_adapter.py      # 内容アドレス型のチャンク保管 (batch_has / batch_put / batch_get)
 │   ├── l4_log.py              # 単一書き手追記ログ・Merkle塊・HeadPin (B6/B7防御)
 │   ├── l5_clayfs.py           # clayfs スナップショット連携アダプタ (NFC正規化・非再帰)
+│   ├── fs/                    # CoW 抽象 (CoW があれば CoW、無ければ実コピー)
 │   ├── cli.py                 # サーバ側 CLI (serve / delegate / init / push / pull / status)
 │   ├── remotes.py             # dfs5cli のリモート定義（名前 -> 接続情報、root アンカー）
 │   ├── cli_main.py            # dfs5cli 本体（ls/cat/copy/sync/pull/rm/mkdir など）
@@ -224,6 +228,7 @@ dfs5/
 │   ├── l3_ost_adapter.py      # 内容アドレス型のチャンク保管 (batch_has / batch_put / batch_get)
 │   ├── l4_log.py              # 単一書き手追記ログ・Merkle塊・HeadPin (B6/B7防御)
 │   ├── l5_clayfs.py           # clayfs スナップショット連携アダプタ (NFC正規化・非再帰)
+│   ├── fs/                    # CoW 抽象 (CoW があれば CoW、無ければ実コピー)
 │   ├── remotes.py             # rclone ライク CLI のリモート定義（名前 -> 接続情報）
 │   ├── cli_main.py            # ローカル CLI（dfs5cli）本体（ls/cat/copy/sync/pull/rm など）
 │   └── svc.py                 # ローカルにサーバを立てる（空きポート 2 つ + serve 起動）

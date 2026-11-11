@@ -6,7 +6,6 @@ L5 (clayfs ローカル実体化 & スナップショット連携) アダプタ�
 
 from __future__ import annotations
 
-import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -15,39 +14,55 @@ from typing import Any, Dict, List, Optional, Tuple
 from .crypto import ContentAddressedCrypto
 from .l2_registry import DirectoryRegistryService
 from .l3_ost_adapter import OSTClient
+from .fs import FileSystem
 from .l4_log import L4LogClient, MerkleTreeBuilder
 
 
 class ClayFSAdapter:
-    def __init__(self, mount_root: Path | str):
+    """作業ツリーのスナップショット入出力。
+
+    実体のコピーは ``dfs5.fs.FileSystem`` に委譲する。CoW (clonefile / FICLONE /
+    block clone) が使える環境ではそれを自動で使い、無い環境では実コピーに落ちる。
+    どちらでもスナップショットは作業ツリーから独立した inode になる。
+    """
+
+    def __init__(self, mount_root: Path | str, backend: str = "auto"):
         self.mount_root = Path(mount_root).resolve()
         self.work_tree = self.mount_root / "tree"
         self.clayfs_meta = self.mount_root / ".clayfs"
         self.snap_root = self.clayfs_meta / "snapshots"
         self.work_tree.mkdir(parents=True, exist_ok=True)
         self.snap_root.mkdir(parents=True, exist_ok=True)
+        self.fs = FileSystem(
+            self.mount_root,
+            backend=backend,
+            work_tree=self.work_tree,
+            snap_root=self.snap_root,
+        )
+
+    @property
+    def backend(self):
+        return self.fs.backend.name
+
+    @property
+    def is_cow(self) -> bool:
+        return self.fs.is_cow
 
     def take_snapshot(self, snap_id: str) -> Path:
-        dest = self.snap_root / snap_id
-        if dest.exists():
-            shutil.rmtree(dest)
-        shutil.copytree(
-            self.work_tree,
-            dest,
-            ignore=shutil.ignore_patterns(".clayfs", ".DS_Store", "._*"),
-            copy_function=os.link,
-        )
-        if (dest / ".clayfs").exists():
-            raise RuntimeError("Invariant violation: .clayfs directory leaked into snapshot")
-        return dest
+        return self.fs.take_snapshot(snap_id).path
 
     def replace_work_tree(self, source_dir: Path) -> None:
-        if self.work_tree.exists():
-            shutil.rmtree(self.work_tree)
+        source_dir = Path(source_dir)
+        if self.work_tree.exists() or self.work_tree.is_symlink():
+            if self.work_tree.is_symlink() or self.work_tree.is_file():
+                self.work_tree.unlink()
+            else:
+                shutil.rmtree(self.work_tree)
         shutil.copytree(
             source_dir,
             self.work_tree,
             ignore=shutil.ignore_patterns(".clayfs", ".DS_Store", "._*"),
+            symlinks=True,
         )
 
 
