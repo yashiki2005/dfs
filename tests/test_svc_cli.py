@@ -164,7 +164,7 @@ class StartStopTests(unittest.TestCase):
         self.service = None
 
     def test_start_registers_delegation(self) -> None:
-        """start は書き手の鍵と委譲まで用意する（dfs5r がそのまま使える）。"""
+        """start は書き手の鍵と委譲まで用意する（dfs5cli がそのまま使える）。"""
         start_port, _ = find_consecutive_free_ports(23000, 2, "127.0.0.1")
         self.assertEqual(svc_main(["start", "--name", "d", "--port", str(start_port)]), 0)
         service = ServiceStore().get("d")
@@ -207,7 +207,7 @@ class StartStopTests(unittest.TestCase):
             name="e", registry=service.registry_url, key=service.writer_key,
             secret="test-secret", workdir=str(self.home / "wd-e"),
         ))
-        from dfs5.rclone_cli import main as rclone_main
+        from dfs5.cli_main import main as rclone_main
 
         self.assertEqual(rclone_main(["ls", "e:"]), 0, "ls が初期化を要求して失敗した")
 

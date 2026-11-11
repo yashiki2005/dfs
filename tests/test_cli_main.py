@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-dfs5/tests/test_rclone_cli.py
-rclone ライク CLI (`dfs5/rclone_cli.py`) の試験。
+dfs5/tests/test_cli_main.py
+rclone ライク CLI (`dfs5/cli_main.py`) の試験。
 
-ローカルに L2 名簿 (HTTP) と L3 OST (TLS) を 1 つ立て、`dfs5r` の主要な操作を
+ローカルに L2 名簿 (HTTP) と L3 OST (TLS) を 1 つ立て、`dfs5cli` の主要な操作を
 実際に呼ぶ。サーバは既存の `cli.py` の部品をそのまま使う。
 """
 
@@ -26,7 +26,7 @@ from dfs5.l1_delegation import create_delegation_envelope
 from dfs5.l3_store import ChunkStoreServer
 from dfs5.l4_log import MerkleTreeBuilder
 from dfs5.l5_clayfs import DFS5Node
-from dfs5.rclone_cli import main as rclone_main
+from dfs5.cli_main import main as cli_main
 from dfs5.remotes import Remote, RemoteStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,7 +80,7 @@ class RcloneCase(unittest.TestCase):
     """共通の準備（鍵・委譲・サーバ・リモート定義・データ）。"""
 
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5r_test_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5cli_test_")
         self.base = Path(self._tmp.name)
         self.root_key = _keypair(self.base, "root")
         self.alice_key = _keypair(self.base, "alice")
@@ -125,8 +125,8 @@ class RcloneCase(unittest.TestCase):
         self._tmp.cleanup()
 
     def run_cli(self, *argv: str) -> int:
-        """`dfs5r` を同じプロセスで実行する（出力はそのまま出る）。"""
-        return rclone_main(list(argv))
+        """`dfs5cli` を同じプロセスで実行する（出力はそのまま出る）。"""
+        return cli_main(list(argv))
 
     def test_config_can_omit_ost_and_path(self) -> None:
         """--ost と --path を省いても、L2 から解決して読み書きできる。
@@ -165,7 +165,7 @@ class RcloneCase(unittest.TestCase):
 
     def test_registry_host_only_gets_default_port(self) -> None:
         """--registry はホスト名だけでよい（ポートを補う）。"""
-        from dfs5.rclone_cli import normalize_registry
+        from dfs5.cli_main import normalize_registry
 
         self.assertEqual(normalize_registry("172.16.1.60"), "http://172.16.1.60:9440")
         self.assertEqual(normalize_registry("http://host:1234"), "http://host:1234")
@@ -211,7 +211,7 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(rc, 2, "存在しない --key を受け入れた")
 
     def test_create_alias_exists(self) -> None:
-        """`dfs5r create` は `dfs5r config create` と同じ（短い入口）。"""
+        """`dfs5cli create` は `dfs5cli config create` と同じ（短い入口）。"""
         store = RemoteStore(self.config_file)
         store.remotes.pop("t", None)
         store.save()
@@ -249,8 +249,8 @@ class RcloneCase(unittest.TestCase):
             if pid == 0:
                 os.environ["DFS5_CONFIG"] = str(config)
                 os.execv(
-                    str(ROOT / "dfs5r"),
-                    ["./dfs5r", "create", name,
+                    str(ROOT / "dfs5cli"),
+                    ["./dfs5cli", "create", name,
                      "--registry", self.server.registry_url,
                      "--key", str(self.alice_key),
                      "--key-dir", str(keys),

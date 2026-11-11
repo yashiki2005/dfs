@@ -10,7 +10,7 @@ dfs5/svc.py
 2. root の鍵（L1 権威の Ed25519）が無ければ作る。
 3. 状態ディレクトリを用意し、`dfs5 serve` を起動する。
 4. 立ち上がったら、接続に必要な値を `~/.config/dfs5/services.json` に記録する
-   （`dfs5r config create` に渡す値を自分で組み立てなくて済むように）。
+   （`dfs5cli config create` に渡す値を自分で組み立てなくて済むように）。
 5. `stop` / `list` / `status` で後始末と確認ができる。
 
 使い方:
@@ -21,9 +21,13 @@ dfs5/svc.py
     dfs5svc list                  # 記録済みのサービス
     dfs5svc status dev            # 状態と接続情報
     dfs5svc stop dev              # 止める
-    dfs5svc env dev               # dfs5r config create の行を出す
+    dfs5svc env dev               # dfs5cli config create の行を出す
 
 出力は機械可読も兼ねる（`--json`）。
+
+TODO（完成時）:
+  リポジトリ直下の `dfs5svc` は、PATH の通った場所に置く（`dfs5cli` と同じ扱い）。
+  ラッパーは `dirname` から自分の位置を決めて Python を探すので、シンボリックリンクでも動く。
 """
 
 from __future__ import annotations
@@ -538,10 +542,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(f"  L2 Registry : {service.registry_url}")
         print(f"  L3 OST      : tls://{service.ost_endpoint}")
         print()
-        print("[dfs5svc] dfs5r につなぐには:")
+        print("[dfs5svc] dfs5cli につなぐには:")
         key_hint = service.writer_key or "<書き手の Ed25519 秘密鍵>"
         print(
-            f"  dfs5r config create {name} --registry {service.registry_url} "
+            f"  dfs5cli config create {name} --registry {service.registry_url} "
             f"--key {key_hint} --secret <tree_secret>"
         )
         print(f"  # L3 の場所もサブツリーも L2 が知っているので --ost も --path も不要です")
@@ -664,13 +668,13 @@ def _stop_process(s: Service) -> bool:
 
 
 def cmd_env(args: argparse.Namespace) -> int:
-    """dfs5r につなぐための設定行を出す。"""
+    """dfs5cli につなぐための設定行を出す。"""
     store = ServiceStore()
     s = store.get(args.name)
     writer = s.writer_key or "<書き手の Ed25519 秘密鍵>"
     print(f"# {s.name} に接続する（L3 は L2 が広告するので --ost は不要）")
     print(
-        f"dfs5r config create {s.name} --registry {s.registry_url} "
+        f"dfs5cli config create {s.name} --registry {s.registry_url} "
         f"--key {writer} --secret <tree_secret>"
         f"{f' --workdir {args.workdir}' if args.workdir else ''}"
     )
@@ -721,7 +725,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--path",
         help=f"委譲するサブツリー（既定 {DEFAULT_ROOT_ANCHOR}/<name>）。"
-             "dfs5r は書き手の鍵からこのパスを引く",
+             "dfs5cli は書き手の鍵からこのパスを引く",
     )
     p.add_argument("--no-delegate", action="store_true",
                    help="委譲を登録しない（サーバだけ立てる）")
@@ -742,7 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--forget", action="store_true", help="記録からも消す")
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("env", help="dfs5r の設定行を出す")
+    p = sub.add_parser("env", help="dfs5cli の設定行を出す")
     p.add_argument("name", nargs="?", default=DEFAULT_NAME)
     p.add_argument("--workdir", help="--workdir も付ける")
     p.set_defaults(func=cmd_env)

@@ -72,7 +72,7 @@ dfs5svc logs   [NAME] [-n LINES]
 | `--root-key` | `~/dfs5svc/<name>/keys/root` | L1 権威の Ed25519 鍵（無ければ作る） |
 | `--root-anchor` | `/example.com` | 根のパス |
 | `--writer-key` | `~/dfs5svc/<name>/keys/writer` | 書き手の Ed25519 鍵（無ければ作る） |
-| `--path` | `<root-anchor>/<name>` | 委譲するサブツリー。`dfs5r` は鍵から引く |
+| `--path` | `<root-anchor>/<name>` | 委譲するサブツリー。`dfs5cli` は鍵から引く |
 | `--no-delegate` | — | 委譲を登録しない（サーバだけ立てる） |
 | `--wait` | `30` | 起動を待つ秒数 |
 | `--foreground` | — | 前面で動かす（Ctrl-C で停止） |
@@ -109,7 +109,7 @@ dfs5svc logs   [NAME] [-n LINES]
 ### 2.3 委譲まで自動で登録する
 
 `dfs5 serve` を上げただけでは、リモートは空である（`/v1/paths` が空）。そのため
-`dfs5r` はサブツリーを解決できない。`dfs5svc start` はここまで面倒を見る。
+`dfs5cli` はサブツリーを解決できない。`dfs5svc start` はここまで面倒を見る。
 
 - 書き手の Ed25519 鍵を `~/dfs5svc/<name>/keys/writer` に用意する。
 - 根から見て途中の階層にも委譲を張る（L1 は多段を要求する）。`/example.com/team/notes` なら
@@ -137,8 +137,8 @@ cd ~/src/dfs5
 # 1. サーバを立てる（連続した空きポートを選び、鍵と委譲まで用意する）
 ./dfs5svc start --name dev
 
-# 2. dfs5r につなぐ。L3 もサブツリーも L2 が知っているので --ost も --path も不要
-./dfs5r config create dev \
+# 2. dfs5cli につなぐ。L3 もサブツリーも L2 が知っているので --ost も --path も不要
+./dfs5cli config create dev \
     --registry http://127.0.0.1:19441 \
     --key ~/dfs5svc/dev/keys/writer \
     --secret dev-secret
@@ -146,9 +146,9 @@ cd ~/src/dfs5
 # 3. 使う
 mkdir -p /tmp/sample
 echo "hello" > /tmp/sample/hello.txt
-./dfs5r copy /tmp/sample dev:
-./dfs5r ls   dev:
-./dfs5r cat  dev:hello.txt
+./dfs5cli copy /tmp/sample dev:
+./dfs5cli ls   dev:
+./dfs5cli cat  dev:hello.txt
 ```
 
 `./dfs5svc env dev` を実行すると、4 の行（`--secret` を除く）をそのまま出せる。
@@ -156,7 +156,7 @@ echo "hello" > /tmp/sample/hello.txt
 ```
 $ ./dfs5svc env dev
 # dev に接続する（L3 は L2 が広告するので --ost は不要）
-dfs5r config create dev --registry http://127.0.0.1:19441 --key ~/dfs5svc/dev/keys/writer --secret <tree_secret>
+dfs5cli config create dev --registry http://127.0.0.1:19441 --key ~/dfs5svc/dev/keys/writer --secret <tree_secret>
 
 # 参考: このサーバの L3 は tls://127.0.0.1:19442
 #        書き手の鍵 : ~/dfs5svc/dev/keys/writer（--key にそのまま使える）
@@ -208,21 +208,21 @@ dfs5r config create dev --registry http://127.0.0.1:19441 --key ~/dfs5svc/dev/ke
 - **認証は無い。** `--host 0.0.0.0` で立てるなら WireGuard / LAN の中に限ること。
   完全性は L4 の署名で担保する。
 - **`tree_secret` は `dfs5svc` が作らない。** サーバに置かない共有秘密なので、
-  `dfs5r config create --secret` で自分で渡す。
+  `dfs5cli config create --secret` で自分で渡す。
 - **`stop` は記録を残す。** 同じ名前で立て直すと `--force` が要る。消すなら `--forget`。
 - **root 鍵は使い回す。** 同じ `--name` で立て直すと、以前の委譲がそのまま使える。
   作り直したいときは `--root-key` を別の場所にする。
-- **`dfs5r` の参照系は作業ディレクトリを自動で作る。** `ls` / `cat` / `size` / `check` などは
+- **`dfs5cli` の参照系は作業ディレクトリを自動で作る。** `ls` / `cat` / `size` / `check` などは
   リモートの版を読むだけだが、接続情報（解決した ost と sub_path）と HeadPin を置く場所が
   要る。`touch` を先に打たせず、その場で作る。
 
 ## 6. 落とし穴の記録
 
 - **参照系に `touch` を要求していた。** 最初、`open_remote(create=False)` で実装したため、
-  `dfs5r ls` が「not initialized、先に touch を打て」と返していた。読み取り専用なのに
+  `dfs5cli ls` が「not initialized、先に touch を打て」と返していた。読み取り専用なのに
   初期化を求めるのは筋が悪いので、参照系も `create=True` にした。
 - **`dfs5svc start` が委譲を登録していなかった。** サーバは立てば動くが、リモートが空なので
-  `ls` に出せるものが無く、`dfs5r` はサブツリーを解決できない。start に含めた。
+  `ls` に出せるものが無く、`dfs5cli` はサブツリーを解決できない。start に含めた。
 - **`SO_REUSEADDR` の bind で空きを誤判定していた。** §1.1 の 2 段判定に直した。
 - **多段委譲の有効期間が同じで、時刻のずれで落ちていた。** 中間と末端を別プロセスで
   署名するため、1 秒ずれるだけで子の `expires_at` が親を超え、Invariant 3 に落ちる。

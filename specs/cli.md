@@ -1,15 +1,15 @@
-# rclone ライク CLI（`specs/rclone_cli.md`）
+# dfs5cli（`specs/cli.md`）
 
 ## 0. 目的と位置づけ
 
 `dfs5/cli.py` は層の試験用で、`serve` / `delegate` / `init` / `push` / `pull` という
 「層の操作」をそのまま見せる。日常のファイル操作には、もっと普通の道具が要る。
 そこで `dfs5/cli.py` の部品（L2 名簿クライアント、サーバ、ノード構築）をそのまま使い、
-**リモート名で場所を指す** CLI を被せたものが `dfs5r` である。
+**リモート名で場所を指す** CLI を被せたものが `dfs5cli` である。
 
-- 実装: `dfs5/rclone_cli.py`、`dfs5/remotes.py`
-- エントリポイント: `./dfs5r`
-- 試験: `tests/test_rclone_cli.py`
+- 実装: `dfs5/cli_main.py`、`dfs5/remotes.py`
+- エントリポイント: `./dfs5cli`
+- 試験: `tests/test_cli_main.py`
 
 `dfs5/cli.py` は残す。層を直接確かめる用途（`serve` の起動、`delegate` の登録、
 `push`/`pull` の往復計測）では今もそちらを使う。
@@ -38,7 +38,7 @@ rclone のリモートはこれに対応させた。**ホスト名ではない�
 
 ```bash
 # ホスト名だけ。鍵は作り、secret は端末から読む
-dfs5r config create scw --registry 172.16.1.60
+dfs5cli config create scw --registry 172.16.1.60
 ```
 
 #### レジストリはホスト名だけでよい
@@ -77,10 +77,10 @@ L2 は `--advertise`（または bind から推定したホスト）で自分の
 ものだけ採る。
 
 ```
-$ dfs5r create scw --registry 172.16.1.60
+$ dfs5cli create scw --registry 172.16.1.60
 scw の tree_secret:                       ← 入力は画面に出ない
 scw の tree_secret（確認のためもう一度）:  ← 同じものを打つ
-[dfs5r] リモート 'scw' を保存しました: ~/.config/dfs5/remotes.json
+[dfs5cli] リモート 'scw' を保存しました: ~/.config/dfs5/remotes.json
   registry    : http://172.16.1.60:9440
   書き手の鍵  : ~/.config/dfs5/keys/scw_ed25519（作った。OpenSSH 形式の Ed25519）
   tree_secret : *** （端末から読みました）
@@ -89,7 +89,7 @@ scw の tree_secret（確認のためもう一度）:  ← 同じものを打つ
 一致しなければやり直す（3 回まで）。
 
 ```
-[dfs5r] 入力が一致しません。もう一度入力してください（1/3）
+[dfs5cli] 入力が一致しません。もう一度入力してください（1/3）
 ```
 
 3 回とも一致しなければ、secret を空のまま登録し、あとで `--secret` を設定するよう促す。
@@ -100,10 +100,10 @@ scw の tree_secret（確認のためもう一度）:  ← 同じものを打つ
 登録は一番よく打つので、`config` を省いた入口を用意した。中身は同じ関数。
 
 ```bash
-dfs5r create scw --registry 172.16.1.60       # = dfs5r config create scw ...
-dfs5r config show scw                         # 表示・削除・一覧は config の下
-dfs5r config delete scw
-dfs5r listremotes                             # config list と同じ
+dfs5cli create scw --registry 172.16.1.60       # = dfs5cli config create scw ...
+dfs5cli config show scw                         # 表示・削除・一覧は config の下
+dfs5cli config delete scw
+dfs5cli listremotes                             # config list と同じ
 ```
 
 実装は Python の `getpass`（標準ライブラリ）。`/dev/tty` からエコーなしで読む。
@@ -132,11 +132,11 @@ dfs5r listremotes                             # config list と同じ
 ## 2. コマンド
 
 ```text
-dfs5r listremotes
+dfs5cli listremotes
 # 最小（ホスト名だけ。鍵を作り、secret は端末から 2 回読む）
-dfs5r create NAME --registry HOST
+dfs5cli create NAME --registry HOST
 # ↑ は config create と同じ。以下は明示したいときだけ
-dfs5r config create NAME --registry HOST
+dfs5cli config create NAME --registry HOST
 
 # 省略したくないときだけ足す
 #   --registry-port N  ポートを補う番号（既定 9440）
@@ -145,36 +145,36 @@ dfs5r config create NAME --registry HOST
 #   --secret VALUE     tree_secret（省くと端末から読む）
 #   --no-prompt        端末から読まない
 #   --ost / --path / --workdir / --epoch / --node-name
-dfs5r config create NAME --registry HOST --key FILE --ost HOST:PORT --path /sub/path \
+dfs5cli config create NAME --registry HOST --key FILE --ost HOST:PORT --path /sub/path \
                           [--workdir DIR] [--epoch N] [--node-name NAME]
-dfs5r config show|delete|list [NAME]
+dfs5cli config show|delete|list [NAME]
 
 # 読み出し（版を進めない）
-dfs5r ls     REMOTE:path
-dfs5r lsl    REMOTE:path
-dfs5r lsjson REMOTE:path
-dfs5r size   REMOTE:path
-dfs5r cat    REMOTE:path/file
-dfs5r about  REMOTE:
-dfs5r check  REMOTE:path LOCAL_DIR
+dfs5cli ls     REMOTE:path
+dfs5cli lsl    REMOTE:path
+dfs5cli lsjson REMOTE:path
+dfs5cli size   REMOTE:path
+dfs5cli cat    REMOTE:path/file
+dfs5cli about  REMOTE:
+dfs5cli check  REMOTE:path LOCAL_DIR
 
 # 書き込み（1 版としてまとめる）
-dfs5r copy   LOCAL REMOTE:path [--checksum] [-n|--dry-run]
-dfs5r copyto LOCAL_FILE REMOTE:path/file [--checksum] [-n]
-dfs5r sync   LOCAL_DIR REMOTE:path [--delete] [--checksum] [-n]
+dfs5cli copy   LOCAL REMOTE:path [--checksum] [-n|--dry-run]
+dfs5cli copyto LOCAL_FILE REMOTE:path/file [--checksum] [-n]
+dfs5cli sync   LOCAL_DIR REMOTE:path [--delete] [--checksum] [-n]
 
 # ディレクトリと削除
-dfs5r mkdir  REMOTE:dir
-dfs5r rm     REMOTE:path [-R|--recursive] [--rmdirs] [-n]
-dfs5r rmdir  REMOTE:dir [-n]
-dfs5r purge  REMOTE:path [-n]
+dfs5cli mkdir  REMOTE:dir
+dfs5cli rm     REMOTE:path [-R|--recursive] [--rmdirs] [-n]
+dfs5cli rmdir  REMOTE:dir [-n]
+dfs5cli purge  REMOTE:path [-n]
 
 # 取り出し
-dfs5r pull   REMOTE:path LOCAL_DIR [--force]
+dfs5cli pull   REMOTE:path LOCAL_DIR [--force]
 
 # サーバ側は cli.py のものをそのまま使う
-dfs5r serve    ... --advertise <L3 を広告するホスト>
-dfs5r delegate ...
+dfs5cli serve    ... --advertise <L3 を広告するホスト>
+dfs5cli delegate ...
 ```
 
 `REMOTE` は `config create` で付けた名前。`REMOTE:` はそのリモートの根、`REMOTE:docs` は
@@ -192,7 +192,7 @@ dfs5r delegate ...
 | `POST /v1/ost` | L3 の場所（`tls://host:port`）と、パスごとのロケータの endpoint |
 | `POST /v1/paths` | 登録済みのサブツリー、書き手公開鍵、epoch、先頭版 |
 
-`dfs5r` はこの 2 つを使って `--ost` と `--path` を解決する。
+`dfs5cli` はこの 2 つを使って `--ost` と `--path` を解決する。
 
 - **OST**: まずロケータの `endpoints` を見る。無ければ（初回）`/v1/ost` の広告を使う。
 - **パス**: 秘密鍵の公開鍵を作り（`ssh-keygen -y` または `.pub`）、`/v1/paths` で
@@ -219,11 +219,11 @@ dfs5r delegate ...
 `--checksum` のときだけ内容アドレス（`plain_id`）まで比べる。
 
 ```
-$ dfs5r copy ./sample local:
-[dfs5r] copy OK -> v1 | 追加/更新 4 件（同じ 0 件） | sent=6303 B | 74.7 ms
+$ dfs5cli copy ./sample local:
+[dfs5cli] copy OK -> v1 | 追加/更新 4 件（同じ 0 件） | sent=6303 B | 74.7 ms
 
-$ dfs5r copy ./sample local:
-[dfs5r] copy: 変更なし（4 ファイルが同じ）。新しい版は作りません
+$ dfs5cli copy ./sample local:
+[dfs5cli] copy: 変更なし（4 ファイルが同じ）。新しい版は作りません
 ```
 
 dfs5 は書き手側の索引で塊を重複排除するので、内容が同じなら `push` しても本文は送られない。
@@ -314,7 +314,7 @@ srv/
 
 ## 5. 試験
 
-`tests/test_rclone_cli.py` に 12 件。
+`tests/test_cli_main.py` に 12 件。
 
 | 試験 | 確かめること |
 |---|---|
@@ -344,7 +344,7 @@ srv/
 | `test_config_create_makes_key_when_omitted` | `--key` を省くと OpenSSH 形式の鍵を作る（600） |
 | `test_explicit_missing_key_is_refused` | `--key` の打ち間違いでは鍵を作らない |
 | `test_no_prompt_keeps_secret_empty` | `--no-prompt` なら端末から読まない |
-| `test_create_alias_exists` | `dfs5r create` が `config create` と同じに動く |
+| `test_create_alias_exists` | `dfs5cli create` が `config create` と同じに動く |
 | `test_prompt_verifies_secret_twice` | 端末では secret を 2 回聞き、不一致ならやり直す |
 | `test_path_without_leading_slash_is_accepted` | `--path` は `/` で始まらなくてよい |
 | `test_empty_secret_is_refused_on_write` | `tree_secret` が空のまま書こうとすると止まる |

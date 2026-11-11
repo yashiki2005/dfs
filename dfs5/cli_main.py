@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-dfs5/rclone_cli.py
+dfs5/cli_main.py
 rclone ライクな dfs5 の CLI。
 
 `cli.py` の部品（L2 名簿クライアント、`serve`、`delegate`、ノード構築）をそのまま使い、
 「リモート名で場所を指す」操作体系を被せる。
 
-    dfs5r listremotes
-    dfs5r config create scaleway --registry http://172.16.1.60:19440 \\
+    dfs5cli listremotes
+    dfs5cli config create scaleway --registry http://172.16.1.60:19440 \\
         --ost 172.16.1.60:19443 --path /example.com/alice/notes \\
         --key ~/.ssh/alice --secret <共有秘密>
-    dfs5r ls    scaleway:
-    dfs5r ls    scaleway:docs
-    dfs5r cat   scaleway:docs/readme.md
-    dfs5r copy  ./local scaleway:docs
-    dfs5r sync  ./local scaleway:docs      # リモートをローカルに合わせる
-    dfs5r pull  scaleway:docs ./local      # リモートをローカルへ取り出す
-    dfs5r check scaleway:docs ./local
-    dfs5r about scaleway:
+    dfs5cli ls    scaleway:
+    dfs5cli ls    scaleway:docs
+    dfs5cli cat   scaleway:docs/readme.md
+    dfs5cli copy  ./local scaleway:docs
+    dfs5cli sync  ./local scaleway:docs      # リモートをローカルに合わせる
+    dfs5cli pull  scaleway:docs ./local      # リモートをローカルへ取り出す
+    dfs5cli check scaleway:docs ./local
+    dfs5cli about scaleway:
 
 設計上の注意（dfs5 の単一書き手）:
   - リモートは「1 つの書き込み境界（サブツリー）」に対応する。
@@ -27,6 +27,14 @@ rclone ライクな dfs5 の CLI。
 
 環境変数:
   DFS5_CONFIG    リモート定義ファイル（既定 ~/.config/dfs5/remotes.json）
+
+TODO（完成時）:
+  このリポジトリの `dfs5cli` と `dfs5svc` は、今はリポジトリ直下から
+  `./dfs5cli ...` として使う。完成したら、PATH の通った場所に置く。
+  例: /usr/local/bin にシンボリックリンクを張る、または pip で console_scripts として
+  配る（`dfs5cli = dfs5.cli_main:main`、`dfs5svc = dfs5.svc:main`）。
+  ラッパーは `dirname` から自分の位置を決めて `cryptography` の入った Python を探すので、
+  リンクでも実体でも動く（Python 側は `python -m dfs5.cli_main`）。
 """
 
 from __future__ import annotations
@@ -84,7 +92,7 @@ def _ensure_keypair(priv_key: Path) -> None:
     if res.returncode != 0:
         raise UsageError(f"Cannot read public key from {priv_key}: {res.stderr.strip()}")
     pub.write_text(res.stdout.strip() + "\n", encoding="utf-8")
-    print(f"[dfs5r] 公開鍵を作成しました: {pub}", file=sys.stderr)
+    print(f"[dfs5cli] 公開鍵を作成しました: {pub}", file=sys.stderr)
 
 
 def resolve_ost(remote: Remote, registry: Optional[cli_mod.RemoteRegistryClient] = None) -> str:
@@ -166,7 +174,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
         if not create:
             raise UsageError(
                 f"Remote {remote.name!r} is not initialized at {mount_root}.\n"
-                f"Run 'dfs5r touch {remote.name}:' or a write command first."
+                f"Run 'dfs5cli touch {remote.name}:' or a write command first."
             )
         priv_key = Path(remote.key).expanduser()
         _ensure_keypair(priv_key)
@@ -175,7 +183,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             # 空のまま暗号化すると、誰でも復号できる木を作ってしまう。
             raise UsageError(
                 f"Remote {remote.name!r} has no tree_secret.\n"
-                f"Set it with 'dfs5r config create {remote.name} ... --secret <共有秘密>' "
+                f"Set it with 'dfs5cli config create {remote.name} ... --secret <共有秘密>' "
                 f"(or edit {RemoteStore().path})."
             )
         registry = cli_mod.RemoteRegistryClient(remote.registry)
@@ -553,17 +561,17 @@ def prompt_secret(
             return ""  # 端末を制御できない
         if first != second:
             print(
-                f"[dfs5r] 入力が一致しません。もう一度入力してください"
+                f"[dfs5cli] 入力が一致しません。もう一度入力してください"
                 f"（{attempt}/{max_tries}）",
                 file=sys.stderr,
             )
             continue
         if first == "":
-            print("[dfs5r] 空のまま進めます（あとで設定できます）", file=sys.stderr)
+            print("[dfs5cli] 空のまま進めます（あとで設定できます）", file=sys.stderr)
             return ""
         return first.strip()
 
-    print("[dfs5r] 何度も一致しませんでした。--secret で渡すか、あとで設定してください", file=sys.stderr)
+    print("[dfs5cli] 何度も一致しませんでした。--secret で渡すか、あとで設定してください", file=sys.stderr)
     return ""
 
 
@@ -599,7 +607,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         registry = normalize_registry(args.registry, args.registry_port)
 
         # --key が無ければ、その場で Ed25519 の鍵を作る。
-        # 書き手の鍵は dfs5r が初めて使うものなので、利用者に用意させない。
+        # 書き手の鍵は dfs5cli が初めて使うものなので、利用者に用意させない。
         key_path: Path
         created_key = False
         if args.key:
@@ -615,7 +623,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             if not key_path.is_file():
                 res = subprocess.run(
                     ["ssh-keygen", "-t", "ed25519", "-N", "",
-                     "-C", f"dfs5r-{args.name}@{socket.gethostname()}", "-f", str(key_path)],
+                     "-C", f"dfs5cli-{args.name}@{socket.gethostname()}", "-f", str(key_path)],
                     capture_output=True, text=True,
                 )
                 if res.returncode != 0:
@@ -645,7 +653,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             node_name=args.node_name or args.name,
         )
         store.set(remote)
-        print(f"[dfs5r] リモート {remote.name!r} を保存しました: {store.path}")
+        print(f"[dfs5cli] リモート {remote.name!r} を保存しました: {store.path}")
         print(f"  registry    : {remote.registry}")
         if created_key:
             print(f"  書き手の鍵  : {key_path}（作った。OpenSSH 形式の Ed25519）")
@@ -669,7 +677,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     if args.action == "delete":
         if store.delete(args.name):
-            print(f"[dfs5r] リモート {args.name!r} を削除しました")
+            print(f"[dfs5cli] リモート {args.name!r} を削除しました")
             return 0
         raise UsageError(f"Unknown remote {args.name!r}")
 
@@ -760,7 +768,7 @@ def cmd_cat(args: argparse.Namespace) -> int:
 
 
 def _print_plan(action: str, items: List[str], dry_run: bool) -> None:
-    head = "[dfs5r] " + ("(dry-run) " if dry_run else "")
+    head = "[dfs5cli] " + ("(dry-run) " if dry_run else "")
     print(f"{head}{action}: {len(items)} 件", file=sys.stderr)
     if dry_run:
         for i in items[:40]:
@@ -781,7 +789,7 @@ def cmd_copy(args: argparse.Namespace) -> int:
     prefix = _norm_prefix(sub)
     local = _collect_local(Path(args.src))
     if not local:
-        print("[dfs5r] コピーするファイルがありません", file=sys.stderr)
+        print("[dfs5cli] コピーするファイルがありません", file=sys.stderr)
         return 0
 
     node = open_remote(remote, create=True)
@@ -797,7 +805,7 @@ def cmd_copy(args: argparse.Namespace) -> int:
         return 0
     if not writes:
         print(
-            f"[dfs5r] copy: 変更なし（{len(unchanged)} ファイルが同じ）。新しい版は作りません",
+            f"[dfs5cli] copy: 変更なし（{len(unchanged)} ファイルが同じ）。新しい版は作りません",
             file=sys.stderr,
         )
         return 0
@@ -807,7 +815,7 @@ def cmd_copy(args: argparse.Namespace) -> int:
     log_env, sent = _push(node, remote)
     ms = (time.perf_counter() - t0) * 1000.0
     print(
-        f"[dfs5r] copy OK -> v{log_env['payload']['version']} "
+        f"[dfs5cli] copy OK -> v{log_env['payload']['version']} "
         f"| 追加/更新 {len(writes)} 件（同じ {len(unchanged)} 件） | sent={sent} B | {ms:.1f} ms"
     )
     return 0
@@ -833,7 +841,7 @@ def cmd_copyto(args: argparse.Namespace) -> int:
     writes, _deletes, unchanged = plan_changes(node, "", {sub: src}, checksum=args.checksum)
     if not writes:
         print(
-            f"[dfs5r] copyto: 変更なし（{sub} は同じ）。新しい版は作りません",
+            f"[dfs5cli] copyto: 変更なし（{sub} は同じ）。新しい版は作りません",
             file=sys.stderr,
         )
         return 0
@@ -841,7 +849,7 @@ def cmd_copyto(args: argparse.Namespace) -> int:
 
     log_env, sent = _push(node, remote)
     print(
-        f"[dfs5r] copyto OK -> v{log_env['payload']['version']} "
+        f"[dfs5cli] copyto OK -> v{log_env['payload']['version']} "
         f"| {sub} | sent={sent} B"
     )
     return 0
@@ -870,7 +878,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             + [f"delete {remote.name}:{path}" for path in deletes])
     if not plan:
         print(
-            f"[dfs5r] sync: 変更なし（{len(unchanged)} ファイルが同じ）。新しい版は作りません",
+            f"[dfs5cli] sync: 変更なし（{len(unchanged)} ファイルが同じ）。新しい版は作りません",
             file=sys.stderr,
         )
         return 0
@@ -886,7 +894,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     n_add = sum(1 for _p, _s, k in writes if k == "add")
     n_upd = sum(1 for _p, _s, k in writes if k == "update")
     print(
-        f"[dfs5r] sync OK -> v{log_env['payload']['version']} "
+        f"[dfs5cli] sync OK -> v{log_env['payload']['version']} "
         f"| add={n_add} update={n_upd} delete={len(deletes)} "
         f"| same={len(unchanged)} | sent={sent} B"
     )
@@ -924,7 +932,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
         shutil.copyfile(item, target)
         count += 1
 
-    print(f"[dfs5r] pull OK <- v{version} | {count} ファイル -> {dest}")
+    print(f"[dfs5cli] pull OK <- v{version} | {count} ファイル -> {dest}")
     return 0
 
 
@@ -961,11 +969,11 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     if only_remote or only_local or size_diff:
         print(
-            f"[dfs5r] check: 一致しません "
+            f"[dfs5cli] check: 一致しません "
             f"(remote のみ {len(only_remote)} / local のみ {len(only_local)} / 差 {len(size_diff)})"
         )
         return 1
-    print(f"[dfs5r] check: 一致しました（{len(remote_files)} ファイル）")
+    print(f"[dfs5cli] check: 一致しました（{len(remote_files)} ファイル）")
     return 0
 
 
@@ -1016,13 +1024,13 @@ def cmd_mkdir(args: argparse.Namespace) -> int:
     refresh_cache(node)
     existing = _remote_dir_paths(node) | _remote_file_paths(node)
     if sub in existing:
-        print(f"[dfs5r] mkdir: すでにあります: {name}:{sub}", file=sys.stderr)
+        print(f"[dfs5cli] mkdir: すでにあります: {name}:{sub}", file=sys.stderr)
         return 0
 
     target = _tree_path(node, sub)
     target.mkdir(parents=True, exist_ok=True)
     log_env, sent = _push(node, remote)
-    print(f"[dfs5r] mkdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
+    print(f"[dfs5cli] mkdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
     return 0
 
 
@@ -1065,11 +1073,11 @@ def cmd_rm(args: argparse.Namespace) -> int:
 
     if not targets:
         if not args.rmdirs:
-            print(f"[dfs5r] rm: 消すファイルがありません（{name}:{sub}）", file=sys.stderr)
+            print(f"[dfs5cli] rm: 消すファイルがありません（{name}:{sub}）", file=sys.stderr)
             return 0
         # --rmdirs なら、ファイルが無くても空ディレクトリの掃除に進む
         print(
-            f"[dfs5r] rm: {name}:{sub} にファイルはありません。空ディレクトリを片付けます",
+            f"[dfs5cli] rm: {name}:{sub} にファイルはありません。空ディレクトリを片付けます",
             file=sys.stderr,
         )
 
@@ -1088,7 +1096,7 @@ def cmd_rm(args: argparse.Namespace) -> int:
     log_env, sent = _push(node, remote)
     extra = f" | 空になったディレクトリ {len(removed_dirs)} 件も削除" if removed_dirs else ""
     print(
-        f"[dfs5r] rm OK -> v{log_env['payload']['version']} "
+        f"[dfs5cli] rm OK -> v{log_env['payload']['version']} "
         f"| 削除 {len(targets)} 件{extra} | sent={sent} B"
     )
     return 0
@@ -1126,7 +1134,7 @@ def cmd_rmdir(args: argparse.Namespace) -> int:
     parent = str(Path(sub).parent)
     prune_empty_dirs(node, start=_tree_path(node, parent) if parent != "." else node.clayfs.work_tree)
     log_env, sent = _push(node, remote)
-    print(f"[dfs5r] rmdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
+    print(f"[dfs5cli] rmdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
     return 0
 
 
@@ -1151,7 +1159,7 @@ def cmd_purge(args: argparse.Namespace) -> int:
         target_dirs = sorted(dirs, key=lambda d: len(d.split("/")), reverse=True)
 
     if not targets and not target_dirs:
-        print(f"[dfs5r] purge: 消すものがありません（{name}:{sub}）", file=sys.stderr)
+        print(f"[dfs5cli] purge: 消すものがありません（{name}:{sub}）", file=sys.stderr)
         return 0
 
     _print_plan(
@@ -1166,7 +1174,7 @@ def cmd_purge(args: argparse.Namespace) -> int:
     prune_empty_dirs(node)
     log_env, sent = _push(node, remote)
     print(
-        f"[dfs5r] purge OK -> v{log_env['payload']['version']} "
+        f"[dfs5cli] purge OK -> v{log_env['payload']['version']} "
         f"| ファイル {len(targets)} 件・ディレクトリ {len(target_dirs)} 件 | sent={sent} B"
     )
     return 0
@@ -1178,7 +1186,7 @@ def cmd_touch(args: argparse.Namespace) -> int:
     name, _sub = split_remote_spec(args.remote, args.remote_name)
     remote = store.get(name)
     node = open_remote(remote, create=True)
-    print(f"[dfs5r] 初期化しました: {node.clayfs.mount_root}")
+    print(f"[dfs5cli] 初期化しました: {node.clayfs.mount_root}")
     return 0
 
 
@@ -1230,20 +1238,20 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="dfs5r",
-        description="dfs5r: dfs5 を rclone ライクに扱う CLI（リモート名で場所を指す）",
+        prog="dfs5cli",
+        description="dfs5cli: dfs5 を rclone ライクに扱う CLI（リモート名で場所を指す）",
     )
     parser.add_argument(
         "--remote", dest="remote_name", metavar="NAME",
         help="`path` だけを書いたときに使うリモート名（rclone の :backend: 相当）",
     )
-    parser.add_argument("--version", action="version", version=f"dfs5r {_version()}")
+    parser.add_argument("--version", action="version", version=f"dfs5cli {_version()}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("listremotes", help="定義済みのリモートを一覧する")
     p.set_defaults(func=cmd_listremotes)
 
-    # `dfs5r create NAME ...` は `dfs5r config create NAME ...` と同じ。
+    # `dfs5cli create NAME ...` は `dfs5cli config create NAME ...` と同じ。
     # 登録は一番よく打つので短い入口を用意する。
     p = sub.add_parser("create", help="リモートを登録する（= config create）")
     _add_create_args(p, args_name_required=True)
@@ -1378,24 +1386,24 @@ def _friendly_error(exc: BaseException) -> int:
     """例外を利用者向けの 1 行にして返す（終了コード付き）。"""
     if isinstance(exc, ConflictError):
         print(
-            f"[dfs5r] 単一書き手の競合: {exc}\n"
-            "        他の端末が先に書きました。'dfs5r pull' の後でやり直してください。",
+            f"[dfs5cli] 単一書き手の競合: {exc}\n"
+            "        他の端末が先に書きました。'dfs5cli pull' の後でやり直してください。",
             file=sys.stderr,
         )
         return 7
     if isinstance(exc, RollbackDetectedError):
-        print(f"[dfs5r] 巻き戻しを検出しました（B6）: {exc}", file=sys.stderr)
+        print(f"[dfs5cli] 巻き戻しを検出しました（B6）: {exc}", file=sys.stderr)
         return 8
     if isinstance(exc, SilentDropDetectedError):
-        print(f"[dfs5r] 黙った破棄を検出しました（B7）: {exc}", file=sys.stderr)
+        print(f"[dfs5cli] 黙った破棄を検出しました（B7）: {exc}", file=sys.stderr)
         return 9
     if isinstance(exc, ServiceUnavailableError):
-        print(f"[dfs5r] L2/L3 に到達できません: {exc}", file=sys.stderr)
+        print(f"[dfs5cli] L2/L3 に到達できません: {exc}", file=sys.stderr)
         return 6
     if isinstance(exc, (UsageError, RemoteError)):
-        print(f"[dfs5r] {exc}", file=sys.stderr)
+        print(f"[dfs5cli] {exc}", file=sys.stderr)
         return 2
-    print(f"[dfs5r] 予期しないエラー: {type(exc).__name__}: {exc}", file=sys.stderr)
+    print(f"[dfs5cli] 予期しないエラー: {type(exc).__name__}: {exc}", file=sys.stderr)
     return 1
 
 
@@ -1405,7 +1413,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:
-        print("\n[dfs5r] 中断しました", file=sys.stderr)
+        print("\n[dfs5cli] 中断しました", file=sys.stderr)
         return 130
     except SystemExit:
         raise

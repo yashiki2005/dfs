@@ -49,10 +49,10 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
   `DFS5_OST_CONNECT_TIMEOUT`）、往復削減（一括 HAS・`assume_absent`）を入れた。
 - 残る未検証: WAN での 100 塊以上の実測、実効スループット、3 台以上の同時参加、長時間運用。
 
-#### 2.0.2 rclone ライク CLI（`specs/rclone_cli.md`）
+#### 2.0.2 ローカル CLI（`dfs5cli`、`specs/cli.md`）
 
 層の試験用 CLI（`dfs5/cli.py`）とは別に、日常のファイル操作のための CLI を足した
-（`dfs5r`）。`dfs5/cli.py` の部品（L2 名簿クライアント、サーバ、ノード構築）をそのまま使い、
+（`dfs5cli`）。`dfs5/cli.py` の部品（L2 名簿クライアント、サーバ、ノード構築）をそのまま使い、
 リモート名で場所を指す操作体系を被せたものである。
 
 - リモート = 書き込み境界（サブツリー）。核は L2 名簿だけで、**L3 OST とサブパスは
@@ -64,7 +64,7 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
     **エコーなしで 2 回**読む（Python の `getpass`。macOS に pinentry/dialog が無いため）。
     打ち間違いは復号できないツリーになるので、確認用にもう一度聞いて一致したものだけ採る。
     空のまま書こうとすると使い方の誤りとして止める。
-  - 登録は `dfs5r create`（`config create` の短い入口）。
+  - 登録は `dfs5cli create`（`config create` の短い入口）。
   - `--path` は `/` で始まらなくてよい。
 - 読み出し（`ls` / `lsl` / `lsjson` / `size` / `cat` / `check`）は版を進めない。一覧は
   ディレクトリ塊だけを辿り、ファイルの中身を取らない（`l4_log.py::list_tree`）。
@@ -77,7 +77,7 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
 - `--key` は OpenSSH 形式の Ed25519 秘密鍵（`crypto.py` の署名経路が OpenSSH 形式前提）。
 - 実測（Mac ローカル）: 4 ファイル 4,027B の copy が 69.9 ms。`--ost` / `--path` を省いて
   `config create` → `touch` → `copy` → `cat` → `pull` が通り、`pull` の内容は `diff` で一致した。
-- 回帰は `tests/test_rclone_cli.py` の 31 件（冪等・dry-run・`--delete` の有無・終了コード・
+- 回帰は `tests/test_cli_main.py` の 31 件（冪等・dry-run・`--delete` の有無・終了コード・
   一覧が直下だけであること・`--ost`/`--path` の省略・`tree_secret` 空の拒否・削除と空
   ディレクトリの往復・ホスト名だけの registry・鍵の自動作成・`--no-prompt`・`create` の
   短い入口・secret の 2 回入力）。
@@ -90,7 +90,7 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
 
 - **連続した空きポートを 2 つ探し**、1 つ目を L2、2 つ目を L3 に割り当てる。
 - root の Ed25519 鍵と**書き手の鍵**を用意し、状態ディレクトリを作って `dfs5 serve` を起動し、
-  書き手への委譲（途中の階層も含む）を登録する。`start` 1 回で `dfs5r` が使える。
+  書き手への委譲（途中の階層も含む）を登録する。`start` 1 回で `dfs5cli` が使える。
   多段の委譲は有効期間を揃えると時刻のずれで Invariant 3 に落ちるため、中間を 1 日長くする。
 - 起動を待って L2 の応答を確かめ、接続に必要な値を `~/.config/dfs5/services.json`（600）に記録する。
 - `stop` / `list` / `status` / `env` / `logs` で後始末と確認ができる。`stop` は SIGTERM →
@@ -98,7 +98,7 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
 - 空きポートの判定は 2 段（接続を試す → `SO_REUSEADDR` 無しで bind）。macOS では
   `SO_REUSEADDR` 付きの bind が `0.0.0.0:N` の待ち受けを素通りしてしまうため。
 - 実測（Mac ローカル）: launchd のサーバが 19440/19443 を使っている状態で `start` すると
-  19441/19442 の連続ペアを選び、委譲 → `dfs5r` 登録（`--ost` 不要）→ `copy` → `cat` まで通った。
+  19441/19442 の連続ペアを選び、委譲 → `dfs5cli` 登録（`--ost` 不要）→ `copy` → `cat` まで通った。
 - 回帰は `tests/test_svc_cli.py` の 12 件（ポート探索・記録・起動停止・委譲の自動登録・
   書き込み前の `ls`・`--no-delegate`・`--path` の多段）。
 
@@ -191,9 +191,9 @@ dfs5/
 │   ├── l4_log.py              # 単一書き手追記ログ・Merkle塊・HeadPin (B6/B7防御)
 │   ├── l5_clayfs.py           # clayfs スナップショット連携アダプタ (NFC正規化・非再帰)
 │   ├── remotes.py             # rclone ライク CLI のリモート定義（名前 -> 接続情報）
-│   ├── rclone_cli.py          # rclone ライク CLI 本体（ls/cat/copy/sync/pull/check）
+│   ├── cli_main.py            # ローカル CLI（dfs5cli）本体（ls/cat/copy/sync/pull/rm など）
 │   └── svc.py                 # ローカルにサーバを立てる（空きポート 2 つ + serve 起動）
-├── dfs5r                      # rclone ライク CLI のエントリポイント
+├── dfs5cli                      # rclone ライク CLI のエントリポイント
 ├── dfs5svc                    # ローカルにサーバを立てる CLI のエントリポイント
 └── tests/
     ├── test_evil_suite.py     # A2, A5, B6, B7 + 単一書き手排他 + 委譲失効の回帰試験
