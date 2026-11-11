@@ -13,7 +13,7 @@
 |---|---|---|---|
 | **L0 / L1** | 識別子と権威の委譲 | Canonical JSON (`jq -cnS`) + OpenSSH Ed25519 分離署名 (`ssh-keygen -Y`, 名前空間 `dfs5-delegation-v1`) | 親子のパス前方一致・期限包含 (`child.expires_at <= parent.expires_at`)・`epoch` 単調増加による即時失効 (`specs/delegation.md`) |
 | **L2** | 所在地解決 | 署名付きロケータ (`dfs5-l2-locator-v1`)。<br>初期実装は **名簿（MDSAnnouncer 型）** とし、将来 DHT を足す際は 2 段キャッシュとする | ロケータ内に L4 先頭版 (`head_version`, `head_hash`) を含め、解決と先頭確認を **1 RTT** で完結させる |
-| **L3** | データ平面 | `mini_lustre` の無認証 OST（TLS/TCP）を無改造流用。<br>塊の暗号化は **標準 AEAD（ChaCha20-Poly1305、Nonce は毎回ランダム）** | 重複排除は暗号化の前に平文アドレス `plain_id = HMAC(K_addr, P)` で判定し、主体は書き手自身の索引（署名済み履歴から復元可能）。OST は `wire_id = SHA256(C)` のみを検証 |
+| **L3** | データ平面 | 独自 TLS/TCP OST（`l3_ost_adapter.py`）。`mini_lustre` の OST とはプロトコルが異なり、**無改造流用は不可**（`specs/l3_data_plane.md` §3）。<br>塊の暗号化は **標準 AEAD（ChaCha20-Poly1305、Nonce は毎回ランダム）** | 重複排除は暗号化の前に平文アドレス `plain_id = HMAC(K_addr, P)` で判定し、主体は書き手自身の索引（署名済み履歴から復元可能）。OST は `wire_id = SHA256(C)` のみを検証 |
 | **L4** | 一貫性と追記ログ | 部分木単位の単一書き手追記ログ (`dfs5-l4-log-v1`) + ディレクトリ塊 (`dfs5-dir-v1`) | 先頭版の **CAS（Compare-And-Swap）** による同時書き込み拒否（三方向マージの排除）、`HeadPin` による B6 防御、Read-after-Write による B7 防御 |
 | **L5** | ローカル実体化 | `clayfs` を無改造で使用し、外側の薄いアダプタ (`ClayFSAdapter`) で接続 | スナップショット (`/.clayfs/snapshots/<id>/`) を L4 の入出力境界とし、`.clayfs` 自身の再帰混入と OS 固有メタデータ（NFD/NFC 揺れ、`.DS_Store`）を境界で正規化・除外 |
 
@@ -47,8 +47,9 @@
   変更のない部分木は再利用される（`dfs5/l4_log.py::upload_directory`）。
 - **L2 は名簿を初期実装とする。** 往復回数の比較は `specs/l2_comparison.md` を参照。
   DHT を足す場合も、エンドポイント解決と先頭版の取得を分ける 2 段構成とする。
-- **L3 は mini_lustre の OST をそのまま使う。** 塊の数が少ないうちは libtorrent の
-  固定費が相対的に重いため、導入しない。
+- **L3 は独自の TLS/TCP OST を使う。** mini_lustre の OST とはフレーム形式も塊の識別子も
+  異なるため、無改造では使えない（`specs/l3_data_plane.md` §3）。塊の数が少ないうちは
+  libtorrent の固定費が相対的に重いため、導入しない。
 - **重複排除は書き手側の索引で行う。** 無変更の部分木は再暗号化も再送もしない。
   実測値ではなく、`tests/test_integration.py` が「無変更で暗号文本体の送信量が 0」を検証する。
 

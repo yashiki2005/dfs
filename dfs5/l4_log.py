@@ -117,7 +117,10 @@ class MerkleTreeBuilder:
         def _stage(plaintext: bytes) -> Tuple[str, str]:
             plain_id = self.crypto.compute_plain_id(plaintext).hex()
             known_wire = self.index.get(plain_id)
-            if known_wire is not None and known_wire not in pending:
+            if known_wire is not None:
+                # このバッチで送信待ちなら、そのまま同じ wire_id を共有する
+                if known_wire in pending:
+                    return plain_id, known_wire
                 try:
                     if self.ost.batch_has([known_wire]).get(known_wire, False):
                         return plain_id, known_wire

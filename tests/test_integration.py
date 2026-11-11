@@ -30,6 +30,47 @@ def generate_ssh_keypair(dirpath: Path, name: str) -> tuple[Path, str]:
     return priv, pub
 
 
+class TestL3ContentDedup(unittest.TestCase):
+    """段階 4: 同じ内容の塊を、同一・別名・別バッチで再送しない。"""
+
+    def test_same_content_is_not_reencrypted_inside_one_upload(self) -> None:
+        import subprocess as sp
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_ost_adapter import MiniLustreOSTServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_l3_") as tmpdir:
+            base = Path(tmpdir)
+            cert, key = base / "c.pem", base / "k.pem"
+            sp.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
+                    "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=l"],
+                   check=True, capture_output=True)
+            ost = MiniLustreOSTServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                (tree / "a.bin").write_bytes(b"X" * 8192)
+                (tree / "b.bin").write_bytes(b"X" * 8192)
+
+                client = OSTClient("127.0.0.1", ost.port)
+                builder = MerkleTreeBuilder(ContentAddressedCrypto("dedup-secret"), client)
+                builder.upload_directory(tree)
+
+                # 同一内容 2 ファイルでも、暗号文本体は 1 ファイル分しか送らない
+                self.assertLess(
+                    client.blob_bytes_sent, 8192 * 2,
+                    f"同一内容を二重送信している: {client.blob_bytes_sent} bytes",
+                )
+                # 索引は「ファイル 1 つ + ディレクトリ塊 1 つ」の 2 件になる。
+                # 同一内容の 2 ファイルが別々の plain_id を持っていたら 3 件になる。
+                self.assertEqual(
+                    len(builder.index), 2,
+                    f"同一内容が別の plain_id として索引に入っている: {len(builder.index)}",
+                )
+            finally:
+                ost.close()
+
+
 class TestStage5Integration(unittest.TestCase):
     def test_two_node_sharing_and_final_metrics(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dfs5_int_") as tmpdir:
