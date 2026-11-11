@@ -492,16 +492,23 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     # サービスが空のままでは使い道が無いので、書き手への委譲まで登録する。
     # --no-delegate を付けたときだけ省く（自分で委譲を組む場合）。
+    #
+    # ここで失敗したら、起動済みのサーバを必ず止めてから抜ける。止めないと、
+    # 記録にも残らないプロセスがポートを掴んだまま残る（テストで実際に起きた）。
     sub_path = ""
-    if not args.no_delegate:
-        raw_path = (args.path or "").strip()
-        sub_path = raw_path.rstrip("/") if raw_path else f"{args.root_anchor}/{name}"
-        if not sub_path.startswith("/"):
-            sub_path = "/" + sub_path
-        # 根の直下でなければ、親のパスも委譲が要る（L1 は多段）
-        _ensure_parent_delegations(root_key, root_pub, args.root_anchor, sub_path, registry_url)
-        register_delegation(root_key, writer_pub, sub_path, registry_url)
-        print(f"[dfs5svc] 委譲を登録: {sub_path}（書き手 {writer_key.name}）")
+    try:
+        if not args.no_delegate:
+            raw_path = (args.path or "").strip()
+            sub_path = raw_path.rstrip("/") if raw_path else f"{args.root_anchor}/{name}"
+            if not sub_path.startswith("/"):
+                sub_path = "/" + sub_path
+            # 根の直下でなければ、親のパスも委譲が要る（L1 は多段）
+            _ensure_parent_delegations(root_key, root_pub, args.root_anchor, sub_path, registry_url)
+            register_delegation(root_key, writer_pub, sub_path, registry_url)
+            print(f"[dfs5svc] 委譲を登録: {sub_path}（書き手 {writer_key.name}）")
+    except BaseException:
+        _terminate(proc)
+        raise
 
     service = Service(
         name=name,
@@ -615,6 +622,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
         store.save()
     print(f"[dfs5svc] {'停止しました' if stopped else 'もともと動いていません'}: {args.name}")
     return 0
+
+
+def _terminate(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+    """起動したばかりのサーバを確実に止める（記録に載せる前の後始末）。"""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _stop_process(s: Service) -> bool:

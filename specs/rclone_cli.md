@@ -72,15 +72,38 @@ L2 は `--advertise`（または bind から推定したホスト）で自分の
 #### tree_secret は端末から読む
 
 `tree_secret` は L2 から引けない（サーバに置かない共有秘密だから）。**書く前に**必要になる。
-`--secret` を省くと、端末から**エコーなし**で読む。
+`--secret` を省くと、端末から**エコーなしで 2 回**聞く。打ち間違えると復号できないツリーに
+なる（サーバに平文を置かないので取り返しがつかない）ため、確認用にもう一度聞き、一致した
+ものだけ採る。
 
 ```
-$ dfs5r config create scw --registry 172.16.1.60
-scw の tree_secret:          ← 入力は画面に出ない
+$ dfs5r create scw --registry 172.16.1.60
+scw の tree_secret:                       ← 入力は画面に出ない
+scw の tree_secret（確認のためもう一度）:  ← 同じものを打つ
 [dfs5r] リモート 'scw' を保存しました: ~/.config/dfs5/remotes.json
   registry    : http://172.16.1.60:9440
   書き手の鍵  : ~/.config/dfs5/keys/scw_ed25519（作った。OpenSSH 形式の Ed25519）
   tree_secret : *** （端末から読みました）
+```
+
+一致しなければやり直す（3 回まで）。
+
+```
+[dfs5r] 入力が一致しません。もう一度入力してください（1/3）
+```
+
+3 回とも一致しなければ、secret を空のまま登録し、あとで `--secret` を設定するよう促す。
+空のまま書こうとすると使い方の誤り（終了コード 2）で止まる。
+
+#### `create` は `config create` の短い入口
+
+登録は一番よく打つので、`config` を省いた入口を用意した。中身は同じ関数。
+
+```bash
+dfs5r create scw --registry 172.16.1.60       # = dfs5r config create scw ...
+dfs5r config show scw                         # 表示・削除・一覧は config の下
+dfs5r config delete scw
+dfs5r listremotes                             # config list と同じ
 ```
 
 実装は Python の `getpass`（標準ライブラリ）。`/dev/tty` からエコーなしで読む。
@@ -110,7 +133,9 @@ scw の tree_secret:          ← 入力は画面に出ない
 
 ```text
 dfs5r listremotes
-# 最小（ホスト名だけ。鍵を作り、secret は端末から読む）
+# 最小（ホスト名だけ。鍵を作り、secret は端末から 2 回読む）
+dfs5r create NAME --registry HOST
+# ↑ は config create と同じ。以下は明示したいときだけ
 dfs5r config create NAME --registry HOST
 
 # 省略したくないときだけ足す
@@ -319,6 +344,8 @@ srv/
 | `test_config_create_makes_key_when_omitted` | `--key` を省くと OpenSSH 形式の鍵を作る（600） |
 | `test_explicit_missing_key_is_refused` | `--key` の打ち間違いでは鍵を作らない |
 | `test_no_prompt_keeps_secret_empty` | `--no-prompt` なら端末から読まない |
+| `test_create_alias_exists` | `dfs5r create` が `config create` と同じに動く |
+| `test_prompt_verifies_secret_twice` | 端末では secret を 2 回聞き、不一致ならやり直す |
 | `test_path_without_leading_slash_is_accepted` | `--path` は `/` で始まらなくてよい |
 | `test_empty_secret_is_refused_on_write` | `tree_secret` が空のまま書こうとすると止まる |
 | `test_registry_advertises_ost_and_paths` | L2 が L3 の場所と登録済みパスを返す |

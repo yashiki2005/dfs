@@ -210,6 +210,100 @@ class RcloneCase(unittest.TestCase):
         )
         self.assertEqual(rc, 2, "存在しない --key を受け入れた")
 
+    def test_create_alias_exists(self) -> None:
+        """`dfs5r create` は `dfs5r config create` と同じ（短い入口）。"""
+        store = RemoteStore(self.config_file)
+        store.remotes.pop("t", None)
+        store.save()
+        rc = self.run_cli(
+            "create", "t",
+            "--registry", self.server.registry_url,
+            "--key", str(self.alice_key),
+            "--secret", "s3cret",
+            "--workdir", str(self.workdir),
+        )
+        self.assertEqual(rc, 0, "create が失敗した")
+        saved = RemoteStore(self.config_file).get("t")
+        self.assertEqual(saved.secret, "s3cret")
+        self.assertEqual(saved.registry, self.server.registry_url)
+
+    def test_prompt_verifies_secret_twice(self) -> None:
+        """端末があるときは secret を 2 回聞き、一致したものだけ採る。
+
+        擬似端末で「1 回目と 2 回目が違う」「一致する」を順に試す。
+        """
+        import pty
+        import select
+        import warnings
+
+        # forkpty は「スレッドのあるプロセスでは fork が危険」と警告する。
+        # 試験の子は exec ですぐ置き換わるので、ここでは抑制する。
+        warnings.filterwarnings("ignore", category=DeprecationWarning, module="pty")
+
+        def run_create(name: str, answers: list[bytes], timeout: float = 10.0) -> tuple[int, str]:
+            config = self.base / f"{name}_remotes.json"
+            keys = self.base / f"{name}_keys"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                pid, fd = pty.fork()
+            if pid == 0:
+                os.environ["DFS5_CONFIG"] = str(config)
+                os.execv(
+                    str(ROOT / "dfs5r"),
+                    ["./dfs5r", "create", name,
+                     "--registry", self.server.registry_url,
+                     "--key", str(self.alice_key),
+                     "--key-dir", str(keys),
+                     "--workdir", str(self.base / f"{name}_wd")],
+                )
+                os._exit(1)
+            out = b""
+            idx = 0
+            end = time.time() + timeout
+            while time.time() < end:
+                r, _, _ = select.select([fd], [], [], 0.3)
+                if r:
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    out += chunk
+                    # プロンプトが出るたびに次の答えを送る
+                    if out.count(b"tree_secret") > idx and idx < len(answers):
+                        time.sleep(0.15)
+                        os.write(fd, answers[idx])
+                        idx += 1
+                try:
+                    wpid, _ = os.waitpid(pid, os.WNOHANG)
+                    if wpid:
+                        break
+                except ChildProcessError:
+                    break
+            import signal as _signal
+
+            try:
+                os.kill(pid, _signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            return 0, out.decode(errors="replace")
+
+        # 1 回目と 2 回目が違う -> 照合に失敗し、やり直しを求められる
+        _rc, out = run_create("mismatch", [b"one\n", b"two\n"])
+        self.assertIn("一致しません", out, f"不一致を指摘していない: {out[-300:]}")
+
+        # 一致する -> 保存される
+        _rc, out = run_create("match", [b"same-secret\n", b"same-secret\n"])
+        saved = json.loads((self.base / "match_remotes.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["remotes"]["match"]["secret"], "same-secret")
+        # 入力した文字は画面に出ない
+        self.assertNotIn("same-secret", out, "入力がエコーされている")
+
     def test_no_prompt_keeps_secret_empty(self) -> None:
         """--no-prompt なら端末から読まず、secret は空のままになる。"""
         store = RemoteStore(self.config_file)

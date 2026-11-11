@@ -61,8 +61,10 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
   - 書き手の鍵は `--key` を省くとその場で作る（`~/.config/dfs5/keys/<名前>_ed25519`、
     OpenSSH 形式）。渡したパスが無ければ断る（打ち間違いで新規作成しない）。
   - `tree_secret` はサーバに置かない共有秘密なので、`--secret` を省くと端末から
-    エコーなしで読む（Python の `getpass`。macOS に pinentry/dialog が無いため）。
+    **エコーなしで 2 回**読む（Python の `getpass`。macOS に pinentry/dialog が無いため）。
+    打ち間違いは復号できないツリーになるので、確認用にもう一度聞いて一致したものだけ採る。
     空のまま書こうとすると使い方の誤りとして止める。
+  - 登録は `dfs5r create`（`config create` の短い入口）。
   - `--path` は `/` で始まらなくてよい。
 - 読み出し（`ls` / `lsl` / `lsjson` / `size` / `cat` / `check`）は版を進めない。一覧は
   ディレクトリ塊だけを辿り、ファイルの中身を取らない（`l4_log.py::list_tree`）。
@@ -75,9 +77,10 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
 - `--key` は OpenSSH 形式の Ed25519 秘密鍵（`crypto.py` の署名経路が OpenSSH 形式前提）。
 - 実測（Mac ローカル）: 4 ファイル 4,027B の copy が 69.9 ms。`--ost` / `--path` を省いて
   `config create` → `touch` → `copy` → `cat` → `pull` が通り、`pull` の内容は `diff` で一致した。
-- 回帰は `tests/test_rclone_cli.py` の 29 件（冪等・dry-run・`--delete` の有無・終了コード・
+- 回帰は `tests/test_rclone_cli.py` の 31 件（冪等・dry-run・`--delete` の有無・終了コード・
   一覧が直下だけであること・`--ost`/`--path` の省略・`tree_secret` 空の拒否・削除と空
-  ディレクトリの往復・ホスト名だけの registry・鍵の自動作成・`--no-prompt`）。
+  ディレクトリの往復・ホスト名だけの registry・鍵の自動作成・`--no-prompt`・`create` の
+  短い入口・secret の 2 回入力）。
 
 #### 2.0.3 ローカルにサーバを立てる（`dfs5svc`）
 

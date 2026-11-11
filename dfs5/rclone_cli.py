@@ -502,13 +502,23 @@ def normalize_registry(value: str, default_port: int = DEFAULT_REGISTRY_PORT) ->
     return urlunsplit((parts.scheme or "http", netloc, parts.path.rstrip("/"), "", ""))
 
 
-def prompt_secret(prompt: str = "tree_secret: ") -> str:
-    """``--secret`` が無いときに、端末からエコーなしで読む。
+def prompt_secret(
+    prompt: str = "tree_secret: ",
+    confirm_prompt: Optional[str] = None,
+    max_tries: int = 3,
+) -> str:
+    """``--secret`` が無いときに、端末からエコーなしで読む（2 回聞いて照合する）。
 
     標準の ``getpass`` を使う。macOS には ``pinentry`` / ``dialog`` / ``whiptail``
     が無いので、外部コマンドに頼らずこれで足りる。``getpass.getpass`` は
-    ``/dev/tty`` から読み、入力は画面に出ない。パイプやリダイレクトの中では
-    端末が無いため読めないので、そのときは空を返して「--secret を渡す」ように促す。
+    ``/dev/tty`` から読み、入力は画面に出ない。
+
+    ``secret`` は打ち間違えると復号できないツリーになる（サーバに平文を置かないので
+    取り返しがつかない）。そこで確認用にもう一度聞き、一致しなければやり直す。
+    空文字は「未設定」として認める（あとで ``--secret`` を設定する運用があるため）。
+
+    パイプやリダイレクトの中では端末が無いため読めないので、空を返して
+    「--secret を渡す」ように促す。
     """
     import getpass
     import warnings
@@ -517,18 +527,44 @@ def prompt_secret(prompt: str = "tree_secret: ") -> str:
     # getpass は端末を制御しようとして GetPassWarning を出すので、ここで止める。
     if not sys.stdin.isatty() or not Path("/dev/tty").exists():
         return ""
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", getpass.GetPassWarning)
-            return getpass.getpass(prompt).strip()
-    except getpass.GetPassWarning:
-        # 端末を制御できない（テストなど）。黙って空を返し、--secret を促す。
-        return ""
-    except (EOFError, KeyboardInterrupt):
-        print("", file=sys.stderr)
-        return ""
-    except Exception:  # noqa: BLE001 - 端末が無いときは黙って空を返す
-        return ""
+
+    confirm_prompt = confirm_prompt or f"{prompt}（確認のためもう一度）"
+
+    def _ask(text: str) -> Optional[str]:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                return getpass.getpass(text)
+        except getpass.GetPassWarning:
+            return None
+        except (EOFError, KeyboardInterrupt):
+            print("", file=sys.stderr)
+            raise
+        except Exception:  # noqa: BLE001 - 端末が無いときは読めない
+            return None
+
+    for attempt in range(1, max_tries + 1):
+        try:
+            first = _ask(prompt)
+            second = _ask(confirm_prompt)
+        except (EOFError, KeyboardInterrupt):
+            raise
+        if first is None or second is None:
+            return ""  # 端末を制御できない
+        if first != second:
+            print(
+                f"[dfs5r] 入力が一致しません。もう一度入力してください"
+                f"（{attempt}/{max_tries}）",
+                file=sys.stderr,
+            )
+            continue
+        if first == "":
+            print("[dfs5r] 空のまま進めます（あとで設定できます）", file=sys.stderr)
+            return ""
+        return first.strip()
+
+    print("[dfs5r] 何度も一致しませんでした。--secret で渡すか、あとで設定してください", file=sys.stderr)
+    return ""
 
 
 def _normalize_path_arg(value: Optional[str]) -> str:
@@ -591,7 +627,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         secret = args.secret
         secret_from_prompt = False
         if not secret and not args.no_prompt:
-            secret = prompt_secret(f"{args.name} の tree_secret: ")
+            secret = prompt_secret(
+                f"{args.name} の tree_secret: ",
+                f"{args.name} の tree_secret（確認のためもう一度）: ",
+            )
             secret_from_prompt = bool(secret)
 
         remote = Remote(
@@ -1156,6 +1195,39 @@ def cmd_delegate(args: argparse.Namespace) -> int:
 # ==========================================
 # 引数の組み立て
 # ==========================================
+def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> None:
+    """``create`` と ``config create`` で共有する引数。"""
+    p.add_argument(
+        "--registry",
+        help=f"L2 名簿。ホスト名だけでよい（例: 172.16.1.60）。"
+             f"ポートを省くと {DEFAULT_REGISTRY_PORT} を補う",
+    )
+    p.add_argument(
+        "--registry-port", type=int, default=DEFAULT_REGISTRY_PORT,
+        help=f"--registry にポートが無いときに補う番号（既定 {DEFAULT_REGISTRY_PORT}）",
+    )
+    p.add_argument("--ost", help="L3 OST の host:port（例: 172.16.1.60:19443）")
+    p.add_argument("--path", help="サブツリーのパス（例: /example.com/alice/notes）")
+    p.add_argument("--key", help="書き手の OpenSSH Ed25519 秘密鍵（省略すると作る）")
+    p.add_argument(
+        "--key-dir",
+        help="--key を省いたときに鍵を置く場所（既定 ~/.config/dfs5/keys）",
+    )
+    p.add_argument(
+        "--secret",
+        help="tree_secret（Convergent AEAD の共有秘密）。省略すると端末からエコーなしで読む",
+    )
+    p.add_argument(
+        "--no-prompt", action="store_true",
+        help="--secret を省いても端末から読まない（パイプで使うとき）",
+    )
+    p.add_argument("--workdir", help="作業ディレクトリ（既定 ~/.cache/dfs5/<name>）")
+    p.add_argument("--epoch", type=int, default=1, help="委譲のエポック（既定 1）")
+    p.add_argument("--node-name", help="端末名（既定はリモート名）")
+    if args_name_required:
+        p.add_argument("name", help="リモートの名前（例: scw）")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dfs5r",
@@ -1171,36 +1243,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("listremotes", help="定義済みのリモートを一覧する")
     p.set_defaults(func=cmd_listremotes)
 
+    # `dfs5r create NAME ...` は `dfs5r config create NAME ...` と同じ。
+    # 登録は一番よく打つので短い入口を用意する。
+    p = sub.add_parser("create", help="リモートを登録する（= config create）")
+    _add_create_args(p, args_name_required=True)
+    p.set_defaults(func=cmd_config, action="create")
+
     p_conf = sub.add_parser("config", help="リモート定義の作成・表示・削除")
     p_conf.add_argument("action", choices=["create", "show", "delete", "list"])
     p_conf.add_argument("name", nargs="?", default="")
-    p_conf.add_argument(
-        "--registry",
-        help=f"L2 名簿。ホスト名だけでよい（例: 172.16.1.60）。"
-             f"ポートを省くと {DEFAULT_REGISTRY_PORT} を補う",
-    )
-    p_conf.add_argument(
-        "--registry-port", type=int, default=DEFAULT_REGISTRY_PORT,
-        help=f"--registry にポートが無いときに補う番号（既定 {DEFAULT_REGISTRY_PORT}）",
-    )
-    p_conf.add_argument("--ost", help="L3 OST の host:port（例: 172.16.1.60:19443）")
-    p_conf.add_argument("--path", help="サブツリーのパス（例: /example.com/alice/notes）")
-    p_conf.add_argument("--key", help="書き手の OpenSSH Ed25519 秘密鍵（省略すると作る）")
-    p_conf.add_argument(
-        "--key-dir",
-        help="--key を省いたときに鍵を置く場所（既定 ~/.config/dfs5/keys）",
-    )
-    p_conf.add_argument(
-        "--secret",
-        help="tree_secret（Convergent AEAD の共有秘密）。省略すると端末からエコーなしで読む",
-    )
-    p_conf.add_argument(
-        "--no-prompt", action="store_true",
-        help="--secret を省いても端末から読まない（パイプで使うとき）",
-    )
-    p_conf.add_argument("--workdir", help="作業ディレクトリ（既定 ~/.cache/dfs5/<name>）")
-    p_conf.add_argument("--epoch", type=int, default=1, help="委譲のエポック（既定 1）")
-    p_conf.add_argument("--node-name", help="端末名（既定はリモート名）")
+    _add_create_args(p_conf, args_name_required=False)
     p_conf.set_defaults(func=cmd_config)
 
     p = sub.add_parser("ls", help="リモートの直下を一覧する（内容は取らない）")
