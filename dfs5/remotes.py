@@ -23,7 +23,10 @@ CONFIG_ENV = "DFS5_CONFIG"
 DEFAULT_CONFIG = "~/.config/dfs5/remotes.json"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
-REQUIRED_FIELDS = ("registry", "ost", "path", "key", "secret")
+# ``ost`` は必須にしない。L2 のロケータ（``endpoints``）から引けるため、
+# 指定が無ければ最初の版を読むときに解決する。``path`` も同様に省略できる
+# （その場合は「作業ディレクトリをリモートの根として使う」＝ rclone の `remote:` 相当）。
+REQUIRED_FIELDS = ("registry", "key")
 
 
 class RemoteError(Exception):
@@ -36,10 +39,10 @@ class Remote:
 
     name: str
     registry: str                       # L2 名簿 URL（例: http://172.16.1.60:19440）
-    ost: str                            # L3 OST の host:port（例: 172.16.1.60:19443）
-    path: str                           # サブツリーのパス（例: /example.com/alice/notes）
     key: str                            # 書き手の OpenSSH Ed25519 秘密鍵
-    secret: str                         # tree_secret（Convergent AEAD）
+    ost: str = ""                       # L3 OST の host:port。空ならロケータから解決する
+    path: str = ""                      # サブツリーのパス。空ならロケータの path を使う
+    secret: str = ""                    # tree_secret。空なら --secret を後で渡す
     workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs5/<name>）
     epoch: int = 1                      # 委譲のエポック
     node_name: str = ""                 # 端末名（既定: リモート名）
@@ -59,17 +62,27 @@ class Remote:
         missing = [f for f in ("name",) + REQUIRED_FIELDS if not data.get(f)]
         if missing:
             raise RemoteError(f"Remote definition is missing fields: {', '.join(missing)}")
+        raw_path = str(data.get("path", "") or "")
         return cls(
             name=str(data["name"]),
             registry=str(data["registry"]),
-            ost=str(data["ost"]),
-            path=normalize_path(str(data["path"])),
             key=str(data["key"]),
-            secret=str(data["secret"]),
+            ost=str(data.get("ost", "") or ""),
+            path=normalize_path(raw_path) if raw_path else "",
+            secret=str(data.get("secret", "") or ""),
             workdir=str(data.get("workdir", "")),
             epoch=int(data.get("epoch", 1)),
             node_name=str(data.get("node_name", "") or data["name"]),
         )
+
+    @staticmethod
+    def normalize_ost(endpoint: str) -> str:
+        """ロケータの endpoint（``tls://host:port``）を ``host:port`` に直す。"""
+        value = endpoint.strip()
+        for prefix in ("tls://", "http://", "https://"):
+            if value.startswith(prefix):
+                value = value[len(prefix):]
+        return value.rstrip("/")
 
 
 def config_path() -> Path:

@@ -49,6 +49,27 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
   `DFS5_OST_CONNECT_TIMEOUT`）、往復削減（一括 HAS・`assume_absent`）を入れた。
 - 残る未検証: WAN での 100 塊以上の実測、実効スループット、3 台以上の同時参加、長時間運用。
 
+#### 2.0.2 rclone ライク CLI（`specs/rclone_cli.md`）
+
+層の試験用 CLI（`dfs5/cli.py`）とは別に、日常のファイル操作のための CLI を足した
+（`dfs5r`）。`dfs5/cli.py` の部品（L2 名簿クライアント、サーバ、ノード構築）をそのまま使い、
+リモート名で場所を指す操作体系を被せたものである。
+
+- リモート = 書き込み境界（サブツリー）。核は L2 URL と書き手鍵だけで、**L3 OST とサブパスは
+  L2 に問い合わせて解決する**（ロケータの `endpoints` と、委譲レコードの書き手公開鍵）。
+  最小の登録は `--registry` と `--key`。`tree_secret` だけはサーバに置かない共有秘密なので、
+  書く前に別途設定する（空なら使い方の誤りとして止める）。`--path` は `/` で始まらなくてよい。
+- 読み出し（`ls` / `lsl` / `lsjson` / `size` / `cat` / `check`）は版を進めない。一覧は
+  ディレクトリ塊だけを辿り、ファイルの中身を取らない（`l4_log.py::list_tree`）。
+- 書き込み（`copy` / `copyto` / `sync`）は「写しを先頭版に合わせてから変更を載せ、1 版として
+  まとめて push」する。**変更が無ければ版を作らない**（冪等）。
+- 単一書き手の衝突は終了コードで区別する（7: CAS 失敗、8: B6、9: B7、6: 到達不能、2: 使い方の誤り）。
+- `--key` は OpenSSH 形式の Ed25519 秘密鍵（`crypto.py` の署名経路が OpenSSH 形式前提）。
+- 実測（Mac ローカル）: 4 ファイル 4,027B の copy が 69.9 ms。`--ost` / `--path` を省いて
+  `config create` → `touch` → `copy` → `cat` → `pull` が通り、`pull` の内容は `diff` で一致した。
+- 回帰は `tests/test_rclone_cli.py` の 16 件（冪等・dry-run・`--delete` の有無・終了コード・
+  一覧が直下だけであること・`--ost`/`--path` の省略・`tree_secret` 空の拒否）。
+
 ### 2.1 セキュリティ・一貫性検証（段階 1・2）
 
 すべての evil 試験および境界試験において、三方向マージや履歴の巻き戻しを起こさず、意図した例外で確実に停止・拒否できることを確認した（`tests/test_evil_suite.py`、`tests/test_integration.py`）。

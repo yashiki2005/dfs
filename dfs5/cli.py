@@ -151,6 +151,26 @@ class RemoteRegistryClient:
         res = self._post("/v1/resolve", {"path": path})
         return res.get("delegation"), res.get("locator"), res.get("head_log")
 
+    def list_paths(self) -> Dict[str, Any]:
+        """登録済みのサブツリーと書き手公開鍵の一覧（``/v1/paths``）。"""
+        return self._post("/v1/paths", {})
+
+    def ost_info(self) -> Dict[str, Any]:
+        """L3 OST の場所（``/v1/ost``）。ロケータが無い初回でも引ける。"""
+        return self._post("/v1/ost", {})
+
+    def find_path_for_writer(self, writer_pubkey: str) -> Optional[str]:
+        """書き手公開鍵に一致するサブツリーを探す（複数あれば最短のもの）。"""
+        want = " ".join(writer_pubkey.split())
+        found = [
+            row["path"]
+            for row in self.list_paths().get("paths", [])
+            if " ".join(str(row.get("writer", "")).split()) == want
+        ]
+        if not found:
+            return None
+        return sorted(found, key=lambda p: (len(p), p))[0]
+
 
 class PersistentRegistryState:
     """サー再起動時にも L1 委譲・L2 ロケータ・L4 ログ・L3 チャンクを保持する永続化ラッパー"""
@@ -161,6 +181,9 @@ class PersistentRegistryState:
         self.chunks_dir = state_dir / "ost_chunks"
         self.chunks_dir.mkdir(parents=True, exist_ok=True)
         self.service = DirectoryRegistryService(root_anchor, root_pubkey)
+        # L3 OST の広告用。`serve` の起動時に埋める（ロケータが無い初回でも引けるように）。
+        self.ost_endpoint: str = ""
+        self.root_anchor = root_anchor
         self._load()
 
     def _load(self) -> None:
@@ -233,6 +256,31 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                             "locator": loc_env,
                         },
                     )
+                elif self.path == "/v1/paths":
+                    # 登録済みのサブツリーと、その書き手公開鍵を返す。
+                    # CLI が --path を省略したとき、鍵の指紋から自分のパスを探すのに使う。
+                    rows = []
+                    for path, env in sorted(pstate.service.delegations.items()):
+                        p = env.get("payload", {})
+                        head = pstate.service.logs.get(path) or []
+                        rows.append({
+                            "path": path,
+                            "writer": p.get("writer", ""),
+                            "epoch": p.get("epoch"),
+                            "base_version": p.get("base_version"),
+                            "head_version": head[-1]["payload"]["version"] if head else 0,
+                        })
+                    self._send_json(200, {"root_anchor": pstate.root_anchor, "paths": rows})
+                elif self.path == "/v1/ost":
+                    # L3 の場所を返す。ロケータ（endpoints）がまだ無い初回でも引けるように、
+                    # サーバ自身が把握している endpoint を返す。
+                    self._send_json(200, {
+                        "endpoint": pstate.ost_endpoint,
+                        "locators": {
+                            path: (env.get("payload", {}).get("endpoints") or [None])[0]
+                            for path, env in pstate.service.locators.items()
+                        },
+                    })
                 else:
                     self._send_json(404, {"error_type": "RegistryError", "message": f"Unknown path {self.path}"})
             except (ConflictError, DelegationError, ChunkIntegrityError, ServiceUnavailableError, RegistryError) as e:
@@ -302,13 +350,17 @@ def cmd_serve(args: argparse.Namespace) -> None:
     pstate = PersistentRegistryState(state_dir, args.root_anchor, root_pubkey)
     pstate.load_ost_chunks(ost)
 
+    # 自前の L3 の場所を広告する（--advertise があれば優先。無ければ bind から推定）
+    advertised_host = args.advertise or ("127.0.0.1" if args.bind in ("0.0.0.0", "::") else args.bind)
+    pstate.ost_endpoint = f"tls://{advertised_host}:{ost.port}"
+
     handler = make_registry_http_handler(pstate, ost)
     httpd = ThreadingHTTPServer((args.bind, args.registry_port), handler)
 
     print(f"[dfs5 serve] Root Anchor : {args.root_anchor}")
     print(f"[dfs5 serve] State Dir   : {state_dir}")
     print(f"[dfs5 serve] L2 Registry : http://{args.bind}:{args.registry_port}")
-    print(f"[dfs5 serve] L3 OST (TLS): tls://{args.bind}:{ost.port}")
+    print(f"[dfs5 serve] L3 OST (TLS): {pstate.ost_endpoint}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -501,6 +553,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--root-anchor", default="/example.com", help="Root anchor path (default: /example.com)")
     p_serve.add_argument("--root-pubkey", required=True, help="Path to root anchor .pub file")
     p_serve.add_argument("--state-dir", default="~/.dfs5_server", help="Server persistence directory")
+    p_serve.add_argument(
+        "--advertise",
+        help="L2 が L3 の場所として広告するホスト名/IP（既定は bind から推定）",
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     # delegate

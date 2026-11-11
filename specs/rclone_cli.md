@@ -53,8 +53,14 @@ rclone のリモートはこれに対応させた。**ホスト名ではない�
 
 ```text
 dfs5r listremotes
-dfs5r config create NAME --registry URL --ost HOST:PORT --path /sub/path \
-                          --key <Ed25519 秘密鍵> --secret <tree_secret> \
+# 最小（L2 が OST とパスを知っているので、この 3 つだけでよい）
+dfs5r config create NAME --registry URL --key <Ed25519 秘密鍵>
+
+# 書くなら tree_secret も渡す
+dfs5r config create NAME --registry URL --key <Ed25519 秘密鍵> --secret <tree_secret>
+
+# 明示したいときだけ --ost / --path / --workdir / --epoch / --node-name を足す
+dfs5r config create NAME --registry URL --key <鍵> --ost HOST:PORT --path /sub/path \
                           [--workdir DIR] [--epoch N] [--node-name NAME]
 dfs5r config show|delete|list [NAME]
 
@@ -76,13 +82,30 @@ dfs5r sync   LOCAL_DIR REMOTE:path [--delete] [--checksum] [-n]
 dfs5r pull   REMOTE:path LOCAL_DIR [--force]
 
 # サーバ側は cli.py のものをそのまま使う
-dfs5r serve    ...
+dfs5r serve    ... --advertise <L3 を広告するホスト>
 dfs5r delegate ...
 ```
 
 `REMOTE` は `config create` で付けた名前。`REMOTE:` はそのリモートの根、`REMOTE:docs` は
 配下を指す。`--remote NAME` を付ければ `remote:` を省略してパスだけ書ける
 （rclone の `:backend:` 相当）。
+
+---
+
+## 2.1 L2 が答える追加の問い合わせ
+
+`config create` を短くするために、L2 に 2 つの口を足した（`dfs5/cli.py`）。
+
+| エンドポイント | 返すもの |
+|---|---|
+| `POST /v1/ost` | L3 の場所（`tls://host:port`）と、パスごとのロケータの endpoint |
+| `POST /v1/paths` | 登録済みのサブツリー、書き手公開鍵、epoch、先頭版 |
+
+`dfs5r` はこの 2 つを使って `--ost` と `--path` を解決する。
+
+- **OST**: まずロケータの `endpoints` を見る。無ければ（初回）`/v1/ost` の広告を使う。
+- **パス**: 秘密鍵の公開鍵を作り（`ssh-keygen -y` または `.pub`）、`/v1/paths` で
+  一致するサブツリーを探す。複数あれば短いものを選ぶ。
 
 ---
 
@@ -192,6 +215,10 @@ srv/
 | `test_ls_prefix_only_lists_direct_children` | `ls` が直下だけを返す |
 | `test_no_default_remote_is_reported` | `--remote` 無しのパスを終了コード 2 で弾く |
 | `test_remote_error_exit_code` | 知らないリモートが終了コード 2 で返る |
+| `test_config_can_omit_ost_and_path` | `--ost` / `--path` を省いても L2 から解決して読み書きできる |
+| `test_path_without_leading_slash_is_accepted` | `--path` は `/` で始まらなくてよい |
+| `test_empty_secret_is_refused_on_write` | `tree_secret` が空のまま書こうとすると止まる |
+| `test_registry_advertises_ost_and_paths` | L2 が L3 の場所と登録済みパスを返す |
 
 `tests/test_integration.py` の `TestPullBatch` は、`list_tree` を支える読み出し側の
 一括取得（1 階層 1 往復）を確かめる。
@@ -205,5 +232,8 @@ srv/
 - **`sync --delete` はリモートを消す**。`-n` で何が消えるか先に見ること。
 - **`tree_secret` はリモートごとに独立**。WAN 試験のツリー（`dfs5-wan-shared-secret`）と
   別の秘密で `config create` すれば、別のツリーとして扱われる。共有したい場合は同じ秘密を使う。
+  L2 からは引けない（サーバに置かない共有秘密）ので、書く前に必ず設定する。
+- **`--path` は 1 つの鍵で 1 つの境界**を書く前提で省略できる。1 つの鍵を複数のサブツリーに
+  使っている場合、L2 はどれか 1 つ（短いもの）を返す。そのときは `--path` を明示する。
 - **認証は無い**。L3 は WireGuard / LAN の中だけで使うこと。完全性は L4 の署名で担保する。
 - サーバを常駐させるなら launchd を使う。`nohup` だけだと親のセッション終了で落ちる。

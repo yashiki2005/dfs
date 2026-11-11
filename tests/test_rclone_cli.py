@@ -54,6 +54,8 @@ class LocalServer:
         )
         self.ost = ChunkStoreServer(cert, key)
         self.pstate = cli_mod.PersistentRegistryState(base / "state", "/example.com", root_pub)
+        # cmd_serve を通さないので、広告する L3 の場所はここで埋める
+        self.pstate.ost_endpoint = f"tls://127.0.0.1:{self.ost.port}"
         handler = cli_mod.make_registry_http_handler(self.pstate, self.ost)
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
@@ -125,6 +127,85 @@ class RcloneCase(unittest.TestCase):
     def run_cli(self, *argv: str) -> int:
         """`dfs5r` を同じプロセスで実行する（出力はそのまま出る）。"""
         return rclone_main(list(argv))
+
+    def test_config_can_omit_ost_and_path(self) -> None:
+        """--ost と --path を省いても、L2 から解決して読み書きできる。
+
+        L2 はロケータ（endpoints）で L3 の場所を知っており、委譲に書き手公開鍵を
+        持っている。だから CLI はこの 2 つを要求しなくてよい。
+        """
+        store = RemoteStore(self.config_file)
+        store.remotes.pop("t", None)
+        store.save()
+        # ost / path を空にして登録し直す
+        rc = self.run_cli(
+            "config", "create", "t",
+            "--registry", self.server.registry_url,
+            "--key", str(self.alice_key),
+            "--secret", "s3cret",
+            "--workdir", str(self.workdir),
+        )
+        self.assertEqual(rc, 0)
+        saved = RemoteStore(self.config_file).get("t")
+        self.assertEqual(saved.ost, "")
+        self.assertEqual(saved.path, "")
+
+        # touch が L2 から ost と path を解決して初期化する
+        self.assertEqual(self.run_cli("touch", "t:"), 0)
+        cfg = json.loads(
+            (self.workdir / ".clayfs" / "dfs5_config.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(cfg["sub_path"], "/example.com/alice/notes")
+        self.assertEqual(int(cfg["ost_port"]), self.server.ost.port)
+
+        # 読み書きも通る
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        self.assertEqual(self.run_cli("cat", "t:a.txt"), 0)
+        self.assertEqual(self.run_cli("about", "t:"), 0)
+
+    def test_path_without_leading_slash_is_accepted(self) -> None:
+        """--path は / で始まらなくてもよい。"""
+        store = RemoteStore(self.config_file)
+        rc = self.run_cli(
+            "config", "create", "nolead",
+            "--registry", self.server.registry_url,
+            "--key", str(self.alice_key),
+            "--secret", "s3cret",
+            "--path", "example.com//alice/notes/",
+            "--workdir", str(self.base / "wd2"),
+        )
+        self.assertEqual(rc, 0)
+        saved = RemoteStore(self.config_file).get("nolead")
+        self.assertEqual(saved.path, "/example.com/alice/notes")
+
+    def test_empty_secret_is_refused_on_write(self) -> None:
+        """tree_secret が空のまま書こうとしたら、黙って弱い暗号にせず止める。"""
+        store = RemoteStore(self.config_file)
+        store.remotes.pop("t", None)
+        store.save()
+        self.assertEqual(
+            self.run_cli(
+                "config", "create", "t",
+                "--registry", self.server.registry_url,
+                "--key", str(self.alice_key),
+                "--workdir", str(self.base / "wd3"),
+            ),
+            0,
+        )
+        rc = self.run_cli("copy", str(self.local), "t:")
+        self.assertEqual(rc, 2, "secret 無しの書き込みが止まっていない")
+
+    def test_registry_advertises_ost_and_paths(self) -> None:
+        """L2 が L3 の場所と、登録済みパス（書き手公開鍵つき）を返す。"""
+        from dfs5 import cli as cli_mod
+
+        client = cli_mod.RemoteRegistryClient(self.server.registry_url)
+        info = client.ost_info()
+        self.assertTrue(info["endpoint"].startswith("tls://"))
+        rows = client.list_paths()["paths"]
+        self.assertTrue(any(r["path"] == "/example.com/alice/notes" for r in rows))
+        found = client.find_path_for_writer(self.alice_pub)
+        self.assertEqual(found, "/example.com/alice/notes")
 
     # ---- config ----
     def test_config_roundtrip(self) -> None:

@@ -47,6 +47,7 @@ from .l4_log import (
     SilentDropDetectedError,
 )
 from .l5_clayfs import DFS5Node
+from .crypto import normalize_path
 from .remotes import Remote, RemoteError, RemoteStore, split_remote_spec
 
 CACHE_VERSION_FILENAME = "cache_version"
@@ -78,10 +79,77 @@ def _ensure_keypair(priv_key: Path) -> None:
     print(f"[dfs5r] 公開鍵を作成しました: {pub}", file=sys.stderr)
 
 
+def resolve_ost(remote: Remote, registry: Optional[cli_mod.RemoteRegistryClient] = None) -> str:
+    """L3 OST の ``host:port`` を決める。
+
+    優先順: リモート定義の ``ost`` → ロケータの ``endpoints`` → サーバの広告（``/v1/ost``）。
+    L2 は OST の場所を知っているので、``config create`` で ``--ost`` を省ける。
+    """
+    if remote.ost:
+        return remote.ost
+    client = registry or cli_mod.RemoteRegistryClient(remote.registry)
+    # 1) 先頭版があれば、そのロケータに endpoints が入っている
+    if remote.path:
+        try:
+            _del, loc_env, _head = client.resolve(remote.path)
+        except Exception:  # noqa: BLE001 - 解決できなければ次の手に落ちる
+            loc_env = None
+        if loc_env:
+            endpoints = loc_env.get("payload", {}).get("endpoints") or []
+            if endpoints:
+                return Remote.normalize_ost(endpoints[0])
+    # 2) 先頭版がまだ無い（初回）なら、サーバの広告を使う
+    info = client.ost_info()
+    endpoint = info.get("endpoint") or ""
+    if endpoint:
+        return Remote.normalize_ost(endpoint)
+    raise UsageError(
+        f"Cannot determine the L3 OST for remote {remote.name!r}.\n"
+        f"L2 ({remote.registry}) did not advertise one; pass --ost explicitly."
+    )
+
+
+def resolve_path(remote: Remote, registry: Optional[cli_mod.RemoteRegistryClient] = None) -> str:
+    """サブツリーのパスを決める。
+
+    優先順: リモート定義の ``path`` → 書き手公開鍵に一致する登録済みパス。
+    1 つの鍵で 1 つの境界を書く運用なら、``--path`` を省ける。
+    """
+    if remote.path:
+        return remote.path
+    client = registry or cli_mod.RemoteRegistryClient(remote.registry)
+    priv_key = Path(remote.key).expanduser()
+    if not priv_key.is_file():
+        raise UsageError(f"Writer key does not exist: {priv_key}")
+    pub = public_key_of(priv_key)
+    found = client.find_path_for_writer(pub)
+    if not found:
+        raise UsageError(
+            f"Cannot determine the subtree path for remote {remote.name!r}.\n"
+            f"No delegation on {remote.registry} lists this key as its writer; "
+            f"pass --path explicitly."
+        )
+    return found
+
+
+def public_key_of(priv_key: Path) -> str:
+    """秘密鍵から公開鍵の 1 行を出す（``.pub`` があればそれを使う）。"""
+    pub = Path(f"{priv_key}.pub")
+    if pub.is_file():
+        return pub.read_text(encoding="utf-8").strip()
+    import subprocess
+
+    res = subprocess.run(["ssh-keygen", "-y", "-f", str(priv_key)], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise UsageError(f"Cannot read public key from {priv_key}: {res.stderr.strip()}")
+    return res.stdout.strip()
+
+
 def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
     """リモートの作業ディレクトリを用意し、ノードを組み立てる。
 
     ``create=True`` のときは未初期化なら初期化する（書き込み系で使う）。
+    ``ost`` と ``path`` は、指定が無ければ L2 から解決する。
     """
     mount_root = remote.resolved_workdir().expanduser()
     cfg_path = mount_root / ".clayfs" / cli_mod.CONFIG_FILENAME
@@ -94,12 +162,23 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             )
         priv_key = Path(remote.key).expanduser()
         _ensure_keypair(priv_key)
+        if not remote.secret:
+            # tree_secret はサーバに置かない共有秘密なので、L2 からは引けない。
+            # 空のまま暗号化すると、誰でも復号できる木を作ってしまう。
+            raise UsageError(
+                f"Remote {remote.name!r} has no tree_secret.\n"
+                f"Set it with 'dfs5r config create {remote.name} ... --secret <共有秘密>' "
+                f"(or edit {RemoteStore().path})."
+            )
+        registry = cli_mod.RemoteRegistryClient(remote.registry)
+        ost_value = resolve_ost(remote, registry)
+        sub_path = resolve_path(remote, registry)
+        host, _, port_str = ost_value.partition(":")
+        if not port_str:
+            raise UsageError(f"Cannot parse L3 OST endpoint {ost_value!r} for remote {remote.name!r}")
         mount_root.mkdir(parents=True, exist_ok=True)
         (mount_root / "tree").mkdir(exist_ok=True)
         (mount_root / ".clayfs").mkdir(exist_ok=True)
-        host, _, port_str = remote.ost.partition(":")
-        if not port_str:
-            raise UsageError(f"Remote {remote.name!r} has a bad ost value: {remote.ost!r}")
         cfg = {
             "delegation_epoch": int(remote.epoch),
             "node_name": remote.node_name or remote.name,
@@ -107,7 +186,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             "ost_port": int(port_str),
             "priv_key": str(priv_key),
             "registry_url": remote.registry,
-            "sub_path": remote.path,
+            "sub_path": sub_path,
             "tree_secret": remote.secret,
         }
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,20 +432,41 @@ def cmd_listremotes(args: argparse.Namespace) -> int:
     return 0
 
 
+def _normalize_path_arg(value: Optional[str]) -> str:
+    """``--path`` を正規化する。``/`` 始まりでも、無くても受ける。
+
+    ``example.com/alice/notes`` も ``/example.com/alice/notes`` も同じ結果になる。
+    """
+    if value is None or value.strip() == "":
+        return ""
+    text = value.strip()
+    if not text.startswith("/"):
+        text = "/" + text
+    return normalize_subtree_path(text)
+
+
+def normalize_subtree_path(text: str) -> str:
+    """余分な ``/`` や末尾 ``/`` を落とし、``..`` を弾く。"""
+    parts = [p for p in text.split("/") if p not in ("", ".")]
+    if not parts:
+        raise UsageError("--path が空です")
+    if any(p == ".." for p in parts):
+        raise UsageError(f"--path に '..' は使えません: {text!r}")
+    return "/" + "/".join(parts)
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     store = RemoteStore()
     if args.action == "create":
-        if not args.registry or not args.ost or not args.path or not args.key or not args.secret:
-            raise UsageError(
-                "config create には --registry --ost --path --key --secret が必要です"
-            )
+        if not args.registry or not args.key:
+            raise UsageError("config create には --registry と --key が必要です")
         remote = Remote(
             name=args.name,
             registry=args.registry,
-            ost=args.ost,
-            path=args.path,
             key=args.key,
-            secret=args.secret,
+            ost=args.ost or "",
+            path=_normalize_path_arg(args.path),
+            secret=args.secret or "",
             workdir=args.workdir or "",
             epoch=int(args.epoch),
             node_name=args.node_name or args.name,
@@ -374,6 +474,12 @@ def cmd_config(args: argparse.Namespace) -> int:
         store.set(remote)
         print(f"[dfs5r] リモート {remote.name!r} を保存しました: {store.path}")
         print(f"  作業ディレクトリ: {remote.resolved_workdir()}")
+        if not remote.ost:
+            print("  L3 OST      : （未指定。使うときに L2 のロケータから解決します）")
+        if not remote.path:
+            print("  サブツリー  : （未指定。使うときに L2 で書き手鍵から探します）")
+        if not remote.secret:
+            print("  tree_secret : （未指定。暗号化に必要なので、書く前に --secret を設定してください）")
         return 0
 
     if args.action == "delete":
@@ -684,14 +790,18 @@ def cmd_about(args: argparse.Namespace) -> int:
     remote = store.get(name)
     node = open_remote(remote)
     pin = node.l4.pin
+    # 定義に書かれていない ost / path は、実際に使った値（作業ディレクトリの設定）を出す。
+    cfg = json.loads((node.clayfs.clayfs_meta / cli_mod.CONFIG_FILENAME).read_text(encoding="utf-8"))
+    effective_path = cfg.get("sub_path") or remote.path
+    effective_ost = remote.ost or f"{cfg.get('ost_host', '')}:{cfg.get('ost_port', '')}"
     print(f"Remote      : {name}")
     print(f"Registry    : {remote.registry}")
-    print(f"OST         : {remote.ost}")
-    print(f"Subtree     : {remote.path}")
+    print(f"OST         : {effective_ost}" + ("" if remote.ost else "  (L2 のロケータから解決)"))
+    print(f"Subtree     : {effective_path}" + ("" if remote.path else "  (L2 で書き手鍵から解決)"))
     print(f"Workdir     : {remote.resolved_workdir()}")
     print(f"Local Pin   : v{pin.version} (epoch={pin.delegation_epoch})")
     try:
-        del_env, _loc, head_env = node.registry.resolve(remote.path)
+        del_env, _loc, head_env = node.registry.resolve(effective_path)
         if del_env:
             dp = del_env["payload"]
             print(f"Active L1   : epoch={dp['epoch']} base_version={dp['base_version']}")
