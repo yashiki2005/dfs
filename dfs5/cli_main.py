@@ -63,7 +63,7 @@ from .l4_log import (
     SilentDropDetectedError,
 )
 from .l5_clayfs import DFS5Node
-from .crypto import normalize_path
+from .crypto import normalize_path, ssh_key_fingerprint
 from .remotes import Remote, RemoteError, RemoteStore, split_remote_spec
 
 CACHE_VERSION_FILENAME = "cache_version"
@@ -202,6 +202,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             "ost_port": int(port_str),
             "priv_key": str(priv_key),
             "registry_url": remote.registry,
+            "root_pubkey": remote.root_pubkey,
             "sub_path": sub_path,
             "tree_secret": remote.secret,
         }
@@ -210,7 +211,15 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             json.dumps(cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8"
         )
 
-    node, _cfg, _reg = cli_mod.load_node_from_mount(mount_root)
+    node, cfg, _reg = cli_mod.load_node_from_mount(mount_root)
+    # 作業ディレクトリの config に root_pubkey が無い（古い形式）なら、リモート定義から
+    # 補って書き戻す。信頼の根はリモート定義（remotes.json）が持つ。
+    if not cfg.get("root_pubkey") and remote.root_pubkey:
+        cfg["root_pubkey"] = remote.root_pubkey
+        cfg_path.write_text(
+            json.dumps(cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        node.l4.root_pubkey = remote.root_pubkey.strip()
     return node
 
 
@@ -631,6 +640,29 @@ def cmd_config(args: argparse.Namespace) -> int:
                 os.chmod(key_path, 0o600)
                 created_key = True
 
+        # root アンカーの公開鍵を決める（信頼の根）。
+        #   --root-pubkey FILE があれば、その中身を使う（本番はこちら）。
+        #   無ければ名簿から取り、指紋を表示して記録する（TOFU。初回だけ）。
+        root_pubkey = ""
+        root_fingerprint = ""
+        root_source = "未取得"
+        registry_client = cli_mod.RemoteRegistryClient(registry)
+        if args.root_pubkey:
+            rp = Path(args.root_pubkey).expanduser()
+            if not rp.is_file():
+                raise UsageError(f"--root-pubkey のファイルがありません: {rp}")
+            root_pubkey = rp.read_text(encoding="utf-8").strip()
+            root_fingerprint = ssh_key_fingerprint(root_pubkey)
+            root_source = f"指定（{rp}）"
+        else:
+            info = registry_client.root_anchor_info()
+            root_pubkey = (info.get("root_pubkey") or "").strip()
+            if root_pubkey:
+                root_fingerprint = ssh_key_fingerprint(root_pubkey)
+                root_source = "名簿から取得（TOFU）"
+                # 上書きされた root アンカーも記録して、あとで気づけるようにする
+                info_anchor = info.get("root_anchor") or ""
+
         # --secret が無ければ端末から読む（エコーなし）。
         secret = args.secret
         secret_from_prompt = False
@@ -651,6 +683,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             workdir=args.workdir or "",
             epoch=int(args.epoch),
             node_name=args.node_name or args.name,
+            root_pubkey=root_pubkey,
+            root_fingerprint=root_fingerprint,
         )
         store.set(remote)
         print(f"[dfs5cli] リモート {remote.name!r} を保存しました: {store.path}")
@@ -673,6 +707,11 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"  tree_secret : *** （{how}）")
         else:
             print("  tree_secret : （未指定。書く前に設定してください）")
+        if root_pubkey:
+            print(f"  root アンカー: {root_fingerprint} （{root_source}）")
+            print(f"                 これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）")
+        else:
+            print("  root アンカー: （取得できませんでした。--root-pubkey で指定してください）")
         return 0
 
     if args.action == "delete":
@@ -683,13 +722,20 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     if args.action == "show":
         r = store.get(args.name)
-        for key in ("name", "registry", "ost", "path", "key", "workdir", "epoch", "node_name"):
+        for key in ("name", "registry", "ost", "path", "key", "workdir", "epoch", "node_name",
+                    "root_fingerprint"):
             value = getattr(r, key)
             if key == "secret":
                 value = "***"
             if key == "workdir":
                 value = str(r.resolved_workdir())
-            print(f"{key:{12}}: {value}")
+            print(f"{key:{18}}: {value}")
+        # root 公開鍵そのものは長いので、指紋だけ出す（--json を足す余地はある）
+        if r.root_pubkey:
+            algo = r.root_pubkey.split()[0] if r.root_pubkey.split() else "?"
+            print(f"{'root_pubkey':{18}}: {algo} ...（指紋は上に表示）")
+        else:
+            print(f"{'root_pubkey':{18}}: （未取得）")
         return 0
 
     if args.action == "list":
@@ -1232,6 +1278,10 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     p.add_argument("--workdir", help="作業ディレクトリ（既定 ~/.cache/dfs5/<name>）")
     p.add_argument("--epoch", type=int, default=1, help="委譲のエポック（既定 1）")
     p.add_argument("--node-name", help="端末名（既定はリモート名）")
+    p.add_argument(
+        "--root-pubkey",
+        help="root アンカーの公開鍵ファイル（信頼の根）。省略時は名簿から取得して記録する（TOFU）",
+    )
     if args_name_required:
         p.add_argument("name", help="リモートの名前（例: scw）")
 

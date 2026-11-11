@@ -159,6 +159,15 @@ class RemoteRegistryClient:
         """L3 OST の場所（``/v1/ost``）。ロケータが無い初回でも引ける。"""
         return self._post("/v1/ost", {})
 
+    def root_anchor_info(self) -> Dict[str, Any]:
+        """root アンカーのパスと公開鍵（``/v1/paths`` の一部）。
+
+        クライアントは初回だけここから取り（TOFU）、以降は記録した値を信頼する。
+        名簿が違う値を返しても、記録と食い違えば拒否する。
+        """
+        res = self._post("/v1/paths", {})
+        return {"root_anchor": res.get("root_anchor", ""), "root_pubkey": res.get("root_pubkey", "")}
+
     def find_path_for_writer(self, writer_pubkey: str) -> Optional[str]:
         """書き手公開鍵に一致するサブツリーを探す（複数あれば最短のもの）。"""
         want = " ".join(writer_pubkey.split())
@@ -184,6 +193,9 @@ class PersistentRegistryState:
         # L3 OST の広告用。`serve` の起動時に埋める（ロケータが無い初回でも引けるように）。
         self.ost_endpoint: str = ""
         self.root_anchor = root_anchor
+        # root アンカーの公開鍵。クライアントの初回（TOFU）が取得する。
+        # ここから取った値をクライアントが記録し、以降は記録した値だけを信頼する。
+        self.root_pubkey = root_pubkey.strip()
         self._load()
 
     def _load(self) -> None:
@@ -270,7 +282,11 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                             "base_version": p.get("base_version"),
                             "head_version": head[-1]["payload"]["version"] if head else 0,
                         })
-                    self._send_json(200, {"root_anchor": pstate.root_anchor, "paths": rows})
+                    self._send_json(200, {
+                        "root_anchor": pstate.root_anchor,
+                        "root_pubkey": pstate.root_pubkey,
+                        "paths": rows,
+                    })
                 elif self.path == "/v1/ost":
                     # L3 の場所を返す。ロケータ（endpoints）がまだ無い初回でも引けるように、
                     # サーバ自身が把握している endpoint を返す。
@@ -319,6 +335,7 @@ def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], Rem
         registry=reg_client,  # type: ignore[arg-type]
         ost_host=cfg["ost_host"],
         ost_port=int(cfg["ost_port"]),
+        root_pubkey=cfg.get("root_pubkey"),
     )
     return node, cfg, reg_client
 

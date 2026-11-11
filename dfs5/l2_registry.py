@@ -215,17 +215,52 @@ class DirectoryRegistryService:
         log_list.append(log_envelope)
         self.locators[norm_path] = locator_envelope
 
+    def delegation_chain(self, path: str) -> List[Dict[str, Any]]:
+        """``path`` に至る委譲チェーンを、root 直下から末端まで順に組み立てる。
+
+        名簿は末端の委譲しか索引していないので、``parent`` をたどって並べる。
+        クライアントはこれを root アンカー公開鍵から検証する（名簿を信頼しない）。
+        """
+        norm_path = normalize_path(path)
+        chain: List[Dict[str, Any]] = []
+        cur = norm_path
+        seen = set()
+        while cur:
+            if cur in seen:
+                raise RegistryError(f"Delegation chain for {norm_path!r} has a cycle at {cur!r}")
+            seen.add(cur)
+            env = self.delegations.get(cur)
+            if env is None:
+                break
+            chain.append(env)
+            parent = env.get("payload", {}).get("parent", "")
+            if parent == self.root_anchor_path:
+                break
+            cur = parent
+        chain.reverse()
+        return chain
+
     def resolve(
         self, path: str
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """
         (delegation_envelope, locator_envelope, head_log_envelope) を 1 RTT で返す。
+
+        ``delegation_envelope`` には、末端の委譲に **チェーンの組** と **root アンカー** を
+        足したものを返す。クライアントはこれで root から検証できる（名簿を信頼しない）。
         """
         self._ensure_online()
         norm_path = normalize_path(path)
         del_env = self.delegations.get(norm_path)
         loc_env = self.locators.get(norm_path)
         log_list = self.logs.get(norm_path, [])
+
+        # 末端の委譲に、チェーンと root アンカーの情報を足して返す。
+        # クライアントはこの組で root から検証する（名簿を信頼しない）。
+        if del_env is not None:
+            del_env = dict(del_env)
+            del_env["chain"] = self.delegation_chain(norm_path)
+            del_env["root_anchor"] = self.root_anchor_path
 
         if not log_list:
             return del_env, loc_env, None

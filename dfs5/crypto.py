@@ -68,6 +68,23 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def ssh_key_fingerprint(pubkey_line: str) -> str:
+    """OpenSSH 公開鍵の指紋を ``SHA256:<base64>`` の形で返す（ssh-keygen -lf と同じ）。
+
+    人間が目で比べるための短い表現。``ssh-ed25519 AAAA... comment`` の 2 番目を
+    デコードしてハッシュする。解釈できない行では空文字を返す（判断は呼び出し側）。
+    """
+    parts = (pubkey_line or "").split()
+    if len(parts) < 2:
+        return ""
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+    except Exception:
+        return ""
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
 def _ssh_keygen_sign(priv_key_path: Path, namespace: str, payload: bytes) -> str:
     """ssh-keygen -Y sign によるフォールバック署名。必ずタイムアウトする。"""
     with tempfile.TemporaryDirectory(prefix="dfs5_sign_") as tmpdir:

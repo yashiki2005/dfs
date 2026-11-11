@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -25,7 +26,7 @@ from .crypto import (
     ssh_sign,
     ssh_verify,
 )
-from .l1_delegation import DelegationError
+from .l1_delegation import DelegationError, verify_delegation_chain
 from .l2_registry import DirectoryRegistryService, create_locator_envelope
 from .l3_ost_adapter import OSTClient
 
@@ -507,16 +508,52 @@ class L4LogClient:
         priv_key_path: Path | str,
         pub_key_str: str,
         pin_file: Optional[Path] = None,
+        root_pubkey: Optional[str] = None,
     ):
         self.sub_path = normalize_path(sub_path)
         self.priv_key_path = Path(priv_key_path)
         self.pub_key_str = pub_key_str.strip()
         self.pin_file = pin_file
         self.pin = HeadPin.load(pin_file) if pin_file else HeadPin()
+        # root アンカーの公開鍵。ここが信頼の根（名簿からは取らない）。
+        # 未設定なら、名簿が返した chain の先頭の parent を root として扱う検証はしない。
+        self.root_pubkey: Optional[str] = (root_pubkey or "").strip() or None
 
     def _save_pin(self) -> None:
         if self.pin_file:
             self.pin.save(self.pin_file)
+
+    def _verified_writer(self, del_env: Optional[Dict[str, Any]]) -> str:
+        """末端の委譲が root まで連鎖することを検証し、確定した writer を返す。
+
+        ``del_env`` には名簿が ``chain``（root 直下から末端まで）と ``root_anchor`` を
+        足して返す。root アンカー公開鍵は**手元の記録**（リモート定義）を使う。名簿が
+        返した値は使わない（相手から信頼の根を取ると、偽の root を作られて通る）。
+
+        root 公開鍵が未設定（TOFU 前）のときは、chain が 1 段でも root を名乗る場合は
+        検証できないため、名簿の主張をそのまま使う（互換のため）。設定済みなら必ず検証する。
+        """
+        if del_env is None:
+            # 委譲が返らない（未登録）ときは、自分の鍵で検証するしかない。
+            return self.pub_key_str
+
+        chain = del_env.get("chain") or []
+        if not chain:
+            # 名簿がチェーンを返さない（古い名簿）ときは、末端 1 つで検証を試みる。
+            chain = [del_env]
+        root_anchor = del_env.get("root_anchor") or "/"
+
+        if self.root_pubkey:
+            leaf = verify_delegation_chain(
+                root_anchor_path=root_anchor,
+                root_anchor_pubkey=self.root_pubkey,
+                chain=chain,
+                now=int(time.time()),
+            )
+            return str(leaf["writer"])
+
+        # TOFU 前: 検証できないので名簿の主張を使う（初回のみ通る経路）。
+        return str(del_env.get("payload", {}).get("writer") or self.pub_key_str)
 
     def sync_head(
         self,
@@ -539,7 +576,13 @@ class L4LogClient:
         if sha256_hex(raw_p) != head_env.get("entry_hash"):
             raise ChunkIntegrityError("Remote head entry_hash corrupted")
 
-        writer_pub = expected_writer_pubkey or (del_env["payload"]["writer"] if del_env else self.pub_key_str)
+        # 名簿を信頼しない: 末端の委譲が root まで連鎖することを、手元の root 公開鍵で
+        # 検証する。署名を検証する鍵は「名簿が名乗った writer」ではなく、この検証で
+        # 確定した writer でなければならない（さもないと偽の委譲が通る）。
+        writer_pub = expected_writer_pubkey
+        if writer_pub is None:
+            writer_pub = self._verified_writer(del_env)
+
         if not ssh_verify(writer_pub, self.sub_path, NS_L4_LOG, raw_p, head_env["signature"]):
             raise ChunkIntegrityError("Remote head signature verification failed")
 

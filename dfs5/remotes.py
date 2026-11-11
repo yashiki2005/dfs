@@ -46,6 +46,8 @@ class Remote:
     workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs5/<name>）
     epoch: int = 1                      # 委譲のエポック
     node_name: str = ""                 # 端末名（既定: リモート名）
+    root_pubkey: str = ""               # root アンカーの公開鍵（信頼の根。TOFU で記録）
+    root_fingerprint: str = ""          # 表示・比較用の指紋
 
     def resolved_workdir(self) -> Path:
         if self.workdir:
@@ -73,6 +75,8 @@ class Remote:
             workdir=str(data.get("workdir", "")),
             epoch=int(data.get("epoch", 1)),
             node_name=str(data.get("node_name", "") or data["name"]),
+            root_pubkey=str(data.get("root_pubkey", "") or ""),
+            root_fingerprint=str(data.get("root_fingerprint", "") or ""),
         )
 
     @staticmethod

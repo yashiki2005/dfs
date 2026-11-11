@@ -118,7 +118,24 @@ dfs5cli listremotes                             # config list と同じ
 `dialog` / `whiptail` も同種である。ただし macOS には既定で入っていないため、外部コマンドに
 頼らず `getpass` で済ませている。
 
-### 1.2 鍵の形式
+### 1.2 root アンカー（信頼の根）
+
+委譲チェーンを root から検証するには、root アンカーの公開鍵が要る。これは**リモート定義に
+持つ**（`root_pubkey` と、表示用の `root_fingerprint`）。
+
+- `--root-pubkey FILE` を渡せば、その中身を使う（本番はこちら）。
+- 省略すると、名簿の `/v1/paths` から取って記録する（**TOFU**）。指紋を画面に出す。
+- 以降は記録した公開鍵だけを信頼し、名簿が違う値を返したら拒否する。
+
+```text
+  root アンカー: SHA256:n2ypRtbEq5vZOTK+i0WmBioSgHFEPFPCr21KWO7c4Jc （名簿から取得（TOFU））
+                 これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）
+```
+
+理由と限界は `specs/delegation.md` §3.5 に書いた。要は「信頼の根を相手から取ると根に
+ならない」ので、初回だけ TOFU で取り、以降は手元の記録を使う。本番は明示する。
+
+### 1.3 鍵の形式
 
 `--key` は **OpenSSH 形式の Ed25519 秘密鍵**。PEM ではない（省略時はこの形式で作る）。
 

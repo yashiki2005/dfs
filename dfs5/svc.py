@@ -674,8 +674,9 @@ def cmd_env(args: argparse.Namespace) -> int:
     writer = s.writer_key or "<書き手の Ed25519 秘密鍵>"
     print(f"# {s.name} に接続する（L3 は L2 が広告するので --ost は不要）")
     print(
-        f"dfs5cli config create {s.name} --registry {s.registry_url} "
+        f"dfs5cli create {s.name} --registry {s.registry_url} "
         f"--key {writer} --secret <tree_secret>"
+        f"{f' --root-pubkey {s.root_pub}' if s.root_pub else ''}"
         f"{f' --workdir {args.workdir}' if args.workdir else ''}"
     )
     print()
@@ -683,7 +684,10 @@ def cmd_env(args: argparse.Namespace) -> int:
     print(f"#        書き手の鍵 : {writer}" + (f"（--key にそのまま使える）" if s.writer_key else ""))
     if s.sub_path:
         print(f"#        サブツリー : {s.sub_path}（L2 が鍵から引くので --path は不要）")
-    print(f"#        L1 の root : {s.root_key}（--signing-key に使う）")
+    if s.root_pub:
+        # 本番はこちらを使う（TOFU を飛ばして初回から root を固定する）
+        print(f"#        root の公開鍵: {s.root_pub}（--root-pubkey に渡すと TOFU を飛ばせる）")
+    print(f"#        L1 の root 鍵: {s.root_key}（--signing-key に使う）")
     return 0
 
 

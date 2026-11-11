@@ -63,6 +63,7 @@ class DFS5Node:
         registry: DirectoryRegistryService,
         ost_host: str,
         ost_port: int,
+        root_pubkey: Optional[str] = None,
     ):
         self.name = name
         self.sub_path = sub_path
@@ -72,7 +73,10 @@ class DFS5Node:
         self.builder = MerkleTreeBuilder(self.crypto, self.ost)
         self.registry = registry
         pin_file = self.clayfs.clayfs_meta / "local_head.json"
-        self.l4 = L4LogClient(sub_path, priv_key_path, pub_key_str, pin_file=pin_file)
+        self.l4 = L4LogClient(
+            sub_path, priv_key_path, pub_key_str,
+            pin_file=pin_file, root_pubkey=root_pubkey,
+        )
 
     def switch_credentials(self, new_priv_key: Path | str, new_pub_key_str: str) -> None:
         self.l4.priv_key_path = Path(new_priv_key)
