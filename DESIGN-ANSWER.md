@@ -70,6 +70,23 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
 - 回帰は `tests/test_rclone_cli.py` の 16 件（冪等・dry-run・`--delete` の有無・終了コード・
   一覧が直下だけであること・`--ost`/`--path` の省略・`tree_secret` 空の拒否）。
 
+#### 2.0.3 ローカルにサーバを立てる（`dfs5svc`）
+
+`dfs5 serve` は状態ディレクトリ・root 公開鍵・2 つのポートを自分で用意する。層を確かめる
+にはそれでよいが、ローカルで 1 つ試すには手数が多い。そこで `dfs5svc`（`dfs5/svc.py`）を
+足した。
+
+- **連続した空きポートを 2 つ探し**、1 つ目を L2、2 つ目を L3 に割り当てる。
+- root の Ed25519 鍵が無ければ作り、状態ディレクトリを用意して `dfs5 serve` を起動する。
+- 起動を待って L2 の応答を確かめ、接続に必要な値を `~/.config/dfs5/services.json`（600）に記録する。
+- `stop` / `list` / `status` / `env` / `logs` で後始末と確認ができる。`stop` は SIGTERM →
+  10 秒 → SIGKILL。
+- 空きポートの判定は 2 段（接続を試す → `SO_REUSEADDR` 無しで bind）。macOS では
+  `SO_REUSEADDR` 付きの bind が `0.0.0.0:N` の待ち受けを素通りしてしまうため。
+- 実測（Mac ローカル）: launchd のサーバが 19440/19443 を使っている状態で `start` すると
+  19441/19442 の連続ペアを選び、委譲 → `dfs5r` 登録（`--ost` 不要）→ `copy` → `cat` まで通った。
+- 回帰は `tests/test_svc_cli.py` の 8 件（ポート探索・記録・起動停止・同名の拒否・2 多重複）。
+
 ### 2.1 セキュリティ・一貫性検証（段階 1・2）
 
 すべての evil 試験および境界試験において、三方向マージや履歴の巻き戻しを起こさず、意図した例外で確実に停止・拒否できることを確認した（`tests/test_evil_suite.py`、`tests/test_integration.py`）。
@@ -159,8 +176,10 @@ dfs5/
 │   ├── l4_log.py              # 単一書き手追記ログ・Merkle塊・HeadPin (B6/B7防御)
 │   ├── l5_clayfs.py           # clayfs スナップショット連携アダプタ (NFC正規化・非再帰)
 │   ├── remotes.py             # rclone ライク CLI のリモート定義（名前 -> 接続情報）
-│   └── rclone_cli.py          # rclone ライク CLI 本体（ls/cat/copy/sync/pull/check）
+│   ├── rclone_cli.py          # rclone ライク CLI 本体（ls/cat/copy/sync/pull/check）
+│   └── svc.py                 # ローカルにサーバを立てる（空きポート 2 つ + serve 起動）
 ├── dfs5r                      # rclone ライク CLI のエントリポイント
+├── dfs5svc                    # ローカルにサーバを立てる CLI のエントリポイント
 └── tests/
     ├── test_evil_suite.py     # A2, A5, B6, B7 + 単一書き手排他 + 委譲失効の回帰試験
     └── test_integration.py    # 2ノード共有・最終5指標の自動計測テスト
