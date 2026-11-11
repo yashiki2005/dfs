@@ -78,6 +78,12 @@ dfs5r copy   LOCAL REMOTE:path [--checksum] [-n|--dry-run]
 dfs5r copyto LOCAL_FILE REMOTE:path/file [--checksum] [-n]
 dfs5r sync   LOCAL_DIR REMOTE:path [--delete] [--checksum] [-n]
 
+# ディレクトリと削除
+dfs5r mkdir  REMOTE:dir
+dfs5r rm     REMOTE:path [-R|--recursive] [--rmdirs] [-n]
+dfs5r rmdir  REMOTE:dir [-n]
+dfs5r purge  REMOTE:path [-n]
+
 # 取り出し
 dfs5r pull   REMOTE:path LOCAL_DIR [--force]
 
@@ -144,7 +150,31 @@ dfs5 は書き手側の索引で塊を重複排除するので、内容が同じ
 取得量は**構造の階層数**で決まる（`l4_log.py::list_tree` の幅優先走査）。
 `cat` は目的のファイルまでのディレクトリ塊と、そのファイル塊だけを取る。
 
-### 3.4 単一書き手の衝突
+### 3.4 削除と空ディレクトリ
+
+dfs5 は**空のディレクトリも版に残す**。ディレクトリ塊は `{"entries": [], "format": "dfs5-dir-v1"}`
+として表現され、読み出し側はそれを見て実体を作る。つまり「中のファイルが全部消えた」だけでは
+ディレクトリは消えず、`pull` すると空のディレクトリごと降りてくる。
+
+| コマンド | すること |
+|---|---|
+| `mkdir REMOTE:dir` | 空のディレクトリを作る（版に残る） |
+| `rm REMOTE:file` | ファイルを消す。**空になったディレクトリは既定で残す** |
+| `rm REMOTE:dir -R` | ディレクトリを中身ごと消す（ファイルだけ。空の階層は残す） |
+| `rm REMOTE:dir -R --rmdirs` | 中身ごと消し、**空になったディレクトリも片付ける** |
+| `rmdir REMOTE:dir` | 空のディレクトリだけを消す（中身があれば断る） |
+| `purge REMOTE:path` | 指定パスの中身をすべて消し、ディレクトリ自身も消す |
+
+`--rmdirs` は「rclone のように、リモートをローカルの見た目に合わせたい」とき、
+付けなければ「空のディレクトリは資産として残したい」とき、と使い分ける。
+
+`rm` の `--rmdirs` は、掃除の起点を**消したディレクトリの位置**にする。作業ツリー全体を
+掃除すると、無関係な空ディレクトリまで巻き込んで消えてしまうため。
+
+`sync --delete` は「ローカルと一致させる」操作なので、消した結果として空になった
+ディレクトリも片付ける（`--rmdirs` は要らない）。
+
+### 3.5 単一書き手の衝突
 
 他の端末が先に書いていた場合、`push` の CAS が失敗する。CLI はこれを例外にせず、
 終了コード 7 と案内（`pull` してからやり直す）にする。
@@ -213,6 +243,15 @@ srv/
 | `test_dry_run_does_not_write` | `-n` がリモートに書かない |
 | `test_check_reports_difference` | 差分の有無で終了コードが変わる |
 | `test_ls_prefix_only_lists_direct_children` | `ls` が直下だけを返す |
+| `test_rm_file_leaves_empty_dir` | ファイルを消すと空ディレクトリが残る |
+| `test_rm_rmdirs_prunes_empty` | `--rmdirs` で空になったディレクトリも片付く |
+| `test_rm_dir_needs_recursive` | ディレクトリは `--recursive` 無しでは消さない |
+| `test_rm_missing_is_an_error` | 無いパスは終了コード 2 |
+| `test_mkdir_and_rmdir` | 空ディレクトリを作って消せる |
+| `test_rmdir_refuses_non_empty` | 中身のあるディレクトリを `rmdir` で消さない |
+| `test_purge_removes_everything` | `purge` で全部消える |
+| `test_empty_dir_survives_roundtrip` | 空ディレクトリは版に残り `pull` で降りてくる |
+| `test_rm_dry_run` | `rm -n` が実際に消さない |
 | `test_no_default_remote_is_reported` | `--remote` 無しのパスを終了コード 2 で弾く |
 | `test_remote_error_exit_code` | 知らないリモートが終了コード 2 で返る |
 | `test_config_can_omit_ost_and_path` | `--ost` / `--path` を省いても L2 から解決して読み書きできる |
@@ -230,6 +269,9 @@ srv/
 - **リモートは 1 つの書き込み境界**。同じサブツリーを別のリモート名で 2 つ定義して
   同時に書くと、単一書き手の CAS で片方が拒否される（設計どおり）。
 - **`sync --delete` はリモートを消す**。`-n` で何が消えるか先に見ること。
+- **`purge` は取り消せない。** 指定パスの中身を全部消し、ディレクトリも消す。`-n` で確認する。
+- **空ディレクトリは既定で残る。** ローカルに合わせたいときは `rm --rmdirs` か
+  `sync --delete` を使う。
 - **`tree_secret` はリモートごとに独立**。WAN 試験のツリー（`dfs5-wan-shared-secret`）と
   別の秘密で `config create` すれば、別のツリーとして扱われる。共有したい場合は同じ秘密を使う。
   L2 からは引けない（サーバに置かない共有秘密）ので、書く前に必ず設定する。

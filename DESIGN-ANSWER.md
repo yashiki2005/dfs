@@ -61,14 +61,18 @@ WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の�
   書く前に別途設定する（空なら使い方の誤りとして止める）。`--path` は `/` で始まらなくてよい。
 - 読み出し（`ls` / `lsl` / `lsjson` / `size` / `cat` / `check`）は版を進めない。一覧は
   ディレクトリ塊だけを辿り、ファイルの中身を取らない（`l4_log.py::list_tree`）。
+- 削除は `rm` / `rmdir` / `purge`、ディレクトリ作成は `mkdir`。dfs5 は**空のディレクトリも
+  版に残す**（`{"entries": []}` のディレクトリ塊）ので、`rm` は既定で空の階層を残し、
+  `--rmdirs` を付けたときだけ片付ける。`sync --delete` は一致させる操作なので常に片付ける。
 - 書き込み（`copy` / `copyto` / `sync`）は「写しを先頭版に合わせてから変更を載せ、1 版として
   まとめて push」する。**変更が無ければ版を作らない**（冪等）。
 - 単一書き手の衝突は終了コードで区別する（7: CAS 失敗、8: B6、9: B7、6: 到達不能、2: 使い方の誤り）。
 - `--key` は OpenSSH 形式の Ed25519 秘密鍵（`crypto.py` の署名経路が OpenSSH 形式前提）。
 - 実測（Mac ローカル）: 4 ファイル 4,027B の copy が 69.9 ms。`--ost` / `--path` を省いて
   `config create` → `touch` → `copy` → `cat` → `pull` が通り、`pull` の内容は `diff` で一致した。
-- 回帰は `tests/test_rclone_cli.py` の 16 件（冪等・dry-run・`--delete` の有無・終了コード・
-  一覧が直下だけであること・`--ost`/`--path` の省略・`tree_secret` 空の拒否）。
+- 回帰は `tests/test_rclone_cli.py` の 25 件（冪等・dry-run・`--delete` の有無・終了コード・
+  一覧が直下だけであること・`--ost`/`--path` の省略・`tree_secret` 空の拒否・削除と空
+  ディレクトリの往復）。
 
 #### 2.0.3 ローカルにサーバを立てる（`dfs5svc`）
 

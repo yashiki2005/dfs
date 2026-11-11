@@ -361,21 +361,54 @@ def apply_writes(node: DFS5Node, writes: List[Tuple[str, Path, str]]) -> None:
         shutil.copyfile(src, target)
 
 
-def apply_deletes(node: DFS5Node, paths: List[str]) -> None:
-    """消すものを作業ツリーから取り除き、空になったディレクトリを片付ける。"""
+def apply_deletes(node: DFS5Node, paths: List[str], prune_empty: bool = True) -> None:
+    """消すものを作業ツリーから取り除く。
+
+    ``prune_empty=True`` のときは、空になったディレクトリも片付ける（rclone の
+    `sync --delete` と同じで、ローカルの見た目に合わせる）。``rm`` / ``rmdir`` では
+    消した階層だけを片付けたいので、呼び出し側で範囲を決める。
+    """
     for path in paths:
         victim = _tree_path(node, path)
         if victim.exists():
             victim.unlink()
+    if prune_empty:
+        prune_empty_dirs(node)
+
+
+def prune_empty_dirs(node: DFS5Node, start: Optional[Path] = None) -> List[str]:
+    """空のディレクトリを、下から順に取り除く。消したパスを返す。"""
+    root = start if start is not None else node.clayfs.work_tree
+    removed: List[str] = []
     for d in sorted(
-        (p for p in node.clayfs.work_tree.rglob("*") if p.is_dir()),
+        (p for p in root.rglob("*") if p.is_dir()),
         key=lambda p: len(p.parts), reverse=True,
     ):
         try:
             if not any(d.iterdir()):
                 d.rmdir()
+                removed.append(str(d.relative_to(node.clayfs.work_tree)))
         except OSError:
             pass
+    return removed
+
+
+def _remote_file_paths(node: DFS5Node, prefix: str = "") -> set:
+    return {e["path"] for e in _all_entries(node, prefix) if e["type"] == "file"}
+
+
+def _remote_dir_paths(node: DFS5Node, prefix: str = "") -> set:
+    return {e["path"] for e in _all_entries(node, prefix) if e["type"] == "dir"}
+
+
+def _remove_from_tree(node: DFS5Node, paths: List[str]) -> None:
+    """作業ツリーから、ファイルまたはディレクトリ（中身ごと）を取り除く。"""
+    for rel in sorted(paths, key=lambda p: len(p.split("/")), reverse=True):
+        victim = _tree_path(node, rel)
+        if victim.is_dir():
+            shutil.rmtree(victim, ignore_errors=True)
+        elif victim.exists():
+            victim.unlink()
 
 
 # ==========================================
@@ -818,6 +851,175 @@ def cmd_about(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mkdir(args: argparse.Namespace) -> int:
+    """リモートにディレクトリを作る（空のディレクトリも版に残る）。"""
+    store = RemoteStore()
+    name, sub = split_remote_spec(args.remote, args.remote_name)
+    remote = store.get(name)
+    sub = _norm_prefix(sub)
+    if not sub:
+        raise UsageError("mkdir にはディレクトリのパスが必要です（例: remote:dir/sub）")
+
+    node = open_remote(remote, create=True)
+    refresh_cache(node)
+    existing = _remote_dir_paths(node) | _remote_file_paths(node)
+    if sub in existing:
+        print(f"[dfs5r] mkdir: すでにあります: {name}:{sub}", file=sys.stderr)
+        return 0
+
+    target = _tree_path(node, sub)
+    target.mkdir(parents=True, exist_ok=True)
+    log_env, sent = _push(node, remote)
+    print(f"[dfs5r] mkdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
+    return 0
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    """リモートのファイル（または ``--recursive`` でディレクトリ）を消す。
+
+    rclone の ``delete`` / ``deletefile`` に当たる。消した後に空になったディレクトリは、
+    ``--rmdirs`` を付けたときだけ片付ける（既定は空ディレクトリを残す。dfs5 は空の
+    ディレクトリも版に残すため、消すか残すかを選べるようにしてある）。
+    """
+    store = RemoteStore()
+    name, sub = split_remote_spec(args.remote, args.remote_name)
+    remote = store.get(name)
+    sub = _norm_prefix(sub)
+    if not sub:
+        raise UsageError("rm にはパスが必要です（例: remote:dir/file.txt）")
+
+    node = open_remote(remote, create=True)
+    refresh_cache(node)
+
+    files = _remote_file_paths(node)
+    dirs = _remote_dir_paths(node)
+    is_dir = sub in dirs
+    targets: List[str] = []
+    if sub in files:
+        targets = [sub]
+    elif is_dir:
+        if not args.recursive:
+            raise UsageError(
+                f"{name}:{sub} はディレクトリです。中身ごと消すなら --recursive を付けてください"
+            )
+        targets = sorted(p for p in files if p == sub or p.startswith(sub + "/"))
+        if not targets and not args.rmdirs:
+            # 中身が無いディレクトリ。消すには --rmdirs が要る
+            raise UsageError(
+                f"{name}:{sub} は空のディレクトリです。消すなら --rmdirs を付けてください"
+            )
+    else:
+        raise UsageError(f"{name}:{sub} は見つかりません")
+
+    if not targets:
+        if not args.rmdirs:
+            print(f"[dfs5r] rm: 消すファイルがありません（{name}:{sub}）", file=sys.stderr)
+            return 0
+        # --rmdirs なら、ファイルが無くても空ディレクトリの掃除に進む
+        print(
+            f"[dfs5r] rm: {name}:{sub} にファイルはありません。空ディレクトリを片付けます",
+            file=sys.stderr,
+        )
+
+    _print_plan("rm", [f"delete {name}:{p}" for p in targets], args.dry_run)
+    if args.dry_run:
+        return 0
+
+    _remove_from_tree(node, targets)
+    removed_dirs: List[str] = []
+    if args.rmdirs:
+        # 掃除の起点は、消したディレクトリがある位置にする。
+        # 作業ツリー全体を掃除すると、無関係な空ディレクトリまで消えてしまう。
+        start = _tree_path(node, sub) if is_dir and sub else node.clayfs.work_tree
+        removed_dirs = prune_empty_dirs(node, start=start)
+
+    log_env, sent = _push(node, remote)
+    extra = f" | 空になったディレクトリ {len(removed_dirs)} 件も削除" if removed_dirs else ""
+    print(
+        f"[dfs5r] rm OK -> v{log_env['payload']['version']} "
+        f"| 削除 {len(targets)} 件{extra} | sent={sent} B"
+    )
+    return 0
+
+
+def cmd_rmdir(args: argparse.Namespace) -> int:
+    """空のディレクトリを消す（中身があれば断る）。"""
+    store = RemoteStore()
+    name, sub = split_remote_spec(args.remote, args.remote_name)
+    remote = store.get(name)
+    sub = _norm_prefix(sub)
+    if not sub:
+        raise UsageError("rmdir にはディレクトリのパスが必要です（例: remote:dir/sub）")
+
+    node = open_remote(remote, create=True)
+    refresh_cache(node)
+
+    dirs = _remote_dir_paths(node)
+    files = _remote_file_paths(node)
+    if sub not in dirs:
+        raise UsageError(f"{name}:{sub} はディレクトリではありません")
+    children = [p for p in files if p.startswith(sub + "/")] + [
+        d for d in dirs if d.startswith(sub + "/")
+    ]
+    if children:
+        raise UsageError(
+            f"{name}:{sub} は空ではありません（{len(children)} 件が下にあります）"
+        )
+
+    _print_plan("rmdir", [f"delete {name}:{sub}/"], args.dry_run)
+    if args.dry_run:
+        return 0
+
+    _remove_from_tree(node, [sub])
+    parent = str(Path(sub).parent)
+    prune_empty_dirs(node, start=_tree_path(node, parent) if parent != "." else node.clayfs.work_tree)
+    log_env, sent = _push(node, remote)
+    print(f"[dfs5r] rmdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
+    return 0
+
+
+def cmd_purge(args: argparse.Namespace) -> int:
+    """指定パスの中身をすべて消す（ディレクトリ自身も消す）。"""
+    store = RemoteStore()
+    name, sub = split_remote_spec(args.remote, args.remote_name)
+    remote = store.get(name)
+    sub = _norm_prefix(sub)
+
+    node = open_remote(remote, create=True)
+    refresh_cache(node)
+
+    files = _remote_file_paths(node)
+    dirs = _remote_dir_paths(node)
+    if sub:
+        targets = sorted(p for p in files if p == sub or p.startswith(sub + "/"))
+        target_dirs = sorted((d for d in dirs if d == sub or d.startswith(sub + "/")),
+                             key=lambda d: len(d.split("/")), reverse=True)
+    else:
+        targets = sorted(files)
+        target_dirs = sorted(dirs, key=lambda d: len(d.split("/")), reverse=True)
+
+    if not targets and not target_dirs:
+        print(f"[dfs5r] purge: 消すものがありません（{name}:{sub}）", file=sys.stderr)
+        return 0
+
+    _print_plan(
+        "purge",
+        [f"delete {name}:{p}" for p in targets] + [f"rmdir  {name}:{d}/" for d in target_dirs],
+        args.dry_run,
+    )
+    if args.dry_run:
+        return 0
+
+    _remove_from_tree(node, targets + target_dirs)
+    prune_empty_dirs(node)
+    log_env, sent = _push(node, remote)
+    print(
+        f"[dfs5r] purge OK -> v{log_env['payload']['version']} "
+        f"| ファイル {len(targets)} 件・ディレクトリ {len(target_dirs)} 件 | sent={sent} B"
+    )
+    return 0
+
+
 def cmd_touch(args: argparse.Namespace) -> int:
     """リモートの作業ディレクトリを初期化する（push/pull はしない）。"""
     store = RemoteStore()
@@ -918,6 +1120,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("dest", help="ローカルのディレクトリ")
     p.add_argument("--force", action="store_true", help="写しが同じ版でも取り直す")
     p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("mkdir", help="リモートにディレクトリを作る")
+    p.add_argument("remote", help="remote:dir")
+    p.set_defaults(func=cmd_mkdir)
+
+    p = sub.add_parser("rm", help="リモートのファイル（または --recursive でディレクトリ）を消す")
+    p.add_argument("remote", help="remote:path")
+    p.add_argument("-R", "--recursive", action="store_true", help="ディレクトリを中身ごと消す")
+    p.add_argument("--rmdirs", action="store_true",
+                   help="消した後に空になったディレクトリも片付ける")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("rmdir", help="空のディレクトリを消す（中身があれば断る）")
+    p.add_argument("remote", help="remote:dir")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_rmdir)
+
+    p = sub.add_parser("purge", help="指定パスの中身をすべて消す")
+    p.add_argument("remote", help="remote:path")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_purge)
 
     p = sub.add_parser("check", help="リモートとローカルを比べる")
     p.add_argument("remote", help="remote:path")

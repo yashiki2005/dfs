@@ -283,6 +283,103 @@ class RcloneCase(unittest.TestCase):
         paths = {e["path"] for e in node.list_remote()}
         self.assertIn("keep.txt", paths, "--delete なしの sync がリモートのファイルを消した")
 
+    def test_rm_file_leaves_empty_dir(self) -> None:
+        """ファイルを消すと空ディレクトリが残る（dfs5 は空も版に残す）。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+
+        # docs/sub は空になるが、ディレクトリ自体は残る
+        self.assertEqual(self.run_cli("rm", "t:docs/readme.md"), 0)
+        self.assertEqual(self.run_cli("rm", "t:docs/sub/deep.txt"), 0)
+
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        paths = {e["path"]: e["type"] for e in node.list_remote()}
+        self.assertNotIn("docs/readme.md", paths)
+        self.assertNotIn("docs/sub/deep.txt", paths)
+        self.assertEqual(paths.get("docs"), "dir", "空になったディレクトリが消えている")
+        self.assertEqual(paths.get("docs/sub"), "dir", "空になったディレクトリが消えている")
+
+    def test_rm_rmdirs_prunes_empty(self) -> None:
+        """--rmdirs なら、空になったディレクトリも片付く。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+
+        self.assertEqual(self.run_cli("rm", "t:docs/readme.md"), 0)
+        self.assertEqual(self.run_cli("rm", "t:docs/sub/deep.txt", "--rmdirs"), 0)
+
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        paths = {e["path"] for e in node.list_remote()}
+        self.assertNotIn("docs/sub", paths, "--rmdirs なのに空ディレクトリが残っている")
+
+    def test_rm_dir_needs_recursive(self) -> None:
+        """中身のあるディレクトリは --recursive 無しでは消さない。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        rc = self.run_cli("rm", "t:docs")
+        self.assertEqual(rc, 2, "ディレクトリを --recursive 無しで消した")
+
+        self.assertEqual(self.run_cli("rm", "t:docs", "--recursive"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        paths = {e["path"] for e in node.list_remote() if e["type"] == "file"}
+        self.assertFalse(any(p.startswith("docs/") for p in paths), "中身が残っている")
+
+    def test_rm_missing_is_an_error(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        rc = self.run_cli("rm", "t:nope.txt")
+        self.assertEqual(rc, 2)
+
+    def test_mkdir_and_rmdir(self) -> None:
+        """空のディレクトリを作って消せる（空も版に残る）。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        self.assertEqual(self.run_cli("mkdir", "t:empty-dir"), 0)
+
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        paths = {e["path"]: e["type"] for e in node.list_remote()}
+        self.assertEqual(paths.get("empty-dir"), "dir", "作った空ディレクトリが無い")
+
+        self.assertEqual(self.run_cli("rmdir", "t:empty-dir"), 0)
+        node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        paths2 = {e["path"] for e in node2.list_remote()}
+        self.assertNotIn("empty-dir", paths2)
+
+    def test_rmdir_refuses_non_empty(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        rc = self.run_cli("rmdir", "t:docs")
+        self.assertEqual(rc, 2, "中身のあるディレクトリを rmdir で消した")
+
+    def test_purge_removes_everything(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        self.assertEqual(self.run_cli("purge", "t:"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertEqual(node.list_remote(), [], "purge したのに残っている")
+        # 取り出しても何も無い
+        out = self.base / "out_purged"
+        self.assertEqual(self.run_cli("pull", "t:", str(out)), 0)
+        self.assertEqual(list(out.rglob("*")), [])
+
+    def test_empty_dir_survives_roundtrip(self) -> None:
+        """空のディレクトリは版に残り、pull で降りてくる。"""
+        self.run_cli("copy", str(self.local), "t:")
+        self.assertEqual(self.run_cli("mkdir", "t:keep/empty"), 0)
+
+        out = self.base / "out_empty"
+        self.assertEqual(self.run_cli("pull", "t:", str(out)), 0)
+        self.assertTrue((out / "keep" / "empty").is_dir(), "空ディレクトリが降りてこない")
+        self.assertEqual(list((out / "keep" / "empty").iterdir()), [])
+
+    def test_rm_dry_run(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        before = {e["path"] for e in node.list_remote()}
+
+        self.assertEqual(self.run_cli("rm", "t:a.txt", "--dry-run"), 0)
+        node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        after = {e["path"] for e in node2.list_remote()}
+        self.assertEqual(before, after, "dry-run が実際に消した")
+
     def test_dry_run_does_not_write(self) -> None:
         rc = self.run_cli("copy", str(self.local), "t:", "--dry-run")
         self.assertEqual(rc, 0)
