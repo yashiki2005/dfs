@@ -124,78 +124,135 @@ class MerkleTreeBuilder:
 
         重複排除は暗号化の前に plain_id で判定する。索引にあり OST にも現存する塊は
         再暗号化も再送もしない（Nonce がランダムでも重複排除率は落ちない）。
+
+        WAN 向けの往復回数: 索引ヒットの存在確認は全チャンクまとめて 1 往復の
+        ``batch_has`` に集約し、送信も 1 往復の ``batch_put_if_absent`` で行う。
+        したがって 1 回の push は「HAS 1 往復 + PUT 1 往復」に固定される
+        （サーバ側から塊が消えていた場合のみ 2 回目の走査が入る）。
         """
         delegated_mounts = delegated_mounts or {}
-        pending: Dict[str, Dict[str, bytes]] = {sid: {} for sid in self.stores}
-
-        def _stage(plaintext: bytes) -> Tuple[str, str, str]:
-            plain_id = self.crypto.compute_plain_id(plaintext).hex()
-            known = self._index_get(self.index.get(plain_id))
-            if known is not None:
-                known_wire, known_store = known
-                store_id = known_store or self.default_store
-                if known_wire in pending.get(store_id, {}):
-                    return plain_id, known_wire, store_id
-                try:
-                    if self._client(store_id).batch_has([known_wire]).get(known_wire, False):
-                        return plain_id, known_wire, store_id
-                except Exception:
-                    pass
-            store_id = self._store_for_new_chunk()
-            pack_pid, wire_id, blob = self.crypto.pack_chunk(plaintext)
-            assert pack_pid == plain_id
-            self.index[plain_id] = (wire_id, store_id)
-            pending.setdefault(store_id, {})[wire_id] = blob
-            return plain_id, wire_id, store_id
 
         def _entry(store_id: str) -> Dict[str, Any]:
             # 既定の OST のときは store を書かない（旧リーダーとの互換）
             return {} if store_id == self.default_store else {"store": store_id}
 
-        def _walk(directory: Path, mounts: Dict[str, str]) -> Tuple[str, str, str]:
-            items: list = []
-            for item in sorted(directory.iterdir(), key=lambda q: q.name):
-                if item.name in self.IGNORED_NAMES or item.name.startswith("._"):
-                    continue
-                norm_name = normalize_name(item.name)
-                if norm_name in mounts:
-                    items.append(
-                        {
-                            "mount_path": normalize_path(mounts[norm_name]),
-                            "name": norm_name,
-                            "type": "delegated_mount",
-                        }
-                    )
-                elif item.is_file():
-                    raw_data = item.read_bytes()
-                    pid, wid, sid = _stage(raw_data)
-                    item_entry = {
-                        "name": norm_name,
-                        "plain_id": pid,
-                        "size": len(raw_data),
-                        "type": "file",
-                        "wire_id": wid,
-                    }
-                    item_entry.update(_entry(sid))
-                    items.append(item_entry)
-                elif item.is_dir():
-                    sub_pid, sub_wid, sub_sid = _walk(item, {})
-                    item_entry = {
-                        "name": norm_name,
-                        "plain_id": sub_pid,
-                        "type": "dir",
-                        "wire_id": sub_wid,
-                    }
-                    item_entry.update(_entry(sub_sid))
-                    items.append(item_entry)
-            items.sort(key=lambda e: e["name"])
-            dir_bytes = canonical_json({"entries": items, "format": "dfs5-dir-v1"})
-            return _stage(dir_bytes)
+        def _one_pass(
+            force_new: set,
+        ) -> Tuple[Dict[str, Dict[str, bytes]], Dict[str, Tuple[str, str]], Dict[str, Tuple[str, str]], Tuple[str, str, str]]:
+            """ツリーを 1 回走査し結果を返す（``self.index`` は書き換えない）。
 
-        root_pid, root_wid, root_sid = _walk(source_dir, delegated_mounts)
+            戻り値: (送るべき塊, 索引ヒットした塊, 今回暗号化した塊, 根の 3 つ組)
+
+            ``force_new`` の plain_id は索引を信用せず必ず再暗号化する
+            （サーバ側から塊が消えていた場合の再構築に使う）。索引を書き換えないのは、
+            2 回目の走査で 1 回目の結果と混ざらないようにするため。索引の更新は
+            走査がすべて終わってからまとめて行う。
+            """
+            pending: Dict[str, Dict[str, bytes]] = {sid: {} for sid in self.stores}
+            reused: Dict[str, Tuple[str, str]] = {}
+            packed: Dict[str, Tuple[str, str]] = {}
+            # 同じ走査中の重複排除。同一内容の 2 ファイル目以降は再暗号化しない。
+            staged: Dict[str, Tuple[str, str]] = {}
+
+            def _stage(plaintext: bytes) -> Tuple[str, str, str]:
+                plain_id = self.crypto.compute_plain_id(plaintext).hex()
+                if plain_id in staged:
+                    wire_id, store_id = staged[plain_id]
+                    return plain_id, wire_id, store_id
+                known = None if plain_id in force_new else self._index_get(self.index.get(plain_id))
+                if known is not None:
+                    known_wire, known_store = known
+                    store_id = known_store or self.default_store
+                    reused[plain_id] = (known_wire, store_id)
+                    staged[plain_id] = (known_wire, store_id)
+                    return plain_id, known_wire, store_id
+                store_id = self._store_for_new_chunk()
+                pack_pid, wire_id, blob = self.crypto.pack_chunk(plaintext)
+                assert pack_pid == plain_id
+                packed[plain_id] = (wire_id, store_id)
+                staged[plain_id] = (wire_id, store_id)
+                pending.setdefault(store_id, {})[wire_id] = blob
+                return plain_id, wire_id, store_id
+
+            def _walk(directory: Path, mounts: Dict[str, str]) -> Tuple[str, str, str]:
+                items: list = []
+                for item in sorted(directory.iterdir(), key=lambda q: q.name):
+                    if item.name in self.IGNORED_NAMES or item.name.startswith("._"):
+                        continue
+                    norm_name = normalize_name(item.name)
+                    if norm_name in mounts:
+                        items.append(
+                            {
+                                "mount_path": normalize_path(mounts[norm_name]),
+                                "name": norm_name,
+                                "type": "delegated_mount",
+                            }
+                        )
+                    elif item.is_file():
+                        raw_data = item.read_bytes()
+                        pid, wid, sid = _stage(raw_data)
+                        item_entry = {
+                            "name": norm_name,
+                            "plain_id": pid,
+                            "size": len(raw_data),
+                            "type": "file",
+                            "wire_id": wid,
+                        }
+                        item_entry.update(_entry(sid))
+                        items.append(item_entry)
+                    elif item.is_dir():
+                        sub_pid, sub_wid, sub_sid = _walk(item, {})
+                        item_entry = {
+                            "name": norm_name,
+                            "plain_id": sub_pid,
+                            "type": "dir",
+                            "wire_id": sub_wid,
+                        }
+                        item_entry.update(_entry(sub_sid))
+                        items.append(item_entry)
+                items.sort(key=lambda e: e["name"])
+                dir_bytes = canonical_json({"entries": items, "format": "dfs5-dir-v1"})
+                return _stage(dir_bytes)
+
+            root = _walk(source_dir, delegated_mounts)
+            return pending, reused, packed, root
+
+        # ---- 1 回目の走査: 索引ヒットは「サーバに在る」と仮定して記録だけする ----
+        pending, reused, packed, (root_pid, root_wid, root_sid) = _one_pass(force_new=set())
+
+        # ---- 索引ヒットした塊の存在確認を 1 往復の一括 HAS にまとめる ----
+        # ここが WAN 対応の要。チャンクごとに HAS を撃つ実装では往復がチャンク数に比例する。
+        missing_plain: set = set()
+        if reused:
+            by_store: Dict[str, list] = {}
+            for plain_id, (wire, store_id) in reused.items():
+                by_store.setdefault(store_id, []).append((plain_id, wire))
+            for store_id, pairs in by_store.items():
+                try:
+                    presence = self._client(store_id).batch_has([w for _pid, w in pairs])
+                except Exception:
+                    # HAS 自体が失敗したら安全側に倒し、その分は全再送する
+                    missing_plain.update(pid for pid, _w in pairs)
+                    continue
+                for plain_id, wire in pairs:
+                    if not presence.get(wire, False):
+                        missing_plain.add(plain_id)
+
+        # ---- 消えていた塊があれば、それを強制再生成してツリー全体を組み直す ----
+        # ディレクトリ塊は子の wire_id を含むので、部分差し替えでは整合しない。
+        if missing_plain:
+            pending, reused, packed, (root_pid, root_wid, root_sid) = _one_pass(force_new=missing_plain)
+
+        # ---- 索引を確定してから送る ----
+        # 索引ヒットした塊は既存の索引をそのまま維持し、今回暗号化した塊だけ貼り替える。
+        for plain_id, (wire_id, store_id) in packed.items():
+            self.index[plain_id] = (wire_id, store_id)
+
+        # ---- 送信: すべて「未確認（今回暗号化したか、無いと分かっている）」塊なので HAS を省く ----
         for sid, chunks in pending.items():
             if chunks:
-                self._client(sid).batch_put_if_absent(chunks)
+                self._client(sid).batch_put_if_absent(chunks, assume_absent=True)
+
         # 根の配置先を呼び出し側が知れるよう、既定と異なるときは属性に残す
         self.root_store = root_sid
         return root_pid, root_wid

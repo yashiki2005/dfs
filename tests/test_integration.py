@@ -145,6 +145,182 @@ class TestL3Striping(unittest.TestCase):
                 b.close()
 
 
+class TestWanRoundTrips(unittest.TestCase):
+    """WAN 対応: 往復回数をチャンク数から切り離し、タイムアウトを環境変数で変えられる。"""
+
+    @staticmethod
+    def _cert(base: Path):
+        cert, key = base / "c.pem", base / "k.pem"
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
+             "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=l"],
+            check=True, capture_output=True,
+        )
+        return cert, key
+
+    def test_assume_absent_skips_has(self) -> None:
+        """``assume_absent=True`` は内部の batch_has を送らず、1 往復で PUT する。"""
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_aa_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                crypto = ContentAddressedCrypto("assume-absent-secret")
+                blobs = {}
+                for i in range(3):
+                    _pid, wid, blob = crypto.pack_chunk(f"chunk-{i}".encode() * 100)
+                    blobs[wid] = blob
+
+                client = OSTClient("127.0.0.1", ost.port)
+                client.reset_metrics()
+                client.batch_put_if_absent(blobs, assume_absent=True)
+                self.assertEqual(client.round_trips, 1, "assume_absent でも HAS を撃っている")
+                self.assertEqual(len(ost.store), 3)
+
+                # 既にある塊を assume_absent なしで送ると、HAS の 1 往復だけで済む
+                client.reset_metrics()
+                client.batch_put_if_absent(blobs)
+                self.assertEqual(client.round_trips, 1, "既存塊の判定が 1 往復にまとまっていない")
+                self.assertEqual(client.put_count, 0)
+            finally:
+                ost.close()
+
+    def test_push_round_trips_do_not_scale_with_chunks(self) -> None:
+        """チャンク 100 個でも push の L3 往復は 2 以下（HAS 1 + PUT 1）。"""
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_rt_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                for i in range(100):
+                    (tree / f"f{i:03d}.bin").write_bytes(f"payload-{i}".encode() * 40)
+
+                client = OSTClient("127.0.0.1", ost.port)
+                builder = MerkleTreeBuilder(ContentAddressedCrypto("rt-secret"), client)
+                client.reset_metrics()
+                builder.upload_directory(tree)
+                self.assertLessEqual(
+                    client.round_trips, 2,
+                    f"往復回数がチャンク数に比例している: {client.round_trips}",
+                )
+                self.assertGreaterEqual(len(ost.store), 100)
+
+                # 2 回目の push（全チャンクが索引ヒット）も 2 往復以下
+                client.reset_metrics()
+                builder.upload_directory(tree)
+                self.assertLessEqual(
+                    client.round_trips, 2,
+                    f"再 push の往復回数が多い: {client.round_trips}",
+                )
+                self.assertEqual(client.blob_bytes_sent, 0, "変更なしの再 push で本文を送っている")
+            finally:
+                ost.close()
+
+    def test_ost_timeout_env_vars_are_honored(self) -> None:
+        """サーバ・クライアント双方のタイムアウトが環境変数で変わる。"""
+        import os
+        from dfs5.l3_ost_adapter import ost_connect_timeout, ost_socket_timeout
+
+        old_socket = os.environ.get("DFS5_OST_SOCKET_TIMEOUT")
+        old_connect = os.environ.get("DFS5_OST_CONNECT_TIMEOUT")
+        try:
+            os.environ["DFS5_OST_SOCKET_TIMEOUT"] = "42.5"
+            os.environ["DFS5_OST_CONNECT_TIMEOUT"] = "7"
+            self.assertEqual(ost_socket_timeout(), 42.5)
+            self.assertEqual(ost_connect_timeout(), 7.0)
+
+            # 不正値・負値は既定に戻す（壊れた設定で無制限待ちにしない）
+            os.environ["DFS5_OST_SOCKET_TIMEOUT"] = "not-a-number"
+            os.environ["DFS5_OST_CONNECT_TIMEOUT"] = "-1"
+            self.assertEqual(ost_socket_timeout(), 30.0)
+            self.assertEqual(ost_connect_timeout(), 10.0)
+
+            # 環境変数なしの既定
+            del os.environ["DFS5_OST_SOCKET_TIMEOUT"]
+            del os.environ["DFS5_OST_CONNECT_TIMEOUT"]
+            self.assertEqual(ost_socket_timeout(), 30.0)
+            self.assertEqual(ost_connect_timeout(), 10.0)
+        finally:
+            for name, value in (
+                ("DFS5_OST_SOCKET_TIMEOUT", old_socket),
+                ("DFS5_OST_CONNECT_TIMEOUT", old_connect),
+            ):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def test_server_socket_timeout_is_actually_applied(self) -> None:
+        """サーバの accept ループが環境変数の値をソケットに設定する。"""
+        import os
+        import socket
+        import ssl as ssl_mod
+        import time as time_mod
+        from dfs5.l3_store import ChunkStoreServer
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_srv_to_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            old = os.environ.get("DFS5_OST_SOCKET_TIMEOUT")
+            os.environ["DFS5_OST_SOCKET_TIMEOUT"] = "0.5"
+            ost = ChunkStoreServer(cert, key)
+            try:
+                # 何も送らずに放置すると、サーバ側は 0.5 秒で conn を閉じる
+                takes = os.urandom(1)
+                ctx = ssl_mod.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl_mod.CERT_NONE
+                raw = socket.create_connection(("127.0.0.1", ost.port), timeout=5.0)
+                conn = ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+                conn.settimeout(5.0)
+                t0 = time_mod.perf_counter()
+                # サーバのタイムアウトで切断されると、recv は空を返すか例外になる
+                got_eof = False
+                try:
+                    data = conn.recv(1)
+                    got_eof = data == b""
+                except Exception:
+                    got_eof = True
+                elapsed = time_mod.perf_counter() - t0
+                self.assertTrue(got_eof, "サーバがタイムアウトで切断していない")
+                self.assertLess(elapsed, 3.0, f"サーバのタイムアウトが効いていない ({elapsed:.2f}s)")
+                conn.close()
+            finally:
+                ost.close()
+                if old is None:
+                    os.environ.pop("DFS5_OST_SOCKET_TIMEOUT", None)
+                else:
+                    os.environ["DFS5_OST_SOCKET_TIMEOUT"] = old
+
+    def test_l2_timeout_env_var_is_honored(self) -> None:
+        """L2 HTTP タイムアウトが環境変数で変わり、既存の ``_post`` がそれを使う。"""
+        import os
+        from dfs5 import cli as cli_mod
+
+        old = os.environ.get("DFS5_L2_TIMEOUT")
+        try:
+            os.environ["DFS5_L2_TIMEOUT"] = "12.5"
+            self.assertEqual(cli_mod.l2_timeout(), 12.5)
+            os.environ["DFS5_L2_TIMEOUT"] = "0"
+            self.assertEqual(cli_mod.l2_timeout(), 10.0)
+            del os.environ["DFS5_L2_TIMEOUT"]
+            self.assertEqual(cli_mod.l2_timeout(), 10.0)
+        finally:
+            if old is None:
+                os.environ.pop("DFS5_L2_TIMEOUT", None)
+            else:
+                os.environ["DFS5_L2_TIMEOUT"] = old
+
+
 class TestStage5Integration(unittest.TestCase):
     def test_two_node_sharing_and_final_metrics(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dfs5_int_") as tmpdir:

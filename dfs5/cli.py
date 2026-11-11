@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -52,6 +53,25 @@ else:
     from .l5_clayfs import DFS5Node
 
 
+# ---------------------------------------------------------------------------
+# WAN（高遅延）で L2 の 1 往復が LAN 時代の 5 秒固定で切れないよう、環境変数で
+# 上書きできるようにする。既定は RTT 300ms 級を想定した 10 秒。
+# ---------------------------------------------------------------------------
+DEFAULT_L2_TIMEOUT = 10.0
+
+
+def l2_timeout() -> float:
+    """L2 HTTP タイムアウト秒（既定 10 秒、``DFS5_L2_TIMEOUT`` で変更）"""
+    raw = os.environ.get("DFS5_L2_TIMEOUT")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_L2_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_L2_TIMEOUT
+    return value if value > 0 else DEFAULT_L2_TIMEOUT
+
+
 # ==========================================
 # リモート L2 名簿 (HTTP JSON RPC) クライアント & サーバ
 # ==========================================
@@ -65,6 +85,11 @@ class RemoteRegistryClient:
         self.registry_url = registry_url.rstrip("/")
 
     def _post(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST する。タイムアウトは ``DFS5_L2_TIMEOUT``（既定 10 秒）。
+
+        高遅延 WAN では 1 往復だけで数百 ms かかるため、LAN 時代の 5 秒固定は
+        切り詰めの原因になる。環境変数で伸ばせるようにしてある。
+        """
         url = f"{self.registry_url}{endpoint}"
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -74,7 +99,7 @@ class RemoteRegistryClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
+            with urllib.request.urlopen(req, timeout=l2_timeout()) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             try:
@@ -95,6 +120,9 @@ class RemoteRegistryClient:
             raise RegistryError(err_msg) from e
         except urllib.error.URLError as e:
             raise ServiceUnavailableError(f"Cannot reach L2 registry at {self.registry_url}: {e.reason}") from e
+        except (TimeoutError, OSError) as e:
+            # 高遅延 WAN でのタイムアウトや経路断。呼び出し側は「サーバ停止」と同じ扱いにする。
+            raise ServiceUnavailableError(f"L2 registry timed out or is unreachable at {self.registry_url}: {e}") from e
 
     def register_delegation(self, envelope: Dict[str, Any], now: int) -> Dict[str, Any]:
         res = self._post("/v1/delegate", {"envelope": envelope, "now": int(now)})
@@ -346,6 +374,34 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"  Snapshots    : {clayfs_dir / 'snapshots'}")
 
 
+def _emit_metrics(
+    args: argparse.Namespace,
+    node: Any,
+    direction: str,
+    version: int,
+    elapsed_ms: float,
+    payload_bytes: int,
+) -> None:
+    """計測ハーネス向けに L3 の往復回数・転送量を機械可読で出す（``--metrics`` 指定時のみ）。"""
+    if not getattr(args, "metrics", False):
+        return
+    ost = node.ost
+    row = {
+        "direction": direction,
+        "version": int(version),
+        "elapsed_ms": round(elapsed_ms, 3),
+        "round_trips": int(ost.round_trips),
+        "bytes_sent": int(ost.bytes_sent),
+        "bytes_received": int(ost.bytes_received),
+        "blob_bytes_sent": int(ost.blob_bytes_sent),
+        "put_count": int(ost.put_count),
+        "get_count": int(ost.get_count),
+        "tls_handshakes": int(ost.tls_handshakes),
+        "payload_bytes": int(payload_bytes),
+    }
+    print("[dfs5 metrics] " + json.dumps(row, sort_keys=True, ensure_ascii=False))
+
+
 def cmd_push(args: argparse.Namespace) -> None:
     node, cfg, _ = load_node_from_mount(Path(args.mount))
     epoch = int(args.epoch) if args.epoch is not None else int(cfg.get("delegation_epoch", 1))
@@ -367,6 +423,10 @@ def cmd_push(args: argparse.Namespace) -> None:
         raise SystemExit(f"[REJECTED: L1 Delegation Error] {e}") from e
     except SilentDropDetectedError as e:
         raise SystemExit(f"[ALERT: Evil B7 Silent Drop Detected] {e}") from e
+    except ServiceUnavailableError as e:
+        raise SystemExit(f"[UNAVAILABLE: L2/L3 Unreachable] {e}") from e
+    except ChunkIntegrityError as e:
+        raise SystemExit(f"[ALERT: Evil A2 Chunk Integrity Error] {e}") from e
 
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     p = log_env["payload"]
@@ -375,6 +435,7 @@ def cmd_push(args: argparse.Namespace) -> None:
         f"| root={p['root_plain_id'][:12]}... | sent={wire_bytes} B | {elapsed_ms:.1f} ms"
     )
     print(f"  Snapshot saved at: {snap_dir}")
+    _emit_metrics(args, node, direction="push", version=p["version"], elapsed_ms=elapsed_ms, payload_bytes=wire_bytes)
 
 
 def cmd_pull(args: argparse.Namespace) -> None:
@@ -386,6 +447,8 @@ def cmd_pull(args: argparse.Namespace) -> None:
         raise SystemExit(f"[ALERT: Evil B6 Rollback Detected] {e}") from e
     except ChunkIntegrityError as e:
         raise SystemExit(f"[ALERT: Evil A2 Chunk Integrity Error] {e}") from e
+    except ServiceUnavailableError as e:
+        raise SystemExit(f"[UNAVAILABLE: L2/L3 Unreachable] {e}") from e
 
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     pin = node.l4.pin
@@ -400,6 +463,10 @@ def cmd_pull(args: argparse.Namespace) -> None:
     )
     print(f"  Working tree updated : {node.clayfs.work_tree}")
     print(f"  Snapshot saved at    : {snap_dir}")
+    _emit_metrics(
+        args, node, direction="pull", version=pin.version,
+        elapsed_ms=elapsed_ms, payload_bytes=node.ost.bytes_received,
+    )
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -465,6 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_push = sub.add_parser("push", help="Snapshot, encrypt, upload chunks, and commit next L4 version")
     p_push.add_argument("--mount", default=".", help="Mount root directory")
     p_push.add_argument("--epoch", type=int, help="Override delegation epoch")
+    p_push.add_argument("--metrics", action="store_true", help="Print machine-readable L3 metrics")
     p_push.add_argument(
         "--delegated-mount",
         action="append",
@@ -475,6 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     # pull
     p_pull = sub.add_parser("pull", help="Verify remote head (B6), download chunks (A2), and update work tree")
     p_pull.add_argument("--mount", default=".", help="Mount root directory")
+    p_pull.add_argument("--metrics", action="store_true", help="Print machine-readable L3 metrics")
     p_pull.set_defaults(func=cmd_pull)
 
     # status

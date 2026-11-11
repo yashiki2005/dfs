@@ -30,7 +30,23 @@ Mac と Pi5 の 2 台で、1 つのツリーを共有した（`specs/e2e_lan.md`
 - Mac ↔ Pi5 の双方向で push / pull が成功し、内容が SHA-256 まで一致した。
 - 同じ親版からの同時 push は後着が `ConflictError` で拒否された。衝突コピーは 0 件。
 - 既存の mini_lustre（9001/9002）を止めずに、別ポートで試験した。
-- 未検証: 高遅延（RTT 200ms）、3 台以上、長時間運用、LAN 越しの 2 OST。
+- 未検証: 3 台以上、長時間運用、LAN 越しの 2 OST。
+
+#### 2.0.1 WAN（高遅延）実機（`specs/e2e_wan.md`）
+
+WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の条件を測った。
+
+- **push の往復は 1 回に固定された。** 1 回の push は「HAS 1 往復 + PUT 1 往復」で終わる。
+  実測は RTT 278ms でも往復 1 回。2.13MB の送信が 3.9〜4.4 秒で完走した。
+- **pull は往復がファイル数に比例する。** 20 ファイルで 21〜23 往復。
+  285ms の経路では 8.0 秒、22ms の経路では 1.0 秒で、差はほぼ往復回数と RTT の積で説明できる。
+- **高遅延でも単一書き手が効く。** 3 経路すべてで、後着の push が `ConflictError` になり、
+  衝突コピーは 0 件だった。
+- **通信断でハングしない。** サーバ停止中の push は 138〜938ms で `ServiceUnavailableError` になった。
+- WAN 対応として、タイムアウトを環境変数化し（`DFS5_L2_TIMEOUT` / `DFS5_OST_SOCKET_TIMEOUT` /
+  `DFS5_OST_CONNECT_TIMEOUT`）、往復削減（一括 HAS・`assume_absent`）を入れた。
+- 残る未検証: pull の往復削減（`batch_get` の一括化）、100 塊以上の実測、
+  実効スループット、3 台以上の同時参加、長時間運用。
 
 ### 2.1 セキュリティ・一貫性検証（段階 1・2）
 

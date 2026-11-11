@@ -57,6 +57,48 @@ Nonce がランダムでも重複排除率は落ちない（判定は Nonce を�
 
 ---
 
+## 2.2 WAN の往復回数
+
+LAN の計測（§2）だけでは往復回数の問題が見えなかった。RTT 285ms の WAN では
+「チャンクごとに 1 往復」が致命的になる。そこで `l4_log.py::upload_directory` を直し、
+往復をチャンク数から切り離した。
+
+| 場面 | 旧の往復 | 新の往復 |
+|---|---|---|
+| push（索引ヒットしたチャンクが N 個） | N 回の `batch_has` + 1 回の PUT | **1 回の `batch_has`（まとめて）+ 1 回の PUT** |
+| push（新規チャンクが N 個） | — | **1 回の `batch_has` + 1 回の PUT**（`assume_absent=True`） |
+| pull（ファイル N 個） | 根 1 + ファイル N | 根 1 + ファイル N（**未改善**。`batch_get` を塊ごとに呼んでいる） |
+
+実装の要点:
+
+- `batch_has` をチャンクごとに撃つのをやめ、索引ヒットを `reused` に溜めて最後に 1 回だけ送る。
+- 新規に暗号化した塊は「サーバに無い」と分かっているので、`batch_put_if_absent(..., assume_absent=True)`
+  で内部の `batch_has` を省略し、1 往復で PUT する。
+- 一括 HAS で「サーバから消えていた」塊が見つかった場合だけ、もう 1 回走査して作り直す
+  （ディレクトリ塊は子の `wire_id` を含むため、部分差し替えでは整合しない）。
+
+WAN 実測（20 × 128KB、RTT 278〜285ms、`specs/e2e_wan.md`）:
+
+| 経路 | push 往復 | push 所要 | pull 往復 | pull 所要 |
+|---|---|---|---|---|
+| Mac → Scaleway（278.5ms） | **1** | 4,391ms | **21** | 8,025ms |
+| Sakura → Scaleway（279.8ms） | **1** | 3,937ms | **23** | 7,692ms |
+| Mac → Sakura（22.4ms） | **1** | 923ms | **21** | 953ms |
+
+push は往復が固定なので、所要時間はほぼ RTT と転送量で決まる。
+pull は往復がファイル数に比例するため、高遅延ではファイル数がそのまま効く。
+`batch_get` の一括化が次の課題である（§5）。
+
+回帰テスト:
+
+- `TestWanRoundTrips::test_assume_absent_skips_has` — `assume_absent=True` は HAS を送らない。
+- `TestWanRoundTrips::test_push_round_trips_do_not_scale_with_chunks` — チャンク 100 個でも 2 往復以下。
+- `TestWanRoundTrips::test_ost_timeout_env_vars_are_honored` — タイムアウトが環境変数で変わる。
+- `TestWanRoundTrips::test_server_socket_timeout_is_actually_applied` — サーバのソケットに実際に効く。
+- `TestWanRoundTrips::test_l2_timeout_env_var_is_honored` — L2 HTTP のタイムアウトが変わる。
+
+---
+
 ## 3. mini_lustre の OST を「そのまま」使えるか
 
 **結論: そのままでは使えない。** `DESIGN-ANSWER.md` の「無改造流用」という記述は誤りだった。
@@ -120,6 +162,8 @@ OST 側で同じ塊を共有させることはできない。
 | mini_lustre との RPC アダプタ | **未実装**（必要になったとき） |
 | libtorrent | **導入しない**（規模が小さいうち） |
 | 大規模（1,000 塊以上）の再計測 | **未実施** |
+| WAN（RTT 285ms）での実機計測 | **実施済み**（push 1 往復。`specs/e2e_wan.md`） |
+| pull の往復削減（`batch_get` の一括化） | **未実装**（往復がファイル数に比例） |
 
 ---
 

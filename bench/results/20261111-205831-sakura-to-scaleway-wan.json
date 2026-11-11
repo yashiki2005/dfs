@@ -1,0 +1,234 @@
+{
+  "schema": "dfs5-e2e-wan-v1",
+  "label": "sakura-to-scaleway",
+  "mode": "wan",
+  "measured_at_utc": "2026-11-11T11:55:55+00:00",
+  "environment": {
+    "control_host": "macOS-27.3-arm64-arm-64bit",
+    "control_python": "3.12.16",
+    "server_host": "172.16.1.60",
+    "server_ssh": "ubuntu@172.16.1.60",
+    "client_ssh": "ubuntu@yashiki.top",
+    "l2_port": 19440,
+    "l3_port": 19443,
+    "files": 20,
+    "file_size": 131072,
+    "chunk_count": 0,
+    "rtt_avg_ms": 279.799,
+    "payload_desc": "20 × 131072 B",
+    "payload_bytes": 2130089
+  },
+  "steps": [
+    {
+      "step": "RTT 計測（172.16.1.60）",
+      "ok": true,
+      "detail": "avg=279.799 ms"
+    },
+    {
+      "step": "鍵生成（root）",
+      "ok": true,
+      "detail": "ok"
+    },
+    {
+      "step": "鍵生成（alice）",
+      "ok": true,
+      "detail": "ok"
+    },
+    {
+      "step": "サーバへリポジトリ同期（rsync）",
+      "ok": true,
+      "detail": "ok"
+    },
+    {
+      "step": "サーバへ鍵配置",
+      "ok": true,
+      "detail": "alice alice.pub root root.pub KEYS_OK",
+      "elapsed_ms": 3508.0
+    },
+    {
+      "step": "クライアントへリポジトリ同期（rsync）",
+      "ok": true,
+      "detail": "ok"
+    },
+    {
+      "step": "クライアントへ鍵配置",
+      "ok": true,
+      "detail": "alice alice.pub root.pub CKEYS_OK"
+    },
+    {
+      "step": "サーバ状態リセット",
+      "ok": true,
+      "detail": "RESET_OK",
+      "elapsed_ms": 4388.5
+    },
+    {
+      "step": "サーバ起動確認（L2 応答）",
+      "ok": true,
+      "detail": "1 回試行",
+      "elapsed_ms": 25621.7
+    },
+    {
+      "step": "サーバ起動コマンド送出",
+      "ok": true,
+      "detail": "ssh はタイムアウトしたが L2 が応答（デーモンは起動済み）",
+      "elapsed_ms": 25021.6
+    },
+    {
+      "step": "L2 疎通（HTTP）",
+      "ok": true,
+      "detail": "{\"delegation\": null, \"head_log\": null, \"locator\": null}",
+      "elapsed_ms": 615.8
+    },
+    {
+      "step": "L3 疎通（TLS）",
+      "ok": true,
+      "detail": "TLS TLSv1.3 522.3 ms",
+      "elapsed_ms": 1157.1
+    },
+    {
+      "step": "L1 委譲登録（サーバの L2）",
+      "ok": true,
+      "detail": "[dfs5 delegate] Registered on http://172.16.1.60:19440: path=/example.com/alice/notes epoch=1 base_version=0",
+      "elapsed_ms": 3723.9
+    },
+    {
+      "step": "クライアント作業ディレクトリ初期化",
+      "ok": true,
+      "detail": "CLEAN_OK",
+      "elapsed_ms": 4034.6
+    },
+    {
+      "step": "クライアント init",
+      "ok": true,
+      "detail": "[dfs5 init] Initialized mount at /home/ubuntu/dfs5_wan/client_mount\n  Working tree : /home/ubuntu/dfs5_wan/client_mount/tree\n  Snapshots    : /home/ubuntu/dfs5_wan/client_mount/.clayfs/snapshots",
+      "elapsed_ms": 657.2
+    },
+    {
+      "step": "試験データ生成（20 × 131072 B）",
+      "ok": true,
+      "detail": "20 × 131072 B",
+      "elapsed_ms": 933.9
+    },
+    {
+      "step": "クライアント push",
+      "ok": true,
+      "detail": "[dfs5 push] OK v1 (epoch=1) | root=6a843c780c24... | sent=2137755 B | 3937.0 ms\n  Snapshot saved at: /home/ubuntu/dfs5_wan/client_mount/.clayfs/snapshots/v1\n[dfs5 metrics] {\"blob_bytes_sent\": 2136122, \"bytes_received\": 1, \"bytes_sent\": 2137755, \"direction\": \"push\", \"elapsed_ms\": 3936.953, \"get_count\": 0, \"payload_bytes\": 2137755, \"put_count\": 23, \"round_trips\": 1, \"tls_handshakes\": 1, \"version\": 1}",
+      "elapsed_ms": 4619.7
+    },
+    {
+      "step": "読取側 init",
+      "ok": true,
+      "detail": "[dfs5 init] Initialized mount at /home/ubuntu/dfs5_wan/reader_mount\n  Working tree : /home/ubuntu/dfs5_wan/reader_mount/tree\n  Snapshots    : /home/ubuntu/dfs5_wan/reader_mount/.clayfs/snapshots",
+      "elapsed_ms": 685.4
+    },
+    {
+      "step": "読取側 pull",
+      "ok": true,
+      "detail": "[dfs5 pull] OK v1 (epoch=1) | recv=2136237 B | 7691.6 ms\n  Working tree updated : /home/ubuntu/dfs5_wan/reader_mount/tree\n  Snapshot saved at    : /home/ubuntu/dfs5_wan/reader_mount/.clayfs/snapshots/v1\n[dfs5 metrics] {\"blob_bytes_sent\": 0, \"bytes_received\": 2136237, \"bytes_sent\": 3059, \"direction\": \"pull\", \"elapsed_ms\": 7691.555, \"get_count\": 23, \"payload_bytes\": 2136237, \"put_count\": 0, \"round_trips\": 23, \"tls_handshakes\": 1, \"version\": 1}",
+      "elapsed_ms": 8374.5
+    },
+    {
+      "step": "内容一致（SHA-256）",
+      "ok": true,
+      "detail": "writer=22 件, reader=22 件"
+    },
+    {
+      "step": "競合試験の準備（reader 側の変更）",
+      "ok": true,
+      "detail": "TOUCH_OK"
+    },
+    {
+      "step": "競合試験: 先着 push",
+      "ok": true,
+      "detail": "[dfs5 push] OK v2 (epoch=1) | root=9efc9b4ed0d9... | sent=2137755 B | 3976.1 ms\n  Snapshot saved at: /home/ubuntu/dfs5_wan/reader_mount/.clayfs/snapshots/v2",
+      "elapsed_ms": 4686.4
+    },
+    {
+      "step": "競合試験の準備（client 側の変更）",
+      "ok": true,
+      "detail": "TOUCH2_OK"
+    },
+    {
+      "step": "同時書き込みを CAS で拒否（後着）",
+      "ok": true,
+      "detail": "先着=[dfs5 push] OK v2 (epoch=1) | root=9efc9b4ed0d9... | sent=2137755 B | 3976.1 ms\n / 後着 rc=1: [REJECTED: Single-Writer Conflict] CAS conflict on '/example.com/alice/notes': expected version 3 (parent 2, c24a301399...), got version 2 (parent 1, 12a8d7fe1d",
+      "elapsed_ms": 4030.5
+    },
+    {
+      "step": "衝突コピー 0 件",
+      "ok": true,
+      "detail": "0 件"
+    },
+    {
+      "step": "サーバ停止（通信断の注入）",
+      "ok": true,
+      "detail": "STOPPED",
+      "elapsed_ms": 4464.8
+    },
+    {
+      "step": "通信断を失敗として返す（ハングしない）",
+      "ok": true,
+      "detail": "rc=1 elapsed=938ms [UNAVAILABLE: L2/L3 Unreachable] Cannot reach L3 OST at 172.16.1.60:19443: [Errno 111] Connection refused",
+      "elapsed_ms": 937.5
+    },
+    {
+      "step": "サーバ状態リセット",
+      "ok": true,
+      "detail": "RESET_OK",
+      "elapsed_ms": 4539.1
+    },
+    {
+      "step": "サーバ起動確認（L2 応答）",
+      "ok": true,
+      "detail": "1 回試行",
+      "elapsed_ms": 25624.0
+    },
+    {
+      "step": "サーバ起動コマンド送出",
+      "ok": true,
+      "detail": "ssh はタイムアウトしたが L2 が応答（デーモンは起動済み）",
+      "elapsed_ms": 25015.3
+    }
+  ],
+  "metrics": [
+    {
+      "blob_bytes_sent": 2136122,
+      "bytes_received": 1,
+      "bytes_sent": 2137755,
+      "direction": "push",
+      "elapsed_ms": 3936.953,
+      "get_count": 0,
+      "payload_bytes": 2137755,
+      "put_count": 23,
+      "round_trips": 1,
+      "tls_handshakes": 1,
+      "version": 1
+    },
+    {
+      "blob_bytes_sent": 0,
+      "bytes_received": 2136237,
+      "bytes_sent": 3059,
+      "direction": "pull",
+      "elapsed_ms": 7691.555,
+      "get_count": 23,
+      "payload_bytes": 2136237,
+      "put_count": 0,
+      "round_trips": 23,
+      "tls_handshakes": 1,
+      "version": 1
+    }
+  ],
+  "verdict": {
+    "server_started": true,
+    "l2_reachable": true,
+    "l3_reachable": true,
+    "delegation_registered": true,
+    "push_ok": true,
+    "pull_ok": true,
+    "content_matches": true,
+    "concurrent_cas": true,
+    "no_conflict_copies": true,
+    "outage_handled": true
+  },
+  "all_ok": true
+}

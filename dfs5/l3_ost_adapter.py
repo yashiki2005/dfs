@@ -7,6 +7,7 @@ macOS / Linux 両対応・デッドロック完全排除版 L3 OST サーバ & �
 
 from __future__ import annotations
 
+import os
 import socket
 import ssl
 import struct
@@ -22,12 +23,46 @@ ZERO_WIRE_ID = b"0" * 64
 QUIT_FRAME = b"Q" + ZERO_WIRE_ID + struct.pack(">I", 0)
 
 
+# ---------------------------------------------------------------------------
+# WAN（高遅延）向けタイムアウト。環境変数で上書きできる。
+#   DFS5_OST_SOCKET_TIMEOUT  : サーバ側ソケットの 1 操作あたりのタイムアウト秒
+#   DFS5_OST_CONNECT_TIMEOUT : クライアント側の TCP 接続タイムアウト秒
+# 既定はどちらも WAN（RTT 300ms 級）の直列処理に耐える値にしてある。
+# ---------------------------------------------------------------------------
+DEFAULT_OST_SOCKET_TIMEOUT = 30.0
+DEFAULT_OST_CONNECT_TIMEOUT = 10.0
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def ost_socket_timeout() -> float:
+    """サーバ側ソケットタイムアウト秒（既定 30 秒、``DFS5_OST_SOCKET_TIMEOUT`` で変更）"""
+    return _env_positive_float("DFS5_OST_SOCKET_TIMEOUT", DEFAULT_OST_SOCKET_TIMEOUT)
+
+
+def ost_connect_timeout() -> float:
+    """クライアント側 TCP 接続タイムアウト秒（既定 10 秒、``DFS5_OST_CONNECT_TIMEOUT`` で変更）"""
+    return _env_positive_float("DFS5_OST_CONNECT_TIMEOUT", DEFAULT_OST_CONNECT_TIMEOUT)
+
+
 class ChunkStoreServer:
     """
     内容アドレス (wire_id) でチャンクを保管する TLS/TCP サーバ (L3 OST)。
 
     DFS5 が自前で実装したものであり、mini_lustre の OST とは
     フレーム形式も塊の識別子も異なる（同一のポート上で TLS/TCP を使う点のみ共通）。
+
+    クライアントごとのソケットタイムアウトは ``DFS5_OST_SOCKET_TIMEOUT``（既定 30 秒）で
+    上書きできる。WAN では 1 往復が数百 ms になるため、LAN 時代の 2 秒固定から引き上げた。
     """
 
     def __init__(self, certfile: Path | str, keyfile: Path | str, host: str = "127.0.0.1", port: int = 0):
@@ -54,7 +89,7 @@ class ChunkStoreServer:
             try:
                 conn, _ = self.sock.accept()
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.settimeout(2.0)
+                conn.settimeout(ost_socket_timeout())
                 threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
             except Exception:
                 break
@@ -166,6 +201,8 @@ class OSTClient:
     """
     L3 OST クライアントアダプタ。
     切断時は必ず QUIT_FRAME ('Q') を送ってから close() するため、サーバ側スレッドが一切残留しない。
+
+    接続タイムアウトは ``DFS5_OST_CONNECT_TIMEOUT``（既定 10 秒）で上書きできる。
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 0):
@@ -196,9 +233,28 @@ class OSTClient:
         self.round_trips = 0
 
     def _open_new_conn(self) -> ssl.SSLSocket:
-        raw = socket.create_connection((self.host, self.port), timeout=3.0)
+        """接続を張る。到達不能・タイムアウトは ServiceUnavailableError に正規化する。
+
+        WAN では経路断（WireGuard の一時停止など）で生の OSError や socket.timeout が
+        飛ぶ。呼び出し側が「サーバ停止」と同じ扱いにできるよう例外をそろえる。
+        """
+        try:
+            raw = socket.create_connection((self.host, self.port), timeout=ost_connect_timeout())
+        except (OSError, TimeoutError) as e:
+            raise ServiceUnavailableError(
+                f"Cannot reach L3 OST at {self.host}:{self.port}: {e}"
+            ) from e
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        ssl_conn = self._ssl_ctx.wrap_socket(raw, server_hostname=self.host)
+        try:
+            ssl_conn = self._ssl_ctx.wrap_socket(raw, server_hostname=self.host)
+        except (OSError, TimeoutError, ssl.SSLError) as e:
+            try:
+                raw.close()
+            except Exception:
+                pass
+            raise ServiceUnavailableError(
+                f"TLS handshake with L3 OST at {self.host}:{self.port} failed: {e}"
+            ) from e
         self.tls_handshakes += 1
         return ssl_conn
 
@@ -255,9 +311,13 @@ class OSTClient:
     def _recv_exact(conn: ssl.SSLSocket, n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
-            chunk = conn.recv(n - len(buf))
+            try:
+                chunk = conn.recv(n - len(buf))
+            except (OSError, TimeoutError, ssl.SSLError) as e:
+                # 読み取り中のタイムアウト・切断は「サーバが応答しない」と同じ扱い
+                raise ServiceUnavailableError(f"L3 OST read failed or timed out: {e}") from e
             if not chunk:
-                raise ConnectionError("Unexpected EOF from OST")
+                raise ServiceUnavailableError("Unexpected EOF from OST (server closed the connection)")
             buf.extend(chunk)
         return bytes(buf)
 
@@ -287,14 +347,23 @@ class OSTClient:
             self.bytes_received += len(flags)
             return {wid: (flags[i : i + 1] == b"1") for i, wid in enumerate(unique_ids)}
 
-    def batch_put_if_absent(self, chunks: Dict[str, bytes]) -> int:
+    def batch_put_if_absent(self, chunks: Dict[str, bytes], assume_absent: bool = False) -> int:
+        """未送信の塊をまとめて PUT する。
+
+        ``assume_absent=True`` のときは内部の ``batch_has`` を省略し、1 往復で送る。
+        呼び出し側が「それらの wire_id はサーバに存在しない」と確信できる場合
+        （暗号化直後の新しい塊など）にだけ使う。
+        """
         if not chunks:
             return 0
 
-        presence = self.batch_has(list(chunks.keys()))
-        missing_ids = [wid for wid, exists in presence.items() if not exists]
-        if not missing_ids:
-            return 0
+        if assume_absent:
+            missing_ids = list(chunks.keys())
+        else:
+            presence = self.batch_has(list(chunks.keys()))
+            missing_ids = [wid for wid, exists in presence.items() if not exists]
+            if not missing_ids:
+                return 0
 
         with self._acquire_conn() as conn:
             payload_parts = [b"M" + ZERO_WIRE_ID + struct.pack(">I", len(missing_ids))]
