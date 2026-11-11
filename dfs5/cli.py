@@ -81,4 +81,415 @@ class RemoteRegistryClient:
                 err_body = json.loads(e.read().decode("utf-8"))
                 err_type = err_body.get("error_type", "")
                 err_msg = err_body.get("message", str(e))
-            except Exception
+            except Exception:
+                raise RegistryError(f"HTTP {e.code}: {e.reason}") from e
+
+            if err_type == "ConflictError":
+                raise ConflictError(err_msg) from e
+            if err_type == "DelegationError":
+                raise DelegationError(err_msg) from e
+            if err_type == "ChunkIntegrityError":
+                raise ChunkIntegrityError(err_msg) from e
+            if err_type == "ServiceUnavailableError":
+                raise ServiceUnavailableError(err_msg) from e
+            raise RegistryError(err_msg) from e
+        except urllib.error.URLError as e:
+            raise ServiceUnavailableError(f"Cannot reach L2 registry at {self.registry_url}: {e.reason}") from e
+
+    def register_delegation(self, envelope: Dict[str, Any], now: int) -> Dict[str, Any]:
+        res = self._post("/v1/delegate", {"envelope": envelope, "now": int(now)})
+        return res["verified"]
+
+    def announce_and_append(
+        self,
+        path: str,
+        log_envelope: Dict[str, Any],
+        locator_envelope: Dict[str, Any],
+        now: int,
+    ) -> None:
+        self._post(
+            "/v1/announce",
+            {
+                "locator_envelope": locator_envelope,
+                "log_envelope": log_envelope,
+                "now": int(now),
+                "path": path,
+            },
+        )
+
+    def resolve(
+        self, path: str
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        res = self._post("/v1/resolve", {"path": path})
+        return res.get("delegation"), res.get("locator"), res.get("head_log")
+
+
+class PersistentRegistryState:
+    """サー再起動時にも L1 委譲・L2 ロケータ・L4 ログ・L3 チャンクを保持する永続化ラッパー"""
+
+    def __init__(self, state_dir: Path, root_anchor: str, root_pubkey: str):
+        self.state_dir = state_dir
+        self.state_file = state_dir / "registry_state.json"
+        self.chunks_dir = state_dir / "ost_chunks"
+        self.chunks_dir.mkdir(parents=True, exist_ok=True)
+        self.service = DirectoryRegistryService(root_anchor, root_pubkey)
+        self._load()
+
+    def _load(self) -> None:
+        if not self.state_file.exists():
+            return
+        data = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.service.delegations = data.get("delegations", {})
+        self.service.logs = data.get("logs", {})
+        self.service.locators = data.get("locators", {})
+
+    def save(self) -> None:
+        data = {
+            "delegations": self.service.delegations,
+            "locators": self.service.locators,
+            "logs": self.service.logs,
+        }
+        tmp = self.state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp.replace(self.state_file)
+
+    def load_ost_chunks(self, ost: MiniLustreOSTServer) -> None:
+        for f in self.chunks_dir.glob("*.blk"):
+            ost.store[f.stem] = f.read_bytes()
+
+    def save_ost_chunks(self, ost: MiniLustreOSTServer) -> None:
+        for wid, blob in list(ost.store.items()):
+            p = self.chunks_dir / f"{wid}.blk"
+            if not p.exists():
+                p.write_bytes(blob)
+
+
+def make_registry_http_handler(pstate: PersistentRegistryState, ost: MiniLustreOSTServer):
+    class RegistryHTTPHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            sys.stderr.write(f"[L2-HTTP] {self.address_string()} - {fmt % args}\n")
+
+        def _send_json(self, status: int, body: Dict[str, Any]) -> None:
+            raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+            try:
+                if self.path == "/v1/delegate":
+                    verified = pstate.service.register_delegation(req["envelope"], now=int(req["now"]))
+                    pstate.save()
+                    self._send_json(200, {"ok": True, "verified": verified})
+                elif self.path == "/v1/announce":
+                    pstate.service.announce_and_append(
+                        path=req["path"],
+                        log_envelope=req["log_envelope"],
+                        locator_envelope=req["locator_envelope"],
+                        now=int(req["now"]),
+                    )
+                    pstate.save()
+                    pstate.save_ost_chunks(ost)
+                    self._send_json(200, {"ok": True})
+                elif self.path == "/v1/resolve":
+                    del_env, loc_env, head_env = pstate.service.resolve(req["path"])
+                    self._send_json(
+                        200,
+                        {
+                            "delegation": del_env,
+                            "head_log": head_env,
+                            "locator": loc_env,
+                        },
+                    )
+                else:
+                    self._send_json(404, {"error_type": "RegistryError", "message": f"Unknown path {self.path}"})
+            except (ConflictError, DelegationError, ChunkIntegrityError, ServiceUnavailableError, RegistryError) as e:
+                self._send_json(400, {"error_type": type(e).__name__, "message": str(e)})
+            except Exception as e:
+                self._send_json(500, {"error_type": "RegistryError", "message": f"Internal error: {e}"})
+
+    return RegistryHTTPHandler
+
+
+# ==========================================
+# 設定ロード・ノード構築ヘルパー
+# ==========================================
+CONFIG_FILENAME = "dfs5_config.json"
+
+
+def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], RemoteRegistryClient]:
+    mount_root = mount_dir.expanduser().resolve()
+    cfg_path = mount_root / ".clayfs" / CONFIG_FILENAME
+    if not cfg_path.is_file():
+        raise SystemExit(f"Error: {mount_root} is not initialized (missing {cfg_path}). Run 'dfs5 init' first.")
+
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    priv_key = Path(cfg["priv_key"]).expanduser().resolve()
+    pub_key_path = Path(cfg.get("pub_key") or f"{priv_key}.pub").expanduser().resolve()
+    pub_key_str = pub_key_path.read_text(encoding="utf-8").strip()
+
+    reg_client = RemoteRegistryClient(cfg["registry_url"])
+    node = DFS5Node(
+        name=cfg["node_name"],
+        sub_path=cfg["sub_path"],
+        mount_root=mount_root,
+        priv_key_path=priv_key,
+        pub_key_str=pub_key_str,
+        tree_secret=cfg["tree_secret"],
+        registry=reg_client,  # type: ignore[arg-type]
+        ost_host=cfg["ost_host"],
+        ost_port=int(cfg["ost_port"]),
+    )
+    return node, cfg, reg_client
+
+
+# ==========================================
+# サブコマンド実装
+# ==========================================
+def cmd_serve(args: argparse.Namespace) -> None:
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    root_pub_path = Path(args.root_pubkey).expanduser().resolve()
+    root_pubkey = root_pub_path.read_text(encoding="utf-8").strip()
+
+    cert = state_dir / "ost_cert.pem"
+    key = state_dir / "ost_key.pem"
+    if not cert.exists() or not key.exists():
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", str(key), "-out", str(cert),
+                "-days", "365", "-nodes", "-subj", "/CN=dfs5-ost",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    ost = MiniLustreOSTServer(cert, key, host=args.bind, port=args.ost_port)
+    pstate = PersistentRegistryState(state_dir, args.root_anchor, root_pubkey)
+    pstate.load_ost_chunks(ost)
+
+    handler = make_registry_http_handler(pstate, ost)
+    httpd = ThreadingHTTPServer((args.bind, args.registry_port), handler)
+
+    print(f"[dfs5 serve] Root Anchor : {args.root_anchor}")
+    print(f"[dfs5 serve] State Dir   : {state_dir}")
+    print(f"[dfs5 serve] L2 Registry : http://{args.bind}:{args.registry_port}")
+    print(f"[dfs5 serve] L3 OST (TLS): tls://{args.bind}:{ost.port}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[dfs5 serve] Shutting down...")
+    finally:
+        pstate.save()
+        pstate.save_ost_chunks(ost)
+        ost.close()
+        httpd.server_close()
+
+
+def cmd_delegate(args: argparse.Namespace) -> None:
+    priv_key = Path(args.signing_key).expanduser().resolve()
+    writer_pub = Path(args.writer_pubkey).expanduser().resolve().read_text(encoding="utf-8").strip()
+    now = int(time.time())
+
+    env = create_delegation_envelope(
+        parent_priv_key=priv_key,
+        parent=args.parent,
+        path=args.path,
+        writer_pubkey=writer_pub,
+        epoch=args.epoch,
+        base_version=args.base_version,
+        issued_at=now - 60,
+        expires_at=now + int(args.ttl_days * 86400),
+    )
+
+    if args.output:
+        Path(args.output).write_text(json.dumps(env, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"[dfs5 delegate] Wrote signed delegation envelope to {args.output}")
+
+    if args.registry:
+        client = RemoteRegistryClient(args.registry)
+        verified = client.register_delegation(env, now=now)
+        print(
+            f"[dfs5 delegate] Registered on {args.registry}: "
+            f"path={verified['path']} epoch={verified['epoch']} base_version={verified['base_version']}"
+        )
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    mount_root = Path(args.mount).expanduser().resolve()
+    clayfs_dir = mount_root / ".clayfs"
+    tree_dir = mount_root / "tree"
+    clayfs_dir.mkdir(parents=True, exist_ok=True)
+    tree_dir.mkdir(parents=True, exist_ok=True)
+
+    host, port_str = args.ost.split(":", 1)
+    cfg = {
+        "delegation_epoch": int(args.epoch),
+        "node_name": args.name,
+        "ost_host": host,
+        "ost_port": int(port_str),
+        "priv_key": str(Path(args.key).expanduser().resolve()),
+        "registry_url": args.registry,
+        "sub_path": normalize_path(args.path),
+        "tree_secret": args.secret,
+    }
+    cfg_path = clayfs_dir / CONFIG_FILENAME
+    cfg_path.write_text(json.dumps(cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"[dfs5 init] Initialized mount at {mount_root}")
+    print(f"  Working tree : {tree_dir}")
+    print(f"  Snapshots    : {clayfs_dir / 'snapshots'}")
+
+
+def cmd_push(args: argparse.Namespace) -> None:
+    node, cfg, _ = load_node_from_mount(Path(args.mount))
+    epoch = int(args.epoch) if args.epoch is not None else int(cfg.get("delegation_epoch", 1))
+    now = int(time.time())
+
+    mounts: Dict[str, str] = {}
+    for m in args.delegated_mount or []:
+        if "=" not in m:
+            raise SystemExit(f"Invalid --delegated-mount format {m!r} (expected DIR_NAME=/full/sub/path)")
+        k, v = m.split("=", 1)
+        mounts[k] = v
+
+    t0 = time.perf_counter()
+    try:
+        log_env, snap_dir, wire_bytes = node.push(delegation_epoch=epoch, now=now, delegated_mounts=mounts)
+    except ConflictError as e:
+        raise SystemExit(f"[REJECTED: Single-Writer Conflict] {e}\nHint: Run 'dfs5 pull' first.") from e
+    except DelegationError as e:
+        raise SystemExit(f"[REJECTED: L1 Delegation Error] {e}") from e
+    except SilentDropDetectedError as e:
+        raise SystemExit(f"[ALERT: Evil B7 Silent Drop Detected] {e}") from e
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    p = log_env["payload"]
+    print(
+        f"[dfs5 push] OK v{p['version']} (epoch={p['delegation_epoch']}) "
+        f"| root={p['root_plain_id'][:12]}... | sent={wire_bytes} B | {elapsed_ms:.1f} ms"
+    )
+    print(f"  Snapshot saved at: {snap_dir}")
+
+
+def cmd_pull(args: argparse.Namespace) -> None:
+    node, cfg, _ = load_node_from_mount(Path(args.mount))
+    t0 = time.perf_counter()
+    try:
+        snap_dir = node.pull()
+    except RollbackDetectedError as e:
+        raise SystemExit(f"[ALERT: Evil B6 Rollback Detected] {e}") from e
+    except ChunkIntegrityError as e:
+        raise SystemExit(f"[ALERT: Evil A2 Chunk Integrity Error] {e}") from e
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    pin = node.l4.pin
+    if cfg.get("delegation_epoch") != pin.delegation_epoch:
+        cfg["delegation_epoch"] = pin.delegation_epoch
+        (node.clayfs.clayfs_meta / CONFIG_FILENAME).write_text(
+            json.dumps(cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    print(
+        f"[dfs5 pull] OK v{pin.version} (epoch={pin.delegation_epoch}) "
+        f"| recv={node.ost.bytes_received} B | {elapsed_ms:.1f} ms"
+    )
+    print(f"  Working tree updated : {node.clayfs.work_tree}")
+    print(f"  Snapshot saved at    : {snap_dir}")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    node, cfg, reg = load_node_from_mount(Path(args.mount))
+    pin = node.l4.pin
+    print(f"Node Name   : {cfg['node_name']}")
+    print(f"Subtree Path: {cfg['sub_path']}")
+    print(f"Local Pin   : v{pin.version} (epoch={pin.delegation_epoch}, hash={pin.entry_hash[:12]}...)")
+    try:
+        del_env, _, head_env = reg.resolve(cfg["sub_path"])
+        if del_env:
+            dp = del_env["payload"]
+            print(f"Active L1   : epoch={dp['epoch']} base_version={dp['base_version']} writer={dp['writer'][:36]}...")
+        if head_env:
+            hp = head_env["payload"]
+            print(f"Remote Head : v{hp['version']} (epoch={hp['delegation_epoch']}, hash={head_env['entry_hash'][:12]}...)")
+        else:
+            print("Remote Head : (empty)")
+    except Exception as e:
+        print(f"Remote Head : [unreachable: {e}]")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dfs5", description="dfs5: Layered Single-Writer Distributed File System CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # serve
+    p_serve = sub.add_parser("serve", help="Run L2 Registry (HTTP) and L3 OST (TLS/TCP) daemon")
+    p_serve.add_argument("--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    p_serve.add_argument("--registry-port", type=int, default=9440, help="L2 HTTP port (default: 9440)")
+    p_serve.add_argument("--ost-port", type=int, default=9443, help="L3 OST TLS port (default: 9443)")
+    p_serve.add_argument("--root-anchor", default="/example.com", help="Root anchor path (default: /example.com)")
+    p_serve.add_argument("--root-pubkey", required=True, help="Path to root anchor .pub file")
+    p_serve.add_argument("--state-dir", default="~/.dfs5_server", help="Server persistence directory")
+    p_serve.set_defaults(func=cmd_serve)
+
+    # delegate
+    p_del = sub.add_parser("delegate", help="Sign and register an L1 delegation record")
+    p_del.add_argument("--parent", required=True, help="Parent path (e.g. /example.com)")
+    p_del.add_argument("--path", required=True, help="Delegated child path (e.g. /example.com/alice)")
+    p_del.add_argument("--signing-key", required=True, help="Parent private key path")
+    p_del.add_argument("--writer-pubkey", required=True, help="New writer public key (.pub) path")
+    p_del.add_argument("--epoch", type=int, default=1, help="Delegation epoch (>=1)")
+    p_del.add_argument("--base-version", type=int, default=0, help="L4 base_version to continue from")
+    p_del.add_argument("--ttl-days", type=int, default=365, help="Validity period in days")
+    p_del.add_argument("--registry", help="L2 Registry URL (e.g. http://raspi5.local:9440)")
+    p_del.add_argument("--output", help="Optional file path to save the signed JSON envelope")
+    p_del.set_defaults(func=cmd_delegate)
+
+    # init
+    p_init = sub.add_parser("init", help="Initialize a local dfs5 mount directory")
+    p_init.add_argument("--mount", required=True, help="Mount root directory")
+    p_init.add_argument("--name", default="node", help="Node identifier (e.g. mac, raspi5)")
+    p_init.add_argument("--path", required=True, help="Subtree path (e.g. /example.com/alice/notes)")
+    p_init.add_argument("--key", required=True, help="Writer OpenSSH Ed25519 private key path")
+    p_init.add_argument("--secret", required=True, help="Subtree shared secret for Convergent AEAD")
+    p_init.add_argument("--registry", required=True, help="L2 Registry URL (e.g. http://raspi5.local:9440)")
+    p_init.add_argument("--ost", required=True, help="L3 OST host:port (e.g. raspi5.local:9443)")
+    p_init.add_argument("--epoch", type=int, default=1, help="Initial delegation epoch")
+    p_init.set_defaults(func=cmd_init)
+
+    # push
+    p_push = sub.add_parser("push", help="Snapshot, encrypt, upload chunks, and commit next L4 version")
+    p_push.add_argument("--mount", default=".", help="Mount root directory")
+    p_push.add_argument("--epoch", type=int, help="Override delegation epoch")
+    p_push.add_argument(
+        "--delegated-mount",
+        action="append",
+        help="Mark child directory as delegated boundary (format: DIR_NAME=/full/sub/path)",
+    )
+    p_push.set_defaults(func=cmd_push)
+
+    # pull
+    p_pull = sub.add_parser("pull", help="Verify remote head (B6), download chunks (A2), and update work tree")
+    p_pull.add_argument("--mount", default=".", help="Mount root directory")
+    p_pull.set_defaults(func=cmd_pull)
+
+    # status
+    p_stat = sub.add_parser("status", help="Show local HeadPin and remote L2/L4 status")
+    p_stat.add_argument("--mount", default=".", help="Mount root directory")
+    p_stat.set_defaults(func=cmd_status)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
