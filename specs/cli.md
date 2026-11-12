@@ -92,6 +92,38 @@ DNSSEC は root 鍵と初期 registry 一覧の配布に限定し、L4 head や 
 判断には使わない。`--registry` / `--root-pubkey` を併記した場合は、DNSSEC の内容と
 一致しなければ拒否する。詳細は `specs/dnssec.md`。
 
+#### BitTorrent archive
+
+現在の先頭版を、署名済みメタデータ + 全 chunk + `.torrent` として保存できる。
+BitTorrent はホットパスではなく、長期保存・最終復旧用である。
+
+```bash
+dfs5cli archive create scw: --out ./scw-v1
+dfs5cli archive verify ./scw-v1
+dfs5cli archive extract ./scw-v1 ./restored
+```
+
+実際の seeding / downloading は外部の BitTorrent クライアントで行う。
+詳細は `specs/bittorrent.md`。
+
+#### libp2p/QUIC 読み取り
+
+OST の chunk ディレクトリを libp2p/QUIC で配布し、読み取り候補に追加できる。
+サーバは py-libp2p のプロセス制約のため専用プロセスで起動する。
+
+```bash
+dfs5cli libp2p-serve \
+  --chunks-dir ~/.dfs5_server/ost_chunks \
+  --listen /ip4/0.0.0.0/udp/0/quic-v1
+
+dfs5cli create scw \
+  --registry http://primary:9440 \
+  --libp2p-peer /ip4/203.0.113.10/udp/19443/quic-v1/p2p/12D3KooW...
+```
+
+読み取りは主 OST → 複製 OST → libp2p の順に試す。書き込みは主 OST のみ。
+詳細は `specs/libp2p.md`。
+
 **L2 が OST の場所とパスを知っている理由**: L2 のロケータ（`dfs5-l2-locator-v1`）は
 `endpoints` を持ち、そこに L3 の場所（`tls://172.16.1.60:19443`）が入る。これは版を
 書くたびに更新される。委譲レコードは書き手の公開鍵（`writer`）を持つので、「この鍵が

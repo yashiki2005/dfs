@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import cli as cli_mod
+from .archive import ArchiveError, create_archive, extract_bundle, verify_bundle
 from .dnssec import Discovery, DiscoveryError, discover_domain
 
 # L2 名簿の既定ポート。ホスト名だけで済むようにする（例: --registry 172.16.1.60）。
@@ -207,6 +208,8 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             "delegation_epoch": int(remote.epoch),
             "node_name": remote.node_name or remote.name,
             "ost_alternates": list(remote.ost_alternates),
+            "libp2p_peers": list(remote.libp2p_peers),
+            "libp2p_psk": remote.libp2p_psk,
             "ost_host": host,
             "ost_port": int(port_str),
             "priv_key": str(priv_key),
@@ -231,6 +234,13 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
         changed = True
     if list(cfg.get("ost_alternates") or []) != list(remote.ost_alternates):
         cfg["ost_alternates"] = list(remote.ost_alternates)
+        changed = True
+    if (
+        list(cfg.get("libp2p_peers") or []) != list(remote.libp2p_peers)
+        or str(cfg.get("libp2p_psk", "") or "") != remote.libp2p_psk
+    ):
+        cfg["libp2p_peers"] = list(remote.libp2p_peers)
+        cfg["libp2p_psk"] = remote.libp2p_psk
         changed = True
     if changed:
         write_private_json(cfg_path, cfg)
@@ -706,6 +716,11 @@ def cmd_config(args: argparse.Namespace) -> int:
             for value in (getattr(args, "ost_alternate", None) or [])
             if value.strip()
         ]
+        libp2p_peers = [
+            value.strip()
+            for value in (getattr(args, "libp2p_peer", None) or [])
+            if value.strip()
+        ]
 
         # --key が無ければ、その場で Ed25519 の鍵を作る。
         # 書き手の鍵は dfs5cli が初めて使うものなので、利用者に用意させない。
@@ -787,6 +802,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             key=str(key_path),
             ost=args.ost or "",
             ost_alternates=ost_alternates,
+            libp2p_peers=libp2p_peers,
+            libp2p_psk=getattr(args, "libp2p_psk", None) or "",
             path=_normalize_path_arg(args.path),
             secret=secret or "",
             workdir=args.workdir or "",
@@ -811,6 +828,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             print("  L3 OST      : （未指定。使うときに L2 のロケータから解決します）")
         if remote.ost_alternates:
             print(f"  複製 OST    : {', '.join(remote.ost_alternates)}")
+        if remote.libp2p_peers:
+            print(f"  libp2p peer : {', '.join(remote.libp2p_peers)}")
         if remote.path:
             print(f"  サブツリー  : {remote.path}")
         else:
@@ -836,9 +855,10 @@ def cmd_config(args: argparse.Namespace) -> int:
     if args.action == "show":
         r = store.get(args.name)
         for key in ("name", "registry", "registry_alternates", "ost", "ost_alternates",
-                    "path", "key", "workdir", "epoch", "node_name", "root_fingerprint"):
+                    "libp2p_peers", "libp2p_psk", "path", "key", "workdir", "epoch",
+                    "node_name", "root_fingerprint"):
             value = getattr(r, key)
-            if key == "secret":
+            if key in ("secret", "libp2p_psk"):
                 value = "***"
             if key == "workdir":
                 value = str(r.resolved_workdir())
@@ -878,6 +898,63 @@ def cmd_discover(args: argparse.Namespace) -> int:
     for row in discovery.registries:
         print(f"{row.role:10}: {row.url}")
     return 0
+
+
+def cmd_archive(args: argparse.Namespace) -> int:
+    """版単位の archive bundle / torrent を作成・検証・復元する。"""
+    if args.action == "create":
+        store = RemoteStore()
+        name, _sub = split_remote_spec(args.source, args.remote_name)
+        remote = store.get(name)
+        node = open_remote(remote, create=False)
+        out = (
+            Path(args.out).expanduser()
+            if args.out
+            else Path.cwd() / f"dfs5-archive-{remote.name}-{int(time.time())}"
+        )
+        try:
+            result = create_archive(node, out, announce=args.announce)
+        except ArchiveError as e:
+            raise UsageError(f"archive create に失敗しました: {e}") from e
+        print(f"archive     : {result.bundle}")
+        print(f"torrent     : {result.torrent}")
+        print(f"infohash    : {result.infohash}")
+        print(f"version     : v{result.version}")
+        print(f"chunks      : {result.chunk_count}")
+        print(
+            f"magnet      : magnet:?xt=urn:btih:{result.infohash}"
+            f"&dn={result.bundle.name}"
+        )
+        return 0
+
+    bundle = Path(args.source).expanduser()
+    if args.action == "verify":
+        try:
+            meta = verify_bundle(bundle)
+        except ArchiveError as e:
+            raise UsageError(f"archive verify に失敗しました: {e}") from e
+        print(f"archive     : {bundle}")
+        print(f"version     : v{meta['version']}")
+        print(f"chunks      : {len(meta['chunks'])}")
+        print("signatures  : OK")
+        return 0
+
+    if args.action == "extract":
+        if not args.dest:
+            raise UsageError("archive extract には出力先が必要です")
+        secret = args.secret
+        if not secret and not args.no_prompt:
+            secret = prompt_secret("tree_secret: ", "tree_secret（確認）: ")
+        if not secret:
+            raise UsageError("archive extract には --secret が必要です")
+        try:
+            out = extract_bundle(bundle, Path(args.dest).expanduser(), secret)
+        except ArchiveError as e:
+            raise UsageError(f"archive extract に失敗しました: {e}") from e
+        print(f"extracted   : {out}")
+        return 0
+
+    raise UsageError(f"unknown archive action: {args.action}")
 
 
 def cmd_ls(args: argparse.Namespace) -> int:
@@ -1432,6 +1509,31 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_libp2p_serve(args: argparse.Namespace) -> int:
+    """ローカルの OST chunk ディレクトリを libp2p/QUIC で配布する。"""
+    try:
+        from .libp2p_chunk import Libp2pChunkServer, load_chunks_dir
+    except ImportError as e:  # pragma: no cover - 依存環境
+        raise UsageError("libp2p-serve には libp2p パッケージが必要です") from e
+    try:
+        store = load_chunks_dir(args.chunks_dir)
+        server = Libp2pChunkServer(
+            store,
+            listen=args.listen or ["/ip4/0.0.0.0/udp/0/quic-v1"],
+            psk=args.psk,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise UsageError(f"libp2p-serve を開始できません: {e}") from e
+
+    def ready(addrs: List[str]) -> None:
+        print("[dfs5cli] libp2p/QUIC ready")
+        for addr in addrs:
+            print(f"  peer: {addr}")
+
+    server.serve_forever(ready)
+    return 0
+
+
 def cmd_delegate(args: argparse.Namespace) -> int:
     cli_mod.cmd_delegate(args)
     return 0
@@ -1460,6 +1562,11 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
         "--ost-alternate", action="append", default=[],
         help="読み取り用の複製 OST の host:port（複数指定可）",
     )
+    p.add_argument(
+        "--libp2p-peer", action="append", default=[],
+        help="読み取り用 libp2p QUIC multiaddr（複数指定可）",
+    )
+    p.add_argument("--libp2p-psk", help="libp2p private swarm の pre-shared key")
     p.add_argument("--path", help="サブツリーのパス（例: /example.com/alice/notes）")
     p.add_argument("--key", help="書き手の OpenSSH Ed25519 秘密鍵（省略すると作る）")
     p.add_argument(
@@ -1530,6 +1637,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_disc.add_argument("--dnssec-no-ad", action="store_true", help="AD ビットを要求しない")
     p_disc.add_argument("--json", action="store_true", help="レコード JSON をそのまま出す")
     p_disc.set_defaults(func=cmd_discover)
+
+    p_arch = sub.add_parser("archive", help="版の archive bundle / BitTorrent を作る")
+    p_arch.add_argument("action", choices=["create", "verify", "extract"])
+    p_arch.add_argument("source", help="create は remote:path、verify/extract は bundle ディレクトリ")
+    p_arch.add_argument("dest", nargs="?", help="extract の出力先")
+    p_arch.add_argument("--out", help="create の bundle 出力先（既定 .cwd/dfs5-archive-...）")
+    p_arch.add_argument("--announce", help="torrent の announce URL（省略可）")
+    p_arch.add_argument("--secret", help="extract の tree_secret")
+    p_arch.add_argument("--no-prompt", action="store_true", help="secret を端末から読まない")
+    p_arch.set_defaults(func=cmd_archive)
 
     p = sub.add_parser("ls", help="リモートの直下を一覧する（内容は取らない）")
     p.add_argument("remote")
@@ -1644,6 +1761,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="主名簿から複製する代替名簿 URL（複数指定可）",
     )
     p_serve.set_defaults(func=cmd_serve)
+
+    p_libp2p = sub.add_parser(
+        "libp2p-serve", help="OST の chunk ディレクトリを libp2p/QUIC で配布する"
+    )
+    p_libp2p.add_argument(
+        "--chunks-dir", required=True,
+        help="過去に save_ost_chunks が作った .blk ディレクトリ",
+    )
+    p_libp2p.add_argument(
+        "--listen", action="append", default=[],
+        help="QUIC multiaddr（既定 /ip4/0.0.0.0/udp/0/quic-v1）",
+    )
+    p_libp2p.add_argument("--psk", help="private swarm 用 pre-shared key")
+    p_libp2p.set_defaults(func=cmd_libp2p_serve)
 
     p_del = sub.add_parser("delegate", help="L1 委譲を作って L2 名簿へ登録する")
     p_del.add_argument("--parent", required=True)

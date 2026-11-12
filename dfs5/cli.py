@@ -483,6 +483,8 @@ def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], Rem
         ost_port=int(cfg["ost_port"]),
         root_pubkey=cfg.get("root_pubkey"),
         ost_alternates=cfg.get("ost_alternates") or [],
+        libp2p_peers=cfg.get("libp2p_peers") or [],
+        libp2p_psk=cfg.get("libp2p_psk") or "",
     )
     return node, cfg, reg_client
 

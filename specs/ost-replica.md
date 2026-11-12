@@ -12,6 +12,12 @@ dfs5 はサブツリーごとに単一書き手を持つ。書き込みは書き
 複製 OST は書き込み先ではない。書き手が複数いる構成や、複製 OST への直接
 `announce` は対象外とする。
 
+さらに長期保存・最終復旧用として、版単位の BitTorrent archive を別層で扱う。
+詳細は `specs/bittorrent.md`。
+
+読み取り専用の追加経路として、libp2p/QUIC の chunk source も利用できる。
+詳細は `specs/libp2p.md`。
+
 ## 書き込み
 
 1. 書き手はスナップショットを作り、チャンクを主 OST へ送る

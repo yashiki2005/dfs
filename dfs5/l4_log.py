@@ -553,6 +553,7 @@ class L4LogClient:
         self.pin = HeadPin.load(pin_file) if pin_file else HeadPin()
         # 直近に検証したロケータ。読み取り時の OST endpoint フォールバックに使う。
         self.last_locator: Optional[Dict[str, Any]] = None
+        self.last_delegation: Optional[Dict[str, Any]] = None
         # root アンカーの公開鍵。ここが信頼の根（名簿からは取らない）。
         # 未設定なら、名簿が返した chain の先頭の parent を root として扱う検証はしない。
         self.root_pubkey: Optional[str] = (root_pubkey or "").strip() or None
@@ -603,6 +604,7 @@ class L4LogClient:
         L2/L4 から先頭版を取得し、署名検証および B6（巻き戻し・フォーク）チェックを行ってローカルピンを更新する。
         """
         del_env, loc_env, head_env = registry.resolve(self.sub_path)
+        self.last_delegation = del_env
         self.last_locator = loc_env
         if head_env is None:
             if self.pin.version > 0:

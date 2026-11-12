@@ -44,6 +44,8 @@ class Remote:
     registry_alternates: List[str] = field(default_factory=list)  # 読み取り用の代替名簿
     ost: str = ""                       # L3 OST の host:port。空ならロケータから解決する
     ost_alternates: List[str] = field(default_factory=list)  # 読み取り用の複製 OST
+    libp2p_peers: List[str] = field(default_factory=list)  # 読み取り用 libp2p QUIC peer
+    libp2p_psk: str = ""                 # private swarm 用 pre-shared key
     path: str = ""                      # サブツリーのパス。空ならロケータの path を使う
     secret: str = ""                    # tree_secret。空なら --secret を後で渡す
     workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs5/<name>）
@@ -86,6 +88,9 @@ class Remote:
         raw_ost_alternates = data.get("ost_alternates") or []
         if isinstance(raw_ost_alternates, str):
             raw_ost_alternates = [raw_ost_alternates]
+        raw_libp2p_peers = data.get("libp2p_peers") or []
+        if isinstance(raw_libp2p_peers, str):
+            raw_libp2p_peers = [raw_libp2p_peers]
         return cls(
             name=str(data["name"]),
             registry=str(data["registry"]),
@@ -97,6 +102,8 @@ class Remote:
                 for u in raw_ost_alternates
                 if str(u).strip()
             ],
+            libp2p_peers=[str(p) for p in raw_libp2p_peers if str(p).strip()],
+            libp2p_psk=str(data.get("libp2p_psk", "") or ""),
             path=normalize_path(raw_path) if raw_path else "",
             secret=str(data.get("secret", "") or ""),
             workdir=str(data.get("workdir", "")),

@@ -87,6 +87,8 @@ class DFS5Node:
         ost_port: int,
         root_pubkey: Optional[str] = None,
         ost_alternates: Optional[List[str]] = None,
+        libp2p_peers: Optional[List[str]] = None,
+        libp2p_psk: Optional[str] = None,
     ):
         self.name = name
         self.sub_path = sub_path
@@ -111,7 +113,21 @@ class DFS5Node:
         self.builder = MerkleTreeBuilder(
             self.crypto, self.ost, replicas=self.replica_osts
         )
-        self.read_ost = FailoverOSTClient(ost_clients)
+        self.libp2p_client = None
+        if libp2p_peers:
+            try:
+                from .libp2p_chunk import Libp2pChunkClient
+            except ImportError as e:  # pragma: no cover - 依存環境
+                raise RuntimeError(
+                    "libp2p_peers requires the libp2p package"
+                ) from e
+            self.libp2p_client = Libp2pChunkClient(
+                libp2p_peers, psk=libp2p_psk or None
+            )
+        read_clients: List[Any] = list(ost_clients)
+        if self.libp2p_client is not None:
+            read_clients.append(self.libp2p_client)
+        self.read_ost = FailoverOSTClient(read_clients)
         self.read_builder = MerkleTreeBuilder(self.crypto, self.read_ost)
         self.registry = registry
         pin_file = self.clayfs.clayfs_meta / "local_head.json"
@@ -123,6 +139,10 @@ class DFS5Node:
     def switch_credentials(self, new_priv_key: Path | str, new_pub_key_str: str) -> None:
         self.l4.priv_key_path = Path(new_priv_key)
         self.l4.pub_key_str = new_pub_key_str.strip()
+
+    def close(self) -> None:
+        if self.libp2p_client is not None:
+            self.libp2p_client.close()
 
     @staticmethod
     def _parse_ost_endpoint(value: str) -> Tuple[str, int]:
@@ -148,7 +168,7 @@ class DFS5Node:
                 endpoint = f"tls://{host}:{port}"
                 if endpoint not in endpoints:
                     endpoints.append(endpoint)
-        clients: List[OSTClient] = []
+        clients: List[Any] = []
         seen = set()
         for value in endpoints:
             try:
@@ -160,6 +180,8 @@ class DFS5Node:
                 continue
             seen.add(key)
             clients.append(OSTClient(host=host, port=port))
+        if self.libp2p_client is not None:
+            clients.append(self.libp2p_client)
         self.read_ost = FailoverOSTClient(clients)
         self.read_builder = MerkleTreeBuilder(self.crypto, self.read_ost)
 

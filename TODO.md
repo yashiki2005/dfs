@@ -132,6 +132,26 @@ DNSSEC は **root 鍵と初期 registry 一覧の配布**に限定し、L4 head 
 詳細は `specs/dnssec.md`。現段階は検証済みリゾルバの AD ビットを信頼する MVP で、
 クライアント側の DNSKEY/DS 完全検証は今後の課題。
 
+### 2.5.1 BitTorrent archive（MVP 実装済み）
+
+現在の先頭版を、署名済みメタデータ + 全 chunk + `.torrent` として保存する
+`archive create` を実装した。BitTorrent はホットパスではなく、過去版の長期保存・
+最終復旧用とする。`archive verify` と `archive extract` も利用できる。
+
+詳細は `specs/bittorrent.md`。v1 torrent の SHA-1 は transport 用で、chunk の
+真正性は DFS5 の SHA-256 で検証する。BitTorrent v2、L4 への archive descriptor
+統合、erasure coding は未実装。
+
+### 2.5.2 libp2p/QUIC chunk source（実験実装）
+
+libp2p を OST の追加 ChunkSource として実装した。最初の TCP 試作は別プロセス間で
+カスタムストリームが動かなかったが、`enable_quic=True` と
+`/ip4/.../udp/.../quic-v1` では動作することを確認した。
+
+`dfs5cli libp2p-serve` で chunk ディレクトリを QUIC 配布し、クライアントは
+`--libp2p-peer` で読み取り候補に追加する。書き込みは従来の主 OST のまま。
+詳細は `specs/libp2p.md`。
+
 ### 2.6 検証が足りていないもの
 
 | 項目 | 状況 | やり方 |

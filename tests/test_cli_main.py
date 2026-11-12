@@ -182,6 +182,7 @@ class RcloneCase(unittest.TestCase):
             "--registry", self.server.registry_url,
             "--registry-alternate", "127.0.0.1:19440",
             "--ost-alternate", "tls://127.0.0.1:19443",
+            "--libp2p-peer", "/ip4/127.0.0.1/udp/19443/quic-v1/p2p/12D3KooWTest",
             "--key", str(self.alice_key),
             "--secret", "s3cret",
             "--workdir", str(self.base / "wd-alt"),
@@ -190,6 +191,10 @@ class RcloneCase(unittest.TestCase):
         saved = RemoteStore(self.config_file).get("alt")
         self.assertEqual(saved.registry_alternates, ["http://127.0.0.1:19440"])
         self.assertEqual(saved.ost_alternates, ["127.0.0.1:19443"])
+        self.assertEqual(
+            saved.libp2p_peers,
+            ["/ip4/127.0.0.1/udp/19443/quic-v1/p2p/12D3KooWTest"],
+        )
 
     def test_config_create_makes_key_when_omitted(self) -> None:
         """--key を省くと、その場で Ed25519 の鍵を作る。"""
