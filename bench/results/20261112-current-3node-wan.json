@@ -1,0 +1,23 @@
+{
+  "schema": "dfs5-3node-perf-v1",
+  "measured_at_utc": "2026-11-12T10:23:47+00:00",
+  "nodes": [
+    "Mac 172.16.1.30",
+    "Sakura 172.16.1.254",
+    "Scaleway 172.16.1.60"
+  ],
+  "payload": {
+    "files": 20,
+    "file_size_bytes": 131072,
+    "payload_bytes": 2621440
+  },
+  "copy_primary_ms": 9976.266,
+  "pull_primary_ms": 2124.02,
+  "pull_secondary_after_primary_stop_ms": 816.272,
+  "pull_third_after_sakura_stop_ms": 4144.551,
+  "content": {
+    "primary": true,
+    "secondary": true,
+    "third": true
+  }
+}

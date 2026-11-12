@@ -1,0 +1,43 @@
+{
+  "schema": "dfs5-cli-perf-v1",
+  "measured_at_utc": "2026-11-12T09:55:28+00:00",
+  "environment": {
+    "platform": "darwin",
+    "python": "3.12.16"
+  },
+  "payload": {
+    "files": 20,
+    "file_size_bytes": 131072,
+    "payload_bytes": 2621440
+  },
+  "copy_initial_ms": 59.16,
+  "copy_no_change_ms": 48.107,
+  "online_read": {
+    "n": 5,
+    "median_ms": 20.047,
+    "p95_ms": 21.6,
+    "min_ms": 19.573,
+    "max_ms": 21.6
+  },
+  "cache_read_after_registry_stop": {
+    "n": 5,
+    "median_ms": 19.815,
+    "p95_ms": 40.556,
+    "min_ms": 19.092,
+    "max_ms": 40.556
+  },
+  "cache_list_after_registry_stop": {
+    "n": 5,
+    "median_ms": 18.516,
+    "p95_ms": 19.34,
+    "min_ms": 17.992,
+    "max_ms": 19.34
+  },
+  "pull_after_registry_stop_ms": 37.792,
+  "checks": {
+    "copy_rc": 0,
+    "nochange_rc": 0,
+    "read_ok": true,
+    "pull_ok": true
+  }
+}

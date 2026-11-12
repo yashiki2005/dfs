@@ -24,6 +24,8 @@ AD を付けられないローカルリゾルバ向けに ``require_ad=False`` �
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlparse
@@ -41,6 +43,15 @@ ROOT_TRUST_ANCHOR_DS = (
     "38696 8 2 "
     "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16",
 )
+
+_ZONE_KEY_CACHE: Dict[str, Any] = {}
+_ZONE_KEY_CACHE_LOCK = threading.RLock()
+
+
+def clear_zone_cache() -> None:
+    """検証済みゾーン鍵のプロセス内キャッシュを消す（試験・鍵ロールオーバー用）。"""
+    with _ZONE_KEY_CACHE_LOCK:
+        _ZONE_KEY_CACHE.clear()
 
 
 class DiscoveryError(ValueError):
@@ -158,6 +169,15 @@ def _validated_zone_keys(
     zone = dns.name.from_text(str(zone))
     if zone in cache:
         return cache[zone]
+    zone_key = zone.to_text()
+    now = int(time.time())
+    with _ZONE_KEY_CACHE_LOCK:
+        cached = _ZONE_KEY_CACHE.get(zone_key)
+        if cached is not None and cached[0] > now:
+            cache[zone] = cached[1]
+            return cached[1]
+        if cached is not None:
+            _ZONE_KEY_CACHE.pop(zone_key, None)
 
     dnskey_rrset, dnskey_rrsig = _query_rrset(resolver, zone, "DNSKEY")
     if zone == dns.name.root:
@@ -181,6 +201,16 @@ def _validated_zone_keys(
     except Exception as e:  # noqa: BLE001
         raise DiscoveryError(f"DNSKEY validation failed for {zone}: {e}") from e
 
+    expires_at = now + int(dnskey_rrset.ttl or 0)
+    if ds_rrset is not None:
+        expires_at = min(expires_at, now + int(ds_rrset.ttl or 0))
+    for sigset in (dnskey_rrsig, ds_rrsig if zone != dns.name.root else None):
+        if sigset is None:
+            continue
+        for sig in sigset:
+            expires_at = min(expires_at, int(sig.expiration))
+    with _ZONE_KEY_CACHE_LOCK:
+        _ZONE_KEY_CACHE[zone_key] = (max(now + 1, expires_at), dnskey_rrset)
     cache[zone] = dnskey_rrset
     return dnskey_rrset
 

@@ -1,0 +1,75 @@
+{
+  "schema": "dfs5-l3-bench-v1",
+  "measured_at_utc": "2026-11-12T09:54:45+00:00",
+  "environment": {
+    "platform": "macOS-27.3-arm64-arm-64bit",
+    "python": "3.12.16"
+  },
+  "transfer": {
+    "method": "dfs5-l3-batch",
+    "cases": [
+      {
+        "files": 10,
+        "file_size_bytes": 4096,
+        "payload_bytes": 40960,
+        "elapsed_ms": 15.0,
+        "bytes_sent": 44530,
+        "blob_bytes_sent": 43713,
+        "round_trips": 1,
+        "puts": 11,
+        "overhead_ratio": 1.087
+      },
+      {
+        "files": 100,
+        "file_size_bytes": 4096,
+        "payload_bytes": 409600,
+        "elapsed_ms": 9.14,
+        "bytes_sent": 443230,
+        "blob_bytes_sent": 436293,
+        "round_trips": 1,
+        "puts": 101,
+        "overhead_ratio": 1.082
+      },
+      {
+        "files": 100,
+        "file_size_bytes": 65536,
+        "payload_bytes": 6553600,
+        "elapsed_ms": 29.56,
+        "bytes_sent": 6587330,
+        "blob_bytes_sent": 6580393,
+        "round_trips": 1,
+        "puts": 101,
+        "overhead_ratio": 1.005
+      }
+    ]
+  },
+  "dedup": {
+    "method": "dfs5-content-dedup",
+    "same_batch_2_files_blob_bytes": 8757,
+    "one_file_plus_dir_expected": 8252,
+    "index_entries": 2,
+    "new_alias_blob_bytes": 697,
+    "note": "同一バッチ内の同一内容は 1 回だけ送る。無変更の追加は索引で 0 往復省略。"
+  },
+  "mini_lustre_compat": {
+    "available": true,
+    "frame_8byte_header": "mini_lustre: >II (json_len, payload_len) + JSON + payload",
+    "frame_1byte_opcode": "dfs5: 1-byte opcode + 64-byte wire_id + >I length + body",
+    "chunk_identity": {
+      "mini_lustre": "(file_id, chunk_index) — 内容では決まらない",
+      "dfs5": "wire_id = SHA256(ciphertext) — 内容アドレス"
+    },
+    "batch_ops": {
+      "mini_lustre": "個別の read_chunk / write_chunk のみ",
+      "dfs5": "batch_has / batch_put_if_absent / batch_get"
+    },
+    "compatible_without_change": false,
+    "note": "同じポートで TLS/TCP を使う点だけが共通で、アプリケーション層は別物。DFS5 の 1-byte opcode は mini_lustre では JSON 長として読まれ、エラーになる。また mini_lustre は file_id/chunk_index で識別するため、wire_id による内容アドレス重複排除は行えない。"
+  },
+  "verdict": {
+    "use_libtorrent": false,
+    "reason": "塊が 100 個程度の規模では、TLS/TCP の一括 PUT で 2 往復に収まる。libtorrent の固定費（ハンドシェイク・メタデータ検証）を上回る利点がない。",
+    "use_mini_lustre_unchanged": false,
+    "alternative": "プロトコルは独自実装のまま（dfs5/l3_ost_adapter.py）を使い、将来 mini_lustre へ載せる場合は RPC アダプタ層を挟む。"
+  }
+}

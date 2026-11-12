@@ -1,0 +1,80 @@
+{
+  "schema": "dfs5-l2-bench-v1",
+  "measured_at_utc": "2026-11-12T09:55:05+00:00",
+  "environment": {
+    "platform": "macOS-27.3-arm64-arm-64bit",
+    "python": "3.12.16",
+    "hostname": "MacBook-Neo.local"
+  },
+  "directory": {
+    "method": "directory",
+    "round_trips": 1,
+    "resolve": {
+      "n": 5000,
+      "median_ms": 0.0006,
+      "p95_ms": 0.0007,
+      "min_ms": 0.0005,
+      "max_ms": 0.0388
+    },
+    "verify": {
+      "n": 500,
+      "median_ms": 5.9933,
+      "p95_ms": 7.7363,
+      "min_ms": 5.2318,
+      "max_ms": 9.7077
+    },
+    "notes": "resolve() がロケータと先頭版を同時に返す（1 往復）。verify はローカル CPU コスト。"
+  },
+  "dht": {
+    "method": "dht",
+    "round_trips": "ceil(log2(N)/alpha)",
+    "model": [
+      {
+        "nodes": 100,
+        "expected_hops": 6.64,
+        "serial_rounds_alpha3": 3
+      },
+      {
+        "nodes": 1000,
+        "expected_hops": 9.97,
+        "serial_rounds_alpha3": 4
+      },
+      {
+        "nodes": 10000,
+        "expected_hops": 13.29,
+        "serial_rounds_alpha3": 5
+      },
+      {
+        "nodes": 1000000,
+        "expected_hops": 19.93,
+        "serial_rounds_alpha3": 7
+      }
+    ],
+    "notes": "実装を持たない。往復回数は Kademlia の経路長モデルによる見積もり。"
+  },
+  "dns": {
+    "method": "dns",
+    "round_trips": 2,
+    "query": {
+      "n": 50,
+      "median_ms": 12.56,
+      "p95_ms": 18.74,
+      "min_ms": 9.95,
+      "max_ms": 20.28
+    },
+    "notes": "TXT の取得に 1 往復、L4 先頭版の取得に別途 1 往復が必要（合計 2）。"
+  },
+  "high_latency_estimate_ms": {
+    "directory": 200.0,
+    "dht_1000": 800.0,
+    "dht_10000": 1000.0,
+    "dns": 400.0
+  },
+  "verdict": {
+    "threshold_round_trips": 2,
+    "directory": "pass",
+    "dht_1000": "fail",
+    "dns": "pass",
+    "note": "DNS の 2 往復は閾値ちょうど。高遅延では余裕がない。"
+  }
+}

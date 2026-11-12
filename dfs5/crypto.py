@@ -7,6 +7,7 @@ L1 / L2 / L3 / L4 共通の正規化・署名検証・内容アドレス決定�
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -117,6 +118,100 @@ def _ssh_string(data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + data
 
 
+def _read_ssh_string(data: bytes, offset: int) -> Tuple[bytes, int]:
+    if offset < 0 or offset + 4 > len(data):
+        raise ValueError("truncated SSH string")
+    length = struct.unpack(">I", data[offset:offset + 4])[0]
+    start = offset + 4
+    end = start + length
+    if end > len(data):
+        raise ValueError("truncated SSH string")
+    return data[start:end], end
+
+
+def _read_ed25519_public_key(pubkey_str: str) -> bytes:
+    parts = (pubkey_str or "").split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise ValueError("not an Ed25519 SSH public key")
+    blob = base64.b64decode(parts[1], validate=True)
+    key_type, offset = _read_ssh_string(blob, 0)
+    key_bytes, offset = _read_ssh_string(blob, offset)
+    if key_type != b"ssh-ed25519" or len(key_bytes) != 32 or offset != len(blob):
+        raise ValueError("invalid Ed25519 SSH public key")
+    return key_bytes
+
+
+def _read_sshsig_signature(signature: str, namespace: str) -> Tuple[bytes, bytes]:
+    """SSHSIG armored 署名から公開鍵と Ed25519 署名を取り出す。"""
+    lines = [
+        line.strip()
+        for line in (signature or "").splitlines()
+        if line.strip() and not line.strip().startswith("-----")
+    ]
+    if not lines:
+        raise ValueError("empty SSHSIG signature")
+    raw = base64.b64decode("".join(lines), validate=True)
+    if len(raw) < 10 or raw[:6] != b"SSHSIG":
+        raise ValueError("invalid SSHSIG magic")
+    version = struct.unpack(">I", raw[6:10])[0]
+    if version != 1:
+        raise ValueError("unsupported SSHSIG version")
+    offset = 10
+    pubkey_blob, offset = _read_ssh_string(raw, offset)
+    signed_namespace, offset = _read_ssh_string(raw, offset)
+    reserved, offset = _read_ssh_string(raw, offset)
+    hash_alg, offset = _read_ssh_string(raw, offset)
+    signature_blob, offset = _read_ssh_string(raw, offset)
+    if offset != len(raw):
+        raise ValueError("trailing bytes in SSHSIG signature")
+    if signed_namespace.decode("utf-8") != namespace:
+        raise ValueError("SSHSIG namespace mismatch")
+    if reserved != b"" or hash_alg != b"sha512":
+        raise ValueError("unsupported SSHSIG options")
+
+    key_type, key_offset = _read_ssh_string(pubkey_blob, 0)
+    key_bytes, key_offset = _read_ssh_string(pubkey_blob, key_offset)
+    if key_type != b"ssh-ed25519" or len(key_bytes) != 32 or key_offset != len(pubkey_blob):
+        raise ValueError("invalid SSHSIG public key")
+    sig_type, sig_offset = _read_ssh_string(signature_blob, 0)
+    sig_bytes, sig_offset = _read_ssh_string(signature_blob, sig_offset)
+    if sig_type != b"ssh-ed25519" or len(sig_bytes) != 64 or sig_offset != len(signature_blob):
+        raise ValueError("invalid SSHSIG Ed25519 signature")
+    return key_bytes, sig_bytes
+
+
+def _ssh_verify_ed25519(
+    pubkey_str: str,
+    namespace: str,
+    payload: bytes,
+    signature: str,
+) -> bool | None:
+    """Ed25519 の SSHSIG を in-process 検証する。
+
+    未対応形式・解析不能なら ``None`` を返し、呼び出し側が ``ssh-keygen`` に
+    フォールバックする。署名が構文的に正しい Ed25519 SSHSIG で検証失敗した場合は
+    ``False`` を返す。
+    """
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        expected_key = _read_ed25519_public_key(pubkey_str)
+        signed_key, sig_bytes = _read_sshsig_signature(signature, namespace)
+        if not hmac.compare_digest(expected_key, signed_key):
+            return False
+        public_key = Ed25519PublicKey.from_public_bytes(expected_key)
+        try:
+            public_key.verify(sig_bytes, _sshsig_signed_data(payload, namespace))
+        except InvalidSignature:
+            return False
+        return True
+    except ImportError:
+        return None
+    except (ValueError, TypeError, binascii.Error):
+        return None
+
+
 def sshenc_encode(payload: bytes, namespace: str, signature: bytes, pubkey_blob: bytes) -> str:
     """OpenSSH SSHSIG の armored 形式を組み立てる（ssh-keygen -Y verify と互換）。"""
     sig_blob = _ssh_string(b"ssh-ed25519") + _ssh_string(signature)
@@ -194,10 +289,18 @@ def ssh_verify(
     payload: bytes,
     signature: str,
 ) -> bool:
-    """`ssh-keygen -Y verify` を用いて分離署名を検証する。"""
+    """Ed25519 SSHSIG を in-process で検証する。
+
+    ``cryptography`` が無い場合や未対応の鍵形式だけ ``ssh-keygen -Y verify`` に
+    フォールバックする。
+    """
     clean_pub = pubkey_str.strip()
     if not clean_pub or "\n" in clean_pub:
         return False
+
+    in_process = _ssh_verify_ed25519(clean_pub, namespace, payload, signature)
+    if in_process is not None:
+        return in_process
 
     with tempfile.TemporaryDirectory(prefix="dfs5_verify_") as tmpdir:
         tmp_path = Path(tmpdir)

@@ -4,9 +4,9 @@
 まずここを読んで「どこまで動いていて、次に何をするか」を掴んでほしい。
 
 - リポジトリ: `~/src/dfs5`（`/Volumes/ExtSSD/src/dfs5` へのシンボリックリンク）
-- 基準コミット: `05040aa feat: add L4 history and versioned archive catalogs`
-- テスト: **143 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`。実行に約 177 秒）
-- 作業ツリー: 未コミット差分あり（dfs5svc の DNSSEC TXT 出力、pip 配布）
+- 基準コミット: `a6fc970 feat: add dfs5svc DNSSEC output and pip packaging`
+- テスト: **145 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`）
+- 作業ツリー: 未コミット差分あり（性能最適化と計測結果）
 
 ---
 
@@ -51,6 +51,14 @@
 
 WAN（RTT 285ms、20 × 128KB）で push 4.3 秒 / pull 4.0 秒。batch 系の導入前は
 pull が 8.0 秒（21 往復）だった。
+
+2026-11-12 のローカル再測では、2.62MB の初回 copy が 52.5ms、無変更 copy が 16.9ms、
+128KiB read が 7.3ms。Ed25519 検証の in-process 化と DNSSEC ゾーン鍵キャッシュで
+短縮した。詳細は `specs/performance.md`。
+
+3 拠点（Mac / Sakura / Scaleway）の 2.62MB 試験では、2 複製込み push が 9.98 秒、
+primary 停止後の secondary pull が 0.82 秒、Sakura 停止後の Scaleway pull が
+4.15 秒で、全経路の内容が一致した。
 
 ---
 
@@ -164,7 +172,7 @@ libp2p を OST の追加 ChunkSource として実装した。最初の TCP 試�
 
 | 項目 | 状況 | やり方 |
 |---|---|---|
-| 3 台以上の同時参加 | 3 registry の自動試験は実装済み。実機 3 拠点は未実施 | 1 台で複数起動（§4）。足りなければ Docker |
+| 3 台以上の同時参加 | 自動試験と実機 3 拠点（Mac / Sakura / Scaleway）を実施済み | 1 台で複数起動（§4）。足りなければ Docker |
 | 長時間運用・連続 push/pull の劣化 | 未実施 | — |
 | WAN での 100 塊以上の実測 | 未実施 | 20 ファイルのみ。ローカルで 500 は確認 |
 | 実効スループット | 未計測 | 所要時間とバイト数からの概算のみ |
@@ -293,7 +301,7 @@ cd ~/src/dfs5
 # 1. 状態の確認
 git log --oneline -3
 git status --short          # 空ならクリーン
-~/dfs-venv/bin/python -m pytest tests -q   # 143 件パス、1 skip（約 177 秒）
+~/dfs-venv/bin/python -m pytest tests -q   # 145 件パス、1 skip（約 165 秒）
 
 # 2. サーバを立てる（新コードで）
 ./dfs5svc list               # 既存のサービスを確認
