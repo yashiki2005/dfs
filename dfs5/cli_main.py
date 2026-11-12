@@ -14,6 +14,7 @@ rclone ライクな dfs5 の CLI。
     dfs5cli ls    scaleway:docs
     dfs5cli cat   scaleway:docs/readme.md
     dfs5cli copy  ./local scaleway:docs
+    dfs5cli import_tar release.tar.gz scaleway:docs
     dfs5cli mv    scaleway:docs/old.md scaleway:docs/new.md
     dfs5cli sync  ./local scaleway:docs      # リモートをローカルに合わせる
     dfs5cli pull  scaleway:docs ./local      # リモートをローカルへ取り出す
@@ -40,9 +41,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from fnmatch import fnmatchcase
@@ -427,6 +430,67 @@ def _collect_local(src: Path, include_root_name: bool = False) -> Dict[str, Path
         rel = item.relative_to(src).as_posix()
         out[f"{src.name}/{rel}" if include_root_name else rel] = item
     return out
+
+
+def _tar_member_path(name: str, strip_components: int) -> str:
+    """tar member 名を安全な相対パスにする（危険なら UsageError）。"""
+    if "\x00" in name:
+        raise UsageError(f"tar member 名に NUL があります: {name!r}")
+    text = name.replace("\\", "/")
+    if text.startswith("/"):
+        raise UsageError(f"tar に絶対パスがあります: {name!r}")
+    parts = [part for part in text.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise UsageError(f"tar member が親ディレクトリを参照しています: {name!r}")
+    if len(parts) <= strip_components:
+        return ""
+    rel = "/".join(parts[strip_components:])
+    if any(part == ".clayfs" for part in parts):
+        raise UsageError(f"tar に DFS5 の管理ディレクトリが含まれています: {name!r}")
+    if rel.endswith("/"):
+        rel = rel.rstrip("/")
+    return rel
+
+
+def _extract_tar_safely(
+    archive_path: Path,
+    staging: Path,
+    strip_components: int,
+) -> Tuple[Dict[str, Path], set]:
+    """tar を検証しながら staging に展開する。
+
+    symlink / hardlink / device / FIFO は拒否する。通常ファイルとディレクトリだけを
+    許可し、作成したファイルと明示的なディレクトリを返す。
+    """
+    files: Dict[str, Path] = {}
+    dirs = set()
+    try:
+        with tarfile.open(archive_path, mode="r:*") as archive:
+            for member in archive:
+                rel = _tar_member_path(member.name, strip_components)
+                if not rel:
+                    continue
+                if member.issym() or member.islnk():
+                    raise UsageError(f"tar のリンクはインポートできません: {member.name!r}")
+                if not (member.isfile() or member.isdir()):
+                    raise UsageError(
+                        f"tar の特殊ファイルはインポートできません: {member.name!r}"
+                    )
+                if rel == ".DS_Store" or rel.startswith("._"):
+                    continue
+                if member.isdir():
+                    dirs.add(rel)
+                    continue
+                target = safe_target(staging, rel, create_parents=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise UsageError(f"tar member を読めません: {member.name!r}")
+                with source, target.open("wb") as dest:
+                    shutil.copyfileobj(source, dest, length=1024 * 1024)
+                files[rel] = target
+    except (tarfile.TarError, OSError, EOFError) as e:
+        raise UsageError(f"tar を読み込めません: {archive_path}: {e}") from e
+    return files, dirs
 
 
 def _tree_path(node: DFS5Node, rel: str) -> Path:
@@ -1240,6 +1304,85 @@ def cmd_copyto(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_tar(args: argparse.Namespace) -> int:
+    """tar / tar.gz / tar.xz / tar.bz2 をリモートへインポートする。
+
+    archive 内の通常ファイルとディレクトリだけを、1 版として反映する。
+    既存のリモートにしかないファイルは削除しない（copy と同じ追加・更新）。
+    """
+    if args.strip_components < 0:
+        raise UsageError("--strip-components は 0 以上にしてください")
+    store = RemoteStore()
+    name, sub = split_remote_spec(args.dest, args.remote_name)
+    remote = store.get(name)
+    prefix = _norm_prefix(sub)
+    archive = Path(args.archive).expanduser()
+    if not archive.is_file():
+        raise UsageError(f"tar ファイルがありません: {archive}")
+
+    with tempfile.TemporaryDirectory(prefix="dfs5_import_tar_") as tmp:
+        staging = Path(tmp) / "extract"
+        staging.mkdir()
+        files, dirs = _extract_tar_safely(
+            archive, staging, args.strip_components
+        )
+        if not files and not dirs:
+            print(f"[dfs5cli] import_tar: インポートするものがありません: {archive}")
+            return 0
+
+        node = open_remote(remote, create=True)
+        refresh_cache(node)
+        remote_files = _remote_file_paths(node)
+        remote_dirs = _remote_dir_paths(node)
+        target_files = {_join_prefix(prefix, rel) for rel in files}
+        target_dirs = {_join_prefix(prefix, rel) for rel in dirs}
+        file_dir_conflicts = sorted(target_files & remote_dirs)
+        dir_file_conflicts = sorted(target_dirs & remote_files)
+        if file_dir_conflicts or dir_file_conflicts:
+            detail = ", ".join(file_dir_conflicts + dir_file_conflicts[:5])
+            raise UsageError(f"ファイルとディレクトリが衝突します: {detail}")
+
+        # staging を再走査せず、安全展開で確定したファイルだけを使う。
+        local = files
+        writes, _deletes, unchanged = plan_changes(
+            node, prefix, local, checksum=True
+        )
+        new_dirs = sorted(
+            rel for rel in dirs
+            if _join_prefix(prefix, rel) not in remote_dirs
+        )
+        plan = (
+            [f"{kind:6} {name}:{path}" for path, _src, kind in writes]
+            + [f"mkdir  {name}:{_join_prefix(prefix, rel)}/" for rel in new_dirs]
+        )
+        _print_plan("import_tar", plan, args.dry_run)
+        if args.dry_run:
+            return 0
+        if not writes and not new_dirs:
+            print(
+                f"[dfs5cli] import_tar: 変更なし（{len(unchanged)} ファイルが同じ）。"
+                "新しい版は作りません",
+                file=sys.stderr,
+            )
+            return 0
+
+        apply_writes(node, writes)
+        for rel in new_dirs:
+            target = _tree_path(node, _join_prefix(prefix, rel))
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise UsageError(f"ディレクトリを作成できません: {rel}: {e}") from e
+
+        log_env, sent = _push(node, remote)
+        print(
+            f"[dfs5cli] import_tar OK -> v{log_env['payload']['version']} "
+            f"| files={len(writes)} dirs={len(new_dirs)} same={len(unchanged)} "
+            f"| sent={sent} B"
+        )
+    return 0
+
+
 def cmd_mv(args: argparse.Namespace) -> int:
     """リモート内でファイルまたはディレクトリを移動・改名する。
 
@@ -1922,6 +2065,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", "--dry-run", action="store_true")
     p.set_defaults(func=cmd_copyto)
 
+    p = sub.add_parser(
+        "import_tar",
+        aliases=["import-tar"],
+        help="tar / tar.gz / tar.xz / tar.bz2 をリモートへインポートする",
+    )
+    p.add_argument("archive", help="ローカルの tar ファイル")
+    p.add_argument("dest", help="remote:path")
+    p.add_argument(
+        "--strip-components", type=int, default=0, metavar="N",
+        help="tar member の先頭 N 要素を除く（既定 0）",
+    )
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_import_tar)
+
     p = sub.add_parser("mv", help="リモート内でファイルまたはディレクトリを移動する")
     p.add_argument("src", help="移動元 remote:path")
     p.add_argument("dst", help="移動先 remote:path")
@@ -2010,6 +2167,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--root-anchor", default="/example.com")
     p_serve.add_argument("--root-pubkey", required=True)
     p_serve.add_argument("--state-dir", default="~/.dfs5_server")
+    p_serve.add_argument(
+        "--ost-dir",
+        help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）",
+    )
     p_serve.add_argument("--role", choices=["primary", "secondary"])
     p_serve.add_argument("--role-epoch", type=int)
     p_serve.add_argument(

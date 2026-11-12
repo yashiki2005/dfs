@@ -4,9 +4,9 @@
 まずここを読んで「どこまで動いていて、次に何をするか」を掴んでほしい。
 
 - リポジトリ: `~/src/dfs5`（`/Volumes/ExtSSD/src/dfs5` へのシンボリックリンク）
-- 基準コミット: `a6fc970 feat: add dfs5svc DNSSEC output and pip packaging`
-- テスト: **145 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`）
-- 作業ツリー: 未コミット差分あり（性能最適化と計測結果）
+- 基準コミット: `588ff36 perf: optimize signature verification and DNSSEC discovery`
+- テスト: **149 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`）
+- 作業ツリー: 未コミット差分あり（OST 保存先の分離、import_tar）
 
 ---
 
@@ -121,6 +121,7 @@ C（合意形成）は当面やらない。
 | `mv` | 同一リモート内の移動・改名を 1 版で行う。既存宛先は拒否し、ファイル同士だけ `--overwrite` 可 | 実装済み |
 | `--exclude` / `--include` | `copy` / `sync` / `pull` の相対パスフィルタ。`sync --delete` はフィルタ外を消さない | 実装済み |
 | `lsd` | 直下のディレクトリだけを一覧する | 実装済み |
+| `import_tar` | `.tar` / `.tar.gz` / `.tar.xz` / `.tar.bz2` を安全に 1 版でインポートする | 実装済み |
 
 `mv` は宛先を新しい名前そのものとして扱う（既存ディレクトリへの自動格納や merge はしない）。
 詳細は `specs/cli.md` §3.2.1〜3.2.2。
@@ -134,6 +135,10 @@ C（合意形成）は当面やらない。
 - optional extra: `libp2p`
 - `pip install --no-deps --target ... .` で wheel を作り、両エントリポイントの起動を確認済み
 - リポジトリ直下のシェルラッパーは開発用の互換入口として残す
+
+現在の Mac の OST は `/Volumes/ExtSSD/dfs5/ost/` 配下に置き、各 state dir の
+`ost_chunks` はそこへの symlink にしている。新規サービスは
+`dfs5svc start --ost-dir ...`、直接起動は `dfs5 serve --ost-dir ...` で指定できる。
 
 ### 2.5 root アンカーの配布（大規模運用のとき）
 
@@ -301,7 +306,7 @@ cd ~/src/dfs5
 # 1. 状態の確認
 git log --oneline -3
 git status --short          # 空ならクリーン
-~/dfs-venv/bin/python -m pytest tests -q   # 145 件パス、1 skip（約 165 秒）
+~/dfs-venv/bin/python -m pytest tests -q   # 149 件パス、1 skip（約 174 秒）
 
 # 2. サーバを立てる（新コードで）
 ./dfs5svc list               # 既存のサービスを確認

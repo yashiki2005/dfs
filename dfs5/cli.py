@@ -275,11 +275,18 @@ class RemoteRegistryClient:
 class PersistentRegistryState:
     """サー再起動時にも L1 委譲・L2 ロケータ・L4 ログ・L3 チャンクを保持する永続化ラッパー"""
 
-    def __init__(self, state_dir: Path, root_anchor: str, root_pubkey: str):
+    def __init__(
+        self,
+        state_dir: Path,
+        root_anchor: str,
+        root_pubkey: str,
+        chunks_dir: Optional[Path] = None,
+    ):
         self.state_dir = state_dir
         self.state_file = state_dir / "registry_state.json"
-        self.chunks_dir = state_dir / "ost_chunks"
-        self.chunks_dir.mkdir(parents=True, exist_ok=True)
+        self.chunks_dir = Path(chunks_dir) if chunks_dir is not None else state_dir / "ost_chunks"
+        self.chunks_dir = self.chunks_dir.expanduser()
+        ensure_private_dir(self.chunks_dir)
         self.service = DirectoryRegistryService(root_anchor, root_pubkey)
         # L3 OST の広告用。`serve` の起動時に埋める（ロケータが無い初回でも引けるように）。
         self.ost_endpoint: str = ""
@@ -549,6 +556,12 @@ def load_node_from_mount(
 def cmd_serve(args: argparse.Namespace) -> None:
     state_dir = Path(args.state_dir).expanduser().resolve()
     ensure_private_dir(state_dir)
+    chunks_dir = (
+        Path(args.ost_dir).expanduser().resolve()
+        if getattr(args, "ost_dir", None)
+        else state_dir / "ost_chunks"
+    )
+    ensure_private_dir(chunks_dir)
 
     root_pub_path = Path(args.root_pubkey).expanduser().resolve()
     root_pubkey = root_pub_path.read_text(encoding="utf-8").strip()
@@ -567,7 +580,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
         )
 
     ost = ChunkStoreServer(cert, key, host=args.bind, port=args.ost_port)
-    pstate = PersistentRegistryState(state_dir, args.root_anchor, root_pubkey)
+    pstate = PersistentRegistryState(
+        state_dir, args.root_anchor, root_pubkey, chunks_dir=chunks_dir
+    )
     if getattr(args, "role", None):
         pstate.role = str(args.role)
     if getattr(args, "role_epoch", None) is not None:
@@ -614,6 +629,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     print(f"[dfs5 serve] Root Anchor : {args.root_anchor}")
     print(f"[dfs5 serve] Role        : {pstate.role} (epoch={pstate.role_epoch})")
     print(f"[dfs5 serve] State Dir   : {state_dir}")
+    print(f"[dfs5 serve] OST Dir     : {pstate.chunks_dir}")
     print(f"[dfs5 serve] L2 Registry : http://{args.bind}:{args.registry_port}")
     print(f"[dfs5 serve] L3 OST (TLS): {pstate.ost_endpoint}")
     try:
@@ -833,6 +849,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--root-anchor", default="/example.com", help="Root anchor path (default: /example.com)")
     p_serve.add_argument("--root-pubkey", required=True, help="Path to root anchor .pub file")
     p_serve.add_argument("--state-dir", default="~/.dfs5_server", help="Server persistence directory")
+    p_serve.add_argument(
+        "--ost-dir",
+        help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）",
+    )
     p_serve.add_argument(
         "--role", choices=["primary", "secondary"],
         help="Registry role（既存 state の値を上書き）",

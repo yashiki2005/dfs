@@ -17,6 +17,7 @@ dfs5/svc.py
     dfs5svc start                 # 連続した空きポートで1つ立てる（既定 19440 から探索）
     dfs5svc start --name dev      # 名前を付ける（既定 "local"）
     dfs5svc start --port 20000    # この番号から連続した空きを探す
+    dfs5svc start --ost-dir /Volumes/ExtSSD/dfs5/ost/dev  # OST を外部ディスクへ
     dfs5svc start --foreground    # 前面で動かす（Ctrl-C で止まる）
     dfs5svc list                  # 記録済みのサービス
     dfs5svc status dev            # 状態と接続情報
@@ -243,6 +244,7 @@ class Service:
     log_path: str = ""
     role: str = "primary"
     role_epoch: int = 1
+    ost_dir: str = ""
 
     @property
     def registry_url(self) -> str:
@@ -540,11 +542,19 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     base = _base_dir(name)
     state_dir = Path(args.state_dir).expanduser() if args.state_dir else base / "server"
+    existing = store.services.get(name)
+    raw_ost_dir = getattr(args, "ost_dir", None) or (existing.ost_dir if existing else "")
+    ost_dir = (
+        Path(raw_ost_dir).expanduser().resolve()
+        if raw_ost_dir
+        else state_dir / "ost_chunks"
+    )
     root_key = Path(args.root_key).expanduser() if args.root_key else base / "keys" / "root"
     writer_key = Path(args.writer_key).expanduser() if args.writer_key else base / "keys" / "writer"
     log_path = base / "serve.log"
 
     state_dir.mkdir(parents=True, exist_ok=True)
+    ost_dir.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_root_key(root_key)
     ensure_writer_key(writer_key)
@@ -574,6 +584,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "--root-anchor", args.root_anchor,
         "--root-pubkey", str(root_pub),
         "--state-dir", str(state_dir),
+        "--ost-dir", str(ost_dir),
         "--advertise", advertised,
     ]
     for replica in (getattr(args, "replica", None) or []):
@@ -585,6 +596,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     print(f"[dfs5svc] 空きポート: L2={registry_port} / L3={ost_port}（連続した組）")
     print(f"[dfs5svc] 状態      : {state_dir}")
+    print(f"[dfs5svc] OST       : {ost_dir}")
     print(f"[dfs5svc] root 鍵   : {root_key}")
     print(f"[dfs5svc] ログ      : {log_path}")
 
@@ -657,6 +669,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         log_path=str(log_path),
         role=service_role,
         role_epoch=service_role_epoch,
+        ost_dir=str(ost_dir),
     )
     store.services[name] = service
     store.save()
@@ -716,6 +729,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     if s.writer_key:
         print(f"Writer Key  : {s.writer_key}")
     print(f"State Dir   : {s.state_dir}")
+    if s.ost_dir:
+        print(f"OST Dir     : {s.ost_dir}")
     print(f"Root Pubkey : {s.root_pub}")
     print(f"Log         : {s.log_path}")
     if not alive:
@@ -985,6 +1000,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--advertise", help="L2 が L3 の場所として広告するホスト（既定は --host から推定）")
     p.add_argument("--port", type=int, help=f"この番号から連続した空きを探す（既定 {DEFAULT_START_PORT}）")
     p.add_argument("--state-dir", help="状態ディレクトリ（既定 ~/dfs5svc/<name>/server）")
+    p.add_argument(
+        "--ost-dir",
+        help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）",
+    )
     p.add_argument("--root-key", help="root の Ed25519 鍵（既定 ~/dfs5svc/<name>/keys/root）")
     p.add_argument("--root-anchor", default=DEFAULT_ROOT_ANCHOR, help=f"根のパス（既定 {DEFAULT_ROOT_ANCHOR}）")
     p.add_argument("--writer-key", help="書き手の Ed25519 鍵（既定 ~/dfs5svc/<name>/keys/writer）")

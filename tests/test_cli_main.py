@@ -12,6 +12,7 @@ import io
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -456,6 +457,25 @@ class RcloneCase(unittest.TestCase):
         node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
         self.assertEqual(node2.l4.pin.version, v1, "無変更の copy が新しい版を作っている")
 
+    def test_registry_state_can_use_external_ost_dir(self) -> None:
+        ost_dir = self.base / "external-ost"
+        state = cli_mod.PersistentRegistryState(
+            self.base / "external_state",
+            "/example.com",
+            self.root_pub,
+            chunks_dir=ost_dir,
+        )
+
+        class DummyOST:
+            store = {"abc123": b"external chunk"}
+
+        state.save_ost_chunks(DummyOST())
+        self.assertEqual((ost_dir / "abc123.blk").read_bytes(), b"external chunk")
+
+        loaded = type("LoadedOST", (), {"store": {}})()
+        state.load_ost_chunks(loaded)
+        self.assertEqual(loaded.store["abc123"], b"external chunk")
+
     def test_read_uses_l2_cache_after_all_registries_stop(self) -> None:
         """registry が全滅しても、検証済みキャッシュと生きている OST で読める。"""
         self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
@@ -493,6 +513,61 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(self.run_cli("copyto", str(one), "t:docs/one.txt"), 0)
         node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
         self.assertEqual(node2.l4.pin.version, v1, "同じ内容の copyto が版を作っている")
+
+    def test_import_tar_supports_all_compression_formats(self) -> None:
+        source = self.base / "tar_source" / "bundle"
+        (source / "docs").mkdir(parents=True)
+        (source / "docs" / "readme.txt").write_text("from tar\n", encoding="utf-8")
+        (source / "empty").mkdir()
+
+        for suffix, mode in (
+            (".tar", "w"),
+            (".tar.gz", "w:gz"),
+            (".tar.xz", "w:xz"),
+            (".tar.bz2", "w:bz2"),
+        ):
+            archive = self.base / f"import{suffix}"
+            with tarfile.open(archive, mode) as tf:
+                tf.add(source, arcname="bundle")
+            self.assertEqual(
+                self.run_cli(
+                    "import_tar", str(archive), "t:", "--strip-components", "1"
+                ),
+                0,
+                f"import_tar failed for {suffix}",
+            )
+
+        node = cli_mod.load_node_from_mount(self.workdir)[0]
+        self.assertEqual(node.read_remote("docs/readme.txt"), b"from tar\n")
+        paths = {e["path"]: e["type"] for e in node.list_remote()}
+        self.assertEqual(paths.get("empty"), "dir")
+        self.assertEqual(paths.get("docs"), "dir")
+
+    def test_import_tar_rejects_parent_traversal(self) -> None:
+        archive = self.base / "evil.tar"
+        payload = b"must not escape\n"
+        with tarfile.open(archive, "w") as tf:
+            info = tarfile.TarInfo("../escape.txt")
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+
+        self.assertEqual(self.run_cli("import_tar", str(archive), "t:"), 2)
+        self.assertFalse((self.base / "escape.txt").exists())
+        self.assertEqual(self.server.pstate.service.logs, {})
+
+    def test_import_tar_dry_run_does_not_write(self) -> None:
+        source = self.base / "dry_source"
+        source.mkdir()
+        (source / "dry.txt").write_text("dry\n", encoding="utf-8")
+        archive = self.base / "dry.tar"
+        with tarfile.open(archive, "w") as tf:
+            tf.add(source, arcname="dry")
+
+        self.assertEqual(
+            self.run_cli("import_tar", str(archive), "t:", "--dry-run"), 0
+        )
+        node = cli_mod.load_node_from_mount(self.workdir)[0]
+        self.assertEqual(node.list_remote(), [])
 
     def test_mv_file_uses_one_version(self) -> None:
         """mv は copy + rm ではなく、1 版でファイルを改名する。"""

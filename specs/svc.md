@@ -8,7 +8,8 @@
 
 1. **連続した空きポートを 2 つ探し**、1 つ目を L2（名簿）、2 つ目を L3（OST）に割り当てる。
 2. root の鍵（L1 権威の Ed25519）と、**書き手の鍵**（L4 のログに署名する人）が無ければ作る。
-3. 状態ディレクトリを用意し、`dfs5 serve` を起動する。
+3. 状態ディレクトリを用意し、`dfs5 serve` を起動する。OST チャンクだけを
+   別ディスクへ置く場合は `--ost-dir` を使う。
 4. 立ち上がりを待って確認し、**書き手への委譲を登録する**。
 5. 接続に必要な値を記録する（`~/.config/dfs5/services.json`）。
 6. `stop` / `list` / `status` / `env` / `dnssec` / `logs` で後始末と確認ができる。
@@ -49,7 +50,7 @@ L2 と L3 は別のポートで待ち受ける。連続した空きを 2 つ取�
 
 ```text
 dfs5svc start [--name NAME] [--host HOST] [--port N] [--advertise HOST]
-              [--state-dir DIR] [--root-key FILE] [--root-anchor PATH]
+              [--state-dir DIR] [--ost-dir DIR] [--root-key FILE] [--root-anchor PATH]
               [--wait SECONDS] [--foreground] [--force]
 dfs5svc list
 dfs5svc status [NAME]
@@ -71,6 +72,7 @@ dfs5svc logs   [NAME] [-n LINES]
 | `--advertise` | `--host` から推定 | L2 が L3 の場所として広告するホスト |
 | `--port` | `19440` | この番号から連続した空きを探す |
 | `--state-dir` | `~/dfs5svc/<name>/server` | サーバの状態（チャンクと名簿） |
+| `--ost-dir` | `<state-dir>/ost_chunks` | L3 OST チャンクの保存先。外付け SSD などに分離できる |
 | `--root-key` | `~/dfs5svc/<name>/keys/root` | L1 権威の Ed25519 鍵（無ければ作る） |
 | `--root-anchor` | `/example.com` | 根のパス |
 | `--writer-key` | `~/dfs5svc/<name>/keys/writer` | 書き手の Ed25519 鍵（無ければ作る） |
@@ -101,6 +103,7 @@ dfs5svc logs   [NAME] [-n LINES]
       "sub_path": "/example.com/dev",
       "role": "primary",
       "role_epoch": 1,
+      "ost_dir": "/Volumes/ExtSSD/dfs5/ost/dev",
       "pid": 12345
     }
   }
@@ -109,6 +112,13 @@ dfs5svc logs   [NAME] [-n LINES]
 
 `registry_url` と `ost_endpoint` は記録に書かず、読むときに組み立てる（重複を避け、
 書き換えで食い違わないように）。
+
+`ost_dir` を指定した場合、L2 の状態（`registry_state.json`）と TLS 証明書は
+`--state-dir` に残り、L3 の暗号化チャンクだけが `--ost-dir` に置かれる。
+
+```bash
+dfs5svc start --name dev --ost-dir /Volumes/ExtSSD/dfs5/ost/dev
+```
 
 ### 2.3 委譲まで自動で登録する
 

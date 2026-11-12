@@ -294,6 +294,7 @@ dfs5cli check  REMOTE:path LOCAL_DIR
 # 書き込み（1 版としてまとめる）
 dfs5cli copy   LOCAL REMOTE:path [--checksum] [--include PATTERN] [--exclude PATTERN] [-n]
 dfs5cli copyto LOCAL_FILE REMOTE:path/file [--checksum] [-n]
+dfs5cli import_tar ARCHIVE REMOTE:path [--strip-components N] [-n]
 dfs5cli mv     REMOTE:path REMOTE:path [--overwrite] [-n]
 dfs5cli sync   LOCAL_DIR REMOTE:path [--delete] [--checksum] [--include PATTERN] [--exclude PATTERN] [-n]
 
@@ -308,6 +309,7 @@ dfs5cli pull   REMOTE:path LOCAL_DIR [--force] [--include PATTERN] [--exclude PA
 
 # サーバ側は cli.py のものをそのまま使う
 dfs5cli serve    ... --advertise <L3 を広告するホスト>
+dfs5cli serve    ... --ost-dir /Volumes/ExtSSD/dfs5/ost/<name>
 dfs5cli delegate ...
 ```
 
@@ -385,6 +387,24 @@ dfs5 は書き手側の索引で塊を重複排除するので、内容が同じ
 
 `sync --delete` では、フィルタの外側にあるリモートファイルを削除しない。
 たとえば `--exclude 'docs/private/*'` を付ければ、その範囲は同期対象から完全に外れる。
+
+#### 3.2.3 tar インポート
+
+`import_tar` は、`.tar` / `.tar.gz` / `.tar.xz` / `.tar.bz2` を自動判定して
+リモートへインポートする。展開結果は `copy` と同じく追加・更新として 1 版にまとめ、
+リモートにしかないファイルは削除しない。
+
+- 通常ファイルとディレクトリだけを許可する
+- symlink / hardlink / device / FIFO は拒否する
+- 絶対パスと `..` を拒否し、`\` も区切りとして正規化して検査する
+- `.clayfs` は取り込まない
+- `--strip-components N` で tar の先頭 N 要素を除ける
+- 内容が同じファイルだけなら新しい版を作らない
+
+```bash
+dfs5cli import_tar release.tar.gz backup:
+dfs5cli import_tar bundle.tar.xz backup:project --strip-components 1
+```
 
 ### 3.3 一覧は内容を取らない
 
@@ -473,7 +493,7 @@ srv/
 
 ## 5. 試験
 
-`tests/test_cli_main.py` に 41 件。
+`tests/test_cli_main.py` に 47 件。
 
 | 試験 | 確かめること |
 |---|---|
