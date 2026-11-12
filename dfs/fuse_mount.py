@@ -25,7 +25,9 @@ class LocalTreeFuse:
     FUSE の flush / fsync / destroy で呼ばれる。
     """
 
-    use_ns = True
+    # getattr は st_mtime などを秒単位の float で返す。fusepy の use_ns=True は
+    # 値がナノ秒である前提なので、ここは秒単位の False にする。
+    use_ns = False
 
     def __call__(self, op: str, *args: Any) -> Any:
         """fusepy の Operations と同じディスパッチ形式。"""

@@ -34,6 +34,7 @@ class LocalTreeFuseTests(unittest.TestCase):
 
     def test_read_write_and_flush(self) -> None:
         ops = LocalTreeFuse(self.root, self._flush)
+        self.assertFalse(ops.use_ns, "st_mtime は秒単位で返している")
         self.assertTrue(ops.getattr("/")["st_mode"] & 0o040000)
         self.assertIn("hello.txt", ops.readdir("/"))
         self.assertEqual(ops.read("/hello.txt", 5, 0, 0), b"hello")
