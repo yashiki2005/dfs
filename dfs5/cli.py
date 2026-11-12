@@ -482,6 +482,7 @@ def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], Rem
         ost_host=cfg["ost_host"],
         ost_port=int(cfg["ost_port"]),
         root_pubkey=cfg.get("root_pubkey"),
+        ost_alternates=cfg.get("ost_alternates") or [],
     )
     return node, cfg, reg_client
 
@@ -634,7 +635,7 @@ def _emit_metrics(
     """計測ハーネス向けに L3 の往復回数・転送量を機械可読で出す（``--metrics`` 指定時のみ）。"""
     if not getattr(args, "metrics", False):
         return
-    ost = node.ost
+    ost = node.read_ost if direction == "pull" else node.ost
     row = {
         "direction": direction,
         "version": int(version),
@@ -706,13 +707,13 @@ def cmd_pull(args: argparse.Namespace) -> None:
         write_private_json(node.clayfs.clayfs_meta / CONFIG_FILENAME, cfg)
     print(
         f"[dfs5 pull] OK v{pin.version} (epoch={pin.delegation_epoch}) "
-        f"| recv={node.ost.bytes_received} B | {elapsed_ms:.1f} ms"
+        f"| recv={node.read_ost.bytes_received} B | {elapsed_ms:.1f} ms"
     )
     print(f"  Working tree updated : {node.clayfs.work_tree}")
     print(f"  Snapshot saved at    : {snap_dir}")
     _emit_metrics(
         args, node, direction="pull", version=pin.version,
-        elapsed_ms=elapsed_ms, payload_bytes=node.ost.bytes_received,
+        elapsed_ms=elapsed_ms, payload_bytes=node.read_ost.bytes_received,
     )
 
 

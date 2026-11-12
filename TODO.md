@@ -66,8 +66,10 @@ pull が 8.0 秒（21 往復）だった。
 - 複製側は root アンカー・委譲チェーン・L4 署名・CAS を再検証し、古いバンドルで巻き戻さない
 - 回帰試験: `tests/test_availability.py`
 
-**残り**: OST / チャンクの複製。L2 が落ちても OST が生きていれば `ls` / `cat` / `pull` は
-継続できるが、ノード全体が落ちる構成ではデータ平面の複製が別途必要。
+**OST 複製**: 主 OST のチャンクを読み取り専用の複製 OST へコピーし、locator に
+複数 endpoint を持たせる実装を追加した。主 OST が停止しても、複製 OST が生きていれば
+`pull` / `cat` は継続できる。スプールは採用せず、書き込みは主 OST で完結させる。
+詳細は `specs/ost-replica.md`。
 
 **なぜ**: L2 名簿が落ちると**全停止**する（単一障害点）。`specs/l2_comparison.md` §2.5。
 `ls` / `cat` / `pull` が名簿に届かないだけで止まる。
@@ -120,9 +122,15 @@ C（合意形成）は当面やらない（単一書き手なので同時に書�
 
 ### 2.5 root アンカーの配布（大規模運用のとき）
 
-現状は TOFU（初回に名簿から取って指紋を記録）と `--root-pubkey` の明示。大規模では
-**DNSSEC** から取るのが候補。小規模はローカル設定、中・大規模は DNSSEC、という方針
-（利用者の判断）。`DESIGN.md` §10 の問い 1 は引き続き未回答。
+DNSSEC の `_dfs5.<domain>` TXT から root 公開鍵と registry 一覧を取得する方式を
+実装した。`dfs5cli discover <domain>` と `config create --dnssec-domain <domain>` で使う。
+
+DNSSEC は **root 鍵と初期 registry 一覧の配布**に限定し、L4 head や primary 昇格の
+判断には使わない。primary / secondary は DNSSEC レコードまたは静的設定で決め、
+「最初に起動したサーバを root にする」方式は採用しない。
+
+詳細は `specs/dnssec.md`。現段階は検証済みリゾルバの AD ビットを信頼する MVP で、
+クライアント側の DNSKEY/DS 完全検証は今後の課題。
 
 ### 2.6 検証が足りていないもの
 

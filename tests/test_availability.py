@@ -28,6 +28,8 @@ from dfs5.l2_registry import (
     DirectoryRegistryService,
     create_locator_envelope,
 )
+from dfs5.l3_store import ChunkStoreServer
+from dfs5.l5_clayfs import DFS5Node
 from dfs5.remotes import Remote, RemoteStore
 
 
@@ -70,6 +72,20 @@ def _make_locator(key: Path, path: str, log: dict, now: int) -> dict:
         ["tls://127.0.0.1:1"],
         now + 1000,
     )
+
+
+def _tls_cert(base: Path) -> tuple[Path, Path]:
+    cert, key = base / "cert.pem", base / "key.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(key), "-out", str(cert), "-days", "1",
+            "-nodes", "-subj", "/CN=localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key
 
 
 class _DummyOST:
@@ -141,12 +157,14 @@ class AvailabilityCase(unittest.TestCase):
                 name="r",
                 registry="http://primary:9440/",
                 registry_alternates=["http://secondary:9440", "http://primary:9440"],
+                ost_alternates=["tls://ost-b:19443"],
                 key=str(self.alice_key),
             )
         )
         loaded = RemoteStore(path).get("r")
         self.assertEqual(loaded.registry_urls(), ["http://primary:9440", "http://secondary:9440"])
         self.assertEqual(loaded.registry_alternates, ["http://secondary:9440", "http://primary:9440"])
+        self.assertEqual(loaded.ost_alternates, ["ost-b:19443"])
 
     def test_replica_bundle_is_verified_and_idempotent(self) -> None:
         primary = self._registry("primary")
@@ -269,6 +287,56 @@ class AvailabilityCase(unittest.TestCase):
         client.announce_and_append(self.path, self.log, self.loc, now=self.now)
         self.assertIn(self.path, primary.pstate.service.logs)
         self.assertNotIn(self.path, secondary.pstate.service.logs)
+
+    def test_read_fails_over_to_replicated_ost(self) -> None:
+        """主 OST が停止しても、複製 OST と locator endpoints から pull できる。"""
+        cert, key = _tls_cert(self.base)
+        primary_ost = ChunkStoreServer(cert, key)
+        replica_ost = ChunkStoreServer(cert, key)
+        self.addCleanup(primary_ost.close)
+        self.addCleanup(replica_ost.close)
+        writer = DFS5Node(
+            "writer",
+            self.path,
+            self.base / "writer_mount",
+            self.alice_key,
+            self.alice_pub,
+            "availability-secret",
+            self._registry("primary"),
+            "127.0.0.1",
+            primary_ost.port,
+            root_pubkey=self.root_pub,
+            ost_alternates=[f"tls://127.0.0.1:{replica_ost.port}"],
+        )
+        (writer.clayfs.work_tree / "note.txt").write_text("replicated", encoding="utf-8")
+        writer.push(delegation_epoch=1, now=self.now)
+
+        self.assertTrue(primary_ost.store)
+        self.assertTrue(set(primary_ost.store).issubset(set(replica_ost.store)))
+        _del, loc, _head = writer.registry.resolve(self.path)
+        self.assertIsNotNone(loc)
+        endpoints = loc["payload"]["endpoints"]
+        self.assertEqual(len(endpoints), 2)
+
+        primary_ost.close()
+        reader = DFS5Node(
+            "reader",
+            self.path,
+            self.base / "reader_mount",
+            self.alice_key,
+            self.alice_pub,
+            "availability-secret",
+            writer.registry,
+            "127.0.0.1",
+            primary_ost.port,
+            root_pubkey=self.root_pub,
+            ost_alternates=[f"tls://127.0.0.1:{replica_ost.port}"],
+        )
+        reader.pull()
+        self.assertEqual(
+            (reader.clayfs.work_tree / "note.txt").read_text(encoding="utf-8"),
+            "replicated",
+        )
 
 
 if __name__ == "__main__":

@@ -94,6 +94,7 @@ class MerkleTreeBuilder:
         stores: Optional[Dict[str, OSTClient]] = None,
         default_store: str = "ost0",
         index: Optional[Dict[str, Any]] = None,
+        replicas: Optional[List[OSTClient]] = None,
     ):
         self.crypto = crypto
         # 後方互換: ost は既定の OST を指す
@@ -104,6 +105,9 @@ class MerkleTreeBuilder:
         self._next_stripe = 0
         # アップロード時に読み飛ばした項目（symlink など）を呼び出し側へ知らせる。
         self.warnings: List[str] = []
+        # 書き込み後にチャンクを複製する読み取り専用 OST。
+        self.replicas: List[OSTClient] = list(replicas or [])
+        self._last_wire_ids: set[str] = set()
         # (plain_id -> (wire_id, store_id)) の書き手側索引。古い形式（str）も読める。
         self.index: Dict[str, Any] = dict(index or {})
 
@@ -237,6 +241,11 @@ class MerkleTreeBuilder:
                 return _stage(dir_bytes)
 
             root = _walk(source_dir, delegated_mounts)
+            wire_ids: set[str] = set()
+            for chunks in pending.values():
+                wire_ids.update(chunks)
+            wire_ids.update(wire for wire, _store in reused.values())
+            self._last_wire_ids = wire_ids
             return pending, reused, packed, root
 
         # ---- 1 回目の走査: 索引ヒットは「サーバに在る」と仮定して記録だけする ----
@@ -277,7 +286,26 @@ class MerkleTreeBuilder:
 
         # 根の配置先を呼び出し側が知れるよう、既定と異なるときは属性に残す
         self.root_store = root_sid
+        self._replicate_chunks()
         return root_pid, root_wid
+
+    def _replicate_chunks(self) -> None:
+        """今回の版に含まれる塊を、読み取り用の複製 OST へコピーする。"""
+        if not self.replicas or not self._last_wire_ids:
+            return
+        wire_ids = sorted(self._last_wire_ids)
+        for replica in self.replicas:
+            try:
+                presence = replica.batch_has(wire_ids)
+                missing = [wid for wid in wire_ids if not presence.get(wid, False)]
+                for start in range(0, len(missing), 256):
+                    group = missing[start : start + 256]
+                    blobs = self.ost.batch_get(group)
+                    replica.batch_put_if_absent(blobs, assume_absent=True)
+            except Exception as e:  # noqa: BLE001 - 複製失敗で主の push を落とさない
+                self.warnings.append(
+                    f"replica {replica.host}:{replica.port} failed: {type(e).__name__}: {e}"
+                )
 
     # ---- 読み込み ---------------------------------------------------------
     # 一括取得の分割。往復を減らすため件数の上限は大きめに取り、1 回の応答サイズは
@@ -523,6 +551,8 @@ class L4LogClient:
         self.pub_key_str = pub_key_str.strip()
         self.pin_file = pin_file
         self.pin = HeadPin.load(pin_file) if pin_file else HeadPin()
+        # 直近に検証したロケータ。読み取り時の OST endpoint フォールバックに使う。
+        self.last_locator: Optional[Dict[str, Any]] = None
         # root アンカーの公開鍵。ここが信頼の根（名簿からは取らない）。
         # 未設定なら、名簿が返した chain の先頭の parent を root として扱う検証はしない。
         self.root_pubkey: Optional[str] = (root_pubkey or "").strip() or None
@@ -572,7 +602,8 @@ class L4LogClient:
         """
         L2/L4 から先頭版を取得し、署名検証および B6（巻き戻し・フォーク）チェックを行ってローカルピンを更新する。
         """
-        del_env, _, head_env = registry.resolve(self.sub_path)
+        del_env, loc_env, head_env = registry.resolve(self.sub_path)
+        self.last_locator = loc_env
         if head_env is None:
             if self.pin.version > 0:
                 raise RollbackDetectedError(
@@ -629,7 +660,7 @@ class L4LogClient:
         root_plain_id: str,
         root_wire_id: str,
         delegation_epoch: int,
-        ost_endpoint: str,
+        ost_endpoint: str | Sequence[str],
         now: int,
     ) -> Dict[str, Any]:
         """
@@ -665,7 +696,7 @@ class L4LogClient:
             delegation_epoch=delegation_epoch,
             head_version=next_ver,
             head_hash=entry_hash,
-            endpoints=[ost_endpoint],
+            endpoints=[ost_endpoint] if isinstance(ost_endpoint, str) else list(ost_endpoint),
             expires_at=now + 86400,
         )
 

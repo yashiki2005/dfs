@@ -43,6 +43,7 @@ class Remote:
     key: str                            # 書き手の OpenSSH Ed25519 秘密鍵
     registry_alternates: List[str] = field(default_factory=list)  # 読み取り用の代替名簿
     ost: str = ""                       # L3 OST の host:port。空ならロケータから解決する
+    ost_alternates: List[str] = field(default_factory=list)  # 読み取り用の複製 OST
     path: str = ""                      # サブツリーのパス。空ならロケータの path を使う
     secret: str = ""                    # tree_secret。空なら --secret を後で渡す
     workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs5/<name>）
@@ -82,12 +83,20 @@ class Remote:
         raw_alternates = data.get("registry_alternates") or []
         if isinstance(raw_alternates, str):
             raw_alternates = [raw_alternates]
+        raw_ost_alternates = data.get("ost_alternates") or []
+        if isinstance(raw_ost_alternates, str):
+            raw_ost_alternates = [raw_ost_alternates]
         return cls(
             name=str(data["name"]),
             registry=str(data["registry"]),
             key=str(data["key"]),
             registry_alternates=[str(u) for u in raw_alternates if str(u).strip()],
             ost=str(data.get("ost", "") or ""),
+            ost_alternates=[
+                cls.normalize_ost(str(u))
+                for u in raw_ost_alternates
+                if str(u).strip()
+            ],
             path=normalize_path(raw_path) if raw_path else "",
             secret=str(data.get("secret", "") or ""),
             workdir=str(data.get("workdir", "")),

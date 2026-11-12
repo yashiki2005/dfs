@@ -69,6 +69,29 @@ dfs5cli create scw --registry 172.16.1.60 \
 署名済みの委譲チェーン・L4 ログ・ロケータを代替名簿へ複製する。代替名簿は
 root アンカーから再検証し、古いバンドルで巻き戻さない。
 
+`--ost-alternate` を繰り返すと、書き手の主 OST とは別の読み取り専用 OST を
+登録できる。書き込みは主 OST だけで行い、複製 OST にはチャンクをコピーする。
+`pull` / `cat` は locator の `endpoints` を順に試すため、主 OST が停止しても
+複製 OST が生きていれば読み取りを継続できる。詳細は `specs/ost-replica.md`。
+
+#### DNSSEC から root 鍵と registry 一覧を取得する
+
+`--dnssec-domain` を指定すると、`_dfs5.<domain>` の DNSSEC 検証済み TXT レコードから
+root 公開鍵と primary/secondary registry を取得する。`--registry` は不要。
+
+```bash
+dfs5cli discover example.com
+
+dfs5cli config create scw \
+  --dnssec-domain example.com \
+  --key ~/.ssh/alice \
+  --secret <tree_secret>
+```
+
+DNSSEC は root 鍵と初期 registry 一覧の配布に限定し、L4 head や primary 昇格の
+判断には使わない。`--registry` / `--root-pubkey` を併記した場合は、DNSSEC の内容と
+一致しなければ拒否する。詳細は `specs/dnssec.md`。
+
 **L2 が OST の場所とパスを知っている理由**: L2 のロケータ（`dfs5-l2-locator-v1`）は
 `endpoints` を持ち、そこに L3 の場所（`tls://172.16.1.60:19443`）が入る。これは版を
 書くたびに更新される。委譲レコードは書き手の公開鍵（`writer`）を持つので、「この鍵が

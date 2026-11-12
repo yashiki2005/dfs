@@ -15,7 +15,7 @@ import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence
 
 from .crypto import ChunkIntegrityError, sha256_hex
 from .l2_registry import ServiceUnavailableError
@@ -454,6 +454,120 @@ class OSTClient:
 
     def get(self, wire_id: str) -> bytes:
         return self.batch_get([wire_id])[wire_id]
+
+
+class FailoverOSTClient:
+    """複数の OST endpoint を読み取り時に順番に試すクライアント。
+
+    書き込みは先頭（主 OST）だけに送る。読み取りは主 OST が停止・欠損なら
+    代替 OST を試す。主 OST は書き手のローカル OST、代替は読み取りレプリカを
+    想定している。
+    """
+
+    def __init__(self, clients: Sequence[OSTClient]):
+        if not clients:
+            raise ValueError("At least one OST client is required")
+        self.clients: List[OSTClient] = list(clients)
+        self.primary = self.clients[0]
+        self._active: Optional[OSTClient] = None
+
+    @property
+    def host(self) -> str:
+        return self.primary.host
+
+    @property
+    def port(self) -> int:
+        return self.primary.port
+
+    def reset_metrics(self) -> None:
+        for client in self.clients:
+            client.reset_metrics()
+        self._active = None
+
+    @property
+    def bytes_sent(self) -> int:
+        return sum(c.bytes_sent for c in self.clients)
+
+    @property
+    def bytes_received(self) -> int:
+        return sum(c.bytes_received for c in self.clients)
+
+    @property
+    def blob_bytes_sent(self) -> int:
+        return sum(c.blob_bytes_sent for c in self.clients)
+
+    @property
+    def round_trips(self) -> int:
+        return sum(c.round_trips for c in self.clients)
+
+    @property
+    def tls_handshakes(self) -> int:
+        return sum(c.tls_handshakes for c in self.clients)
+
+    @property
+    def put_count(self) -> int:
+        return sum(c.put_count for c in self.clients)
+
+    @property
+    def get_count(self) -> int:
+        return sum(c.get_count for c in self.clients)
+
+    @contextmanager
+    def session(self) -> Iterator["FailoverOSTClient"]:
+        last_error: Optional[ServiceUnavailableError] = None
+        for client in self.clients:
+            try:
+                with client.session():
+                    self._active = client
+                    yield self
+                    return
+            except ServiceUnavailableError as e:
+                last_error = e
+                continue
+        if last_error is not None:
+            raise last_error
+        raise ServiceUnavailableError("No OST endpoint is available")
+
+    def _read_candidates(self) -> List[OSTClient]:
+        if self._active is None:
+            return list(self.clients)
+        return [self._active] + [c for c in self.clients if c is not self._active]
+
+    def batch_has(self, wire_ids: Sequence[str]) -> Dict[str, bool]:
+        last_error: Optional[BaseException] = None
+        for client in self._read_candidates():
+            try:
+                return client.batch_has(wire_ids)
+            except (ServiceUnavailableError, OSError) as e:
+                last_error = e
+                continue
+        if last_error is not None:
+            raise last_error
+        return {}
+
+    def batch_get(self, wire_ids: Sequence[str]) -> Dict[str, bytes]:
+        last_error: Optional[BaseException] = None
+        for client in self._read_candidates():
+            try:
+                result = client.batch_get(wire_ids)
+                self._active = client
+                return result
+            except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                last_error = e
+                continue
+        if last_error is not None:
+            raise last_error
+        return {}
+
+    def get(self, wire_id: str) -> bytes:
+        return self.batch_get([wire_id])[wire_id]
+
+    def batch_put_if_absent(self, chunks: Dict[str, bytes], assume_absent: bool = False) -> int:
+        # 書き込みは主 OST のみ。レプリカへ直接書かない。
+        return self.primary.batch_put_if_absent(chunks, assume_absent=assume_absent)
+
+    def put_if_absent(self, wire_id: str, blob: bytes) -> bool:
+        return self.primary.put_if_absent(wire_id, blob)
 
 
 # 後方互換: 旧名。実体は ChunkStoreServer（mini_lustre の API ではない）。

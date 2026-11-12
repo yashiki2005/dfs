@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import cli as cli_mod
+from .dnssec import Discovery, DiscoveryError, discover_domain
 
 # L2 名簿の既定ポート。ホスト名だけで済むようにする（例: --registry 172.16.1.60）。
 DEFAULT_REGISTRY_PORT = 9440
@@ -205,6 +206,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
         cfg = {
             "delegation_epoch": int(remote.epoch),
             "node_name": remote.node_name or remote.name,
+            "ost_alternates": list(remote.ost_alternates),
             "ost_host": host,
             "ost_port": int(port_str),
             "priv_key": str(priv_key),
@@ -218,15 +220,21 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
 
     node, cfg, _reg = cli_mod.load_node_from_mount(mount_root)
     # リモート定義は接続先の正本。既存の作業 config が古い場合も、
-    # 主名簿と代替名簿をリモート定義に合わせる。
+    # 主名簿・代替名簿・複製 OST をリモート定義に合わせる。
+    changed = False
     if (
         cfg.get("registry_url") != remote.registry
         or list(cfg.get("registry_alternates") or []) != list(remote.registry_alternates)
     ):
         cfg["registry_url"] = remote.registry
         cfg["registry_alternates"] = list(remote.registry_alternates)
+        changed = True
+    if list(cfg.get("ost_alternates") or []) != list(remote.ost_alternates):
+        cfg["ost_alternates"] = list(remote.ost_alternates)
+        changed = True
+    if changed:
         write_private_json(cfg_path, cfg)
-        node.registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
+        node, cfg, _reg = cli_mod.load_node_from_mount(mount_root)
     # 作業ディレクトリの config に root_pubkey が無い（古い形式）なら、リモート定義から
     # 補って書き戻す。信頼の根はリモート定義（remotes.json）が持つ。
     if not cfg.get("root_pubkey") and remote.root_pubkey:
@@ -277,10 +285,14 @@ def refresh_cache(node: DFS5Node, force: bool = False) -> int:
         return version
 
     p = head["payload"]
+    node.refresh_read_ost()
+    node.read_ost.reset_metrics()
     with tempfile.TemporaryDirectory(prefix="dfs5_stage_") as staging:
         staging_dir = Path(staging)
-        with node.ost.session():
-            node.builder.download_directory(p["root_plain_id"], p["root_wire_id"], staging_dir)
+        with node.read_ost.session():
+            node.read_builder.download_directory(
+                p["root_plain_id"], p["root_wire_id"], staging_dir
+            )
         node.clayfs.replace_work_tree(staging_dir)
     node.clayfs.take_snapshot(f"v{version}")
     _save_cached_version(node, version)
@@ -650,13 +662,48 @@ def normalize_subtree_path(text: str) -> str:
 def cmd_config(args: argparse.Namespace) -> int:
     store = RemoteStore()
     if args.action == "create":
-        if not args.registry:
-            raise UsageError("config create には --registry が必要です")
+        dnssec_domain = getattr(args, "dnssec_domain", None)
+        if not args.registry and not dnssec_domain:
+            raise UsageError("config create には --registry か --dnssec-domain が必要です")
 
-        registry = normalize_registry(args.registry, args.registry_port)
-        registry_alternates = [
-            normalize_registry(value, args.registry_port)
-            for value in (getattr(args, "registry_alternate", None) or [])
+        discovery: Optional[Discovery] = None
+        if dnssec_domain:
+            try:
+                discovery = discover_domain(
+                    dnssec_domain,
+                    record_name=getattr(args, "dnssec_name", None),
+                    require_ad=not getattr(args, "dnssec_no_ad", False),
+                )
+            except DiscoveryError as e:
+                raise UsageError(f"DNSSEC discovery に失敗しました: {e}") from e
+            registry = discovery.primary_url
+            registry_alternates = discovery.alternate_urls
+            if args.registry:
+                explicit = normalize_registry(args.registry, args.registry_port)
+                if explicit != registry:
+                    raise UsageError(
+                        f"--registry ({explicit}) が DNSSEC discovery の primary "
+                        f"({registry}) と一致しません"
+                    )
+            explicit_alts = [
+                normalize_registry(value, args.registry_port)
+                for value in (getattr(args, "registry_alternate", None) or [])
+                if value.strip()
+            ]
+            if explicit_alts and explicit_alts != registry_alternates:
+                raise UsageError(
+                    "--registry-alternate が DNSSEC discovery の secondary 一覧と一致しません"
+                )
+        else:
+            registry = normalize_registry(args.registry, args.registry_port)
+            registry_alternates = [
+                normalize_registry(value, args.registry_port)
+                for value in (getattr(args, "registry_alternate", None) or [])
+                if value.strip()
+            ]
+        ost_alternates = [
+            Remote.normalize_ost(value)
+            for value in (getattr(args, "ost_alternate", None) or [])
             if value.strip()
         ]
 
@@ -691,10 +738,20 @@ def cmd_config(args: argparse.Namespace) -> int:
         root_pubkey = ""
         root_fingerprint = ""
         root_source = "未取得"
-        registry_client = cli_mod.RemoteRegistryClient(
-            [registry, *registry_alternates]
-        )
-        if args.root_pubkey:
+        if discovery is not None:
+            root_pubkey = discovery.root_pubkey
+            root_fingerprint = ssh_key_fingerprint(root_pubkey)
+            root_source = "DNSSEC"
+            if args.root_pubkey:
+                rp = Path(args.root_pubkey).expanduser()
+                if not rp.is_file():
+                    raise UsageError(f"--root-pubkey のファイルがありません: {rp}")
+                explicit_root = rp.read_text(encoding="utf-8").strip()
+                if explicit_root != root_pubkey:
+                    raise UsageError(
+                        "--root-pubkey が DNSSEC discovery の root 公開鍵と一致しません"
+                    )
+        elif args.root_pubkey:
             rp = Path(args.root_pubkey).expanduser()
             if not rp.is_file():
                 raise UsageError(f"--root-pubkey のファイルがありません: {rp}")
@@ -702,6 +759,9 @@ def cmd_config(args: argparse.Namespace) -> int:
             root_fingerprint = ssh_key_fingerprint(root_pubkey)
             root_source = f"指定（{rp}）"
         else:
+            registry_client = cli_mod.RemoteRegistryClient(
+                [registry, *registry_alternates]
+            )
             info = registry_client.root_anchor_info()
             root_pubkey = (info.get("root_pubkey") or "").strip()
             if root_pubkey:
@@ -726,6 +786,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             registry_alternates=registry_alternates,
             key=str(key_path),
             ost=args.ost or "",
+            ost_alternates=ost_alternates,
             path=_normalize_path_arg(args.path),
             secret=secret or "",
             workdir=args.workdir or "",
@@ -748,6 +809,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"  L3 OST      : {remote.ost}")
         else:
             print("  L3 OST      : （未指定。使うときに L2 のロケータから解決します）")
+        if remote.ost_alternates:
+            print(f"  複製 OST    : {', '.join(remote.ost_alternates)}")
         if remote.path:
             print(f"  サブツリー  : {remote.path}")
         else:
@@ -772,8 +835,8 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     if args.action == "show":
         r = store.get(args.name)
-        for key in ("name", "registry", "registry_alternates", "ost", "path", "key",
-                    "workdir", "epoch", "node_name", "root_fingerprint"):
+        for key in ("name", "registry", "registry_alternates", "ost", "ost_alternates",
+                    "path", "key", "workdir", "epoch", "node_name", "root_fingerprint"):
             value = getattr(r, key)
             if key == "secret":
                 value = "***"
@@ -792,6 +855,29 @@ def cmd_config(args: argparse.Namespace) -> int:
         return cmd_listremotes(args)
 
     raise UsageError(f"Unknown config action: {args.action}")
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    """DNSSEC の discovery レコードを表示する（設定は変更しない）。"""
+    try:
+        discovery = discover_domain(
+            args.domain,
+            record_name=args.dnssec_name,
+            require_ad=not args.dnssec_no_ad,
+        )
+    except DiscoveryError as e:
+        raise UsageError(f"DNSSEC discovery に失敗しました: {e}") from e
+    if args.json:
+        print(json.dumps(discovery.raw, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    print(f"domain      : {discovery.domain}")
+    print(f"root_anchor : {discovery.root_anchor}")
+    print(f"root_pubkey : {ssh_key_fingerprint(discovery.root_pubkey)}")
+    print(f"epoch       : {discovery.epoch}")
+    print(f"ttl         : {discovery.ttl}")
+    for row in discovery.registries:
+        print(f"{row.role:10}: {row.url}")
+    return 0
 
 
 def cmd_ls(args: argparse.Namespace) -> int:
@@ -1370,6 +1456,10 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
         help="読み取り用の代替 L2 名簿（複数指定可。書き込みは --registry のみ）",
     )
     p.add_argument("--ost", help="L3 OST の host:port（例: 172.16.1.60:19443）")
+    p.add_argument(
+        "--ost-alternate", action="append", default=[],
+        help="読み取り用の複製 OST の host:port（複数指定可）",
+    )
     p.add_argument("--path", help="サブツリーのパス（例: /example.com/alice/notes）")
     p.add_argument("--key", help="書き手の OpenSSH Ed25519 秘密鍵（省略すると作る）")
     p.add_argument(
@@ -1390,6 +1480,18 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     p.add_argument(
         "--root-pubkey",
         help="root アンカーの公開鍵ファイル（信頼の根）。省略時は名簿から取得して記録する（TOFU）",
+    )
+    p.add_argument(
+        "--dnssec-domain",
+        help="DNSSEC の _dfs5.<domain> TXT から root 公開鍵と registry 一覧を取得する",
+    )
+    p.add_argument(
+        "--dnssec-name",
+        help="DNSSEC の TXT レコード名（既定 _dfs5.<domain>）",
+    )
+    p.add_argument(
+        "--dnssec-no-ad", action="store_true",
+        help="DNSSEC の AD ビットを要求しない（検証済みローカルリゾルバ専用）",
     )
     if args_name_required:
         p.add_argument("name", help="リモートの名前（例: scw）")
@@ -1421,6 +1523,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf.add_argument("name", nargs="?", default="")
     _add_create_args(p_conf, args_name_required=False)
     p_conf.set_defaults(func=cmd_config)
+
+    p_disc = sub.add_parser("discover", help="DNSSEC から root/registry 情報を取得して表示する")
+    p_disc.add_argument("domain", help="例: example.com")
+    p_disc.add_argument("--dnssec-name", help="TXT レコード名（既定 _dfs5.<domain>）")
+    p_disc.add_argument("--dnssec-no-ad", action="store_true", help="AD ビットを要求しない")
+    p_disc.add_argument("--json", action="store_true", help="レコード JSON をそのまま出す")
+    p_disc.set_defaults(func=cmd_discover)
 
     p = sub.add_parser("ls", help="リモートの直下を一覧する（内容は取らない）")
     p.add_argument("remote")

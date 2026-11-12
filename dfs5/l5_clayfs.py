@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import ContentAddressedCrypto
 from .l2_registry import DirectoryRegistryService
-from .l3_ost_adapter import OSTClient
+from .l3_ost_adapter import FailoverOSTClient, OSTClient
 from .fs import FileSystem
 from .fs.core import remove_tree
 from .l4_log import L4LogClient, MerkleTreeBuilder
@@ -86,13 +86,33 @@ class DFS5Node:
         ost_host: str,
         ost_port: int,
         root_pubkey: Optional[str] = None,
+        ost_alternates: Optional[List[str]] = None,
     ):
         self.name = name
         self.sub_path = sub_path
         self.clayfs = ClayFSAdapter(mount_root)
         self.crypto = ContentAddressedCrypto(tree_secret)
-        self.ost = OSTClient(host=ost_host, port=ost_port)
-        self.builder = MerkleTreeBuilder(self.crypto, self.ost)
+        primary = (str(ost_host), int(ost_port))
+        endpoints = [primary]
+        for value in ost_alternates or []:
+            endpoints.append(self._parse_ost_endpoint(value))
+        seen = set()
+        self.ost_endpoints: List[str] = []
+        ost_clients: List[OSTClient] = []
+        for host, port in endpoints:
+            key = (host, int(port))
+            if key in seen:
+                continue
+            seen.add(key)
+            ost_clients.append(OSTClient(host=host, port=int(port)))
+            self.ost_endpoints.append(f"tls://{host}:{int(port)}")
+        self.ost = ost_clients[0]
+        self.replica_osts = ost_clients[1:]
+        self.builder = MerkleTreeBuilder(
+            self.crypto, self.ost, replicas=self.replica_osts
+        )
+        self.read_ost = FailoverOSTClient(ost_clients)
+        self.read_builder = MerkleTreeBuilder(self.crypto, self.read_ost)
         self.registry = registry
         pin_file = self.clayfs.clayfs_meta / "local_head.json"
         self.l4 = L4LogClient(
@@ -103,6 +123,45 @@ class DFS5Node:
     def switch_credentials(self, new_priv_key: Path | str, new_pub_key_str: str) -> None:
         self.l4.priv_key_path = Path(new_priv_key)
         self.l4.pub_key_str = new_pub_key_str.strip()
+
+    @staticmethod
+    def _parse_ost_endpoint(value: str) -> Tuple[str, int]:
+        text = str(value).strip()
+        for prefix in ("tls://", "http://", "https://"):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        host, sep, port_text = text.rpartition(":")
+        if not sep or not host or not port_text.isdigit():
+            raise ValueError(f"Invalid OST endpoint: {value!r}")
+        return host, int(port_text)
+
+    def refresh_read_ost(self) -> None:
+        """検証済みロケータの endpoints を優先して、読み取り用 OST を組み直す。"""
+        endpoints = list(self.ost_endpoints)
+        locator = self.l4.last_locator
+        if locator:
+            for value in (locator.get("payload", {}).get("endpoints") or []):
+                try:
+                    host, port = self._parse_ost_endpoint(value)
+                except ValueError:
+                    continue
+                endpoint = f"tls://{host}:{port}"
+                if endpoint not in endpoints:
+                    endpoints.append(endpoint)
+        clients: List[OSTClient] = []
+        seen = set()
+        for value in endpoints:
+            try:
+                host, port = self._parse_ost_endpoint(value)
+            except ValueError:
+                continue
+            key = (host, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            clients.append(OSTClient(host=host, port=port))
+        self.read_ost = FailoverOSTClient(clients)
+        self.read_builder = MerkleTreeBuilder(self.crypto, self.read_ost)
 
     def push(
         self,
@@ -134,23 +193,26 @@ class DFS5Node:
             root_plain_id=root_pid,
             root_wire_id=root_wid,
             delegation_epoch=delegation_epoch,
-            ost_endpoint=f"tls://{self.ost.host}:{self.ost.port}",
+            ost_endpoint=list(self.ost_endpoints),
             now=now,
         )
         wire_bytes = self.ost.bytes_sent
         return log_env, snap_dir, wire_bytes
 
     def pull(self, expected_writer_pubkey: Optional[str] = None) -> Path:
-        self.ost.reset_metrics()
         head_env = self.l4.sync_head(self.registry, expected_writer_pubkey=expected_writer_pubkey)
         if head_env is None:
             raise RuntimeError(f"No versions available on registry for {self.sub_path}")
+        self.refresh_read_ost()
+        self.read_ost.reset_metrics()
 
         p = head_env["payload"]
         with tempfile.TemporaryDirectory(prefix="dfs5_stage_") as staging:
             staging_dir = Path(staging)
-            with self.ost.session():
-                self.builder.download_directory(p["root_plain_id"], p["root_wire_id"], staging_dir)
+            with self.read_ost.session():
+                self.read_builder.download_directory(
+                    p["root_plain_id"], p["root_wire_id"], staging_dir
+                )
             self.clayfs.replace_work_tree(staging_dir)
 
         return self.clayfs.take_snapshot(f"v{p['version']}")
@@ -164,6 +226,7 @@ class DFS5Node:
         head_env = self.l4.sync_head(self.registry, expected_writer_pubkey=expected_writer_pubkey)
         if head_env is None:
             return "", "", getattr(self, "root_store", None), 0
+        self.refresh_read_ost()
         p = head_env["payload"]
         return p["root_plain_id"], p["root_wire_id"], getattr(self, "root_store", None), int(p["version"])
 
@@ -172,25 +235,28 @@ class DFS5Node:
 
         リモートにまだ版が無ければ空の一覧を返す（最初の push の前でも一覧できる）。
         """
-        self.ost.reset_metrics()
         head = self.l4.sync_head(self.registry)
         if head is None:
             return []
+        self.refresh_read_ost()
+        self.read_ost.reset_metrics()
         p = head["payload"]
         root_store = getattr(self, "root_store", None)
-        with self.ost.session():
-            return self.builder.list_tree(
+        with self.read_ost.session():
+            return self.read_builder.list_tree(
                 p["root_plain_id"], p["root_wire_id"], root_store=root_store, prefix=prefix
             )
 
     def read_remote(self, rel_path: str) -> bytes:
         """リモートの 1 ファイルだけを取得する（ツリー全体は落とさない）。"""
-        self.ost.reset_metrics()
         root_pid, root_wid, root_store, ver = self._head_root()
         if ver == 0 or not root_wid:
             raise FileNotFoundError(f"Remote has no versions yet: {rel_path}")
-        with self.ost.session():
-            return self.builder.read_remote_file(root_pid, root_wid, rel_path, root_store=root_store)
+        self.read_ost.reset_metrics()
+        with self.read_ost.session():
+            return self.read_builder.read_remote_file(
+                root_pid, root_wid, rel_path, root_store=root_store
+            )
 
     def remote_version(self) -> int:
         """リモート先頭版の版番号（取得は 1 往復、内容は取らない）。"""
