@@ -19,6 +19,7 @@ rclone ライクな dfs5 の CLI。
     dfs5cli sync  ./local scaleway:docs      # リモートをローカルに合わせる
     dfs5cli pull  scaleway:docs ./local      # リモートをローカルへ取り出す
     dfs5cli lsd   scaleway:docs
+    dfs5cli mount scaleway:docs /mnt/docs
     dfs5cli check scaleway:docs ./local
     dfs5cli about scaleway:
 
@@ -1383,6 +1384,101 @@ def cmd_import_tar(args: argparse.Namespace) -> int:
     return 0
 
 
+def _configure_fuse_library(explicit: Optional[str] = None) -> None:
+    """macOS では fuse-t を必須にし、fusepy の macFUSE フォールバックを防ぐ。"""
+    if explicit:
+        os.environ["FUSE_LIBRARY_PATH"] = str(Path(explicit).expanduser())
+        return
+    if sys.platform != "darwin":
+        return
+    env_path = os.environ.get("FUSE_LIBRARY_PATH", "")
+    if env_path and "fuse-t" in Path(env_path).name.lower():
+        return
+    candidates = (
+        Path("/usr/local/lib/libfuse-t.dylib"),
+        *sorted(Path("/Library/Application Support/fuse-t/lib").glob("libfuse-t-*.dylib")),
+    )
+    for path in candidates:
+        if path.is_file():
+            os.environ["FUSE_LIBRARY_PATH"] = str(path)
+            return
+    raise UsageError(
+        "マウント機能には fuse-t が必要です。"
+        "macOS では "
+        "`brew install macos-fuse-t/homebrew-cask/fuse-t` "
+        "でインストールしてください"
+    )
+
+
+def cmd_mount(args: argparse.Namespace) -> int:
+    """リモートのサブツリーを fuse-t / fusepy でローカルにマウントする。
+
+    作業ツリーを FUSE に公開し、flush / fsync / unmount 時に DFS5 へ push する。
+    """
+    store = RemoteStore()
+    name, sub = split_remote_spec(args.remote, args.remote_name)
+    remote = store.get(name)
+    mountpoint = Path(args.mountpoint).expanduser()
+    if not mountpoint.exists():
+        mountpoint.mkdir(parents=True, exist_ok=True)
+    if not mountpoint.is_dir():
+        raise UsageError(f"マウントポイントがディレクトリではありません: {mountpoint}")
+
+    node = open_remote(remote, create=True)
+    refresh_cache(node)
+
+    def flush_to_dfs5() -> None:
+        log_env, sent = _push(node, remote)
+        print(
+            f"[dfs5cli] mount flush -> v{log_env['payload']['version']} "
+            f"| sent={sent} B",
+            file=sys.stderr,
+        )
+
+    try:
+        from .fuse_mount import LocalTreeFuse
+    except ImportError as e:  # pragma: no cover - 依存環境
+        raise UsageError(
+            "mount には fusepy と fuse-t / FUSE が必要です "
+            "(pip install 'dfs5[fuse]')"
+        ) from e
+
+    _configure_fuse_library(args.fuse_library)
+    try:
+        from fuse import FUSE
+    except (ImportError, OSError) as e:
+        raise UsageError(
+            "fuse-t / libfuse を読み込めません。"
+            "macOS では FUSE-T をインストールし、必要なら --fuse-library を指定してください"
+        ) from e
+
+    operations = LocalTreeFuse(
+        node.clayfs.work_tree,
+        flush_to_dfs5,
+        read_only=args.read_only,
+        sync_delay=0.5,
+    )
+    options = {
+        "fsname": f"dfs5:{name}:{node.sub_path}",
+        "volname": f"dfs5-{name}",
+        "foreground": True,
+        "nothreads": True,
+    }
+    if args.allow_other:
+        options["allow_other"] = True
+    if args.read_only:
+        options["ro"] = True
+    if args.debug:
+        options["debug"] = True
+    try:
+        FUSE(operations, str(mountpoint), **options)
+    except KeyboardInterrupt:
+        print("\n[dfs5cli] mount を終了します", file=sys.stderr)
+    finally:
+        operations.destroy("/")
+    return 0
+
+
 def cmd_mv(args: argparse.Namespace) -> int:
     """リモート内でファイルまたはディレクトリを移動・改名する。
 
@@ -2028,6 +2124,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("lsd", help="リモートの直下にあるディレクトリだけを一覧する")
     p.add_argument("remote")
     p.set_defaults(func=cmd_lsd)
+
+    p = sub.add_parser("mount", help="リモートを fuse-t / FUSE でマウントする")
+    p.add_argument("remote", help="remote:path")
+    p.add_argument("mountpoint", help="ローカルのマウントポイント")
+    p.add_argument("--read-only", action="store_true", help="読み取り専用でマウントする")
+    p.add_argument("--allow-other", action="store_true", help="allow_other を FUSE に渡す")
+    p.add_argument("--debug", action="store_true", help="FUSE のデバッグログを出す")
+    p.add_argument(
+        "--fuse-library",
+        help="fusepy が使う FUSE ライブラリ（macOS の fuse-t など）",
+    )
+    p.set_defaults(func=cmd_mount)
 
     p = sub.add_parser("lsl", help="リモートの直下を大きさ付きで一覧する")
     p.add_argument("remote")

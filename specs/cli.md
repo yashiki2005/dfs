@@ -30,6 +30,18 @@ libp2p/QUIC も使う場合は optional extra を付ける。
 pipx install '.[libp2p]'
 ```
 
+FUSE マウントも使う場合は `fuse` extra を付ける。
+
+```bash
+pipx install '.[fuse]'
+```
+
+macOS では fuse-t も必要になる。
+
+```bash
+brew install macos-fuse-t/homebrew-cask/fuse-t
+```
+
 リポジトリ直下の `./dfs5cli` / `./dfs5svc` は、開発中にそのまま使うための
 互換ラッパーとして残している。
 
@@ -284,6 +296,7 @@ dfs5cli config show|delete|list [NAME]
 # 読み出し（版を進めない）
 dfs5cli ls     REMOTE:path
 dfs5cli lsd    REMOTE:path
+dfs5cli mount  REMOTE:path LOCAL_MOUNT
 dfs5cli lsl    REMOTE:path
 dfs5cli lsjson REMOTE:path
 dfs5cli size   REMOTE:path
@@ -406,6 +419,25 @@ dfs5cli import_tar release.tar.gz backup:
 dfs5cli import_tar bundle.tar.xz backup:project --strip-components 1
 ```
 
+#### 3.2.4 FUSE マウント
+
+`mount` はリモートのサブツリーをローカルのマウントポイントに公開する。
+macOS では fuse-t を優先し、Linux では libfuse を使う。
+
+```bash
+dfs5cli mount scw:docs /mnt/dfs5-docs
+dfs5cli mount scw:docs /mnt/dfs5-docs --read-only
+```
+
+読み書きは作業ツリー上で行い、ファイルを close したとき（FUSE の `release`）と
+アンマウント時に DFS5 へ push する。複数ファイルを同時に書く場合は、ファイルごとに
+版が増えることがある。マウント中も単一書き手の前提を維持するため、同じサブツリーを
+別の DFS5 書き手から同時に変更しないこと。
+
+`--allow-other`、`--debug`、`--fuse-library PATH` も指定できる。macOS で
+fusepy が macFUSE を選んでしまう場合は、`--fuse-library` に fuse-t の
+`libfuse-t.dylib` を渡す。
+
 ### 3.3 一覧は内容を取らない
 
 `ls` / `lsd` / `lsl` / `lsjson` / `size` は、ディレクトリ塊だけを辿ってファイルの中身は取らない。
@@ -494,6 +526,9 @@ srv/
 ## 5. 試験
 
 `tests/test_cli_main.py` に 47 件。
+
+`tests/test_fuse_mount.py` に 4 件（読み書き、`release` 時の push、read-only、
+fuse-t 不在時のエラー）。
 
 | 試験 | 確かめること |
 |---|---|

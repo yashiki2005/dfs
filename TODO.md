@@ -4,9 +4,9 @@
 まずここを読んで「どこまで動いていて、次に何をするか」を掴んでほしい。
 
 - リポジトリ: `~/src/dfs5`（`/Volumes/ExtSSD/src/dfs5` へのシンボリックリンク）
-- 基準コミット: `588ff36 perf: optimize signature verification and DNSSEC discovery`
-- テスト: **149 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`）
-- 作業ツリー: 未コミット差分あり（OST 保存先の分離、import_tar）
+- 基準コミット: `525bdd0 feat: add external OST storage and tar import`
+- テスト: **153 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`）
+- 作業ツリー: 未コミット差分あり（fuse-t マウント）
 
 ---
 
@@ -114,7 +114,7 @@ C（合意形成）は当面やらない。
 
 ### 2.3 CLI の追加（使い勝手）
 
-2026-11-12 に、次の 3 つを実装した。
+2026-11-12 に、次の CLI 機能を実装した。
 
 | コマンド | 内容 | 状態 |
 |---|---|---|
@@ -122,6 +122,7 @@ C（合意形成）は当面やらない。
 | `--exclude` / `--include` | `copy` / `sync` / `pull` の相対パスフィルタ。`sync --delete` はフィルタ外を消さない | 実装済み |
 | `lsd` | 直下のディレクトリだけを一覧する | 実装済み |
 | `import_tar` | `.tar` / `.tar.gz` / `.tar.xz` / `.tar.bz2` を安全に 1 版でインポートする | 実装済み |
+| `mount` | fuse-t / fusepy でリモートをローカルにマウントする | 実装済み |
 
 `mv` は宛先を新しい名前そのものとして扱う（既存ディレクトリへの自動格納や merge はしない）。
 詳細は `specs/cli.md` §3.2.1〜3.2.2。
@@ -306,7 +307,7 @@ cd ~/src/dfs5
 # 1. 状態の確認
 git log --oneline -3
 git status --short          # 空ならクリーン
-~/dfs-venv/bin/python -m pytest tests -q   # 149 件パス、1 skip（約 174 秒）
+~/dfs-venv/bin/python -m pytest tests -q   # 153 件パス、1 skip（約 166 秒）
 
 # 2. サーバを立てる（新コードで）
 ./dfs5svc list               # 既存のサービスを確認
