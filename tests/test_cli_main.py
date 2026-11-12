@@ -63,6 +63,7 @@ class LocalServer:
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
+        self.registry_stopped = False
 
     @property
     def registry_url(self) -> str:
@@ -72,9 +73,16 @@ class LocalServer:
     def ost_endpoint(self) -> str:
         return f"127.0.0.1:{self.ost.port}"
 
-    def close(self) -> None:
+    def stop_registry(self) -> None:
+        """レジストリだけを止める（OST は読み取り可用性の試験用に残す）。"""
+        if self.registry_stopped:
+            return
+        self.registry_stopped = True
         self.httpd.shutdown()
         self.httpd.server_close()
+
+    def close(self) -> None:
+        self.stop_registry()
         self.ost.close()
 
 
@@ -447,6 +455,32 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
         node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
         self.assertEqual(node2.l4.pin.version, v1, "無変更の copy が新しい版を作っている")
+
+    def test_read_uses_l2_cache_after_all_registries_stop(self) -> None:
+        """registry が全滅しても、検証済みキャッシュと生きている OST で読める。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        cache_path = self.workdir / ".clayfs" / "l2_cache.json"
+        self.assertTrue(cache_path.is_file(), "L2 キャッシュが作られていない")
+
+        self.server.stop_registry()
+        node = cli_mod.load_node_from_mount(self.workdir)[0]
+        self.assertEqual(node.read_remote("a.txt"), b"hello world\n")
+        paths = {e["path"] for e in node.list_remote()}
+        self.assertIn("docs/readme.md", paths)
+
+    def test_expired_l2_cache_is_not_used(self) -> None:
+        """期限切れのキャッシュは読み取りに使わない。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        cache_path = self.workdir / ".clayfs" / "l2_cache.json"
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        entry = next(iter(data["paths"].values()))
+        entry["locator"]["payload"]["expires_at"] = int(time.time()) - 1
+        cache_path.write_text(json.dumps(data), encoding="utf-8")
+
+        self.server.stop_registry()
+        node = cli_mod.load_node_from_mount(self.workdir)[0]
+        with self.assertRaises(Exception):
+            node.read_remote("a.txt")
 
     def test_copyto_and_checksum(self) -> None:
         one = self.base / "one.txt"

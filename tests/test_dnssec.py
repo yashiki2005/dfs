@@ -79,15 +79,23 @@ class TestDiscoveryParser(unittest.TestCase):
 class TestDiscoverDomain(unittest.TestCase):
     def _answer(self, *, authenticated: bool):
         import dns.flags
+        import dns.name
+        import dns.rdatatype
 
         class Rdata:
             strings = [_record().encode("utf-8")]
 
+        class TxtRRset:
+            name = dns.name.from_text("_dfs5.example.com.")
+            rdtype = dns.rdatatype.TXT
+
         class Response:
             flags = dns.flags.AD if authenticated else 0
+            answer = [TxtRRset()]
 
         class Answer(list):
             response = Response()
+            canonical_name = dns.name.from_text("_dfs5.example.com.")
 
         class Resolver:
             do_requested = False
@@ -107,18 +115,27 @@ class TestDiscoverDomain(unittest.TestCase):
         resolver = self._answer(authenticated=False)
         with patch("dns.resolver.Resolver", resolver):
             with self.assertRaises(DiscoveryError):
-                discover_domain("example.com")
+                discover_domain("example.com", validate=False)
         resolver = self._answer(authenticated=True)
         with patch("dns.resolver.Resolver", resolver):
-            d = discover_domain("example.com")
+            d = discover_domain("example.com", validate=False)
         self.assertEqual(d.primary.role, "primary")
         self.assertTrue(resolver.do_requested)
 
     def test_no_ad_option_accepts_trusted_local_resolver(self) -> None:
         resolver = self._answer(authenticated=False)
         with patch("dns.resolver.Resolver", resolver):
-            d = discover_domain("example.com", require_ad=False)
+            d = discover_domain("example.com", require_ad=False, validate=False)
         self.assertEqual(d.domain, "example.com")
+
+    def test_full_validation_uses_chain_validator_without_ad(self) -> None:
+        resolver = self._answer(authenticated=False)
+        with patch("dns.resolver.Resolver", resolver), patch(
+            "dfs5.dnssec._validate_answer"
+        ) as validate_answer:
+            d = discover_domain("example.com")
+        self.assertEqual(d.domain, "example.com")
+        validate_answer.assert_called_once()
 
 
 class TestDnssecCli(unittest.TestCase):

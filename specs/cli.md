@@ -328,6 +328,9 @@ dfs5cli delegate ...
 途中で失敗しても、リモートの版は壊れない。dfs5 の push は「塊を送ってから CAS で 1 版を
 追記する」順なので、CAS が失敗すれば版は増えない。
 
+primary / secondary registry が両方停止した場合は、`.clayfs/l2_cache.json` の
+検証済み応答へフォールバックする。キャッシュも期限切れ・巻き戻しは拒否する。
+
 ### 3.2 冪等
 
 変更が無ければ**新しい版を作らない**。判定は rclone の既定と同じく大きさを先に見て、
@@ -426,6 +429,7 @@ wd/
 └── .clayfs/
     ├── dfs5_config.json          L2 URL・OST・sub_path・tree_secret
     ├── local_head.json           HeadPin（版番号 / entry_hash / epoch）
+    ├── l2_cache.json             検証済みの delegation / locator / head
     ├── cache_version             rclone CLI が足した「今の写しの版」
     └── snapshots/v1/             push 時に取った版の写し（ハードリンク）
 

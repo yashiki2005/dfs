@@ -758,6 +758,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                     dnssec_domain,
                     record_name=getattr(args, "dnssec_name", None),
                     require_ad=not getattr(args, "dnssec_no_ad", False),
+                    validate=not getattr(args, "dnssec_no_validate", False),
                 )
             except DiscoveryError as e:
                 raise UsageError(f"DNSSEC discovery に失敗しました: {e}") from e
@@ -960,6 +961,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
             args.domain,
             record_name=args.dnssec_name,
             require_ad=not args.dnssec_no_ad,
+            validate=not getattr(args, "dnssec_no_validate", False),
         )
     except DiscoveryError as e:
         raise UsageError(f"DNSSEC discovery に失敗しました: {e}") from e
@@ -1815,7 +1817,11 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     )
     p.add_argument(
         "--dnssec-no-ad", action="store_true",
-        help="DNSSEC の AD ビットを要求しない（検証済みローカルリゾルバ専用）",
+        help="DNSSEC の AD ビットを要求しない（--dnssec-no-validate と併用する旧経路）",
+    )
+    p.add_argument(
+        "--dnssec-no-validate", action="store_true",
+        help="クライアント側 DNSSEC 検証を省略する（診断用。本番では使わない）",
     )
     if args_name_required:
         p.add_argument("name", help="リモートの名前（例: scw）")
@@ -1852,6 +1858,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_disc.add_argument("domain", help="例: example.com")
     p_disc.add_argument("--dnssec-name", help="TXT レコード名（既定 _dfs5.<domain>）")
     p_disc.add_argument("--dnssec-no-ad", action="store_true", help="AD ビットを要求しない")
+    p_disc.add_argument(
+        "--dnssec-no-validate",
+        action="store_true",
+        help="クライアント側 DNSSEC 検証を省略する（診断用。本番では使わない）",
+    )
     p_disc.add_argument("--json", action="store_true", help="レコード JSON をそのまま出す")
     p_disc.set_defaults(func=cmd_discover)
 

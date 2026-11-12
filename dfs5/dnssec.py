@@ -33,6 +33,15 @@ from .crypto import normalize_path
 SCHEMA = "dfs5-discovery-v1"
 DEFAULT_RECORD_PREFIX = "_dfs5"
 
+# IANA の root trust anchor（KSK-2017 / KSK-2024）。
+# https://data.iana.org/root-anchors/root-anchors.xml
+ROOT_TRUST_ANCHOR_DS = (
+    "20326 8 2 "
+    "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+    "38696 8 2 "
+    "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16",
+)
+
 
 class DiscoveryError(ValueError):
     """DNSSEC discovery のレコード不正・検証失敗。"""
@@ -86,6 +95,121 @@ def _validate_registry_url(value: str) -> str:
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise DiscoveryError(f"Registry URL must be http(s)://host:port: {value!r}")
     return text
+
+
+def _query_rrset(resolver: Any, name: Any, rdtype: str):
+    """DNS 応答から対象 RRset と RRSIG RRset を取り出す。"""
+    import dns.rdatatype
+    import dns.resolver
+
+    try:
+        answer = resolver.resolve(name, rdtype)
+    except Exception as e:  # noqa: BLE001 - dnspython の例外型は環境で揺れる
+        raise DiscoveryError(f"Cannot resolve {name} {rdtype}: {e}") from e
+
+    want = dns.rdatatype.from_text(rdtype)
+    rrset = None
+    sigset = None
+    for item in answer.response.answer:
+        if item.name != answer.canonical_name:
+            continue
+        if item.rdtype == want:
+            rrset = item
+        elif item.rdtype == dns.rdatatype.RRSIG:
+            if any(r.type_covered == want for r in item):
+                sigset = item
+    if rrset is None or sigset is None:
+        raise DiscoveryError(
+            f"DNSSEC proof missing for {answer.canonical_name} {rdtype}"
+        )
+    return rrset, sigset
+
+
+def _matching_dnskeys(zone: Any, keys: Any, ds_rrset: Any):
+    """DS に一致する DNSKEY だけを返す。"""
+    import dns.dnssec
+    import dns.rrset
+
+    matching = []
+    for key in keys:
+        for ds in ds_rrset:
+            if dns.dnssec.key_id(key) != ds.key_tag or key.algorithm != ds.algorithm:
+                continue
+            try:
+                made = dns.dnssec.make_ds(zone, key, ds.digest_type, validating=True)
+            except Exception:  # noqa: BLE001 - 未対応アルゴリズム等
+                continue
+            if made.digest == ds.digest:
+                matching.append(key)
+                break
+    if not matching:
+        raise DiscoveryError(f"No DNSKEY matches the DS set for {zone}")
+    return dns.rrset.from_rdata(zone, keys.ttl, *matching)
+
+
+def _validated_zone_keys(
+    resolver: Any, zone: Any, cache: Dict[Any, Any]
+):
+    """root から ``zone`` までの DNSKEY/DS チェーンを検証し、DNSKEY 集合を返す。"""
+    import dns.dnssec
+    import dns.name
+    import dns.rrset
+
+    zone = dns.name.from_text(str(zone))
+    if zone in cache:
+        return cache[zone]
+
+    dnskey_rrset, dnskey_rrsig = _query_rrset(resolver, zone, "DNSKEY")
+    if zone == dns.name.root:
+        anchor_text = list(ROOT_TRUST_ANCHOR_DS)
+        ds_rrset = dns.rrset.from_text(".", 0, "IN", "DS", *anchor_text)
+    else:
+        ds_rrset, ds_rrsig = _query_rrset(resolver, zone, "DS")
+        signers = {sig.signer for sig in ds_rrsig}
+        if len(signers) != 1:
+            raise DiscoveryError(f"DS for {zone} has ambiguous signers")
+        parent = next(iter(signers))
+        parent_keys = _validated_zone_keys(resolver, parent, cache)
+        try:
+            dns.dnssec.validate(ds_rrset, ds_rrsig, {parent: parent_keys})
+        except Exception as e:  # noqa: BLE001
+            raise DiscoveryError(f"DS validation failed for {zone}: {e}") from e
+
+    trusted_keys = _matching_dnskeys(zone, dnskey_rrset, ds_rrset)
+    try:
+        dns.dnssec.validate(dnskey_rrset, dnskey_rrsig, {zone: trusted_keys})
+    except Exception as e:  # noqa: BLE001
+        raise DiscoveryError(f"DNSKEY validation failed for {zone}: {e}") from e
+
+    cache[zone] = dnskey_rrset
+    return dnskey_rrset
+
+
+def _validate_answer(resolver: Any, answer: Any, rrset: Any) -> None:
+    """TXT 応答の RRSIG を、root から検証したゾーン鍵で確認する。"""
+    import dns.dnssec
+    import dns.rdatatype
+
+    sigset = None
+    for item in answer.response.answer:
+        if item.name != answer.canonical_name:
+            continue
+        if item.rdtype == dns.rdatatype.RRSIG and any(
+            r.type_covered == dns.rdatatype.TXT for r in item
+        ):
+            sigset = item
+            break
+    if sigset is None:
+        raise DiscoveryError(f"DNSSEC proof missing for {answer.canonical_name} TXT")
+    signers = {sig.signer for sig in sigset}
+    if len(signers) != 1:
+        raise DiscoveryError(f"TXT for {answer.canonical_name} has ambiguous signers")
+    zone = next(iter(signers))
+    keys = _validated_zone_keys(resolver, zone, {})
+    try:
+        dns.dnssec.validate(rrset, sigset, {zone: keys})
+    except Exception as e:  # noqa: BLE001
+        raise DiscoveryError(f"TXT DNSSEC validation failed: {e}") from e
 
 
 def parse_discovery_text(
@@ -174,16 +298,18 @@ def discover_domain(
     *,
     record_name: Optional[str] = None,
     require_ad: bool = True,
+    validate: bool = True,
     timeout: float = 5.0,
 ) -> Discovery:
     """DNSSEC 対応リゾルバで ``_dfs5.<domain>`` TXT を読む。
 
-    ``require_ad=True`` のとき、レスポンスに AD ビットがなければ拒否する。
-    これは「検証済みリゾルバを信頼する」方式であり、クライアント自身が
-    DNSKEY/DS チェーンを再検証する方式ではない。詳細は specs/dnssec.md を参照。
+    既定ではクライアント自身が root trust anchor から DNSKEY/DS チェーンを
+    検証する。``validate=False`` のときだけ、従来どおり ``require_ad=True`` で
+    AD ビットを要求する。詳細は specs/dnssec.md を参照。
     """
     try:
         import dns.flags
+        import dns.rdatatype
         import dns.resolver
     except ImportError as e:  # pragma: no cover - 環境依存
         raise DiscoveryError(
@@ -204,11 +330,16 @@ def discover_domain(
         raise DiscoveryError(f"Cannot resolve {qname}: {e}") from e
 
     if require_ad:
-        flags = getattr(getattr(answer, "response", None), "flags", None)
-        if flags is None or not (flags & dns.flags.AD):
-            raise DiscoveryError(
-                f"DNS response for {qname} is not DNSSEC-authenticated (AD bit missing)"
-            )
+        if validate:
+            # 完全検証では AD ビットに依存しない。validate=False のときだけ
+            # 検証済みリゾルバの AD を信頼するフォールバックを使う。
+            pass
+        else:
+            flags = getattr(getattr(answer, "response", None), "flags", None)
+            if flags is None or not (flags & dns.flags.AD):
+                raise DiscoveryError(
+                    f"DNS response for {qname} is not DNSSEC-authenticated (AD bit missing)"
+                )
 
     texts: List[str] = []
     for rdata in answer:
@@ -223,4 +354,16 @@ def discover_domain(
         raise DiscoveryError(
             f"Expected exactly one {qname} TXT record, got {len(texts)}"
         )
+    if validate:
+        txt_rrset = None
+        for item in answer.response.answer:
+            if (
+                item.name == answer.canonical_name
+                and item.rdtype == dns.rdatatype.TXT
+            ):
+                txt_rrset = item
+                break
+        if txt_rrset is None:
+            raise DiscoveryError(f"DNSSEC proof missing for {qname} TXT")
+        _validate_answer(resolver, answer, txt_rrset)
     return parse_discovery_text(texts[0], expected_domain=normalized)

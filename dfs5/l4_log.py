@@ -652,12 +652,35 @@ class L4LogClient:
         if p["delegation_epoch"] < self.pin.delegation_epoch:
             raise RollbackDetectedError("B6 Delegation epoch rollback detected")
 
+        # L2 ロケータは読み取り先 OST の一覧を運ぶ。署名・期限・head との一致を
+        # ここで確認しないと、期限切れの endpoint を使い続けてしまう。
+        if loc_env is not None:
+            loc_p = verify_locator_envelope(
+                loc_env, self.sub_path, writer_pub, int(time.time())
+            )
+            if (
+                int(loc_p.get("head_version", -1)) != int(p["version"])
+                or loc_p.get("head_hash") != head_env["entry_hash"]
+            ):
+                raise ChunkIntegrityError("Locator does not match the current head")
+            if int(loc_p.get("delegation_epoch", -1)) != int(p["delegation_epoch"]):
+                raise ChunkIntegrityError("Locator delegation_epoch does not match the head")
+
         self.pin = HeadPin(
             version=p["version"],
             entry_hash=head_env["entry_hash"],
             delegation_epoch=p["delegation_epoch"],
         )
         self._save_pin()
+        cache_verified = getattr(registry, "cache_verified", None)
+        if callable(cache_verified):
+            cache_verified(
+                self.sub_path,
+                del_env,
+                loc_env,
+                head_env,
+                now=int(time.time()),
+            )
         return head_env
 
     def resolve_verified(
@@ -774,7 +797,7 @@ class L4LogClient:
         )
 
         # 2. B7 防御: Read-after-Write 照合（一致が確認できるまでローカルピンは進めない）
-        _, _, readback = registry.resolve(self.sub_path)
+        readback_del, _readback_loc, readback = registry.resolve(self.sub_path)
         if (
             readback is None
             or readback["payload"]["version"] != next_ver
@@ -792,4 +815,13 @@ class L4LogClient:
             delegation_epoch=delegation_epoch,
         )
         self._save_pin()
+        cache_verified = getattr(registry, "cache_verified", None)
+        if callable(cache_verified):
+            cache_verified(
+                self.sub_path,
+                readback_del or self.last_delegation,
+                loc_env,
+                log_env,
+                now=now,
+            )
         return log_env

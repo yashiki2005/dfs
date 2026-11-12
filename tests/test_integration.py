@@ -535,7 +535,7 @@ class TestStage5Integration(unittest.TestCase):
 
             ost = ChunkStoreServer(cert, key)
             reg = DirectoryRegistryService("/example.com", root_pub)
-            now = 1763000000
+            now = int(time.time())
             sub_path = "/example.com/alice/notes"
             secret = "shared-notes-secret-key"
 

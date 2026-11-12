@@ -49,18 +49,19 @@ URL は `http(s)://host:port` 形式で、重複を拒否する。
 
 ## 検証
 
-1. DNSSEC 対応リゾルバで `_dfs5.<domain>` TXT を引く
-2. EDNS0 の DO ビットを付けて問い合わせ、レスポンスの AD（Authenticated Data）ビットを確認する
-3. TXT の JSON をスキーマ・型・必須項目について検証する
-4. `root_pubkey` を `root_anchor` の信頼の根として記録する
-5. 以後の L1 委譲チェーンは、既存の root アンカー検証で検証する
+1. EDNS0 の DO ビットを付けて `_dfs5.<domain>` TXT を引く
+2. TXT の RRSIG から署名ゾーンを特定する
+3. IANA の root trust anchor（KSK-2017 / KSK-2024 の DS）を根として、
+   署名ゾーンまでの DNSKEY / DS チェーンをクライアント側で検証する
+4. TXT RRset の RRSIG を検証する
+5. TXT の JSON をスキーマ・型・必須項目について検証する
+6. `root_pubkey` を `root_anchor` の信頼の根として記録する
+7. 以後の L1 委譲チェーンは、既存の root アンカー検証で検証する
 
-現段階の実装は **検証済みリゾルバの AD ビットを信頼する**方式である。
-クライアント自身が DNSKEY/DS チェーンを再検証する方式ではない。
-DO ビットを付けない問い合わせでは、署名が正しくても AD が返らない実装があるため、
-`discover_domain` は EDNS0 DO を明示している。
-ローカルで AD を付けられない検証環境向けに `--dnssec-no-ad` を用意するが、
-本番では使わない。
+AD（Authenticated Data）ビットは既定の検証では使わない。`validate=False` を
+明示した旧互換経路だけが、検証済みリゾルバの AD ビットを信頼する。
+この旧経路は `--dnssec-no-validate --dnssec-no-ad` で選ぶ。診断用であり、
+通常運用では使わない。
 
 ## DNSSEC と L2/L3 の役割
 
@@ -105,7 +106,8 @@ dfs5cli config create scw \
 
 ## 制約
 
-- AD ビットを信頼する MVP であり、完全なクライアント側 DNSSEC 検証は未実装
+- root trust anchor はコードに埋め込んでいる。IANA の KSK ロールオーバー時には
+  `ROOT_TRUST_ANCHOR_DS` を更新する必要がある
 - primary 昇格時の fencing は `role_epoch` で行う。旧 primary は、昇格後の
   `role_epoch` を持つ writer からの書き込みを拒否する。ただし旧 epoch の writer は
   引き続き旧 primary に書き込めるため、writer 設定の更新を同時に行う必要がある

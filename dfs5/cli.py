@@ -37,6 +37,7 @@ if __package__ in (None, ""):
         RegistryError,
         ServiceUnavailableError,
     )
+    from dfs5.l2_cache import CachedRegistryClient
     from dfs5.l3_store import ChunkStoreServer
     from dfs5.l4_log import RollbackDetectedError, SilentDropDetectedError
     from dfs5.l5_clayfs import DFS5Node
@@ -51,6 +52,7 @@ else:
         RegistryError,
         ServiceUnavailableError,
     )
+    from .l2_cache import CachedRegistryClient
     from .l3_store import ChunkStoreServer
     from .l4_log import RollbackDetectedError, SilentDropDetectedError
     from .l5_clayfs import DFS5Node
@@ -502,7 +504,9 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
 CONFIG_FILENAME = "dfs5_config.json"
 
 
-def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], RemoteRegistryClient]:
+def load_node_from_mount(
+    mount_dir: Path,
+) -> Tuple[DFS5Node, Dict[str, Any], CachedRegistryClient]:
     mount_root = mount_dir.expanduser().resolve()
     cfg_path = mount_root / ".clayfs" / CONFIG_FILENAME
     if not cfg_path.is_file():
@@ -516,7 +520,10 @@ def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], Rem
     pub_key_str = pub_key_path.read_text(encoding="utf-8").strip()
 
     reg_urls = [cfg["registry_url"], *(cfg.get("registry_alternates") or [])]
-    reg_client = RemoteRegistryClient(reg_urls)
+    reg_client = CachedRegistryClient(
+        RemoteRegistryClient(reg_urls),
+        mount_root / ".clayfs" / "l2_cache.json",
+    )
     node = DFS5Node(
         name=cfg["node_name"],
         sub_path=cfg["sub_path"],

@@ -7,6 +7,7 @@ dfs5/tests/test_evil_suite.py
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -69,7 +70,7 @@ class TestEvilSuite(unittest.TestCase):
         cls.alice_priv, cls.alice_pub = generate_ssh_keypair(cls.base, "alice")
         cls.bob_priv, cls.bob_pub = generate_ssh_keypair(cls.base, "bob")
         cls.cert, cls.key = generate_tls_cert(cls.base)
-        cls.now = 1763000000
+        cls.now = int(time.time())
 
     @classmethod
     def tearDownClass(cls) -> None:

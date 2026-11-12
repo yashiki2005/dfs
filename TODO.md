@@ -5,8 +5,8 @@
 
 - リポジトリ: `~/src/dfs5`（`/Volumes/ExtSSD/src/dfs5` へのシンボリックリンク）
 - 基準コミット: `05040aa feat: add L4 history and versioned archive catalogs`
-- テスト: **137 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`。実行に約 165 秒）
-- 作業ツリー: 未コミット差分あり（CLI 追加、L2 昇格、DNSSEC 修正）
+- テスト: **141 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`。実行に約 168 秒）
+- 作業ツリー: 未コミット差分あり（L2 読み取りキャッシュ、3 registry 試験、DNSSEC 完全検証）
 
 ---
 
@@ -136,8 +136,9 @@ DNSSEC は **root 鍵と初期 registry 一覧の配布**に限定し、L4 head 
 判断には使わない。primary / secondary は DNSSEC レコードまたは静的設定で決め、
 「最初に起動したサーバを root にする」方式は採用しない。
 
-詳細は `specs/dnssec.md`。現段階は検証済みリゾルバの AD ビットを信頼する MVP で、
-クライアント側の DNSKEY/DS 完全検証は今後の課題。
+詳細は `specs/dnssec.md`。クライアント側で root trust anchor から DNSKEY/DS
+チェーンを検証し、TXT の RRSIG を確認する。AD ビットは `validate=False` の
+旧互換経路だけで使う。
 
 ### 2.5.1 BitTorrent archive（MVP 実装済み）
 
@@ -163,7 +164,7 @@ libp2p を OST の追加 ChunkSource として実装した。最初の TCP 試�
 
 | 項目 | 状況 | やり方 |
 |---|---|---|
-| 3 台以上の同時参加 | 未実施 | 1 台で複数起動（§4）。足りなければ Docker |
+| 3 台以上の同時参加 | 3 registry の自動試験は実装済み。実機 3 拠点は未実施 | 1 台で複数起動（§4）。足りなければ Docker |
 | 長時間運用・連続 push/pull の劣化 | 未実施 | — |
 | WAN での 100 塊以上の実測 | 未実施 | 20 ファイルのみ。ローカルで 500 は確認 |
 | 実効スループット | 未計測 | 所要時間とバイト数からの概算のみ |
@@ -178,7 +179,7 @@ libp2p を OST の追加 ChunkSource として実装した。最初の TCP 試�
 |---|---|
 | mini_lustre との RPC アダプタ | 未実装。そもそも mini_lustre 自体が試作なので、必要なら載せ替えを検討 |
 | DHT によるノード発見 | 未実装。`specs/delegation.md` §3.5.5 に、発見後の排除の設計を書いた |
-| 名簿のキャッシュ | 未実装（DHT を足すときに必要） |
+| 名簿のキャッシュ | 実装済み（`.clayfs/l2_cache.json`、全 registry 停止時の読み取りフォールバック） |
 | 過去の版の取り出し（ロールバック） | 実装済み。`/v1/history` / `/v1/resolve?version` / `dfs5cli history` / `archive create --version` |
 
 ---
@@ -292,7 +293,7 @@ cd ~/src/dfs5
 # 1. 状態の確認
 git log --oneline -3
 git status --short          # 空ならクリーン
-~/dfs-venv/bin/python -m pytest tests -q   # 137 件パス、1 skip（約 165 秒）
+~/dfs-venv/bin/python -m pytest tests -q   # 141 件パス、1 skip（約 168 秒）
 
 # 2. サーバを立てる（新コードで）
 ./dfs5svc list               # 既存のサービスを確認

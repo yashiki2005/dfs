@@ -290,6 +290,48 @@ class AvailabilityCase(unittest.TestCase):
         self.assertIsNotNone(head)
         self.assertEqual(head["payload"]["version"], 1)
 
+    def test_three_registry_replication_and_read_failover(self) -> None:
+        """主 + 2 複製へ書き込み、主・次の順で落として 3 台目から読める。"""
+        primary = _RegistryHTTP(
+            cli_mod.PersistentRegistryState(
+                self.base / "primary3_state", "/example.com", self.root_pub
+            )
+        )
+        secondary = _RegistryHTTP(
+            cli_mod.PersistentRegistryState(
+                self.base / "secondary3_state", "/example.com", self.root_pub
+            )
+        )
+        tertiary = _RegistryHTTP(
+            cli_mod.PersistentRegistryState(
+                self.base / "tertiary3_state", "/example.com", self.root_pub
+            )
+        )
+        self.addCleanup(primary.close)
+        self.addCleanup(secondary.close)
+        self.addCleanup(tertiary.close)
+        primary.pstate.replica_registries = [secondary.url, tertiary.url]
+
+        client = cli_mod.RemoteRegistryClient(primary.url)
+        client.register_delegation(self.env, now=self.now)
+        client.announce_and_append(self.path, self.log, self.loc, now=self.now)
+        for server in (primary, secondary, tertiary):
+            self.assertEqual(
+                server.pstate.service.logs[self.path][-1]["entry_hash"],
+                self.log["entry_hash"],
+            )
+
+        primary.stop_http()
+        failover = cli_mod.RemoteRegistryClient(
+            [primary.url, secondary.url, tertiary.url]
+        )
+        _del, _loc, head = failover.resolve(self.path)
+        self.assertEqual(head["payload"]["version"], 1)
+
+        secondary.stop_http()
+        _del, _loc, head = failover.resolve(self.path)
+        self.assertEqual(head["payload"]["version"], 1)
+
     def test_secondary_rejects_writes_and_role_epoch_fences_old_primary(self) -> None:
         service = self._registry("primary")
         primary = _RegistryHTTP(
