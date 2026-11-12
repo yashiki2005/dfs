@@ -14,8 +14,10 @@ rclone ライクな dfs5 の CLI。
     dfs5cli ls    scaleway:docs
     dfs5cli cat   scaleway:docs/readme.md
     dfs5cli copy  ./local scaleway:docs
+    dfs5cli mv    scaleway:docs/old.md scaleway:docs/new.md
     dfs5cli sync  ./local scaleway:docs      # リモートをローカルに合わせる
     dfs5cli pull  scaleway:docs ./local      # リモートをローカルへ取り出す
+    dfs5cli lsd   scaleway:docs
     dfs5cli check scaleway:docs ./local
     dfs5cli about scaleway:
 
@@ -47,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -206,6 +209,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
         ensure_private_dir(mount_root / ".clayfs")
         cfg = {
             "delegation_epoch": int(remote.epoch),
+            "role_epoch": int(remote.role_epoch),
             "node_name": remote.node_name or remote.name,
             "ost_alternates": list(remote.ost_alternates),
             "libp2p_peers": list(remote.libp2p_peers),
@@ -241,6 +245,9 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
     ):
         cfg["libp2p_peers"] = list(remote.libp2p_peers)
         cfg["libp2p_psk"] = remote.libp2p_psk
+        changed = True
+    if int(cfg.get("role_epoch", 1)) != int(remote.role_epoch):
+        cfg["role_epoch"] = int(remote.role_epoch)
         changed = True
     if changed:
         write_private_json(cfg_path, cfg)
@@ -338,6 +345,66 @@ def _join_prefix(prefix: str, rel: str) -> str:
     return f"{prefix}/{rel}" if prefix else rel
 
 
+class PathFilter:
+    """``--include`` / ``--exclude`` の相対パスフィルタ。
+
+    パターンは操作の基準ディレクトリからの相対パスに適用する。``include`` が
+    指定された場合は、まずそれに一致するものだけを対象にし、その後に
+    ``exclude`` を適用する（除外が常に優先）。
+    """
+
+    def __init__(
+        self,
+        includes: Optional[List[str]] = None,
+        excludes: Optional[List[str]] = None,
+    ):
+        self.includes = tuple(
+            p.replace("\\", "/").lstrip("/")
+            for p in (includes or [])
+            if p.strip()
+        )
+        self.excludes = tuple(
+            p.replace("\\", "/").lstrip("/")
+            for p in (excludes or [])
+            if p.strip()
+        )
+
+    @staticmethod
+    def _match(path: str, pattern: str) -> bool:
+        path = path.replace("\\", "/").lstrip("/")
+        pattern = pattern.replace("\\", "/").lstrip("/")
+        if not pattern:
+            return False
+        if pattern.endswith("/"):
+            prefix = pattern.rstrip("/")
+            return path == prefix or path.startswith(prefix + "/")
+        if fnmatchcase(path, pattern):
+            return True
+        # ワイルドカード無しの ``docs`` は、そのディレクトリ配下も対象にする。
+        if not any(ch in pattern for ch in "*?["):
+            return path.startswith(pattern + "/")
+        return False
+
+    def allows(self, path: str) -> bool:
+        path = path.replace("\\", "/").lstrip("/")
+        if self.includes and not any(self._match(path, p) for p in self.includes):
+            return False
+        if any(self._match(path, p) for p in self.excludes):
+            return False
+        return True
+
+
+def _path_filter(args: argparse.Namespace) -> PathFilter:
+    return PathFilter(
+        includes=getattr(args, "include", None),
+        excludes=getattr(args, "exclude", None),
+    )
+
+
+def _filter_local(local: Dict[str, Path], path_filter: PathFilter) -> Dict[str, Path]:
+    return {rel: src for rel, src in local.items() if path_filter.allows(rel)}
+
+
 def _collect_local(src: Path, include_root_name: bool = False) -> Dict[str, Path]:
     """ローカルのファイルを、基準ディレクトリからの相対パス -> 実ファイルの辞書で返す。
 
@@ -391,6 +458,7 @@ def plan_changes(
     prefix: str,
     local: Dict[str, Path],
     checksum: bool = False,
+    path_filter: Optional[PathFilter] = None,
 ) -> Tuple[List[Tuple[str, Path, str]], List[str], List[str]]:
     """ローカルとリモートを比べ、(書くもの, 消すもの, 変わらないもの) を返す。
 
@@ -400,13 +468,20 @@ def plan_changes(
     版が増えるのは無駄なので、「変わらないなら版を作らない」をここで決める。
 
     返り値の「書くもの」は ``(リモートのパス, ローカルの実ファイル, "add"|"update")``。
+    ``path_filter`` が指定された場合、削除候補もフィルタの内側だけに限定する。
     """
+    path_filter = path_filter or PathFilter()
     remote = {
         e["path"]: e
         for e in _all_entries(node, prefix)
         if e["type"] == "file"
+        and path_filter.allows(e["path"][len(prefix) + 1 if prefix else 0:])
     }
-    wanted = {_join_prefix(prefix, rel): src for rel, src in local.items()}
+    wanted = {
+        _join_prefix(prefix, rel): src
+        for rel, src in local.items()
+        if path_filter.allows(rel)
+    }
 
     to_write: List[Tuple[str, Path, str]] = []
     unchanged: List[str] = []
@@ -808,6 +883,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             secret=secret or "",
             workdir=args.workdir or "",
             epoch=int(args.epoch),
+            role_epoch=int(getattr(args, "role_epoch", 1)),
             node_name=args.node_name or args.name,
             root_pubkey=root_pubkey,
             root_fingerprint=root_fingerprint,
@@ -856,7 +932,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         r = store.get(args.name)
         for key in ("name", "registry", "registry_alternates", "ost", "ost_alternates",
                     "libp2p_peers", "libp2p_psk", "path", "key", "workdir", "epoch",
-                    "node_name", "root_fingerprint"):
+                    "role_epoch", "node_name", "root_fingerprint"):
             value = getattr(r, key)
             if key in ("secret", "libp2p_psk"):
                 value = "***"
@@ -1007,6 +1083,17 @@ def cmd_ls(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lsd(args: argparse.Namespace) -> int:
+    """リモートの直下にあるディレクトリだけを一覧する。"""
+    store = RemoteStore()
+    name, sub = split_remote_spec(args.remote, args.remote_name)
+    node = open_remote(store.get(name), create=True)
+    for e in _rel_entries(node, _norm_prefix(sub)):
+        if e["type"] == "dir":
+            print(e["rel"] + "/")
+    return 0
+
+
 def cmd_lsl(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
@@ -1084,14 +1171,17 @@ def cmd_copy(args: argparse.Namespace) -> int:
     name, sub = split_remote_spec(args.dest, args.remote_name)
     remote = store.get(name)
     prefix = _norm_prefix(sub)
-    local = _collect_local(Path(args.src))
+    path_filter = _path_filter(args)
+    local = _filter_local(_collect_local(Path(args.src)), path_filter)
     if not local:
         print("[dfs5cli] コピーするファイルがありません", file=sys.stderr)
         return 0
 
     node = open_remote(remote, create=True)
     refresh_cache(node)
-    writes, _deletes, unchanged = plan_changes(node, prefix, local, checksum=args.checksum)
+    writes, _deletes, unchanged = plan_changes(
+        node, prefix, local, checksum=args.checksum, path_filter=path_filter
+    )
 
     plan = [
         f"{kind:6} {src} -> {remote.name}:{path}"
@@ -1152,6 +1242,79 @@ def cmd_copyto(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mv(args: argparse.Namespace) -> int:
+    """リモート内でファイルまたはディレクトリを移動・改名する。
+
+    移動は作業ツリー上の rename として行い、最後に 1 版だけ push する。宛先が
+    既に存在する場合は既定で拒否する。ファイル同士の置換だけは ``--overwrite``
+    で許可する（ディレクトリの merge は行わない）。
+    """
+    store = RemoteStore()
+    src_name, src_sub = split_remote_spec(args.src, args.remote_name)
+    dst_name, dst_sub = split_remote_spec(args.dst, args.remote_name)
+    if src_name != dst_name:
+        raise UsageError("mv は同じリモート内だけで使えます（別リモート間は copy + rm）")
+
+    src = _norm_prefix(src_sub)
+    dst = _norm_prefix(dst_sub)
+    if not src or not dst:
+        raise UsageError("mv には移動元と移動先のパスが必要です（例: remote:old remote:new）")
+    if src == dst:
+        print(f"[dfs5cli] mv: 移動元と移動先が同じです（{src_name}:{src}）", file=sys.stderr)
+        return 0
+
+    remote = store.get(src_name)
+    node = open_remote(remote, create=True)
+    refresh_cache(node)
+
+    files = _remote_file_paths(node)
+    dirs = _remote_dir_paths(node)
+    if src in files:
+        src_kind = "file"
+    elif src in dirs:
+        src_kind = "dir"
+    else:
+        raise UsageError(f"{src_name}:{src} は見つかりません")
+
+    if src_kind == "dir" and dst.startswith(src + "/"):
+        raise UsageError("ディレクトリを自分自身の下へ移動することはできません")
+
+    dst_kind = "file" if dst in files else ("dir" if dst in dirs else None)
+    if dst_kind is not None:
+        if not (src_kind == "file" and dst_kind == "file" and args.overwrite):
+            raise UsageError(
+                f"移動先 {src_name}:{dst} は既に存在します"
+                + ("（ファイル同士なら --overwrite で置換できます）" if src_kind == "file" else "")
+            )
+
+    _print_plan(
+        "mv",
+        [f"{src_name}:{src}{'/' if src_kind == 'dir' else ''} -> "
+         f"{src_name}:{dst}{'/' if src_kind == 'dir' else ''}"],
+        args.dry_run,
+    )
+    if args.dry_run:
+        return 0
+
+    src_path = _tree_path(node, src)
+    dst_path = _tree_path(node, dst)
+    try:
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        if dst_kind == "file":
+            os.replace(src_path, dst_path)
+        else:
+            src_path.rename(dst_path)
+    except OSError as e:
+        raise UsageError(f"移動に失敗しました: {e}") from e
+
+    log_env, sent = _push(node, remote)
+    print(
+        f"[dfs5cli] mv OK -> v{log_env['payload']['version']} "
+        f"| {src} -> {dst} | sent={sent} B"
+    )
+    return 0
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     """リモートの指定パスを、ローカルディレクトリと完全に一致させる。
 
@@ -1162,11 +1325,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
     name, sub = split_remote_spec(args.dest, args.remote_name)
     remote = store.get(name)
     prefix = _norm_prefix(sub)
-    local = _collect_local(Path(args.src))
+    path_filter = _path_filter(args)
+    local = _filter_local(_collect_local(Path(args.src)), path_filter)
 
     node = open_remote(remote, create=True)
     refresh_cache(node)
-    writes, deletes, unchanged = plan_changes(node, prefix, local, checksum=args.checksum)
+    writes, deletes, unchanged = plan_changes(
+        node, prefix, local, checksum=args.checksum, path_filter=path_filter
+    )
     if not args.delete:
         deletes = []
 
@@ -1206,6 +1372,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     prefix = _norm_prefix(sub)
     node = open_remote(remote, create=True)
     version = refresh_cache(node, force=args.force)
+    path_filter = _path_filter(args)
 
     work_root = node.clayfs.work_tree.resolve(strict=False)
     src_root = work_root if not prefix else work_root / prefix
@@ -1229,17 +1396,20 @@ def cmd_pull(args: argparse.Namespace) -> int:
         if item.is_symlink():
             print(f"[dfs5cli] warning: skipping symlink: {item}", file=sys.stderr)
             continue
+        rel_text = rel.as_posix()
+        if not path_filter.allows(rel_text):
+            continue
         try:
-            target = safe_target(dest, rel.as_posix(), create_parents=True)
+            target = safe_target(dest, rel_text, create_parents=True)
         except UnsafePathError as e:
-            raise UsageError(f"Invalid pull destination: {rel.as_posix()!r} ({e})") from e
+            raise UsageError(f"Invalid pull destination: {rel_text!r} ({e})") from e
         if item.is_dir():
             target.mkdir(parents=True, exist_ok=True)
             continue
         try:
             copyfile_no_follow(item, target)
         except UnsafePathError as e:
-            raise UsageError(f"Refusing symlink write: {rel.as_posix()!r} ({e})") from e
+            raise UsageError(f"Refusing symlink write: {rel_text!r} ({e})") from e
         count += 1
 
     print(f"[dfs5cli] pull OK <- v{version} | {count} ファイル -> {dest}")
@@ -1547,6 +1717,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_promote(args: argparse.Namespace) -> int:
+    cli_mod.cmd_promote(args)
+    return 0
+
+
 def cmd_libp2p_serve(args: argparse.Namespace) -> int:
     """ローカルの OST chunk ディレクトリを libp2p/QUIC で配布する。"""
     try:
@@ -1621,6 +1796,10 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     )
     p.add_argument("--workdir", help="作業ディレクトリ（既定 ~/.cache/dfs5/<name>）")
     p.add_argument("--epoch", type=int, default=1, help="委譲のエポック（既定 1）")
+    p.add_argument(
+        "--role-epoch", type=int, default=1,
+        help="registry primary/secondary の fencing 世代（既定 1）",
+    )
     p.add_argument("--node-name", help="端末名（既定はリモート名）")
     p.add_argument(
         "--root-pubkey",
@@ -1696,6 +1875,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("remote")
     p.set_defaults(func=cmd_ls)
 
+    p = sub.add_parser("lsd", help="リモートの直下にあるディレクトリだけを一覧する")
+    p.add_argument("remote")
+    p.set_defaults(func=cmd_lsd)
+
     p = sub.add_parser("lsl", help="リモートの直下を大きさ付きで一覧する")
     p.add_argument("remote")
     p.set_defaults(func=cmd_lsl)
@@ -1717,6 +1900,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("dest", help="remote:path")
     p.add_argument("--checksum", action="store_true",
                    help="大きさが同じでも内容アドレスまで比べる")
+    p.add_argument("--include", action="append", default=[], metavar="PATTERN",
+                   help="含める相対パターン（複数指定可）")
+    p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                   help="除外する相対パターン（複数指定可、include より優先）")
     p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
     p.set_defaults(func=cmd_copy)
 
@@ -1728,11 +1915,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", "--dry-run", action="store_true")
     p.set_defaults(func=cmd_copyto)
 
+    p = sub.add_parser("mv", help="リモート内でファイルまたはディレクトリを移動する")
+    p.add_argument("src", help="移動元 remote:path")
+    p.add_argument("dst", help="移動先 remote:path")
+    p.add_argument("--overwrite", action="store_true",
+                   help="移動先のファイルを置換する（ディレクトリの merge はしない）")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_mv)
+
     p = sub.add_parser("sync", help="リモートをローカルディレクトリと一致させる")
     p.add_argument("src", help="ローカルのディレクトリ")
     p.add_argument("dest", help="remote:path")
     p.add_argument("--delete", action="store_true", help="リモートにしかないものを消す")
     p.add_argument("--checksum", action="store_true", help="大きさが同じでも書き直して判定する")
+    p.add_argument("--include", action="append", default=[], metavar="PATTERN",
+                   help="含める相対パターン（複数指定可）")
+    p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                   help="除外する相対パターン（複数指定可、include より優先）")
     p.add_argument("-n", "--dry-run", action="store_true")
     p.set_defaults(func=cmd_sync)
 
@@ -1740,6 +1939,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("src", help="remote:path")
     p.add_argument("dest", help="ローカルのディレクトリ")
     p.add_argument("--force", action="store_true", help="写しが同じ版でも取り直す")
+    p.add_argument("--include", action="append", default=[], metavar="PATTERN",
+                   help="含める相対パターン（複数指定可）")
+    p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                   help="除外する相対パターン（複数指定可、include より優先）")
     p.set_defaults(func=cmd_pull)
 
     p_fs = sub.add_parser("fs", help="ローカルの CoW 検出・スナップショット（リモート不要）")
@@ -1800,11 +2003,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--root-anchor", default="/example.com")
     p_serve.add_argument("--root-pubkey", required=True)
     p_serve.add_argument("--state-dir", default="~/.dfs5_server")
+    p_serve.add_argument("--role", choices=["primary", "secondary"])
+    p_serve.add_argument("--role-epoch", type=int)
+    p_serve.add_argument(
+        "--advertise",
+        help="L2 が L3 OST の場所として広告するホスト名/IP（既定は bind から推定）",
+    )
     p_serve.add_argument(
         "--replica", action="append", default=[],
         help="主名簿から複製する代替名簿 URL（複数指定可）",
     )
     p_serve.set_defaults(func=cmd_serve)
+
+    p_promote = sub.add_parser(
+        "promote", help="停止中の registry state を primary に昇格する"
+    )
+    p_promote.add_argument("--state-dir", default="~/.dfs5_server")
+    p_promote.add_argument("--role-epoch", type=int)
+    p_promote.set_defaults(func=cmd_promote)
 
     p_libp2p = sub.add_parser(
         "libp2p-serve", help="OST の chunk ディレクトリを libp2p/QUIC で配布する"

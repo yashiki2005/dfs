@@ -194,6 +194,10 @@ def discover_domain(
     qname = record_name or f"{DEFAULT_RECORD_PREFIX}.{normalized}"
     resolver = dns.resolver.Resolver(configure=True)
     resolver.lifetime = timeout
+    # AD ビットは DNSSEC を要求する問い合わせで検証済みリゾルバが返す。
+    # EDNS0 の DO ビットを付けないと、署名自体は正しくても AD が付かない。
+    if hasattr(resolver, "use_edns"):
+        resolver.use_edns(edns=0, ednsflags=dns.flags.DO, payload=1232)
     try:
         answer = resolver.resolve(qname, "TXT")
     except Exception as e:  # noqa: BLE001 - DNS の例外型は環境で揺れる

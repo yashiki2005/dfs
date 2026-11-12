@@ -90,8 +90,13 @@ class TestDiscoverDomain(unittest.TestCase):
             response = Response()
 
         class Resolver:
+            do_requested = False
+
             def __init__(self, configure: bool = True):
                 self.lifetime = 0
+
+            def use_edns(self, **_kwargs):
+                type(self).do_requested = True
 
             def resolve(self, _name, _rtype):
                 return Answer([Rdata()])
@@ -107,6 +112,7 @@ class TestDiscoverDomain(unittest.TestCase):
         with patch("dns.resolver.Resolver", resolver):
             d = discover_domain("example.com")
         self.assertEqual(d.primary.role, "primary")
+        self.assertTrue(resolver.do_requested)
 
     def test_no_ad_option_accepts_trusted_local_resolver(self) -> None:
         resolver = self._answer(authenticated=False)

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -288,6 +289,49 @@ class AvailabilityCase(unittest.TestCase):
         _del, _loc, head = failover.resolve(self.path)
         self.assertIsNotNone(head)
         self.assertEqual(head["payload"]["version"], 1)
+
+    def test_secondary_rejects_writes_and_role_epoch_fences_old_primary(self) -> None:
+        service = self._registry("primary")
+        primary = _RegistryHTTP(
+            cli_mod.PersistentRegistryState(
+                self.base / "role_state", "/example.com", self.root_pub
+            )
+        )
+        primary.pstate.service = service
+        self.addCleanup(primary.close)
+        client = cli_mod.RemoteRegistryClient(primary.url)
+
+        primary.pstate.role = "secondary"
+        with self.assertRaises(Exception):
+            client.announce_and_append(
+                self.path, self.log, self.loc, now=self.now, role_epoch=1
+            )
+
+        primary.pstate.role = "primary"
+        primary.pstate.role_epoch = 2
+        with self.assertRaises(Exception):
+            client.announce_and_append(
+                self.path, self.log, self.loc, now=self.now, role_epoch=1
+            )
+        client.announce_and_append(
+            self.path, self.log, self.loc, now=self.now, role_epoch=2
+        )
+        self.assertEqual(primary.pstate.service.logs[self.path][-1]["payload"]["version"], 1)
+
+    def test_promote_state_file_increments_role_epoch(self) -> None:
+        state_dir = self.base / "promote_state"
+        pstate = cli_mod.PersistentRegistryState(
+            state_dir, "/example.com", self.root_pub
+        )
+        pstate.role = "secondary"
+        pstate.role_epoch = 1
+        pstate.save()
+        cli_mod.cmd_promote(
+            SimpleNamespace(state_dir=str(state_dir), role_epoch=2)
+        )
+        raw = json.loads((state_dir / "registry_state.json").read_text())
+        self.assertEqual(raw["role"], "primary")
+        self.assertEqual(raw["role_epoch"], 2)
 
     def test_write_stays_on_primary_when_secondary_is_up(self) -> None:
         primary = _RegistryHTTP(

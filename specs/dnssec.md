@@ -50,13 +50,15 @@ URL は `http(s)://host:port` 形式で、重複を拒否する。
 ## 検証
 
 1. DNSSEC 対応リゾルバで `_dfs5.<domain>` TXT を引く
-2. レスポンスの AD（Authenticated Data）ビットを確認する
+2. EDNS0 の DO ビットを付けて問い合わせ、レスポンスの AD（Authenticated Data）ビットを確認する
 3. TXT の JSON をスキーマ・型・必須項目について検証する
 4. `root_pubkey` を `root_anchor` の信頼の根として記録する
 5. 以後の L1 委譲チェーンは、既存の root アンカー検証で検証する
 
 現段階の実装は **検証済みリゾルバの AD ビットを信頼する**方式である。
 クライアント自身が DNSKEY/DS チェーンを再検証する方式ではない。
+DO ビットを付けない問い合わせでは、署名が正しくても AD が返らない実装があるため、
+`discover_domain` は EDNS0 DO を明示している。
 ローカルで AD を付けられない検証環境向けに `--dnssec-no-ad` を用意するが、
 本番では使わない。
 
@@ -78,7 +80,7 @@ head の更新は L2 の署名付きログで行う。
 | DNSSEC / DNS 停止 | 最後に検証済みの root 鍵と registry 一覧を使う |
 | primary registry 停止 | 読み取りは secondary にフォールバック。書き込みは失敗 |
 | secondary registry 停止 | primary で読み書きを継続 |
-| primary の復帰 | 古い primary の書き込みを拒否できるよう epoch / fencing が必要（未実装） |
+| primary の復帰 | `role_epoch` による fencing で、昇格後の writer からの書き込みだけを受理する |
 | DNSSEC 鍵漏洩 | ドメイン権威の侵害として扱い、root 鍵と registry 一覧をローテーションする |
 
 最初に起動したサーバを root にする方式は、同時起動・分断・復帰時に split-brain を
@@ -104,8 +106,9 @@ dfs5cli config create scw \
 ## 制約
 
 - AD ビットを信頼する MVP であり、完全なクライアント側 DNSSEC 検証は未実装
-- primary 昇格時の epoch / fencing は未実装。現在の epoch は discovery レコードの
-  世代を検証・表示するための値で、古い primary の書き込み拒否にはまだ使っていない
+- primary 昇格時の fencing は `role_epoch` で行う。旧 primary は、昇格後の
+  `role_epoch` を持つ writer からの書き込みを拒否する。ただし旧 epoch の writer は
+  引き続き旧 primary に書き込めるため、writer 設定の更新を同時に行う必要がある
 - TXT レコードのサイズ・TTL・伝播遅延を考慮し、多数の registry を 1 レコードに
   詰め込まない
 - DNSSEC は primary の生存監視や自動昇格を行わない

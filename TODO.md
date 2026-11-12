@@ -4,9 +4,9 @@
 まずここを読んで「どこまで動いていて、次に何をするか」を掴んでほしい。
 
 - リポジトリ: `~/src/dfs5`（`/Volumes/ExtSSD/src/dfs5` へのシンボリックリンク）
-- 最終コミット: `122afcf fix(l2): 名簿を信頼しない検証 (root アンカーによる委譲チェーンの検証)`
-- テスト: **69 件パス**（`~/dfs-venv/bin/python -m pytest tests -q`。実行に約 38 秒）
-- 作業ツリー: クリーン
+- 基準コミット: `05040aa feat: add L4 history and versioned archive catalogs`
+- テスト: **137 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`。実行に約 165 秒）
+- 作業ツリー: 未コミット差分あり（CLI 追加、L2 昇格、DNSSEC 修正）
 
 ---
 
@@ -96,19 +96,26 @@ pull が 8.0 秒（21 往復）だった。
 
 ### 2.2 B（書き込みの複製と昇格）
 
-A の結果を見てから。主従で複製し、主が落ちたら従を昇格させる。「主はどれか」の決め方
-（固定設定 / 委譲レコードに書く / 選挙）を決める必要がある。
-C（合意形成）は当面やらない（単一書き手なので同時に書くのは 1 人）。
+primary/secondary の role と role epoch、secondary の書き込み拒否、手動昇格を
+実装した。旧 primary を停止してから secondary の state を昇格し、writer の
+`role_epoch` を更新する。詳細は `specs/promotion.md`。
+
+自動選挙・quorum・lease は持たない。旧 primary を停止せずに両方を primary にすると
+split-brain になるため、強固な自動昇格が必要なら lease / 合意形成を追加する。
+C（合意形成）は当面やらない。
 
 ### 2.3 CLI の追加（使い勝手）
 
-利用者から要望が出ている。実装は小さめ。
+2026-11-12 に、次の 3 つを実装した。
 
-| コマンド | 内容 | 補足 |
+| コマンド | 内容 | 状態 |
 |---|---|---|
-| `mv` | 移動・改名。今は `copy` + `rm` で代用 | 1 版で済ませたいなら要実装 |
-| `--exclude` / `--include` | `sync` / `copy` のフィルタ | 部分同期 |
-| `lsd` | ディレクトリだけの一覧（rclone と同じ） | 今は `ls` で代用 |
+| `mv` | 同一リモート内の移動・改名を 1 版で行う。既存宛先は拒否し、ファイル同士だけ `--overwrite` 可 | 実装済み |
+| `--exclude` / `--include` | `copy` / `sync` / `pull` の相対パスフィルタ。`sync --delete` はフィルタ外を消さない | 実装済み |
+| `lsd` | 直下のディレクトリだけを一覧する | 実装済み |
+
+`mv` は宛先を新しい名前そのものとして扱う（既存ディレクトリへの自動格納や merge はしない）。
+詳細は `specs/cli.md` §3.2.1〜3.2.2。
 
 ### 2.4 配置（完成時）
 
@@ -285,7 +292,7 @@ cd ~/src/dfs5
 # 1. 状態の確認
 git log --oneline -3
 git status --short          # 空ならクリーン
-~/dfs-venv/bin/python -m pytest tests -q   # 69 件パス（約 38 秒）
+~/dfs-venv/bin/python -m pytest tests -q   # 137 件パス、1 skip（約 165 秒）
 
 # 2. サーバを立てる（新コードで）
 ./dfs5svc list               # 既存のサービスを確認

@@ -119,6 +119,20 @@ dfs5cli history scw:/example.com/alice --limit 20
 
 L2 の API では `/v1/history` と `/v1/resolve` の `version` 指定を使う。
 
+#### registry の手動昇格
+
+secondary registry を primary に昇格する場合は、旧 primary を停止してから
+secondary 側で state の role epoch を進める。
+
+```bash
+dfs5 promote --state-dir ~/.dfs5_server --role-epoch 2
+dfs5 serve ... --role primary --role-epoch 2
+```
+
+writer 側も `config create ... --role-epoch 2` で同じ世代に更新する。
+secondary は `role_epoch` が一致する書き込みだけを受け付ける。詳細は
+`specs/promotion.md`。
+
 #### libp2p/QUIC 読み取り
 
 OST の chunk ディレクトリを libp2p/QUIC で配布し、読み取り候補に追加できる。
@@ -250,6 +264,7 @@ dfs5cli config show|delete|list [NAME]
 
 # 読み出し（版を進めない）
 dfs5cli ls     REMOTE:path
+dfs5cli lsd    REMOTE:path
 dfs5cli lsl    REMOTE:path
 dfs5cli lsjson REMOTE:path
 dfs5cli size   REMOTE:path
@@ -258,9 +273,10 @@ dfs5cli about  REMOTE:
 dfs5cli check  REMOTE:path LOCAL_DIR
 
 # 書き込み（1 版としてまとめる）
-dfs5cli copy   LOCAL REMOTE:path [--checksum] [-n|--dry-run]
+dfs5cli copy   LOCAL REMOTE:path [--checksum] [--include PATTERN] [--exclude PATTERN] [-n]
 dfs5cli copyto LOCAL_FILE REMOTE:path/file [--checksum] [-n]
-dfs5cli sync   LOCAL_DIR REMOTE:path [--delete] [--checksum] [-n]
+dfs5cli mv     REMOTE:path REMOTE:path [--overwrite] [-n]
+dfs5cli sync   LOCAL_DIR REMOTE:path [--delete] [--checksum] [--include PATTERN] [--exclude PATTERN] [-n]
 
 # ディレクトリと削除
 dfs5cli mkdir  REMOTE:dir
@@ -269,7 +285,7 @@ dfs5cli rmdir  REMOTE:dir [-n]
 dfs5cli purge  REMOTE:path [-n]
 
 # 取り出し
-dfs5cli pull   REMOTE:path LOCAL_DIR [--force]
+dfs5cli pull   REMOTE:path LOCAL_DIR [--force] [--include PATTERN] [--exclude PATTERN]
 
 # サーバ側は cli.py のものをそのまま使う
 dfs5cli serve    ... --advertise <L3 を広告するホスト>
@@ -328,11 +344,32 @@ $ dfs5cli copy ./sample local:
 dfs5 は書き手側の索引で塊を重複排除するので、内容が同じなら `push` しても本文は送られない。
 それでも版が増えるのは無駄なので、CLI 側で「変わらないなら版を作らない」を決めている。
 
+#### 3.2.1 移動は 1 版
+
+`mv` は同一リモート内の rename として扱い、最後に 1 版だけ push する。
+`copy` + `rm` のように 2 版を消費しない。
+
+- 宛先は「新しい名前そのもの」として解釈する（既存ディレクトリへの自動格納はしない）
+- 宛先が存在する場合は既定で拒否する
+- ファイル同士の置換だけは `--overwrite` で許可する
+- ディレクトリの merge は行わない
+- 別リモート間の移動は `copy` + `rm` を使う
+
+#### 3.2.2 フィルタ
+
+`copy` / `sync` / `pull` は `--include PATTERN` と `--exclude PATTERN` を受け付ける。
+パターンは操作の基準ディレクトリからの相対パスに適用し、`*` / `?` / `[]` の
+シェル風ワイルドカードを使える。`--exclude` は `--include` より常に優先する。
+
+`sync --delete` では、フィルタの外側にあるリモートファイルを削除しない。
+たとえば `--exclude 'docs/private/*'` を付ければ、その範囲は同期対象から完全に外れる。
+
 ### 3.3 一覧は内容を取らない
 
-`ls` / `lsl` / `lsjson` / `size` は、ディレクトリ塊だけを辿ってファイルの中身は取らない。
+`ls` / `lsd` / `lsl` / `lsjson` / `size` は、ディレクトリ塊だけを辿ってファイルの中身は取らない。
 取得量は**構造の階層数**で決まる（`l4_log.py::list_tree` の幅優先走査）。
 `cat` は目的のファイルまでのディレクトリ塊と、そのファイル塊だけを取る。
+`lsd` は直下のディレクトリだけを返す。
 
 ### 3.4 削除と空ディレクトリ
 
@@ -413,7 +450,7 @@ srv/
 
 ## 5. 試験
 
-`tests/test_cli_main.py` に 12 件。
+`tests/test_cli_main.py` に 41 件。
 
 | 試験 | 確かめること |
 |---|---|
@@ -422,6 +459,14 @@ srv/
 | `test_copy_ls_cat_pull` | copy → cat → pull で内容が一致する |
 | `test_copy_is_idempotent` | 2 回目の copy が版を作らない |
 | `test_copyto_and_checksum` | 同じ内容の copyto が版を作らない |
+| `test_mv_file_uses_one_version` | `mv` が 1 版でファイルを改名する |
+| `test_mv_directory_and_dry_run` | ディレクトリ移動と dry-run の非更新 |
+| `test_mv_refuses_collision_and_allows_file_overwrite` | 衝突拒否と `--overwrite` |
+| `test_mv_rejects_cross_remote_and_descendant_destination` | 別リモート・自己配下への移動を拒否する |
+| `test_copy_include_exclude` | `copy` の include / exclude |
+| `test_sync_delete_does_not_touch_excluded_paths` | フィルタ外を `sync --delete` で消さない |
+| `test_pull_include_and_exclude` | `pull` の include / exclude |
+| `test_lsd_lists_only_directories` | `lsd` が直下のディレクトリだけを返す |
 | `test_sync_delete` | `--delete` でリモートにしかないものを消す |
 | `test_sync_without_delete_keeps_remote_only_files` | `--delete` 無しでは消さない |
 | `test_dry_run_does_not_write` | `-n` がリモートに書かない |

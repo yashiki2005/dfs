@@ -8,6 +8,7 @@ rclone ライク CLI (`dfs5/cli_main.py`) の試験。
 """
 
 import json
+import io
 import os
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -457,6 +459,117 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(self.run_cli("copyto", str(one), "t:docs/one.txt"), 0)
         node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
         self.assertEqual(node2.l4.pin.version, v1, "同じ内容の copyto が版を作っている")
+
+    def test_mv_file_uses_one_version(self) -> None:
+        """mv は copy + rm ではなく、1 版でファイルを改名する。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        store = RemoteStore(self.config_file)
+        before = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        before_version = before.l4.pin.version
+
+        self.assertEqual(self.run_cli("mv", "t:a.txt", "t:renamed.txt"), 0)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertEqual(node.l4.pin.version, before_version + 1)
+        paths = {e["path"] for e in node.list_remote()}
+        self.assertNotIn("a.txt", paths)
+        self.assertIn("renamed.txt", paths)
+        self.assertEqual(node.read_remote("renamed.txt"), b"hello world\n")
+
+    def test_mv_directory_and_dry_run(self) -> None:
+        """ディレクトリ全体を移動でき、dry-run では版を進めない。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        before = node.l4.pin.version
+
+        self.assertEqual(self.run_cli("mv", "t:docs", "t:documents", "--dry-run"), 0)
+        node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertEqual(node2.l4.pin.version, before, "dry-run が版を進めた")
+        self.assertIn("docs/readme.md", {e["path"] for e in node2.list_remote()})
+
+        self.assertEqual(self.run_cli("mv", "t:docs", "t:documents"), 0)
+        node3 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        paths = {e["path"] for e in node3.list_remote()}
+        self.assertNotIn("docs", paths)
+        self.assertIn("documents", paths)
+        self.assertIn("documents/sub/deep.txt", paths)
+        self.assertEqual(node3.read_remote("documents/sub/deep.txt"), b"deep\n")
+
+    def test_mv_refuses_collision_and_allows_file_overwrite(self) -> None:
+        """既存宛先は拒否し、--overwrite ならファイルだけ置換する。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        self.assertEqual(self.run_cli("copyto", str(self.base / "local" / "a.txt"), "t:target.txt"), 0)
+        self.assertEqual(self.run_cli("mv", "t:b.bin", "t:target.txt"), 2)
+
+        self.assertEqual(self.run_cli("mv", "t:b.bin", "t:target.txt", "--overwrite"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertNotIn("b.bin", {e["path"] for e in node.list_remote()})
+        self.assertEqual(node.read_remote("target.txt"), b"B" * 4096)
+
+    def test_mv_rejects_cross_remote_and_descendant_destination(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        self.assertEqual(self.run_cli("mv", "t:a.txt", "other:a.txt"), 2)
+        self.assertEqual(self.run_cli("mv", "t:docs", "t:docs/sub/docs2"), 2)
+
+    def test_copy_include_exclude(self) -> None:
+        """copy のフィルタは相対パスに適用され、exclude が優先される。"""
+        self.assertEqual(
+            self.run_cli(
+                "copy", str(self.local), "t:",
+                "--include", "docs/*", "--exclude", "docs/sub/*",
+            ),
+            0,
+        )
+        node = cli_mod.load_node_from_mount(
+            RemoteStore(self.config_file).get("t").resolved_workdir()
+        )[0]
+        paths = {e["path"] for e in node.list_remote() if e["type"] == "file"}
+        self.assertEqual(paths, {"docs/readme.md"})
+
+    def test_sync_delete_does_not_touch_excluded_paths(self) -> None:
+        """sync --delete はフィルタの外側を削除しない。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        (self.local / "docs" / "readme.md").unlink()
+        self.assertEqual(
+            self.run_cli(
+                "sync", str(self.local), "t:", "--delete",
+                "--exclude", "docs/readme.md",
+            ),
+            0,
+        )
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertIn("docs/readme.md", {e["path"] for e in node.list_remote()})
+
+    def test_pull_include_and_exclude(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        included = self.base / "pull_included"
+        self.assertEqual(
+            self.run_cli("pull", "t:", str(included), "--include", "*.md"), 0
+        )
+        self.assertTrue((included / "docs" / "readme.md").is_file())
+        self.assertFalse((included / "a.txt").exists())
+        self.assertFalse((included / "b.bin").exists())
+
+        excluded = self.base / "pull_excluded"
+        self.assertEqual(
+            self.run_cli("pull", "t:", str(excluded), "--exclude", "*.bin"), 0
+        )
+        self.assertTrue((excluded / "docs" / "sub" / "deep.txt").is_file())
+        self.assertFalse((excluded / "b.bin").exists())
+
+    def test_lsd_lists_only_directories(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.run_cli("lsd", "t:"), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["docs/"])
+
+        out2 = io.StringIO()
+        with redirect_stdout(out2):
+            self.assertEqual(self.run_cli("lsd", "t:docs"), 0)
+        self.assertEqual(out2.getvalue().splitlines(), ["sub/"])
 
     def test_sync_delete(self) -> None:
         self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)

@@ -729,6 +729,7 @@ class L4LogClient:
         delegation_epoch: int,
         ost_endpoint: str | Sequence[str],
         now: int,
+        role_epoch: int = 1,
     ) -> Dict[str, Any]:
         """
         新しい版を署名して L2/L4 に CAS 追記し、直後に Read-after-Write 照合 (B7 防御) を行う。
@@ -768,7 +769,9 @@ class L4LogClient:
         )
 
         # 1. CAS 追記要求
-        registry.announce_and_append(self.sub_path, log_env, loc_env, now=now)
+        registry.announce_and_append(
+            self.sub_path, log_env, loc_env, now=now, role_epoch=role_epoch
+        )
 
         # 2. B7 防御: Read-after-Write 照合（一致が確認できるまでローカルピンは進めない）
         _, _, readback = registry.resolve(self.sub_path)

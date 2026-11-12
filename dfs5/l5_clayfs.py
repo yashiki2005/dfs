@@ -89,6 +89,7 @@ class DFS5Node:
         ost_alternates: Optional[List[str]] = None,
         libp2p_peers: Optional[List[str]] = None,
         libp2p_psk: Optional[str] = None,
+        role_epoch: int = 1,
     ):
         self.name = name
         self.sub_path = sub_path
@@ -130,6 +131,7 @@ class DFS5Node:
         self.read_ost = FailoverOSTClient(read_clients)
         self.read_builder = MerkleTreeBuilder(self.crypto, self.read_ost)
         self.registry = registry
+        self.role_epoch = int(role_epoch)
         pin_file = self.clayfs.clayfs_meta / "local_head.json"
         self.l4 = L4LogClient(
             sub_path, priv_key_path, pub_key_str,
@@ -217,6 +219,7 @@ class DFS5Node:
             delegation_epoch=delegation_epoch,
             ost_endpoint=list(self.ost_endpoints),
             now=now,
+            role_epoch=self.role_epoch,
         )
         wire_bytes = self.ost.bytes_sent
         return log_env, snap_dir, wire_bytes

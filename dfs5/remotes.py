@@ -50,6 +50,7 @@ class Remote:
     secret: str = ""                    # tree_secret。空なら --secret を後で渡す
     workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs5/<name>）
     epoch: int = 1                      # 委譲のエポック
+    role_epoch: int = 1                 # registry primary/secondary の fencing 世代
     node_name: str = ""                 # 端末名（既定: リモート名）
     root_pubkey: str = ""               # root アンカーの公開鍵（信頼の根。TOFU で記録）
     root_fingerprint: str = ""          # 表示・比較用の指紋
@@ -108,6 +109,7 @@ class Remote:
             secret=str(data.get("secret", "") or ""),
             workdir=str(data.get("workdir", "")),
             epoch=int(data.get("epoch", 1)),
+            role_epoch=int(data.get("role_epoch", 1)),
             node_name=str(data.get("node_name", "") or data["name"]),
             root_pubkey=str(data.get("root_pubkey", "") or ""),
             root_fingerprint=str(data.get("root_fingerprint", "") or ""),

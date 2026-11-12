@@ -562,6 +562,10 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     for replica in (getattr(args, "replica", None) or []):
         cmd.extend(["--replica", replica])
+    if getattr(args, "role", None):
+        cmd.extend(["--role", args.role])
+    if getattr(args, "role_epoch", None) is not None:
+        cmd.extend(["--role-epoch", str(args.role_epoch)])
 
     print(f"[dfs5svc] 空きポート: L2={registry_port} / L3={ost_port}（連続した組）")
     print(f"[dfs5svc] 状態      : {state_dir}")
@@ -907,6 +911,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--replica", action="append", default=[],
         help="主名簿から複製する代替名簿 URL（複数指定可）",
     )
+    p.add_argument("--role", choices=["primary", "secondary"], help="registry role")
+    p.add_argument("--role-epoch", type=int, help="registry fencing epoch")
     p.add_argument("--force", action="store_true", help="同じ名前の記録を上書きする")
     p.set_defaults(func=cmd_start)
 

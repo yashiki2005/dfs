@@ -203,6 +203,7 @@ class RemoteRegistryClient:
         log_envelope: Dict[str, Any],
         locator_envelope: Dict[str, Any],
         now: int,
+        role_epoch: int = 1,
     ) -> None:
         # now は旧サーバとの互換用。現行サーバは認可判定に自分の時計を使う。
         self._post(
@@ -212,6 +213,7 @@ class RemoteRegistryClient:
                 "log_envelope": log_envelope,
                 "now": int(now),
                 "path": path,
+                "role_epoch": int(role_epoch),
             },
         )
 
@@ -283,6 +285,8 @@ class PersistentRegistryState:
         # root アンカーの公開鍵。クライアントの初回（TOFU）が取得する。
         # ここから取った値をクライアントが記録し、以降は記録した値だけを信頼する。
         self.root_pubkey = root_pubkey.strip()
+        self.role: str = "primary"
+        self.role_epoch: int = 1
         # 書き込み系 API は「サービス更新 -> state 保存」まで同じ排他区間に入れる。
         self.lock = threading.RLock()
         self.own_registry_url: str = ""
@@ -297,12 +301,16 @@ class PersistentRegistryState:
         self.service.delegations = data.get("delegations", {})
         self.service.logs = data.get("logs", {})
         self.service.locators = data.get("locators", {})
+        self.role = str(data.get("role", "primary"))
+        self.role_epoch = int(data.get("role_epoch", 1))
 
     def save(self) -> None:
         data = {
             "delegations": self.service.delegations,
             "locators": self.service.locators,
             "logs": self.service.logs,
+            "role": self.role,
+            "role_epoch": int(self.role_epoch),
         }
         write_private_json(self.state_file, data)
 
@@ -389,6 +397,10 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
             try:
                 with pstate.lock:
                     if self.path == "/v1/delegate":
+                        if pstate.role != "primary":
+                            raise RegistryError(
+                                f"Registry is {pstate.role}; delegation writes require primary"
+                            )
                         verified = pstate.service.register_delegation(req["envelope"], now=now)
                         pstate.save()
                         pstate.push_to_replicas(
@@ -396,11 +408,21 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                         )
                         self._send_json(200, {"ok": True, "verified": verified})
                     elif self.path == "/v1/announce":
+                        if pstate.role != "primary":
+                            raise RegistryError(
+                                f"Registry is {pstate.role}; announce requires primary"
+                            )
+                        if int(req.get("role_epoch", 1)) != pstate.role_epoch:
+                            raise ConflictError(
+                                f"Registry role epoch mismatch: expected {pstate.role_epoch}, "
+                                f"got {req.get('role_epoch')!r}"
+                            )
                         pstate.service.announce_and_append(
                             path=req["path"],
                             log_envelope=req["log_envelope"],
                             locator_envelope=req["locator_envelope"],
                             now=now,
+                            role_epoch=pstate.role_epoch,
                         )
                         pstate.save()
                         pstate.save_ost_chunks(ost)
@@ -509,6 +531,7 @@ def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], Rem
         ost_alternates=cfg.get("ost_alternates") or [],
         libp2p_peers=cfg.get("libp2p_peers") or [],
         libp2p_psk=cfg.get("libp2p_psk") or "",
+        role_epoch=int(cfg.get("role_epoch", 1)),
     )
     return node, cfg, reg_client
 
@@ -538,6 +561,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     ost = ChunkStoreServer(cert, key, host=args.bind, port=args.ost_port)
     pstate = PersistentRegistryState(state_dir, args.root_anchor, root_pubkey)
+    if getattr(args, "role", None):
+        pstate.role = str(args.role)
+    if getattr(args, "role_epoch", None) is not None:
+        pstate.role_epoch = int(args.role_epoch)
+    pstate.save()
     pstate.load_ost_chunks(ost)
     pstate.replica_registries = [
         value.strip().rstrip("/")
@@ -577,6 +605,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     threading.Thread(target=_watch_stop, daemon=True).start()
 
     print(f"[dfs5 serve] Root Anchor : {args.root_anchor}")
+    print(f"[dfs5 serve] Role        : {pstate.role} (epoch={pstate.role_epoch})")
     print(f"[dfs5 serve] State Dir   : {state_dir}")
     print(f"[dfs5 serve] L2 Registry : http://{args.bind}:{args.registry_port}")
     print(f"[dfs5 serve] L3 OST (TLS): {pstate.ost_endpoint}")
@@ -594,6 +623,28 @@ def cmd_serve(args: argparse.Namespace) -> None:
         except OSError:
             pass
         httpd.server_close()
+
+
+def cmd_promote(args: argparse.Namespace) -> None:
+    """停止中の registry state を primary に昇格する（ローカル操作）。"""
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    state_file = state_dir / "registry_state.json"
+    if not state_file.is_file():
+        raise SystemExit(f"State file not found: {state_file}")
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    current = int(data.get("role_epoch", 1))
+    requested = int(args.role_epoch) if args.role_epoch is not None else current + 1
+    if requested <= current:
+        raise SystemExit(
+            f"role epoch must increase: current={current}, requested={requested}"
+        )
+    data["role"] = "primary"
+    data["role_epoch"] = requested
+    write_private_json(state_file, data)
+    print(f"[dfs5 promote] primary role epoch -> {requested}")
+    print(f"[dfs5 promote] state: {state_file}")
+    print("[dfs5 promote] restart 'dfs5 serve' on this node with --role primary")
+    print(f"               (or --role-epoch {requested})")
 
 
 def cmd_delegate(args: argparse.Namespace) -> None:
@@ -776,6 +827,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--root-pubkey", required=True, help="Path to root anchor .pub file")
     p_serve.add_argument("--state-dir", default="~/.dfs5_server", help="Server persistence directory")
     p_serve.add_argument(
+        "--role", choices=["primary", "secondary"],
+        help="Registry role（既存 state の値を上書き）",
+    )
+    p_serve.add_argument(
+        "--role-epoch", type=int,
+        help="Registry fencing epoch（既存 state の値を上書き）",
+    )
+    p_serve.add_argument(
         "--advertise",
         help="L2 が L3 の場所として広告するホスト名/IP（既定は bind から推定）",
     )
@@ -786,6 +845,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="主名簿から複製する代替名簿 URL（複数指定可。例: http://host:19440）",
     )
     p_serve.set_defaults(func=cmd_serve)
+
+    p_promote = sub.add_parser(
+        "promote", help="停止中の registry state を primary に昇格する"
+    )
+    p_promote.add_argument("--state-dir", default="~/.dfs5_server")
+    p_promote.add_argument("--role-epoch", type=int)
+    p_promote.set_defaults(func=cmd_promote)
 
     # delegate
     p_del = sub.add_parser("delegate", help="Sign and register an L1 delegation record")

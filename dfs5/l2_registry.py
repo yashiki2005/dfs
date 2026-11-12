@@ -167,6 +167,7 @@ class DirectoryRegistryService:
         log_envelope: Dict[str, Any],
         locator_envelope: Dict[str, Any],
         now: int,
+        role_epoch: int = 1,
     ) -> None:
         """
         単一書き手の CAS 検証を行った上で L4 ログを追記し、L2 ロケータを更新する。
