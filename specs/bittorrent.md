@@ -51,16 +51,26 @@ v1 の SHA-1 は BitTorrent の transport 用であり、DFS5 の最終的な完
 # 現在の先頭版をアーカイブする
 dfs5cli archive create scw: --out ./scw-v1
 
+# 過去の版を指定してアーカイブする
+dfs5cli archive create scw: --version 3 --out ./scw-v3
+
 # bundle の署名・chunk hash・サイズを検証する
 dfs5cli archive verify ./scw-v1
 
 # ローカルに復元する（tree_secret が必要）
 dfs5cli archive extract ./scw-v1 ./restored
+
+# descriptor から archive 一覧を表示する
+dfs5cli archive catalog .
 ```
 
 `archive create` は torrent の infohash と magnet link を表示する。実際の seeding /
 downloading は qBittorrent、Transmission、libtorrent などの外部クライアントで行う。
 DFS5 は BitTorrent クライアントを内蔵しない。
+
+`archive create --version N` は、L2 の L4 履歴から指定版の署名済み head を取得する。
+過去版には現在の locator を流用せず、locator なしで bundle を作る。bundle の
+`meta.json` には選択した版の head / delegation が入る。
 
 ## 復元の条件
 
@@ -87,9 +97,7 @@ DFS5 は BitTorrent クライアントを内蔵しない。
 
 ## 制約
 
-- 現在は「現在の先頭版」だけを archive 化する。過去版をあとから遡って取得する
-  L4 history API は未実装
-- infohash の配布・カタログはまだ L4 / L2 に統合していない
+- infohash の配布は descriptor / 外部共有が中心。L4 への archive descriptor 統合は未実装
 - torrent は v1。v2、erasure coding、k-of-n 復元は未実装
 - bundle の自動 retention / garbage collection は未実装
 

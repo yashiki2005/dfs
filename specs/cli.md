@@ -99,12 +99,25 @@ BitTorrent はホットパスではなく、長期保存・最終復旧用であ
 
 ```bash
 dfs5cli archive create scw: --out ./scw-v1
+dfs5cli archive create scw: --version 3 --out ./scw-v3
 dfs5cli archive verify ./scw-v1
 dfs5cli archive extract ./scw-v1 ./restored
+dfs5cli archive catalog .
 ```
 
 実際の seeding / downloading は外部の BitTorrent クライアントで行う。
 詳細は `specs/bittorrent.md`。
+
+#### L4 版履歴
+
+`history` は L2 が保持する署名済み L4 ログの履歴を新しい順に表示する。
+
+```bash
+dfs5cli history scw:
+dfs5cli history scw:/example.com/alice --limit 20
+```
+
+L2 の API では `/v1/history` と `/v1/resolve` の `version` 指定を使う。
 
 #### libp2p/QUIC 読み取り
 

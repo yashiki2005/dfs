@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import cli as cli_mod
-from .archive import ArchiveError, create_archive, extract_bundle, verify_bundle
+from .archive import ArchiveError, catalog, create_archive, extract_bundle, verify_bundle
 from .dnssec import Discovery, DiscoveryError, discover_domain
 
 # L2 名簿の既定ポート。ホスト名だけで済むようにする（例: --registry 172.16.1.60）。
@@ -913,11 +913,14 @@ def cmd_archive(args: argparse.Namespace) -> int:
             else Path.cwd() / f"dfs5-archive-{remote.name}-{int(time.time())}"
         )
         try:
-            result = create_archive(node, out, announce=args.announce)
+            result = create_archive(
+                node, out, announce=args.announce, version=args.version
+            )
         except ArchiveError as e:
             raise UsageError(f"archive create に失敗しました: {e}") from e
         print(f"archive     : {result.bundle}")
         print(f"torrent     : {result.torrent}")
+        print(f"descriptor  : {result.descriptor}")
         print(f"infohash    : {result.infohash}")
         print(f"version     : v{result.version}")
         print(f"chunks      : {result.chunk_count}")
@@ -925,6 +928,18 @@ def cmd_archive(args: argparse.Namespace) -> int:
             f"magnet      : magnet:?xt=urn:btih:{result.infohash}"
             f"&dn={result.bundle.name}"
         )
+        return 0
+
+    if args.action == "catalog":
+        try:
+            rows = catalog(Path(args.source).expanduser())
+        except ArchiveError as e:
+            raise UsageError(f"archive catalog に失敗しました: {e}") from e
+        for row in rows:
+            print(
+                f"{row.get('path', '?')} v{row.get('version', '?')} "
+                f"{row.get('infohash', '?')} {row.get('bundle', '')}"
+            )
         return 0
 
     bundle = Path(args.source).expanduser()
@@ -955,6 +970,29 @@ def cmd_archive(args: argparse.Namespace) -> int:
         return 0
 
     raise UsageError(f"unknown archive action: {args.action}")
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    """L2 の署名済み L4 ログ履歴を表示する。"""
+    store = RemoteStore()
+    name, sub = split_remote_spec(args.remote, args.remote_name)
+    remote = store.get(name)
+    path = ("/" + sub.lstrip("/")) if sub else remote.path
+    if not path:
+        raise UsageError(
+            "history にはパスが必要です（例: dfs5cli history remote:/example.com/alice）"
+        )
+    client = cli_mod.RemoteRegistryClient(remote.registry_urls())
+    try:
+        rows = client.history(path, limit=args.limit)
+    except Exception as e:  # noqa: BLE001
+        raise UsageError(f"history の取得に失敗しました: {e}") from e
+    for row in rows:
+        print(
+            f"v{row.get('version', '?'):<6} {row.get('timestamp', '?')} "
+            f"{str(row.get('entry_hash', ''))[:16]}"
+        )
+    return 0
 
 
 def cmd_ls(args: argparse.Namespace) -> int:
@@ -1639,14 +1677,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_disc.set_defaults(func=cmd_discover)
 
     p_arch = sub.add_parser("archive", help="版の archive bundle / BitTorrent を作る")
-    p_arch.add_argument("action", choices=["create", "verify", "extract"])
+    p_arch.add_argument("action", choices=["create", "verify", "extract", "catalog"])
     p_arch.add_argument("source", help="create は remote:path、verify/extract は bundle ディレクトリ")
     p_arch.add_argument("dest", nargs="?", help="extract の出力先")
     p_arch.add_argument("--out", help="create の bundle 出力先（既定 .cwd/dfs5-archive-...）")
     p_arch.add_argument("--announce", help="torrent の announce URL（省略可）")
+    p_arch.add_argument("--version", type=int, help="archive する版（省略時は先頭版）")
     p_arch.add_argument("--secret", help="extract の tree_secret")
     p_arch.add_argument("--no-prompt", action="store_true", help="secret を端末から読まない")
     p_arch.set_defaults(func=cmd_archive)
+
+    p_history = sub.add_parser("history", help="L4 の版履歴を表示する")
+    p_history.add_argument("remote", help="remote:path")
+    p_history.add_argument("--limit", type=int, default=50, help="表示件数（既定 50）")
+    p_history.set_defaults(func=cmd_history)
 
     p = sub.add_parser("ls", help="リモートの直下を一覧する（内容は取らない）")
     p.add_argument("remote")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,6 +120,7 @@ def _fetch_chunks(node: Any, wire_ids: Sequence[str]) -> Dict[str, bytes]:
 class ArchiveResult:
     bundle: Path
     torrent: Path
+    descriptor: Path
     infohash: str
     version: int
     chunk_count: int
@@ -129,17 +131,19 @@ def create_archive(
     out_dir: Path | str,
     *,
     announce: Optional[str] = None,
+    version: Optional[int] = None,
 ) -> ArchiveResult:
-    """現在の先頭版を、署名済みメタデータ + 全チャンク + torrent として保存する。"""
+    """指定版（省略時は先頭版）を、署名済みメタデータ + 全チャンク + torrent として保存する。"""
     bundle = Path(out_dir).expanduser()
     if bundle.exists() and any(bundle.iterdir()):
         raise ArchiveError(f"Archive output is not empty: {bundle}")
-    head = node.l4.sync_head(node.registry)
-    if head is None:
-        raise ArchiveError("No remote version to archive")
+    try:
+        head, del_env, loc_env = node.l4.resolve_verified(
+            node.registry, version=version
+        )
+    except Exception as e:  # noqa: BLE001
+        raise ArchiveError(f"Cannot resolve archive version: {e}") from e
     node.refresh_read_ost()
-    del_env = node.l4.last_delegation
-    loc_env = node.l4.last_locator
     if not del_env or not del_env.get("chain"):
         raise ArchiveError("No verified delegation chain for the current version")
     if not node.l4.root_pubkey:
@@ -197,13 +201,52 @@ def create_archive(
         f"{sha256_hex(meta_bytes)[:12]}"
     )
     infohash = _write_torrent(bundle, torrent, name, announce)
+    descriptor = bundle.with_suffix(".archive.json")
+    descriptor.write_text(
+        json.dumps(
+            {
+                "schema": "dfs5-archive-descriptor-v1",
+                "bundle": str(bundle),
+                "created_at": int(time.time()),
+                "head_hash": head.get("entry_hash", ""),
+                "infohash": infohash,
+                "path": node.sub_path,
+                "root_wire_id": root_wid,
+                "torrent": str(torrent),
+                "version": int(p["version"]),
+            },
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
     return ArchiveResult(
         bundle=bundle,
         torrent=torrent,
+        descriptor=descriptor,
         infohash=infohash,
         version=int(p["version"]),
         chunk_count=len(wire_ids),
     )
+
+
+def catalog(directory: Path | str) -> List[Dict[str, Any]]:
+    """``create_archive`` が作った descriptor を一覧する。"""
+    root = Path(directory).expanduser()
+    if not root.exists():
+        raise ArchiveError(f"Archive catalog directory does not exist: {root}")
+    rows: List[Dict[str, Any]] = []
+    for item in sorted(root.glob("*.archive.json")):
+        try:
+            data = json.loads(item.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            data["descriptor"] = str(item)
+            rows.append(data)
+    rows.sort(key=lambda row: (str(row.get("path", "")), int(row.get("version", 0))))
+    return rows
 
 
 def _load_meta(bundle: Path) -> Dict[str, Any]:

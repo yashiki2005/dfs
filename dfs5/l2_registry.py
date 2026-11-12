@@ -385,7 +385,7 @@ class DirectoryRegistryService:
             self.delegations[normalize_path(p["path"])] = env
 
     def resolve(
-        self, path: str
+        self, path: str, version: Optional[int] = None
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """
         (delegation_envelope, locator_envelope, head_log_envelope) を 1 RTT で返す。
@@ -410,9 +410,46 @@ class DirectoryRegistryService:
             if not log_list:
                 return del_env, loc_env, None
 
+            if version is not None:
+                try:
+                    wanted = int(version)
+                except (TypeError, ValueError) as e:
+                    raise RegistryError(f"Invalid version: {version!r}") from e
+                selected = next(
+                    (entry for entry in log_list
+                     if int(entry.get("payload", {}).get("version", -1)) == wanted),
+                    None,
+                )
+                if selected is None:
+                    raise RegistryError(
+                        f"Version {wanted} not found for {norm_path!r}"
+                    )
+                # ロケータは現在の先頭版にしか対応しない。過去版では返さない。
+                selected_locator = loc_env if selected is log_list[-1] else None
+                return del_env, selected_locator, selected
+
             # evil B6 シミュレーション（古いログエントリを先頭と見せかける）
             if 0 <= self.simulate_rollback_b6_to_index < len(log_list):
                 stale_head = log_list[self.simulate_rollback_b6_to_index]
                 return del_env, loc_env, stale_head
 
             return del_env, loc_env, log_list[-1]
+
+    def history(self, path: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """指定パスの L4 ログ履歴を新しい順に返す（署名済みエンベロープの要約）。"""
+        with self._lock:
+            self._ensure_online()
+            norm_path = normalize_path(path)
+            if limit < 1 or limit > 1000:
+                raise RegistryError(f"history limit must be between 1 and 1000: {limit}")
+            entries = list(self.logs.get(norm_path, []))
+            rows = []
+            for entry in reversed(entries[-limit:]):
+                p = entry.get("payload", {})
+                rows.append({
+                    "entry_hash": entry.get("entry_hash", ""),
+                    "path": p.get("path", norm_path),
+                    "timestamp": p.get("timestamp"),
+                    "version": p.get("version"),
+                })
+            return rows

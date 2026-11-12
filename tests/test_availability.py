@@ -236,6 +236,27 @@ class AvailabilityCase(unittest.TestCase):
         self.assertIsNotNone(head)
         self.assertEqual(head["payload"]["version"], 1)
 
+    def test_history_and_version_resolve_over_http(self) -> None:
+        service = self._registry("primary")
+        service.announce_and_append(self.path, self.log, self.loc, now=self.now)
+        primary = _RegistryHTTP(
+            cli_mod.PersistentRegistryState(
+                self.base / "history_state", "/example.com", self.root_pub
+            )
+        )
+        primary.pstate.service = service
+        self.addCleanup(primary.close)
+
+        client = cli_mod.RemoteRegistryClient(primary.url)
+        rows = client.history(self.path)
+        self.assertEqual([row["version"] for row in rows], [1])
+        old, _loc, head = client.resolve(self.path, version=1)
+        self.assertIsNotNone(old)
+        self.assertIsNotNone(head)
+        self.assertEqual(head["payload"]["version"], 1)
+        with self.assertRaises(Exception):
+            client.resolve(self.path, version=99)
+
     def test_primary_replicates_updates_to_secondary(self) -> None:
         primary = _RegistryHTTP(
             cli_mod.PersistentRegistryState(

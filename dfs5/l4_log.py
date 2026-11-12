@@ -27,7 +27,11 @@ from .crypto import (
     ssh_verify,
 )
 from .l1_delegation import DelegationError, verify_delegation_chain
-from .l2_registry import DirectoryRegistryService, create_locator_envelope
+from .l2_registry import (
+    DirectoryRegistryService,
+    create_locator_envelope,
+    verify_locator_envelope,
+)
 from .l3_ost_adapter import OSTClient
 
 
@@ -655,6 +659,67 @@ class L4LogClient:
         )
         self._save_pin()
         return head_env
+
+    def resolve_verified(
+        self,
+        registry: DirectoryRegistryService,
+        version: Optional[int] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+        """版を指定して、root アンカーから検証済みの head を返す。
+
+        通常の ``sync_head`` と違い、B6 のローカルピンは更新しない。過去版の
+        archive 作成や履歴参照で使う。
+        """
+        del_env, loc_env, head_env = registry.resolve(self.sub_path, version=version)
+        if head_env is None:
+            raise DelegationError(f"No version available for {self.sub_path!r}")
+        p = head_env.get("payload", {})
+        try:
+            head_path = normalize_path(p["path"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ChunkIntegrityError(f"Head has invalid path: {e}") from e
+        if head_path != self.sub_path:
+            raise ChunkIntegrityError(
+                f"Head path mismatch: expected {self.sub_path!r}, got {head_path!r}"
+            )
+        if not self.root_pubkey:
+            raise DelegationError("root_pubkey is required to verify a historical head")
+        chain = (del_env or {}).get("chain") or []
+        if not chain:
+            raise DelegationError("Delegation chain is missing")
+        try:
+            verified_at = int(p["timestamp"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ChunkIntegrityError(f"Head has invalid timestamp: {e}") from e
+        leaf = verify_delegation_chain(
+            root_anchor_path=(del_env or {}).get("root_anchor") or "/",
+            root_anchor_pubkey=self.root_pubkey,
+            chain=chain,
+            now=verified_at,
+            requested_path=self.sub_path,
+        )
+        raw = canonical_json(p)
+        if sha256_hex(raw) != head_env.get("entry_hash"):
+            raise ChunkIntegrityError("Head entry_hash mismatch")
+        if not ssh_verify(
+            leaf["writer"], self.sub_path, NS_L4_LOG, raw, head_env.get("signature", "")
+        ):
+            raise ChunkIntegrityError("Head signature verification failed")
+        if loc_env is not None:
+            loc_p = verify_locator_envelope(
+                loc_env, self.sub_path, leaf["writer"], verified_at
+            )
+            if (
+                int(loc_p["head_version"]) != int(p["version"])
+                or loc_p["head_hash"] != head_env["entry_hash"]
+            ):
+                raise ChunkIntegrityError("Locator does not match historical head")
+        self.last_delegation = del_env
+        self.last_locator = loc_env
+        return head_env, del_env, loc_env
+
+    def history(self, registry: DirectoryRegistryService, limit: int = 50) -> List[Dict[str, Any]]:
+        return registry.history(self.sub_path, limit=limit)
 
     def commit(
         self,

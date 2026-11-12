@@ -172,7 +172,7 @@ libp2p を OST の追加 ChunkSource として実装した。最初の TCP 試�
 | mini_lustre との RPC アダプタ | 未実装。そもそも mini_lustre 自体が試作なので、必要なら載せ替えを検討 |
 | DHT によるノード発見 | 未実装。`specs/delegation.md` §3.5.5 に、発見後の排除の設計を書いた |
 | 名簿のキャッシュ | 未実装（DHT を足すときに必要） |
-| 過去の版の取り出し（ロールバック） | 未実装。dfs5 は履歴を持つので版指定の取り出しは足せる |
+| 過去の版の取り出し（ロールバック） | 実装済み。`/v1/history` / `/v1/resolve?version` / `dfs5cli history` / `archive create --version` |
 
 ---
 

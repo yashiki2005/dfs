@@ -216,10 +216,23 @@ class RemoteRegistryClient:
         )
 
     def resolve(
-        self, path: str
+        self, path: str, version: Optional[int] = None
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-        res = self._post("/v1/resolve", {"path": path}, read_failover=True)
+        payload: Dict[str, Any] = {"path": path}
+        if version is not None:
+            payload["version"] = int(version)
+        res = self._post("/v1/resolve", payload, read_failover=True)
         return res.get("delegation"), res.get("locator"), res.get("head_log")
+
+    def history(self, path: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """署名済み L4 ログ履歴を新しい順に取得する。"""
+        res = self._post(
+            "/v1/history",
+            {"path": path, "limit": int(limit)},
+            read_failover=True,
+        )
+        rows = res.get("history", [])
+        return rows if isinstance(rows, list) else []
 
     def list_paths(self) -> Dict[str, Any]:
         """登録済みのサブツリーと書き手公開鍵の一覧（``/v1/paths``）。"""
@@ -400,7 +413,10 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                         pstate.save()
                         self._send_json(200, {"ok": True, "updated": updated})
                     elif self.path == "/v1/resolve":
-                        del_env, loc_env, head_env = pstate.service.resolve(req["path"])
+                        version = req.get("version")
+                        del_env, loc_env, head_env = pstate.service.resolve(
+                            req["path"], version=version
+                        )
                         self._send_json(
                             200,
                             {
@@ -408,6 +424,14 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                                 "head_log": head_env,
                                 "locator": loc_env,
                             },
+                        )
+                    elif self.path == "/v1/history":
+                        rows = pstate.service.history(
+                            req["path"], limit=int(req.get("limit", 50))
+                        )
+                        self._send_json(
+                            200,
+                            {"path": req["path"], "history": rows, "count": len(rows)},
                         )
                     elif self.path == "/v1/paths":
                         # 登録済みのサブツリーと、その書き手公開鍵を返す。
