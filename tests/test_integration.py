@@ -70,6 +70,94 @@ class TestL3ContentDedup(unittest.TestCase):
             finally:
                 ost.close()
 
+    def test_index_persists_across_builders(self) -> None:
+        import subprocess as sp
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_index_") as tmpdir:
+            base = Path(tmpdir)
+            cert, key = base / "c.pem", base / "k.pem"
+            sp.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert), "-days", "1",
+                    "-nodes", "-subj", "/CN=l"],
+                   check=True, capture_output=True)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                (tree / "a.bin").write_bytes(b"persistent index\n" * 100)
+                index_file = base / "ost_index.json"
+                secret = "persistent-index-secret"
+
+                first = OSTClient("127.0.0.1", ost.port)
+                MerkleTreeBuilder(
+                    ContentAddressedCrypto(secret), first, index_file=index_file
+                ).upload_directory(tree)
+                self.assertGreater(first.blob_bytes_sent, 0)
+                self.assertTrue(index_file.is_file())
+
+                second = OSTClient("127.0.0.1", ost.port)
+                builder = MerkleTreeBuilder(
+                    ContentAddressedCrypto(secret), second, index_file=index_file
+                )
+                builder.upload_directory(tree)
+                self.assertEqual(second.blob_bytes_sent, 0,
+                                 "永続索引を読んだのに同じチャンクを再送している")
+
+                # 内容アドレス鍵が変わった索引は再利用してはいけない。
+                third = OSTClient("127.0.0.1", ost.port)
+                MerkleTreeBuilder(
+                    ContentAddressedCrypto("different-secret"), third,
+                    index_file=index_file,
+                ).upload_directory(tree)
+                self.assertGreater(third.blob_bytes_sent, 0)
+            finally:
+                ost.close()
+
+    def test_folder_xattr_selects_zstd_codec(self) -> None:
+        import subprocess as sp
+        from dfs5.compression import set_xattr
+        from dfs5.crypto import ContentAddressedCrypto
+        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs5.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs5_compress_") as tmpdir:
+            base = Path(tmpdir)
+            cert, key = base / "c.pem", base / "k.pem"
+            sp.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert), "-days", "1",
+                    "-nodes", "-subj", "/CN=l"],
+                   check=True, capture_output=True)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                (tree / "src").mkdir(parents=True)
+                (tree / "src" / "main.py").write_text(
+                    "print('compress me')\n" * 1000, encoding="utf-8"
+                )
+                if not set_xattr(tree / "src", "zstd"):
+                    self.skipTest("filesystem does not support user xattrs")
+                client = OSTClient("127.0.0.1", ost.port)
+                builder = MerkleTreeBuilder(
+                    ContentAddressedCrypto("folder-compression"), client
+                )
+                builder.upload_directory(tree)
+                codecs = {entry[2] for entry in builder.index.values()}
+                self.assertIn("zstd", codecs)
+
+                out = base / "out"
+                builder.download_directory(
+                    *builder.upload_directory(tree), out
+                )
+                self.assertEqual(
+                    (out / "src" / "main.py").read_text(encoding="utf-8"),
+                    "print('compress me')\n" * 1000,
+                )
+            finally:
+                ost.close()
+
 
 class TestL3Striping(unittest.TestCase):
     """段階 4: 複数 OST へのストライピング。既定は 1 OST。"""

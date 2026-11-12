@@ -90,6 +90,7 @@ class DFS5Node:
         libp2p_peers: Optional[List[str]] = None,
         libp2p_psk: Optional[str] = None,
         role_epoch: int = 1,
+        compression: str = "none",
     ):
         self.name = name
         self.sub_path = sub_path
@@ -112,7 +113,11 @@ class DFS5Node:
         self.ost = ost_clients[0]
         self.replica_osts = ost_clients[1:]
         self.builder = MerkleTreeBuilder(
-            self.crypto, self.ost, replicas=self.replica_osts
+            self.crypto,
+            self.ost,
+            replicas=self.replica_osts,
+            index_file=self.clayfs.clayfs_meta / "ost_index.json",
+            compression=compression,
         )
         self.libp2p_client = None
         if libp2p_peers:
@@ -132,6 +137,7 @@ class DFS5Node:
         self.read_builder = MerkleTreeBuilder(self.crypto, self.read_ost)
         self.registry = registry
         self.role_epoch = int(role_epoch)
+        self.compression = str(compression or "none")
         pin_file = self.clayfs.clayfs_meta / "local_head.json"
         self.l4 = L4LogClient(
             sub_path, priv_key_path, pub_key_str,

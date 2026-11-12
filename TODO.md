@@ -4,9 +4,9 @@
 まずここを読んで「どこまで動いていて、次に何をするか」を掴んでほしい。
 
 - リポジトリ: `~/src/dfs5`（`/Volumes/ExtSSD/src/dfs5` へのシンボリックリンク）
-- 基準コミット: `525bdd0 feat: add external OST storage and tar import`
-- テスト: **153 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`）
-- 作業ツリー: 未コミット差分あり（fuse-t マウント）
+- 基準コミット: `1562f01 feat: add fuse-t mount support`
+- テスト: **160 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`）
+- 作業ツリー: 未コミット差分あり（checksum 形式、フォルダ圧縮、B3 チャンク）
 
 ---
 
@@ -123,6 +123,11 @@ C（合意形成）は当面やらない。
 | `lsd` | 直下のディレクトリだけを一覧する | 実装済み |
 | `import_tar` | `.tar` / `.tar.gz` / `.tar.xz` / `.tar.bz2` を安全に 1 版でインポートする | 実装済み |
 | `mount` | fuse-t / fusepy でリモートをローカルにマウントする | 実装済み |
+| `--checksum` | `size` / `crc32` / `sha1` / `plain_id` の変更検出 | 実装済み |
+| フォルダ圧縮 | `user.dfs5.compression` xattr と `DFS5B3` codec ヘッダー | 実装済み |
+
+書き手の内容アドレス索引は `.clayfs/ost_index.json` に永続化する。tree_secret が
+変わると `address_key` が一致しなくなるため、古い索引は自動的に無効化される。
 
 `mv` は宛先を新しい名前そのものとして扱う（既存ディレクトリへの自動格納や merge はしない）。
 詳細は `specs/cli.md` §3.2.1〜3.2.2。
@@ -307,7 +312,7 @@ cd ~/src/dfs5
 # 1. 状態の確認
 git log --oneline -3
 git status --short          # 空ならクリーン
-~/dfs-venv/bin/python -m pytest tests -q   # 153 件パス、1 skip（約 166 秒）
+~/dfs-venv/bin/python -m pytest tests -q   # 160 件パス、1 skip（約 171 秒）
 
 # 2. サーバを立てる（新コードで）
 ./dfs5svc list               # 既存のサービスを確認

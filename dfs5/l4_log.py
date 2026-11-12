@@ -26,6 +26,7 @@ from .crypto import (
     ssh_sign,
     ssh_verify,
 )
+from .compression import effective_policy, normalize_policy, set_xattr
 from .l1_delegation import DelegationError, verify_delegation_chain
 from .l2_registry import (
     DirectoryRegistryService,
@@ -33,6 +34,7 @@ from .l2_registry import (
     verify_locator_envelope,
 )
 from .l3_ost_adapter import OSTClient
+from .private_io import write_private_json
 
 
 class RollbackDetectedError(Exception):
@@ -99,6 +101,8 @@ class MerkleTreeBuilder:
         default_store: str = "ost0",
         index: Optional[Dict[str, Any]] = None,
         replicas: Optional[List[OSTClient]] = None,
+        index_file: Optional[Path] = None,
+        compression: str = "none",
     ):
         self.crypto = crypto
         # 後方互換: ost は既定の OST を指す
@@ -114,6 +118,49 @@ class MerkleTreeBuilder:
         self._last_wire_ids: set[str] = set()
         # (plain_id -> (wire_id, store_id)) の書き手側索引。古い形式（str）も読める。
         self.index: Dict[str, Any] = dict(index or {})
+        self.index_file = Path(index_file).expanduser() if index_file else None
+        self.index_key = sha256_hex(self.crypto.address_secret)
+        self.compression = normalize_policy(compression)
+        if self.index_file is not None and index is None:
+            self.index = self._load_index_file()
+
+    def _load_index_file(self) -> Dict[str, Any]:
+        if self.index_file is None or not self.index_file.is_file():
+            return {}
+        try:
+            data = json.loads(self.index_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+        if not isinstance(data, dict) or data.get("schema") != "dfs5-ost-index-v1":
+            return {}
+        if data.get("address_key") != self.index_key:
+            return {}
+        entries = data.get("entries")
+        if not isinstance(entries, dict):
+            return {}
+        result: Dict[str, Any] = {}
+        for plain_id, entry in entries.items():
+            parsed = self._index_get(entry)
+            if parsed is not None:
+                result[str(plain_id)] = parsed
+        return result
+
+    def _save_index_file(self) -> None:
+        if self.index_file is None:
+            return
+        entries: Dict[str, Any] = {}
+        for plain_id, entry in self.index.items():
+            parsed = self._index_get(entry)
+            if parsed is not None:
+                entries[str(plain_id)] = [parsed[0], parsed[1], parsed[2]]
+        write_private_json(
+            self.index_file,
+            {
+                "address_key": self.index_key,
+                "entries": entries,
+                "schema": "dfs5-ost-index-v1",
+            },
+        )
 
     # ---- ストア選択 -------------------------------------------------------
     def _store_for_new_chunk(self) -> str:
@@ -128,14 +175,16 @@ class MerkleTreeBuilder:
         return self.stores.get(store_id, self.ost)
 
     @staticmethod
-    def _index_get(entry: Any) -> Optional[Tuple[str, str]]:
-        """索引の値を (wire_id, store_id) に正規化する。旧形式の str も受ける。"""
+    def _index_get(entry: Any) -> Optional[Tuple[str, str, str]]:
+        """索引の値を (wire_id, store_id, codec) に正規化する。旧形式も受ける。"""
         if entry is None:
             return None
         if isinstance(entry, str):
-            return entry, ""
+            return entry, "", "none"
         if isinstance(entry, (tuple, list)) and len(entry) == 2:
-            return str(entry[0]), str(entry[1])
+            return str(entry[0]), str(entry[1]), "none"
+        if isinstance(entry, (tuple, list)) and len(entry) >= 3:
+            return str(entry[0]), str(entry[1]), str(entry[2] or "none")
         return None
 
     # ---- 書き込み ---------------------------------------------------------
@@ -163,7 +212,12 @@ class MerkleTreeBuilder:
 
         def _one_pass(
             force_new: set,
-        ) -> Tuple[Dict[str, Dict[str, bytes]], Dict[str, Tuple[str, str]], Dict[str, Tuple[str, str]], Tuple[str, str, str]]:
+        ) -> Tuple[
+            Dict[str, Dict[str, bytes]],
+            Dict[str, Tuple[str, str, str]],
+            Dict[str, Tuple[str, str, str]],
+            Tuple[str, str, str, str],
+        ]:
             """ツリーを 1 回走査し結果を返す（``self.index`` は書き換えない）。
 
             戻り値: (送るべき塊, 索引ヒットした塊, 今回暗号化した塊, 根の 3 つ組)
@@ -174,32 +228,36 @@ class MerkleTreeBuilder:
             走査がすべて終わってからまとめて行う。
             """
             pending: Dict[str, Dict[str, bytes]] = {sid: {} for sid in self.stores}
-            reused: Dict[str, Tuple[str, str]] = {}
-            packed: Dict[str, Tuple[str, str]] = {}
+            reused: Dict[str, Tuple[str, str, str]] = {}
+            packed: Dict[str, Tuple[str, str, str]] = {}
             # 同じ走査中の重複排除。同一内容の 2 ファイル目以降は再暗号化しない。
-            staged: Dict[str, Tuple[str, str]] = {}
+            staged: Dict[str, Tuple[str, str, str]] = {}
 
-            def _stage(plaintext: bytes) -> Tuple[str, str, str]:
+            def _stage(plaintext: bytes, policy: str) -> Tuple[str, str, str, str]:
                 plain_id = self.crypto.compute_plain_id(plaintext).hex()
                 if plain_id in staged:
-                    wire_id, store_id = staged[plain_id]
-                    return plain_id, wire_id, store_id
+                    wire_id, store_id, codec = staged[plain_id]
+                    return plain_id, wire_id, store_id, codec
                 known = None if plain_id in force_new else self._index_get(self.index.get(plain_id))
                 if known is not None:
-                    known_wire, known_store = known
+                    known_wire, known_store, known_codec = known
                     store_id = known_store or self.default_store
-                    reused[plain_id] = (known_wire, store_id)
-                    staged[plain_id] = (known_wire, store_id)
-                    return plain_id, known_wire, store_id
+                    reused[plain_id] = (known_wire, store_id, known_codec)
+                    staged[plain_id] = (known_wire, store_id, known_codec)
+                    return plain_id, known_wire, store_id, known_codec
                 store_id = self._store_for_new_chunk()
-                pack_pid, wire_id, blob = self.crypto.pack_chunk(plaintext)
+                pack_pid, wire_id, blob = self.crypto.pack_chunk(
+                    plaintext, compression=policy
+                )
                 assert pack_pid == plain_id
-                packed[plain_id] = (wire_id, store_id)
-                staged[plain_id] = (wire_id, store_id)
+                codec = self.crypto.chunk_codec(blob)
+                packed[plain_id] = (wire_id, store_id, codec)
+                staged[plain_id] = (wire_id, store_id, codec)
                 pending.setdefault(store_id, {})[wire_id] = blob
-                return plain_id, wire_id, store_id
+                return plain_id, wire_id, store_id, codec
 
-            def _walk(directory: Path, mounts: Dict[str, str]) -> Tuple[str, str, str]:
+            def _walk(directory: Path, mounts: Dict[str, str]) -> Tuple[str, str, str, str]:
+                dir_policy = effective_policy(directory, source_dir, self.compression)
                 items: list = []
                 for item in sorted(directory.iterdir(), key=lambda q: q.name):
                     if item.name in self.IGNORED_NAMES or item.name.startswith("._"):
@@ -220,8 +278,11 @@ class MerkleTreeBuilder:
                         )
                     elif item.is_file():
                         raw_data = item.read_bytes()
-                        pid, wid, sid = _stage(raw_data)
+                        item_policy = effective_policy(item, source_dir, self.compression)
+                        pid, wid, sid, codec = _stage(raw_data, item_policy)
                         item_entry = {
+                            "codec": codec,
+                            "compression": item_policy,
                             "name": norm_name,
                             "plain_id": pid,
                             "size": len(raw_data),
@@ -231,8 +292,11 @@ class MerkleTreeBuilder:
                         item_entry.update(_entry(sid))
                         items.append(item_entry)
                     elif item.is_dir():
-                        sub_pid, sub_wid, sub_sid = _walk(item, {})
+                        item_policy = effective_policy(item, source_dir, self.compression)
+                        sub_pid, sub_wid, sub_sid, sub_codec = _walk(item, {})
                         item_entry = {
+                            "codec": sub_codec,
+                            "compression": item_policy,
                             "name": norm_name,
                             "plain_id": sub_pid,
                             "type": "dir",
@@ -241,26 +305,32 @@ class MerkleTreeBuilder:
                         item_entry.update(_entry(sub_sid))
                         items.append(item_entry)
                 items.sort(key=lambda e: e["name"])
-                dir_bytes = canonical_json({"entries": items, "format": "dfs5-dir-v1"})
-                return _stage(dir_bytes)
+                dir_bytes = canonical_json(
+                    {
+                        "compression": dir_policy,
+                        "entries": items,
+                        "format": "dfs5-dir-v1",
+                    }
+                )
+                return _stage(dir_bytes, dir_policy)
 
             root = _walk(source_dir, delegated_mounts)
             wire_ids: set[str] = set()
             for chunks in pending.values():
                 wire_ids.update(chunks)
-            wire_ids.update(wire for wire, _store in reused.values())
+            wire_ids.update(wire for wire, _store, _codec in reused.values())
             self._last_wire_ids = wire_ids
             return pending, reused, packed, root
 
         # ---- 1 回目の走査: 索引ヒットは「サーバに在る」と仮定して記録だけする ----
-        pending, reused, packed, (root_pid, root_wid, root_sid) = _one_pass(force_new=set())
+        pending, reused, packed, (root_pid, root_wid, root_sid, _root_codec) = _one_pass(force_new=set())
 
         # ---- 索引ヒットした塊の存在確認を 1 往復の一括 HAS にまとめる ----
         # ここが WAN 対応の要。チャンクごとに HAS を撃つ実装では往復がチャンク数に比例する。
         missing_plain: set = set()
         if reused:
             by_store: Dict[str, list] = {}
-            for plain_id, (wire, store_id) in reused.items():
+            for plain_id, (wire, store_id, _codec) in reused.items():
                 by_store.setdefault(store_id, []).append((plain_id, wire))
             for store_id, pairs in by_store.items():
                 try:
@@ -276,12 +346,12 @@ class MerkleTreeBuilder:
         # ---- 消えていた塊があれば、それを強制再生成してツリー全体を組み直す ----
         # ディレクトリ塊は子の wire_id を含むので、部分差し替えでは整合しない。
         if missing_plain:
-            pending, reused, packed, (root_pid, root_wid, root_sid) = _one_pass(force_new=missing_plain)
+            pending, reused, packed, (root_pid, root_wid, root_sid, _root_codec) = _one_pass(force_new=missing_plain)
 
         # ---- 索引を確定してから送る ----
         # 索引ヒットした塊は既存の索引をそのまま維持し、今回暗号化した塊だけ貼り替える。
-        for plain_id, (wire_id, store_id) in packed.items():
-            self.index[plain_id] = (wire_id, store_id)
+        for plain_id, (wire_id, store_id, codec) in packed.items():
+            self.index[plain_id] = (wire_id, store_id, codec)
 
         # ---- 送信: すべて「未確認（今回暗号化したか、無いと分かっている）」塊なので HAS を省く ----
         for sid, chunks in pending.items():
@@ -291,6 +361,10 @@ class MerkleTreeBuilder:
         # 根の配置先を呼び出し側が知れるよう、既定と異なるときは属性に残す
         self.root_store = root_sid
         self._replicate_chunks()
+        try:
+            self._save_index_file()
+        except OSError as e:
+            self.warnings.append(f"cannot persist OST index: {e}")
         return root_pid, root_wid
 
     def _replicate_chunks(self) -> None:
@@ -380,7 +454,7 @@ class MerkleTreeBuilder:
         level: List[Tuple[str, str, str, Path]] = [
             (root_plain_id, root_wire_id, root_store_id, dest_dir)
         ]
-        files: List[Tuple[str, str, str, Path, Optional[int]]] = []
+        files: List[Tuple[str, str, str, Path, Optional[int], str]] = []
         depth = 0
         while level:
             depth += 1
@@ -399,6 +473,9 @@ class MerkleTreeBuilder:
 
                 # 各階層の対象ディレクトリは、塊を取る前に必ず用意する
                 target.mkdir(parents=True, exist_ok=True)
+                parent_policy = dir_obj.get("compression")
+                if parent_policy:
+                    set_xattr(target, parent_policy)
                 for entry in dir_obj["entries"]:
                     name = normalize_name(entry["name"])
                     child = target / name
@@ -407,11 +484,19 @@ class MerkleTreeBuilder:
 
                     if etype == "file":
                         files.append(
-                            (entry["plain_id"], entry["wire_id"], entry_store, child, entry.get("size"))
+                            (
+                                entry["plain_id"],
+                                entry["wire_id"],
+                                entry_store,
+                                child,
+                                entry.get("size"),
+                                entry.get("compression", "none"),
+                            )
                         )
                     elif etype == "dir":
                         # 空のディレクトリも含めて、ここで実体を作る
                         child.mkdir(parents=True, exist_ok=True)
+                        set_xattr(child, entry.get("compression", "none"))
                         next_level.append((entry["plain_id"], entry["wire_id"], entry_store, child))
                     elif etype == "delegated_mount":
                         child.mkdir(parents=True, exist_ok=True)
@@ -421,9 +506,9 @@ class MerkleTreeBuilder:
 
         # 2) ファイル塊を store ごと・上限ごとに一括取得して書き出す。
         file_blobs = self._fetch_grouped(
-            [(sid, wid, size) for _pid, wid, sid, _t, size in files]
+            [(sid, wid, size) for _pid, wid, sid, _t, size, _policy in files]
         )
-        for plain_id, wire_id, _store_id, target, size in files:
+        for plain_id, wire_id, _store_id, target, size, policy in files:
             f_blob = file_blobs.get(wire_id)
             if f_blob is None:
                 raise ChunkIntegrityError(f"Missing file chunk during download: {wire_id}")
@@ -431,6 +516,7 @@ class MerkleTreeBuilder:
             if size is not None and len(f_data) != size:
                 raise ChunkIntegrityError(f"File size mismatch for {target.name}")
             target.write_bytes(f_data)
+            set_xattr(target, policy)
 
 
     # ---- 参照のみ（rclone ライク CLI 用） ---------------------------------
@@ -483,6 +569,8 @@ class MerkleTreeBuilder:
                     "type": etype,
                     "wire_id": entry.get("wire_id", ""),
                     "plain_id": entry.get("plain_id", ""),
+                    "codec": entry.get("codec", "none"),
+                    "compression": entry.get("compression", "none"),
                     "store": child_store,
                 }
                 if etype == "file":

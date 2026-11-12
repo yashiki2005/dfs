@@ -546,6 +546,7 @@ def load_node_from_mount(
         libp2p_peers=cfg.get("libp2p_peers") or [],
         libp2p_psk=cfg.get("libp2p_psk") or "",
         role_epoch=int(cfg.get("role_epoch", 1)),
+        compression=str(cfg.get("compression", "none") or "none"),
     )
     return node, cfg, reg_client
 

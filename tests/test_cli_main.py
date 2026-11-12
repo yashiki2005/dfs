@@ -207,6 +207,21 @@ class RcloneCase(unittest.TestCase):
             ["/ip4/127.0.0.1/udp/19443/quic-v1/p2p/12D3KooWTest"],
         )
 
+    def test_config_create_accepts_compression_policy(self) -> None:
+        store = RemoteStore(self.config_file)
+        store.remotes.pop("zstd", None)
+        store.save()
+        rc = self.run_cli(
+            "config", "create", "zstd",
+            "--registry", self.server.registry_url,
+            "--key", str(self.alice_key),
+            "--secret", "s3cret",
+            "--compression", "zstd",
+            "--workdir", str(self.base / "wd-zstd"),
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(RemoteStore(self.config_file).get("zstd").compression, "zstd")
+
     def test_config_create_makes_key_when_omitted(self) -> None:
         """--key を省くと、その場で Ed25519 の鍵を作る。"""
         store = RemoteStore(self.config_file)
@@ -513,6 +528,38 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(self.run_cli("copyto", str(one), "t:docs/one.txt"), 0)
         node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
         self.assertEqual(node2.l4.pin.version, v1, "同じ内容の copyto が版を作っている")
+
+    def test_checksum_modes(self) -> None:
+        src = self.base / "same-size.txt"
+        src.write_text("AAAA\n", encoding="utf-8")
+        self.assertEqual(self.run_cli("copyto", str(src), "t:same-size.txt"), 0)
+        store = RemoteStore(self.config_file)
+        node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        v1 = node.l4.pin.version
+
+        src.write_text("BBBB\n", encoding="utf-8")
+        self.assertEqual(
+            self.run_cli("copyto", str(src), "t:same-size.txt", "--checksum", "size"),
+            0,
+        )
+        node2 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertEqual(node2.l4.pin.version, v1, "size checksum が内容変更を検出した")
+
+        self.assertEqual(
+            self.run_cli("copyto", str(src), "t:same-size.txt", "--checksum", "crc32"),
+            0,
+        )
+        node3 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertEqual(node3.l4.pin.version, v1 + 1, "crc32 checksum が更新しない")
+
+        src.write_text("CCCC\n", encoding="utf-8")
+        self.assertEqual(
+            self.run_cli("copyto", str(src), "t:same-size.txt", "--checksum", "sha1"),
+            0,
+        )
+        node4 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
+        self.assertEqual(node4.l4.pin.version, v1 + 2, "sha1 checksum が更新しない")
+        self.assertEqual(node4.read_remote("same-size.txt"), b"CCCC\n")
 
     def test_import_tar_supports_all_compression_formats(self) -> None:
         source = self.base / "tar_source" / "bundle"

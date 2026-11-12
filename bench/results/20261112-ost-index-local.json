@@ -1,0 +1,13 @@
+{
+  "schema": "dfs5-ost-index-bench-v1",
+  "measured_at_utc": "2026-11-12T12:20:00+00:00",
+  "payload": {
+    "files": 20,
+    "file_size_bytes": 131072,
+    "payload_bytes": 2621440
+  },
+  "first_push_sent_bytes": 2628420,
+  "after_one_file_changed_sent_bytes": 5731,
+  "index_entries": 21,
+  "note": "CLI を別プロセスで2回実行。2回目は永続索引により未変更チャンクを再送しない。"
+}

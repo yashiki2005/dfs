@@ -40,6 +40,7 @@ rclone ライクな dfs5 の CLI。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -48,6 +49,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zlib
 import time
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -75,6 +77,7 @@ from .private_io import ensure_private_dir, write_private_json
 from .remotes import Remote, RemoteError, RemoteStore, split_remote_spec
 
 CACHE_VERSION_FILENAME = "cache_version"
+CHECKSUM_MODES = ("size", "crc32", "sha1", "plain_id")
 
 
 class UsageError(Exception):
@@ -210,6 +213,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
         cfg = {
             "delegation_epoch": int(remote.epoch),
             "role_epoch": int(remote.role_epoch),
+            "compression": remote.compression,
             "node_name": remote.node_name or remote.name,
             "ost_alternates": list(remote.ost_alternates),
             "libp2p_peers": list(remote.libp2p_peers),
@@ -248,6 +252,9 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
         changed = True
     if int(cfg.get("role_epoch", 1)) != int(remote.role_epoch):
         cfg["role_epoch"] = int(remote.role_epoch)
+        changed = True
+    if str(cfg.get("compression", "none") or "none") != remote.compression:
+        cfg["compression"] = remote.compression
         changed = True
     if changed:
         write_private_json(cfg_path, cfg)
@@ -518,19 +525,26 @@ def plan_changes(
     node: DFS5Node,
     prefix: str,
     local: Dict[str, Path],
-    checksum: bool = False,
+    checksum: str = "size",
     path_filter: Optional[PathFilter] = None,
 ) -> Tuple[List[Tuple[str, Path, str]], List[str], List[str]]:
     """ローカルとリモートを比べ、(書くもの, 消すもの, 変わらないもの) を返す。
 
-    転送の判定は rclone の既定と同じく大きさを先に見る。``checksum=True`` のときだけ
-    中身の内容アドレス (``plain_id``) まで比べる。dfs5 は書き手側の索引で塊を
+    転送の判定は rclone の既定と同じく大きさを先に見る。``checksum`` が
+    ``size`` 以外なら内容の checksum まで比べる。``plain_id`` は dfs5 の
+    内容アドレス、``crc32`` / ``sha1`` は互換用の軽い比較。dfs5 は書き手側の索引で塊を
     重複排除するため、内容が同じなら ``push`` しても本文は送られない。それでも
     版が増えるのは無駄なので、「変わらないなら版を作らない」をここで決める。
 
     返り値の「書くもの」は ``(リモートのパス, ローカルの実ファイル, "add"|"update")``。
     ``path_filter`` が指定された場合、削除候補もフィルタの内側だけに限定する。
     """
+    if checksum is True:
+        checksum = "plain_id"
+    elif checksum is False or checksum is None:
+        checksum = "size"
+    if checksum not in CHECKSUM_MODES:
+        raise UsageError(f"unknown checksum mode: {checksum!r}")
     path_filter = path_filter or PathFilter()
     remote = {
         e["path"]: e
@@ -555,10 +569,23 @@ def plan_changes(
         if int(entry.get("size", 0)) != size:
             to_write.append((path, src, "update"))
             continue
-        if checksum:
+        data: Optional[bytes] = None
+        if checksum in ("plain_id", "crc32", "sha1"):
             data = src.read_bytes()
+        if checksum == "plain_id":
             pid = node.crypto.compute_plain_id(data).hex()
             if pid != entry.get("plain_id", ""):
+                to_write.append((path, src, "update"))
+                continue
+        elif checksum in ("crc32", "sha1"):
+            remote_data = node.read_remote(path)
+            if checksum == "crc32":
+                local_sum = zlib.crc32(data) & 0xFFFFFFFF
+                remote_sum = zlib.crc32(remote_data) & 0xFFFFFFFF
+            else:
+                local_sum = hashlib.sha1(data).hexdigest()
+                remote_sum = hashlib.sha1(remote_data).hexdigest()
+            if local_sum != remote_sum:
                 to_write.append((path, src, "update"))
                 continue
         unchanged.append(path)
@@ -946,6 +973,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             workdir=args.workdir or "",
             epoch=int(args.epoch),
             role_epoch=int(getattr(args, "role_epoch", 1)),
+            compression=str(getattr(args, "compression", "none") or "none"),
             node_name=args.node_name or args.name,
             root_pubkey=root_pubkey,
             root_fingerprint=root_fingerprint,
@@ -994,7 +1022,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         r = store.get(args.name)
         for key in ("name", "registry", "registry_alternates", "ost", "ost_alternates",
                     "libp2p_peers", "libp2p_psk", "path", "key", "workdir", "epoch",
-                    "role_epoch", "node_name", "root_fingerprint"):
+                    "role_epoch", "compression", "node_name", "root_fingerprint"):
             value = getattr(r, key)
             if key in ("secret", "libp2p_psk"):
                 value = "***"
@@ -1228,7 +1256,7 @@ def cmd_copy(args: argparse.Namespace) -> int:
     """ローカルのファイルをリモートへ足す（リモートにしかないものは残す）。
 
     変更が無ければ版を作らない（rclone と同じく冪等）。判定は大きさを先に見て、
-    ``--checksum`` のときだけ内容アドレスまで比べる。
+    ``--checksum size|crc32|sha1|plain_id`` で変更検出方法を選ぶ。
     """
     store = RemoteStore()
     name, sub = split_remote_spec(args.dest, args.remote_name)
@@ -1346,7 +1374,7 @@ def cmd_import_tar(args: argparse.Namespace) -> int:
         # staging を再走査せず、安全展開で確定したファイルだけを使う。
         local = files
         writes, _deletes, unchanged = plan_changes(
-            node, prefix, local, checksum=True
+            node, prefix, local, checksum="plain_id"
         )
         new_dirs = sorted(
             rel for rel in dirs
@@ -2037,6 +2065,10 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
         "--role-epoch", type=int, default=1,
         help="registry primary/secondary の fencing 世代（既定 1）",
     )
+    p.add_argument(
+        "--compression", choices=["none", "zstd"], default="none",
+        help="フォルダ xattr が無い場合の既定圧縮（既定 none）",
+    )
     p.add_argument("--node-name", help="端末名（既定はリモート名）")
     p.add_argument(
         "--root-pubkey",
@@ -2156,8 +2188,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("copy", help="ローカルのファイルをリモートへ足す（残す）")
     p.add_argument("src", help="ローカルのファイルまたはディレクトリ")
     p.add_argument("dest", help="remote:path")
-    p.add_argument("--checksum", action="store_true",
-                   help="大きさが同じでも内容アドレスまで比べる")
+    p.add_argument(
+        "--checksum", nargs="?", const="plain_id", default="size",
+        choices=CHECKSUM_MODES,
+        help="変更検出: size / crc32 / sha1 / plain_id（単独指定は plain_id）",
+    )
     p.add_argument("--include", action="append", default=[], metavar="PATTERN",
                    help="含める相対パターン（複数指定可）")
     p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
@@ -2168,8 +2203,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("copyto", help="ローカルの 1 ファイルをリモートの指定パスへ置く")
     p.add_argument("src")
     p.add_argument("dest", help="remote:path/file")
-    p.add_argument("--checksum", action="store_true",
-                   help="大きさが同じでも内容アドレスまで比べる")
+    p.add_argument(
+        "--checksum", nargs="?", const="plain_id", default="size",
+        choices=CHECKSUM_MODES,
+        help="変更検出: size / crc32 / sha1 / plain_id（単独指定は plain_id）",
+    )
     p.add_argument("-n", "--dry-run", action="store_true")
     p.set_defaults(func=cmd_copyto)
 
@@ -2199,7 +2237,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("src", help="ローカルのディレクトリ")
     p.add_argument("dest", help="remote:path")
     p.add_argument("--delete", action="store_true", help="リモートにしかないものを消す")
-    p.add_argument("--checksum", action="store_true", help="大きさが同じでも書き直して判定する")
+    p.add_argument(
+        "--checksum", nargs="?", const="plain_id", default="size",
+        choices=CHECKSUM_MODES,
+        help="変更検出: size / crc32 / sha1 / plain_id（単独指定は plain_id）",
+    )
     p.add_argument("--include", action="append", default=[], metavar="PATTERN",
                    help="含める相対パターン（複数指定可）")
     p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",

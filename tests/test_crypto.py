@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5.crypto import NS_L4_LOG, ssh_sign, ssh_verify
+from dfs5.crypto import ContentAddressedCrypto, NS_L4_LOG, ssh_sign, ssh_verify
 
 
 class SshVerifyTests(unittest.TestCase):
@@ -46,6 +47,25 @@ class SshVerifyTests(unittest.TestCase):
             self.assertFalse(
                 ssh_verify(pub, "ignored-identity", NS_L4_LOG, b"tampered", signature)
             )
+
+
+class ChunkCompressionTests(unittest.TestCase):
+    def test_zstd_roundtrip_and_codec(self) -> None:
+        crypto = ContentAddressedCrypto("compression-test")
+        plaintext = b"source code and log lines\n" * 20000
+        pid, wid, blob = crypto.pack_chunk(plaintext, compression="zstd")
+        self.assertTrue(blob.startswith(crypto.MAGIC_HEADER_V3))
+        self.assertEqual(crypto.chunk_codec(blob), "zstd")
+        self.assertLess(len(blob), len(plaintext))
+        self.assertEqual(crypto.unpack_chunk(pid, wid, blob), plaintext)
+
+    def test_incompressible_data_falls_back_to_plain_chunk(self) -> None:
+        crypto = ContentAddressedCrypto("compression-test")
+        plaintext = os.urandom(64 * 1024)
+        pid, wid, blob = crypto.pack_chunk(plaintext, compression="zstd")
+        self.assertTrue(blob.startswith(crypto.MAGIC_HEADER))
+        self.assertEqual(crypto.chunk_codec(blob), "none")
+        self.assertEqual(crypto.unpack_chunk(pid, wid, blob), plaintext)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,10 @@ class ChunkIntegrityError(CryptoError):
     """L3 チャンクの破損・改ざん・ハッシュ不一致 (evil A2 検出)"""
 
 
+class CompressionError(CryptoError):
+    """圧縮コーデックの利用・圧縮データの展開失敗"""
+
+
 def normalize_name(name: str) -> str:
     """ファイル名・パス要素を UTF-8 NFC に正規化し、不正な要素を拒否する。"""
     if not name or "/" in name or "\x00" in name or name in (".", ".."):
@@ -358,6 +362,12 @@ class ContentAddressedCrypto:
     """
 
     MAGIC_HEADER = b"DFS5B2"
+    MAGIC_HEADER_V3 = b"DFS5B3"
+    CODEC_NONE = 0
+    CODEC_ZSTD = 1
+    ZSTD_LEVEL = 10
+    COMPRESSION_THRESHOLD = 0.95
+    COMPRESSION_SAMPLE_BYTES = 64 * 1024
     NONCE_LEN = 12
     TAG_LEN = 16  # ChaCha20-Poly1305 のタグ長
 
@@ -382,27 +392,91 @@ class ContentAddressedCrypto:
         """平文の内容アドレス。暗号化鍵のローテーションに依存しない。"""
         return hmac.new(self.address_secret, b"dfs5-plain-id-v1:" + plaintext, hashlib.sha256).digest()
 
-    def pack_chunk(self, plaintext: bytes, nonce: bytes | None = None) -> Tuple[str, str, bytes]:
+    @staticmethod
+    def _normalize_compression(compression: str | None) -> str:
+        value = str(compression or "none").strip().lower()
+        if value in ("", "none", "off", "false", "0"):
+            return "none"
+        if value in ("zstd", "zstandard", "zstd:10"):
+            return "zstd"
+        raise CompressionError(f"Unsupported compression codec: {compression!r}")
+
+    @classmethod
+    def _compress_if_beneficial(cls, plaintext: bytes) -> bytes | None:
+        """サンプルで明らかな非圧縮を除外し、最終圧縮率で採否を決める。"""
+        if len(plaintext) < 4096:
+            return None
+        try:
+            import zstandard as zstd
+        except ImportError as e:
+            raise CompressionError(
+                "zstd compression requires zstandard (pip install 'dfs5[compression]')"
+            ) from e
+        sample_size = cls.COMPRESSION_SAMPLE_BYTES
+        if len(plaintext) <= sample_size * 3:
+            sample = plaintext
+        else:
+            middle = len(plaintext) // 2
+            sample = (
+                plaintext[:sample_size]
+                + plaintext[middle:middle + sample_size]
+                + plaintext[-sample_size:]
+            )
+        compressor = zstd.ZstdCompressor(level=cls.ZSTD_LEVEL)
+        sampled = compressor.compress(sample)
+        if len(sampled) / len(sample) >= cls.COMPRESSION_THRESHOLD:
+            return None
+        compressed = compressor.compress(plaintext)
+        if len(compressed) >= len(plaintext):
+            return None
+        if len(compressed) / len(plaintext) >= cls.COMPRESSION_THRESHOLD:
+            return None
+        return compressed
+
+    @classmethod
+    def chunk_codec(cls, blob: bytes) -> str:
+        if blob.startswith(cls.MAGIC_HEADER_V3) and len(blob) > len(cls.MAGIC_HEADER_V3):
+            codec = blob[len(cls.MAGIC_HEADER_V3)]
+            if codec == cls.CODEC_ZSTD:
+                return "zstd"
+        return "none"
+
+    def pack_chunk(
+        self,
+        plaintext: bytes,
+        nonce: bytes | None = None,
+        compression: str | None = "none",
+    ) -> Tuple[str, str, bytes]:
         """平文を暗号化し、(plain_id, wire_id, blob) を返す。
 
         ``nonce`` を省略すると毎回 ``os.urandom`` で生成する（決定的暗号にしない）。
         同じ平文でも呼ぶたびに ``wire_id`` は変わりうるが、重複排除は ``plain_id`` で
-        行うため影響しない。
+        行うため影響しない。圧縮する場合は平文を圧縮してから暗号化し、B3 ヘッダーに
+        codec と元サイズを保存する。
         """
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         plain_id_bytes = self.compute_plain_id(plaintext)
         plain_id_hex = plain_id_bytes.hex()
+        codec = self._normalize_compression(compression)
+        payload = self._compress_if_beneficial(plaintext) if codec == "zstd" else None
+        if payload is None:
+            codec = "none"
+            payload = plaintext
         if nonce is None:
             nonce = os.urandom(self.NONCE_LEN)
         if len(nonce) != self.NONCE_LEN:
             raise ValueError(f"Nonce must be {self.NONCE_LEN} bytes, got {len(nonce)}")
 
         key = self._enc_key(plain_id_bytes)
-        aad = self.MAGIC_HEADER + plain_id_bytes
-        ciphertext = ChaCha20Poly1305(key).encrypt(nonce, plaintext, aad)
-
-        blob = self.MAGIC_HEADER + plain_id_bytes + nonce + ciphertext
+        if codec == "zstd":
+            codec_byte = bytes([self.CODEC_ZSTD])
+            header = self.MAGIC_HEADER_V3 + codec_byte + plain_id_bytes + struct.pack(">Q", len(plaintext))
+        else:
+            header = self.MAGIC_HEADER + plain_id_bytes
+            codec_byte = b""
+        ciphertext = ChaCha20Poly1305(key).encrypt(nonce, payload, header)
+        blob = header + nonce + ciphertext
         wire_id_hex = sha256_hex(blob)
         return plain_id_hex, wire_id_hex, blob
 
@@ -420,24 +494,55 @@ class ContentAddressedCrypto:
         except ValueError as e:
             raise ChunkIntegrityError(f"Invalid plain_id hex: {expected_plain_id}") from e
 
-        m_len = len(self.MAGIC_HEADER)
-        head_len = m_len + 32 + self.NONCE_LEN
-        if len(blob) < head_len + self.TAG_LEN or not blob.startswith(self.MAGIC_HEADER):
+        if blob.startswith(self.MAGIC_HEADER_V3):
+            m_len = len(self.MAGIC_HEADER_V3)
+            if len(blob) < m_len + 1 + 32 + 8 + self.NONCE_LEN + self.TAG_LEN:
+                raise ChunkIntegrityError("Invalid or truncated DFS5B3 chunk header")
+            codec = blob[m_len]
+            embedded_plain_id = blob[m_len + 1 : m_len + 33]
+            plain_size = struct.unpack(">Q", blob[m_len + 33 : m_len + 41])[0]
+            head_len = m_len + 1 + 32 + 8 + self.NONCE_LEN
+            aad = blob[: m_len + 1 + 32 + 8]
+            if not hmac.compare_digest(embedded_plain_id, plain_id_bytes):
+                raise ChunkIntegrityError("Embedded plain_id does not match the manifest (A2)")
+            nonce = blob[m_len + 41 : head_len]
+            ciphertext = blob[head_len:]
+        else:
+            m_len = len(self.MAGIC_HEADER)
+            head_len = m_len + 32 + self.NONCE_LEN
+            if len(blob) < head_len + self.TAG_LEN or not blob.startswith(self.MAGIC_HEADER):
+                raise ChunkIntegrityError("Invalid or truncated DFS5 chunk header")
+            codec = self.CODEC_NONE
+            embedded_plain_id = blob[m_len : m_len + 32]
+            plain_size = 0
+            if not hmac.compare_digest(embedded_plain_id, plain_id_bytes):
+                raise ChunkIntegrityError("Embedded plain_id does not match the manifest (A2)")
+            nonce = blob[m_len + 32 : head_len]
+            ciphertext = blob[head_len:]
+            aad = self.MAGIC_HEADER + plain_id_bytes
+
+        if len(blob) < head_len + self.TAG_LEN:
             raise ChunkIntegrityError("Invalid or truncated DFS5 chunk header")
 
-        embedded_plain_id = blob[m_len : m_len + 32]
-        if not hmac.compare_digest(embedded_plain_id, plain_id_bytes):
-            raise ChunkIntegrityError("Embedded plain_id does not match the manifest (A2)")
-
-        nonce = blob[m_len + 32 : head_len]
-        ciphertext = blob[head_len:]
-
         key = self._enc_key(plain_id_bytes)
-        aad = self.MAGIC_HEADER + plain_id_bytes
         try:
-            plaintext = ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
+            payload = ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
         except Exception as e:
             raise ChunkIntegrityError(f"AEAD authentication failed (A2 or wrong key): {e}") from e
+
+        if codec == self.CODEC_ZSTD:
+            try:
+                import zstandard as zstd
+
+                plaintext = zstd.ZstdDecompressor().decompress(
+                    payload, max_output_size=plain_size
+                )
+            except Exception as e:
+                raise CompressionError(f"zstd decompression failed: {e}") from e
+        elif codec == self.CODEC_NONE:
+            plaintext = payload
+        else:
+            raise CompressionError(f"Unsupported chunk codec: {codec}")
 
         actual_plain_id = self.compute_plain_id(plaintext).hex()
         if actual_plain_id != expected_plain_id:

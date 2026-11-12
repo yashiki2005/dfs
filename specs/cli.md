@@ -30,6 +30,12 @@ libp2p/QUIC も使う場合は optional extra を付ける。
 pipx install '.[libp2p]'
 ```
 
+Zstandard 圧縮も使う場合。
+
+```bash
+pipx install '.[compression]'
+```
+
 FUSE マウントも使う場合は `fuse` extra を付ける。
 
 ```bash
@@ -288,7 +294,7 @@ dfs5cli config create NAME --registry HOST
 #   --key-dir DIR      鍵を作る場所（既定 ~/.config/dfs5/keys）
 #   --secret VALUE     tree_secret（省くと端末から読む）
 #   --no-prompt        端末から読まない
-#   --ost / --path / --workdir / --epoch / --node-name
+#   --ost / --path / --workdir / --epoch / --compression / --node-name
 dfs5cli config create NAME --registry HOST --key FILE --ost HOST:PORT --path /sub/path \
                           [--workdir DIR] [--epoch N] [--node-name NAME]
 dfs5cli config show|delete|list [NAME]
@@ -305,11 +311,11 @@ dfs5cli about  REMOTE:
 dfs5cli check  REMOTE:path LOCAL_DIR
 
 # 書き込み（1 版としてまとめる）
-dfs5cli copy   LOCAL REMOTE:path [--checksum] [--include PATTERN] [--exclude PATTERN] [-n]
-dfs5cli copyto LOCAL_FILE REMOTE:path/file [--checksum] [-n]
+dfs5cli copy   LOCAL REMOTE:path [--checksum [MODE]] [--include PATTERN] [--exclude PATTERN] [-n]
+dfs5cli copyto LOCAL_FILE REMOTE:path/file [--checksum [MODE]] [-n]
 dfs5cli import_tar ARCHIVE REMOTE:path [--strip-components N] [-n]
 dfs5cli mv     REMOTE:path REMOTE:path [--overwrite] [-n]
-dfs5cli sync   LOCAL_DIR REMOTE:path [--delete] [--checksum] [--include PATTERN] [--exclude PATTERN] [-n]
+dfs5cli sync   LOCAL_DIR REMOTE:path [--delete] [--checksum [MODE]] [--include PATTERN] [--exclude PATTERN] [-n]
 
 # ディレクトリと削除
 dfs5cli mkdir  REMOTE:dir
@@ -367,8 +373,9 @@ primary / secondary registry が両方停止した場合は、`.clayfs/l2_cache.
 
 ### 3.2 冪等
 
-変更が無ければ**新しい版を作らない**。判定は rclone の既定と同じく大きさを先に見て、
-`--checksum` のときだけ内容アドレス（`plain_id`）まで比べる。
+変更が無ければ**新しい版を作らない**。判定は rclone の既定と同じく大きさを先に見る。
+`--checksum` には `size` / `crc32` / `sha1` / `plain_id` を指定できる。単独の
+`--checksum` は既存互換のため `plain_id` として扱う。
 
 ```
 $ dfs5cli copy ./sample local:
@@ -438,6 +445,24 @@ dfs5cli mount scw:docs /mnt/dfs5-docs --read-only
 fusepy が macFUSE を選んでしまう場合は、`--fuse-library` に fuse-t の
 `libfuse-t.dylib` を渡す。
 
+#### 3.2.5 フォルダ単位の圧縮
+
+圧縮ポリシーはディレクトリの xattr `user.dfs5.compression` で指定できる。
+値は `none` / `zstd`。子は最も近い親の設定を継承する。
+
+```bash
+xattr -w user.dfs5.compression zstd /path/to/tree/src
+xattr -w user.dfs5.compression none /path/to/tree/archive
+```
+
+push 時には実効ポリシーを署名済みディレクトリ塊へ保存するため、xattr が後で
+失われてもリモート側の解釈は変わらない。圧縮は平文に対して行い、チャンクは
+`DFS5B3` の codec 付きヘッダーで保存する。実際の圧縮率が 95% 以上なら
+非圧縮の `DFS5B2` として保存する。
+
+リモート全体の既定値は `config create --compression zstd` で指定できる。
+xattr が無い場合にだけこの既定値を使う。
+
 ### 3.3 一覧は内容を取らない
 
 `ls` / `lsd` / `lsl` / `lsjson` / `size` は、ディレクトリ塊だけを辿ってファイルの中身は取らない。
@@ -501,6 +526,7 @@ wd/
     ├── dfs5_config.json          L2 URL・OST・sub_path・tree_secret
     ├── local_head.json           HeadPin（版番号 / entry_hash / epoch）
     ├── l2_cache.json             検証済みの delegation / locator / head
+    ├── ost_index.json            書き手の plain_id -> (wire_id, store_id) 索引
     ├── cache_version             rclone CLI が足した「今の写しの版」
     └── snapshots/v1/             push 時に取った版の写し（ハードリンク）
 
@@ -525,7 +551,7 @@ srv/
 
 ## 5. 試験
 
-`tests/test_cli_main.py` に 47 件。
+`tests/test_cli_main.py` に 49 件。
 
 `tests/test_fuse_mount.py` に 4 件（読み書き、`release` 時の push、read-only、
 fuse-t 不在時のエラー）。

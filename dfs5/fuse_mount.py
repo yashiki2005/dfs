@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .compression import get_raw_xattr, remove_raw_xattr, set_raw_xattr
 from .path_safety import UnsafePathError, safe_target
 
 
@@ -248,3 +249,28 @@ class LocalTreeFuse:
                 os.utime(target, None)
             else:
                 os.utime(target, (times[0], times[1]))
+
+    def getxattr(self, path: str, name: str, position: int = 0) -> bytes:
+        value = get_raw_xattr(self._path(path), name)
+        if value is None:
+            raise OSError(errno.ENODATA, os.strerror(errno.ENODATA))
+        return value
+
+    def setxattr(
+        self,
+        path: str,
+        name: str,
+        value: bytes,
+        options: int = 0,
+        position: int = 0,
+    ) -> None:
+        with self._lock:
+            self._mark_dirty()
+            if not set_raw_xattr(self._path(path), name, value):
+                raise OSError(errno.ENOTSUP, "xattr is not supported")
+
+    def removexattr(self, path: str, name: str) -> None:
+        with self._lock:
+            self._mark_dirty()
+            if not remove_raw_xattr(self._path(path), name):
+                raise OSError(errno.ENODATA, os.strerror(errno.ENODATA))

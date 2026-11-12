@@ -1,0 +1,40 @@
+{
+  "schema": "zstd-level10-bench-v1",
+  "measured_at_utc": "2026-11-12T12:20:59+00:00",
+  "level": 10,
+  "input_mib": 16,
+  "rows": [
+    {
+      "data": "text",
+      "input_bytes": 16777216,
+      "compressed_bytes": 204471,
+      "ratio": 0.0122,
+      "compress_ms": {
+        "median_ms": 57.092,
+        "p95_ms": 66.519
+      },
+      "decompress_ms": {
+        "median_ms": 2.479,
+        "p95_ms": 3.318
+      },
+      "compress_mib_s": 280.2,
+      "decompress_mib_s": 6453.5
+    },
+    {
+      "data": "random",
+      "input_bytes": 16777216,
+      "compressed_bytes": 16777610,
+      "ratio": 1.0,
+      "compress_ms": {
+        "median_ms": 4.732,
+        "p95_ms": 6.054
+      },
+      "decompress_ms": {
+        "median_ms": 0.732,
+        "p95_ms": 1.12
+      },
+      "compress_mib_s": 3381.5,
+      "decompress_mib_s": 21869.1
+    }
+  ]
+}

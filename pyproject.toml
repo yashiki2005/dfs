@@ -13,6 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+compression = ["zstandard>=0.22"]
 libp2p = ["libp2p>=0.8"]
 fuse = ["fusepy>=3"]
 test = ["pytest>=8"]
