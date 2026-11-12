@@ -11,7 +11,7 @@
 3. 状態ディレクトリを用意し、`dfs5 serve` を起動する。
 4. 立ち上がりを待って確認し、**書き手への委譲を登録する**。
 5. 接続に必要な値を記録する（`~/.config/dfs5/services.json`）。
-6. `stop` / `list` / `status` / `env` / `logs` で後始末と確認ができる。
+6. `stop` / `list` / `status` / `env` / `dnssec` / `logs` で後始末と確認ができる。
 
 - 実装: `dfs5/svc.py`
 - エントリポイント: `./dfs5svc`
@@ -55,6 +55,8 @@ dfs5svc list
 dfs5svc status [NAME]
 dfs5svc stop   [NAME] [--forget]
 dfs5svc env    [NAME] [--workdir DIR]
+dfs5svc dnssec [NAME] [--domain DOMAIN] [--primary-url URL]
+                     [--secondary-url URL] [--ttl SECONDS] [--epoch N]
 dfs5svc logs   [NAME] [-n LINES]
 ```
 
@@ -97,6 +99,8 @@ dfs5svc logs   [NAME] [-n LINES]
       "root_key": "~/dfs5svc/dev/keys/root",
       "writer_key": "~/dfs5svc/dev/keys/writer",
       "sub_path": "/example.com/dev",
+      "role": "primary",
+      "role_epoch": 1,
       "pid": 12345
     }
   }
@@ -124,6 +128,33 @@ dfs5svc logs   [NAME] [-n LINES]
 日単位の粗さで足りる。
 
 `--no-delegate` を付けると、サーバだけ立てて委譲は自分で組む。
+
+### 2.4 DNSSEC TXT を出力する
+
+`dnssec` は、サービス記録の root 公開鍵・root アンカー・registry URL から
+`_dfs5.<domain>` TXT に置く JSON を生成する。
+
+```bash
+dfs5svc dnssec dev
+```
+
+既定のドメインは `root_anchor` の先頭要素（`/example.com/dev` なら
+`example.com`）で、registry URL はそのサービスの L2 URL。公開 DNSSEC では
+必要に応じて上書きする。
+
+```bash
+dfs5svc dnssec dev \
+  --domain yashiki.top \
+  --primary-url https://l2.yashiki.top \
+  --secondary-url https://l2-b.yashiki.top \
+  --ttl 300 \
+  --epoch 2
+```
+
+標準出力は TXT にそのまま入れる 1 行 JSON で、レコード名は標準エラーに出す。
+`--json` を付けると整形 JSON になる（`dfs5svc --json dnssec dev`）。
+生成値は discovery パーサで再検証し、primary がちょうど 1 つであること、
+URL と TTL が有効であることを確認する。
 
 ---
 
@@ -180,7 +211,7 @@ dfs5cli config create dev --registry http://127.0.0.1:19441 --key ~/dfs5svc/dev/
 
 ## 4. 試験
 
-`tests/test_svc_cli.py` に 8 件。
+`tests/test_svc_cli.py` に 14 件。
 
 | 試験 | 確かめること |
 |---|---|
@@ -196,6 +227,8 @@ dfs5cli config create dev --registry http://127.0.0.1:19441 --key ~/dfs5svc/dev/
 | `test_ls_works_before_any_write` | 何も書いていないリモートでも `ls` が通る |
 | `test_no_delegate_leaves_registry_empty` | `--no-delegate` なら委譲を作らない |
 | `test_explicit_path_is_used` | `--path` の末端と中間の両方に委譲が張られる |
+| `test_dnssec_outputs_txt_json` | `dnssec` が TXT 用 JSON とレコード名を出す |
+| `test_dnssec_json_and_secondary_primary_requirement` | 整形 JSON、secondary の primary 必須、secondary URL の自動追加 |
 
 試験は `HOME` を一時ディレクトリに差し替え、その中に状態と記録を閉じる。
 `tearDown` で記録に残ったサービスを全部止める（`addCleanup` は一時ディレクトリの

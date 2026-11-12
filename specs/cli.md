@@ -14,6 +14,25 @@
 `dfs5/cli.py` は残す。層を直接確かめる用途（`serve` の起動、`delegate` の登録、
 `push`/`pull` の往復計測）では今もそちらを使う。
 
+### インストール
+
+pip / pipx で console script として入れられる。
+
+```bash
+pipx install .
+dfs5cli --version
+dfs5svc --help
+```
+
+libp2p/QUIC も使う場合は optional extra を付ける。
+
+```bash
+pipx install '.[libp2p]'
+```
+
+リポジトリ直下の `./dfs5cli` / `./dfs5svc` は、開発中にそのまま使うための
+互換ラッパーとして残している。
+
 ---
 
 ## 1. 考え方

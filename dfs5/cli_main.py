@@ -30,13 +30,9 @@ rclone ライクな dfs5 の CLI。
 環境変数:
   DFS5_CONFIG    リモート定義ファイル（既定 ~/.config/dfs5/remotes.json）
 
-TODO（完成時）:
-  このリポジトリの `dfs5cli` と `dfs5svc` は、今はリポジトリ直下から
-  `./dfs5cli ...` として使う。完成したら、PATH の通った場所に置く。
-  例: /usr/local/bin にシンボリックリンクを張る、または pip で console_scripts として
-  配る（`dfs5cli = dfs5.cli_main:main`、`dfs5svc = dfs5.svc:main`）。
-  ラッパーは `dirname` から自分の位置を決めて `cryptography` の入った Python を探すので、
-  リンクでも実体でも動く（Python 側は `python -m dfs5.cli_main`）。
+配布:
+  `pyproject.toml` の console_scripts で `dfs5cli` / `dfs5svc` をインストールできる。
+  リポジトリ直下のシェルラッパーは開発用の互換入口として残している。
 """
 
 from __future__ import annotations

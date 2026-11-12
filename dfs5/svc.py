@@ -22,12 +22,13 @@ dfs5/svc.py
     dfs5svc status dev            # 状態と接続情報
     dfs5svc stop dev              # 止める
     dfs5svc env dev               # dfs5cli config create の行を出す
+    dfs5svc dnssec dev            # _dfs5.<domain> TXT の JSON を出す
 
 出力は機械可読も兼ねる（`--json`）。
 
-TODO（完成時）:
-  リポジトリ直下の `dfs5svc` は、PATH の通った場所に置く（`dfs5cli` と同じ扱い）。
-  ラッパーは `dirname` から自分の位置を決めて Python を探すので、シンボリックリンクでも動く。
+配布:
+  `pyproject.toml` の console_scripts で `dfs5cli` / `dfs5svc` をインストールできる。
+  リポジトリ直下のシェルラッパーは開発用の互換入口として残している。
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .dnssec import DEFAULT_RECORD_PREFIX, parse_discovery_text
 from .paths import config_dir, dfs5_home, restrict_to_owner
 
 CONFIG_FILENAME = "services.json"
@@ -239,6 +241,8 @@ class Service:
     sub_path: str = ""
     config_path: str = ""
     log_path: str = ""
+    role: str = "primary"
+    role_epoch: int = 1
 
     @property
     def registry_url(self) -> str:
@@ -549,6 +553,18 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     advertised = args.advertise or ("127.0.0.1" if host in ("0.0.0.0", "::") else host)
     registry_url = f"http://{advertised}:{registry_port}"
+    service_role = args.role or "primary"
+    service_role_epoch = args.role_epoch if args.role_epoch is not None else 1
+    state_file = state_dir / "registry_state.json"
+    if state_file.is_file():
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            if not args.role:
+                service_role = str(state.get("role", service_role))
+            if args.role_epoch is None:
+                service_role_epoch = int(state.get("role_epoch", service_role_epoch))
+        except (OSError, ValueError, TypeError):
+            pass
 
     cmd = [
         sys.executable, "-m", "dfs5.cli", "serve",
@@ -639,6 +655,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         config_path=str(store.path),
         log_path=str(log_path),
+        role=service_role,
+        role_epoch=service_role_epoch,
     )
     store.services[name] = service
     store.save()
@@ -692,6 +710,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"L2 Registry : {s.registry_url}")
     print(f"L3 OST      : tls://{s.ost_endpoint}")
     print(f"Root Anchor : {s.root_anchor}")
+    print(f"Role        : {s.role} (epoch={s.role_epoch})")
     if s.sub_path:
         print(f"Subtree     : {s.sub_path}")
     if s.writer_key:
@@ -863,6 +882,77 @@ def cmd_env(args: argparse.Namespace) -> int:
     return 0
 
 
+def _domain_from_root_anchor(root_anchor: str) -> str:
+    """``/yashiki.top`` から ``yashiki.top`` を取り出す。"""
+    value = str(root_anchor or "").strip().strip("/")
+    if not value:
+        raise ServiceError("root_anchor が空です。--domain を指定してください")
+    return value.split("/", 1)[0].lower()
+
+
+def cmd_dnssec(args: argparse.Namespace) -> int:
+    """DNSSEC の ``_dfs5.<domain>`` TXT に置く JSON を出力する。"""
+    store = ServiceStore()
+    service = store.get(args.name)
+    domain = (args.domain or _domain_from_root_anchor(service.root_anchor)).strip().rstrip(".").lower()
+
+    root_pub_path = Path(service.root_pub).expanduser()
+    if not root_pub_path.is_file():
+        raise ServiceError(f"root 公開鍵がありません: {root_pub_path}")
+    root_pubkey = root_pub_path.read_text(encoding="utf-8").strip()
+    if not root_pubkey:
+        raise ServiceError(f"root 公開鍵が空です: {root_pub_path}")
+
+    primary_url = args.primary_url
+    if not primary_url:
+        if service.role == "secondary":
+            raise ServiceError(
+                "secondary の TXT を作るには --primary-url が必要です"
+            )
+        primary_url = service.registry_url
+
+    registries: List[Dict[str, str]] = [
+        {"role": "primary", "url": primary_url}
+    ]
+    secondary_urls = list(getattr(args, "secondary_url", None) or [])
+    if (
+        service.role == "secondary"
+        and service.registry_url != primary_url
+        and service.registry_url not in secondary_urls
+    ):
+        secondary_urls.append(service.registry_url)
+    seen_urls = {primary_url}
+    for url in secondary_urls:
+        value = str(url).strip()
+        if not value or value in seen_urls:
+            continue
+        seen_urls.add(value)
+        registries.append({"role": "secondary", "url": value})
+
+    record = {
+        "schema": "dfs5-discovery-v1",
+        "domain": domain,
+        "epoch": int(args.epoch) if args.epoch is not None else int(service.role_epoch),
+        "registries": registries,
+        "root_anchor": service.root_anchor,
+        "root_pubkey": root_pubkey,
+        "ttl": int(args.ttl),
+    }
+    txt_value = json.dumps(
+        record, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    # 生成した値を discovery のパーサにも通し、primary 1 つ・URL 形式・TTL を確認する。
+    parse_discovery_text(txt_value, expected_domain=domain)
+
+    record_name = f"{DEFAULT_RECORD_PREFIX}.{domain}"
+    if args.json:
+        print(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(txt_value)
+    print(f"# TXT record: {record_name}", file=sys.stderr)
+    return 0
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     store = ServiceStore()
     s = store.get(args.name)
@@ -932,6 +1022,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", default=DEFAULT_NAME)
     p.add_argument("--workdir", help="--workdir も付ける")
     p.set_defaults(func=cmd_env)
+
+    p = sub.add_parser("dnssec", help="_dfs5.<domain> TXT に置く JSON を出す")
+    p.add_argument("name", nargs="?", default=DEFAULT_NAME)
+    p.add_argument("--domain", help="TXT のドメイン（既定は root_anchor から推定）")
+    p.add_argument(
+        "--primary-url",
+        help="primary registry の URL（secondary では必須。既定はこのサービスの URL）",
+    )
+    p.add_argument(
+        "--secondary-url", action="append", default=[],
+        help="secondary registry の URL（複数指定可）",
+    )
+    p.add_argument("--ttl", type=int, default=300, help="TXT の推奨 TTL（既定 300）")
+    p.add_argument(
+        "--epoch", type=int,
+        help="discovery の世代（既定は service の role_epoch）",
+    )
+    p.set_defaults(func=cmd_dnssec)
 
     p = sub.add_parser("logs", help="ログの末尾を出す")
     p.add_argument("name", nargs="?", default=DEFAULT_NAME)

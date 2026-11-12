@@ -98,6 +98,9 @@ dfs5cli config create scw \
   --dnssec-domain example.com \
   --key ~/.ssh/alice \
   --secret <tree_secret>
+
+# dfs5svc が管理するサービスの TXT JSON を生成
+dfs5svc dnssec scw --domain example.com
 ```
 
 `--registry` / `--registry-alternate` を併記した場合は、DNSSEC の内容と一致しなければ

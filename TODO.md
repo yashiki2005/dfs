@@ -5,8 +5,8 @@
 
 - リポジトリ: `~/src/dfs5`（`/Volumes/ExtSSD/src/dfs5` へのシンボリックリンク）
 - 基準コミット: `05040aa feat: add L4 history and versioned archive catalogs`
-- テスト: **141 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`。実行に約 168 秒）
-- 作業ツリー: 未コミット差分あり（L2 読み取りキャッシュ、3 registry 試験、DNSSEC 完全検証）
+- テスト: **143 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`。実行に約 177 秒）
+- 作業ツリー: 未コミット差分あり（dfs5svc の DNSSEC TXT 出力、pip 配布）
 
 ---
 
@@ -119,13 +119,13 @@ C（合意形成）は当面やらない。
 
 ### 2.4 配置（完成時）
 
-`./dfs5cli` と `./dfs5svc` は今はリポジトリ直下から使う。完成したら PATH の通った場所に
-置く。両方のモジュールの docstring に TODO を書いてある。
+`pyproject.toml` を追加し、pip / pipx で配布できるようにした。
 
-- 案 1: `/usr/local/bin` にシンボリックリンクを張る（ラッパーは `dirname` から自分の位置を
-  決めるので動く）
-- 案 2: pip の console_scripts として配る
-  （`dfs5cli = dfs5.cli_main:main`、`dfs5svc = dfs5.svc:main`）
+- console scripts: `dfs5cli = dfs5.cli_main:main`、`dfs5svc = dfs5.svc:main`
+- 必須依存: `cryptography` / `dnspython`
+- optional extra: `libp2p`
+- `pip install --no-deps --target ... .` で wheel を作り、両エントリポイントの起動を確認済み
+- リポジトリ直下のシェルラッパーは開発用の互換入口として残す
 
 ### 2.5 root アンカーの配布（大規模運用のとき）
 
@@ -293,7 +293,7 @@ cd ~/src/dfs5
 # 1. 状態の確認
 git log --oneline -3
 git status --short          # 空ならクリーン
-~/dfs-venv/bin/python -m pytest tests -q   # 141 件パス、1 skip（約 168 秒）
+~/dfs-venv/bin/python -m pytest tests -q   # 143 件パス、1 skip（約 177 秒）
 
 # 2. サーバを立てる（新コードで）
 ./dfs5svc list               # 既存のサービスを確認

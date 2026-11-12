@@ -8,6 +8,7 @@ dfs5/tests/test_svc_cli.py
 """
 
 import json
+import io
 import os
 import socket
 import subprocess
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -105,6 +107,89 @@ class ServiceRecordTests(unittest.TestCase):
             # 派生値（registry_url）はファイルに書かない
             raw = json.loads(path.read_text(encoding="utf-8"))
             self.assertNotIn("registry_url", raw["services"]["a"])
+
+
+class DnssecOutputTests(unittest.TestCase):
+    """サーバを立てずに DNSSEC TXT を生成する。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5svc_dnssec_")
+        self.home = Path(self._tmp.name)
+        self.old_home = os.environ.get("DFS5_HOME")
+        os.environ["DFS5_HOME"] = str(self.home)
+        root_pub = self.home / "root.pub"
+        root_pub.write_text(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestRoot root@test\n",
+            encoding="utf-8",
+        )
+        store = ServiceStore()
+        store.services["a"] = Service(
+            name="a",
+            state_dir=str(self.home / "state"),
+            root_key=str(self.home / "root"),
+            root_pub=str(root_pub),
+            registry_port=19440,
+            ost_port=19441,
+            bind="127.0.0.1",
+            advertise="127.0.0.1",
+            root_anchor="/example.com",
+            pid=0,
+            started_at="2026-01-01T00:00:00+00:00",
+            role="primary",
+            role_epoch=3,
+        )
+        store.save()
+
+    def tearDown(self) -> None:
+        if self.old_home is None:
+            os.environ.pop("DFS5_HOME", None)
+        else:
+            os.environ["DFS5_HOME"] = self.old_home
+        self._tmp.cleanup()
+
+    def test_dnssec_outputs_txt_json(self) -> None:
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(svc_main(["dnssec", "a"]), 0)
+        record = json.loads(out.getvalue().strip())
+        self.assertEqual(record["schema"], "dfs5-discovery-v1")
+        self.assertEqual(record["domain"], "example.com")
+        self.assertEqual(record["root_anchor"], "/example.com")
+        self.assertEqual(record["epoch"], 3)
+        self.assertEqual(record["registries"], [
+            {"role": "primary", "url": "http://127.0.0.1:19440"}
+        ])
+        self.assertIn("_dfs5.example.com", err.getvalue())
+
+    def test_dnssec_json_and_secondary_primary_requirement(self) -> None:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(svc_main(["--json", "dnssec", "a", "--ttl", "60"]), 0)
+        pretty = json.loads(out.getvalue())
+        self.assertEqual(pretty["ttl"], 60)
+
+        store = ServiceStore()
+        service = store.get("a")
+        service.role = "secondary"
+        store.save()
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(svc_main(["dnssec", "a"]), 2)
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(
+                svc_main([
+                    "dnssec", "a",
+                    "--primary-url", "https://l2.example.com",
+                ]),
+                0,
+            )
+        record = json.loads(out.getvalue().strip())
+        self.assertEqual(record["registries"], [
+            {"role": "primary", "url": "https://l2.example.com"},
+            {"role": "secondary", "url": "http://127.0.0.1:19440"},
+        ])
 
 
 class StartStopTests(unittest.TestCase):
