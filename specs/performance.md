@@ -45,7 +45,7 @@ L2 HTTP、署名検証、L3 TLS のコストが加わる。
 pull は L3 の転送が支配的で、署名検証の最適化ではほとんど変わらない。
 
 なお、ローカルで registry を停止した場合は connection refused が即時に返る。
-実際の通信断では `DFS5_L2_TIMEOUT`（既定 10 秒）を registry ごとに待つ可能性がある。
+実際の通信断では `DFS_L2_TIMEOUT`（既定 10 秒）を registry ごとに待つ可能性がある。
 
 ## DNSSEC
 
@@ -132,4 +132,4 @@ python bench/l3_bench.py
 python bench/e2e_wan.py --mode loopback --server-host 127.0.0.1
 ```
 
-`e2e_wan.py` は既存の dfs5 サーバを `pkill` するため、共用環境では実行しないこと。
+`e2e_wan.py` は既存の dfs サーバを `pkill` するため、共用環境では実行しないこと。

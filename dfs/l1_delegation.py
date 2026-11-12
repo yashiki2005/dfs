@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dfs5/l1_delegation.py
+dfs/l1_delegation.py
 specs/delegation.md の 5 つの不変条件 (Invariants 1〜5) と多段委譲チェーン検証を実装する L1 モジュール。
 """
 

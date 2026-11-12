@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-dfs5/fs/api.py
+dfs/fs/api.py
 ``FileSystem`` の薄いファサード。1 行で CoW 検出とスナップショットができる。
 
-    from dfs5.fs import fs
+    from dfs.fs import fs
     f = fs("/path/to/mount")
     print(f.info())              # {'backend': 'reflink', 'cow': True, ...}
     f.take_snapshot("v1")

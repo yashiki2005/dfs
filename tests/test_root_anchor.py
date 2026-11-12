@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dfs5/tests/test_root_anchor.py
+dfs/tests/test_root_anchor.py
 root アンカーによる委譲チェーン検証（穴を塞いだこと）の試験。
 
 要点:
@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5.crypto import (
+from dfs.crypto import (
     EMPTY_SHA256,
     NS_L4_LOG,
     canonical_json,
@@ -27,9 +27,9 @@ from dfs5.crypto import (
     ssh_key_fingerprint,
     ssh_sign,
 )
-from dfs5.l1_delegation import create_delegation_envelope, verify_delegation_chain
-from dfs5.l2_registry import DirectoryRegistryService
-from dfs5.l4_log import L4LogClient
+from dfs.l1_delegation import create_delegation_envelope, verify_delegation_chain
+from dfs.l2_registry import DirectoryRegistryService
+from dfs.l4_log import L4LogClient
 
 
 def keypair(base: Path, name: str) -> Path:
@@ -43,7 +43,7 @@ def keypair(base: Path, name: str) -> Path:
 
 class RootAnchorCase(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5_root_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs_root_")
         self.base = Path(self._tmp.name)
         self.root_key = keypair(self.base, "root")
         self.alice_key = keypair(self.base, "alice")

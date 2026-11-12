@@ -13,14 +13,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5.crypto import ChunkIntegrityError
-from dfs5.l2_registry import ServiceUnavailableError
-from dfs5.libp2p_chunk import Libp2pChunkClient
+from dfs.crypto import ChunkIntegrityError
+from dfs.l2_registry import ServiceUnavailableError
+from dfs.libp2p_chunk import Libp2pChunkClient
 
 
 class TestLibp2pChunkSource(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5_libp2p_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs_libp2p_")
         self.base = Path(self._tmp.name)
         self.chunks = self.base / "chunks"
         self.chunks.mkdir()
@@ -37,7 +37,7 @@ class TestLibp2pChunkSource(unittest.TestCase):
         )
         self.proc = subprocess.Popen(
             [
-                sys.executable, "-m", "dfs5.libp2p_chunk",
+                sys.executable, "-m", "dfs.libp2p_chunk",
                 "--chunks-dir", str(self.chunks),
                 "--listen", "/ip4/127.0.0.1/udp/0/quic-v1",
             ],

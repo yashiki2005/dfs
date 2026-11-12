@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-dfs5/paths.py
+dfs/paths.py
 OS ごとの保存場所と、秘密ファイルの保護。
 
-* ``DFS5_HOME`` があれば ``~`` の代わりにそれを使う。
+* ``DFS_HOME`` があれば ``~`` の代わりにそれを使う。
   ``Path.home()`` は Windows で ``HOME`` を見ない（``USERPROFILE`` を見る）ため、
   テストや「別の場所に状態を置きたい」用途ではこの環境変数で切り替える。
 * ``restrict_to_owner()`` は POSIX なら ``chmod 0600``、Windows なら ACL を
@@ -18,15 +18,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-HOME_ENV = "DFS5_HOME"
+HOME_ENV = "DFS_HOME"
 
 # 絞り込み後も残す特権（バックアップ・管理用）。SID 直指定で名前解決に依存しない。
 _WINDOWS_SYSTEM_SID = "*S-1-5-18"
 _WINDOWS_ADMINS_SID = "*S-1-5-32-544"
 
 
-def dfs5_home() -> Path:
-    """dfs5 が「ホーム」として使うディレクトリ。"""
+def dfs_home() -> Path:
+    """dfs が「ホーム」として使うディレクトリ。"""
     override = os.environ.get(HOME_ENV)
     if override:
         return Path(override).expanduser()
@@ -34,13 +34,13 @@ def dfs5_home() -> Path:
 
 
 def config_dir() -> Path:
-    """``~/.config/dfs5``（Windows でも同じ場所を使う）。"""
-    return dfs5_home() / ".config" / "dfs5"
+    """``~/.config/dfs``（Windows でも同じ場所を使う）。"""
+    return dfs_home() / ".config" / "dfs"
 
 
 def cache_dir() -> Path:
-    """``~/.cache/dfs5``。"""
-    return dfs5_home() / ".cache" / "dfs5"
+    """``~/.cache/dfs``。"""
+    return dfs_home() / ".cache" / "dfs"
 
 
 def _windows_user_sid() -> str:

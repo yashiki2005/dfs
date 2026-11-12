@@ -14,15 +14,15 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5 import cli_main
-from dfs5.dnssec import (
+from dfs import cli_main
+from dfs.dnssec import (
     Discovery,
     DiscoveryError,
     RegistryEndpoint,
     discover_domain,
     parse_discovery_text,
 )
-from dfs5.remotes import RemoteStore
+from dfs.remotes import RemoteStore
 
 
 ROOT_PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestRootKey"
@@ -30,7 +30,7 @@ ROOT_PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestRootKey"
 
 def _record(**overrides):
     data = {
-        "schema": "dfs5-discovery-v1",
+        "schema": "dfs-discovery-v1",
         "domain": "example.com",
         "root_anchor": "/example.com",
         "root_pubkey": ROOT_PUB,
@@ -86,7 +86,7 @@ class TestDiscoverDomain(unittest.TestCase):
             strings = [_record().encode("utf-8")]
 
         class TxtRRset:
-            name = dns.name.from_text("_dfs5.example.com.")
+            name = dns.name.from_text("_dfs.example.com.")
             rdtype = dns.rdatatype.TXT
 
         class Response:
@@ -95,7 +95,7 @@ class TestDiscoverDomain(unittest.TestCase):
 
         class Answer(list):
             response = Response()
-            canonical_name = dns.name.from_text("_dfs5.example.com.")
+            canonical_name = dns.name.from_text("_dfs.example.com.")
 
         class Resolver:
             do_requested = False
@@ -131,7 +131,7 @@ class TestDiscoverDomain(unittest.TestCase):
     def test_full_validation_uses_chain_validator_without_ad(self) -> None:
         resolver = self._answer(authenticated=False)
         with patch("dns.resolver.Resolver", resolver), patch(
-            "dfs5.dnssec._validate_answer"
+            "dfs.dnssec._validate_answer"
         ) as validate_answer:
             d = discover_domain("example.com")
         self.assertEqual(d.domain, "example.com")
@@ -140,7 +140,7 @@ class TestDiscoverDomain(unittest.TestCase):
 
 class TestDnssecCli(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5_dnssec_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs_dnssec_")
         self.base = Path(self._tmp.name)
         self.key = self.base / "writer"
         subprocess.run(
@@ -156,8 +156,8 @@ class TestDnssecCli(unittest.TestCase):
         )
         self.root_pub = Path(f"{self.root_key}.pub").read_text(encoding="utf-8").strip()
         self.config_file = self.base / "remotes.json"
-        self.old_config = os.environ.get("DFS5_CONFIG")
-        os.environ["DFS5_CONFIG"] = str(self.config_file)
+        self.old_config = os.environ.get("DFS_CONFIG")
+        os.environ["DFS_CONFIG"] = str(self.config_file)
         self.discovery = Discovery(
             domain="example.com",
             root_anchor="/example.com",
@@ -173,9 +173,9 @@ class TestDnssecCli(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.old_config is None:
-            os.environ.pop("DFS5_CONFIG", None)
+            os.environ.pop("DFS_CONFIG", None)
         else:
-            os.environ["DFS5_CONFIG"] = self.old_config
+            os.environ["DFS_CONFIG"] = self.old_config
         self._tmp.cleanup()
 
     def test_config_create_uses_dnssec_registry_and_root(self) -> None:

@@ -13,14 +13,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5 import cli_main
-from dfs5.cli_main import UsageError
-from dfs5.fuse_mount import LocalTreeFuse
+from dfs import cli_main
+from dfs.cli_main import UsageError
+from dfs.fuse_mount import LocalTreeFuse
 
 
 class LocalTreeFuseTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5_fuse_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs_fuse_")
         self.root = Path(self._tmp.name) / "tree"
         self.root.mkdir()
         (self.root / "hello.txt").write_bytes(b"hello world")

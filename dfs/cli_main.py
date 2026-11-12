@@ -1,39 +1,39 @@
 #!/usr/bin/env python3
 """
-dfs5/cli_main.py
-rclone ライクな dfs5 の CLI。
+dfs/cli_main.py
+rclone ライクな dfs の CLI。
 
 `cli.py` の部品（L2 名簿クライアント、`serve`、`delegate`、ノード構築）をそのまま使い、
 「リモート名で場所を指す」操作体系を被せる。
 
-    dfs5cli listremotes
-    dfs5cli config create scaleway --registry http://172.16.1.60:19440 \\
+    dfscli listremotes
+    dfscli config create scaleway --registry http://172.16.1.60:19440 \\
         --ost 172.16.1.60:19443 --path /example.com/alice/notes \\
         --key ~/.ssh/alice --secret <共有秘密>
-    dfs5cli ls    scaleway:
-    dfs5cli ls    scaleway:docs
-    dfs5cli cat   scaleway:docs/readme.md
-    dfs5cli copy  ./local scaleway:docs
-    dfs5cli import_tar release.tar.gz scaleway:docs
-    dfs5cli mv    scaleway:docs/old.md scaleway:docs/new.md
-    dfs5cli sync  ./local scaleway:docs      # リモートをローカルに合わせる
-    dfs5cli pull  scaleway:docs ./local      # リモートをローカルへ取り出す
-    dfs5cli lsd   scaleway:docs
-    dfs5cli mount scaleway:docs /mnt/docs
-    dfs5cli check scaleway:docs ./local
-    dfs5cli about scaleway:
+    dfscli ls    scaleway:
+    dfscli ls    scaleway:docs
+    dfscli cat   scaleway:docs/readme.md
+    dfscli copy  ./local scaleway:docs
+    dfscli import_tar release.tar.gz scaleway:docs
+    dfscli mv    scaleway:docs/old.md scaleway:docs/new.md
+    dfscli sync  ./local scaleway:docs      # リモートをローカルに合わせる
+    dfscli pull  scaleway:docs ./local      # リモートをローカルへ取り出す
+    dfscli lsd   scaleway:docs
+    dfscli mount scaleway:docs /mnt/docs
+    dfscli check scaleway:docs ./local
+    dfscli about scaleway:
 
-設計上の注意（dfs5 の単一書き手）:
+設計上の注意（dfs の単一書き手）:
   - リモートは「1 つの書き込み境界（サブツリー）」に対応する。
   - 書き込み系（copy / sync / copyto）は、まず作業ディレクトリの写しを先頭版に
     合わせてから、変更を載せて 1 版としてまとめて push する。
   - 読み出し系（ls / cat / size / check）は版を進めない。
 
 環境変数:
-  DFS5_CONFIG    リモート定義ファイル（既定 ~/.config/dfs5/remotes.json）
+  DFS_CONFIG    リモート定義ファイル（既定 ~/.config/dfs/remotes.json）
 
 配布:
-  `pyproject.toml` の console_scripts で `dfs5cli` / `dfs5svc` をインストールできる。
+  `pyproject.toml` の console_scripts で `dfscli` / `dfssvc` をインストールできる。
   リポジトリ直下のシェルラッパーは開発用の互換入口として残している。
 """
 
@@ -61,14 +61,14 @@ from .dnssec import Discovery, DiscoveryError, discover_domain
 
 # L2 名簿の既定ポート。ホスト名だけで済むようにする（例: --registry 172.16.1.60）。
 DEFAULT_REGISTRY_PORT = 9440
-# dfs5svc が立てるサーバの既定。こちらは連続した空きを選ぶので 19440 から。
+# dfssvc が立てるサーバの既定。こちらは連続した空きを選ぶので 19440 から。
 DEFAULT_LOCAL_REGISTRY_PORT = 19440
 from .l2_registry import ConflictError, ServiceUnavailableError
 from .l4_log import (
     RollbackDetectedError,
     SilentDropDetectedError,
 )
-from .l5_clayfs import DFS5Node
+from .l5_clayfs import DFSNode
 from .crypto import normalize_path, ssh_key_fingerprint
 from .fs.core import remove_tree
 from .path_safety import UnsafePathError, copyfile_no_follow, safe_target
@@ -103,7 +103,7 @@ def _ensure_keypair(priv_key: Path) -> None:
     if res.returncode != 0:
         raise UsageError(f"Cannot read public key from {priv_key}: {res.stderr.strip()}")
     pub.write_text(res.stdout.strip() + "\n", encoding="utf-8")
-    print(f"[dfs5cli] 公開鍵を作成しました: {pub}", file=sys.stderr)
+    print(f"[dfscli] 公開鍵を作成しました: {pub}", file=sys.stderr)
 
 
 def resolve_ost(remote: Remote, registry: Optional[cli_mod.RemoteRegistryClient] = None) -> str:
@@ -172,7 +172,7 @@ def public_key_of(priv_key: Path) -> str:
     return res.stdout.strip()
 
 
-def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
+def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     """リモートの作業ディレクトリを用意し、ノードを組み立てる。
 
     ``create=True`` のときは未初期化なら初期化する（書き込み系で使う）。
@@ -189,7 +189,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
         if not create:
             raise UsageError(
                 f"Remote {remote.name!r} is not initialized at {mount_root}.\n"
-                f"Run 'dfs5cli touch {remote.name}:' or a write command first."
+                f"Run 'dfscli touch {remote.name}:' or a write command first."
             )
         priv_key = Path(remote.key).expanduser()
         _ensure_keypair(priv_key)
@@ -198,7 +198,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             # 空のまま暗号化すると、誰でも復号できる木を作ってしまう。
             raise UsageError(
                 f"Remote {remote.name!r} has no tree_secret.\n"
-                f"Set it with 'dfs5cli config create {remote.name} ... --secret <共有秘密>' "
+                f"Set it with 'dfscli config create {remote.name} ... --secret <共有秘密>' "
                 f"(or edit {RemoteStore().path})."
             )
         registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
@@ -268,11 +268,11 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
     return node
 
 
-def _cache_marker(node: DFS5Node) -> Path:
+def _cache_marker(node: DFSNode) -> Path:
     return node.clayfs.clayfs_meta / CACHE_VERSION_FILENAME
 
 
-def _load_cached_version(node: DFS5Node) -> int:
+def _load_cached_version(node: DFSNode) -> int:
     marker = _cache_marker(node)
     if not marker.is_file():
         return -1
@@ -282,13 +282,13 @@ def _load_cached_version(node: DFS5Node) -> int:
         return -1
 
 
-def _save_cached_version(node: DFS5Node, version: int) -> None:
+def _save_cached_version(node: DFSNode, version: int) -> None:
     marker = _cache_marker(node)
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(str(int(version)) + "\n", encoding="utf-8")
 
 
-def refresh_cache(node: DFS5Node, force: bool = False) -> int:
+def refresh_cache(node: DFSNode, force: bool = False) -> int:
     """作業ディレクトリの写しをリモートの先頭版に合わせ、その版番号を返す。
 
     すでに同じ版を持っていれば何もしない（L2 の 1 往復だけ）。
@@ -311,7 +311,7 @@ def refresh_cache(node: DFS5Node, force: bool = False) -> int:
     p = head["payload"]
     node.refresh_read_ost()
     node.read_ost.reset_metrics()
-    with tempfile.TemporaryDirectory(prefix="dfs5_stage_") as staging:
+    with tempfile.TemporaryDirectory(prefix="dfs_stage_") as staging:
         staging_dir = Path(staging)
         with node.read_ost.session():
             node.read_builder.download_directory(
@@ -323,7 +323,7 @@ def refresh_cache(node: DFS5Node, force: bool = False) -> int:
     return version
 
 
-def _push(node: DFS5Node, remote: Remote, delegated_mounts: Optional[Dict[str, str]] = None) -> Tuple[dict, int]:
+def _push(node: DFSNode, remote: Remote, delegated_mounts: Optional[Dict[str, str]] = None) -> Tuple[dict, int]:
     log_env, _snap, wire_bytes = node.push(
         delegation_epoch=int(remote.epoch),
         now=int(time.time()),
@@ -454,7 +454,7 @@ def _tar_member_path(name: str, strip_components: int) -> str:
         return ""
     rel = "/".join(parts[strip_components:])
     if any(part == ".clayfs" for part in parts):
-        raise UsageError(f"tar に DFS5 の管理ディレクトリが含まれています: {name!r}")
+        raise UsageError(f"tar に DFS の管理ディレクトリが含まれています: {name!r}")
     if rel.endswith("/"):
         rel = rel.rstrip("/")
     return rel
@@ -501,7 +501,7 @@ def _extract_tar_safely(
     return files, dirs
 
 
-def _tree_path(node: DFS5Node, rel: str) -> Path:
+def _tree_path(node: DFSNode, rel: str) -> Path:
     try:
         return safe_target(node.clayfs.work_tree, rel)
     except UnsafePathError as e:
@@ -522,7 +522,7 @@ def _validate_snapshot_id(snap_id: str) -> str:
 
 
 def plan_changes(
-    node: DFS5Node,
+    node: DFSNode,
     prefix: str,
     local: Dict[str, Path],
     checksum: str = "size",
@@ -531,8 +531,8 @@ def plan_changes(
     """ローカルとリモートを比べ、(書くもの, 消すもの, 変わらないもの) を返す。
 
     転送の判定は rclone の既定と同じく大きさを先に見る。``checksum`` が
-    ``size`` 以外なら内容の checksum まで比べる。``plain_id`` は dfs5 の
-    内容アドレス、``crc32`` / ``sha1`` は互換用の軽い比較。dfs5 は書き手側の索引で塊を
+    ``size`` 以外なら内容の checksum まで比べる。``plain_id`` は dfs の
+    内容アドレス、``crc32`` / ``sha1`` は互換用の軽い比較。dfs は書き手側の索引で塊を
     重複排除するため、内容が同じなら ``push`` しても本文は送られない。それでも
     版が増えるのは無駄なので、「変わらないなら版を作らない」をここで決める。
 
@@ -594,7 +594,7 @@ def plan_changes(
     return to_write, to_delete, unchanged
 
 
-def apply_writes(node: DFS5Node, writes: List[Tuple[str, Path, str]]) -> None:
+def apply_writes(node: DFSNode, writes: List[Tuple[str, Path, str]]) -> None:
     """``plan_changes`` の「書くもの」を、作業ツリーへ反映する。"""
     for path, src, _kind in writes:
         relative = path
@@ -608,7 +608,7 @@ def apply_writes(node: DFS5Node, writes: List[Tuple[str, Path, str]]) -> None:
             raise UsageError(f"Refusing symlink write: {relative!r} ({e})") from e
 
 
-def apply_deletes(node: DFS5Node, paths: List[str], prune_empty: bool = True) -> None:
+def apply_deletes(node: DFSNode, paths: List[str], prune_empty: bool = True) -> None:
     """消すものを作業ツリーから取り除く。
 
     ``prune_empty=True`` のときは、空になったディレクトリも片付ける（rclone の
@@ -623,7 +623,7 @@ def apply_deletes(node: DFS5Node, paths: List[str], prune_empty: bool = True) ->
         prune_empty_dirs(node)
 
 
-def prune_empty_dirs(node: DFS5Node, start: Optional[Path] = None) -> List[str]:
+def prune_empty_dirs(node: DFSNode, start: Optional[Path] = None) -> List[str]:
     """空のディレクトリを、下から順に取り除く。消したパスを返す。"""
     root = start if start is not None else node.clayfs.work_tree
     removed: List[str] = []
@@ -640,15 +640,15 @@ def prune_empty_dirs(node: DFS5Node, start: Optional[Path] = None) -> List[str]:
     return removed
 
 
-def _remote_file_paths(node: DFS5Node, prefix: str = "") -> set:
+def _remote_file_paths(node: DFSNode, prefix: str = "") -> set:
     return {e["path"] for e in _all_entries(node, prefix) if e["type"] == "file"}
 
 
-def _remote_dir_paths(node: DFS5Node, prefix: str = "") -> set:
+def _remote_dir_paths(node: DFSNode, prefix: str = "") -> set:
     return {e["path"] for e in _all_entries(node, prefix) if e["type"] == "dir"}
 
 
-def _remove_from_tree(node: DFS5Node, paths: List[str]) -> None:
+def _remove_from_tree(node: DFSNode, paths: List[str]) -> None:
     """作業ツリーから、ファイルまたはディレクトリ（中身ごと）を取り除く。"""
     for rel in sorted(paths, key=lambda p: len(p.split("/")), reverse=True):
         victim = _tree_path(node, rel)
@@ -674,7 +674,7 @@ def _human_size(n: int) -> str:
     return f"{n}B"
 
 
-def _rel_entries(node: DFS5Node, prefix: str) -> List[Dict[str, Any]]:
+def _rel_entries(node: DFSNode, prefix: str) -> List[Dict[str, Any]]:
     """リモートの一覧を prefix で絞り、prefix からの相対パスを付けて返す。"""
     entries = node.list_remote()
     keep = []
@@ -697,7 +697,7 @@ def _rel_entries(node: DFS5Node, prefix: str) -> List[Dict[str, Any]]:
     return keep
 
 
-def _all_entries(node: DFS5Node, prefix: str) -> List[Dict[str, Any]]:
+def _all_entries(node: DFSNode, prefix: str) -> List[Dict[str, Any]]:
     entries = node.list_remote()
     if not prefix:
         return entries
@@ -795,17 +795,17 @@ def prompt_secret(
             return ""  # 端末を制御できない
         if first != second:
             print(
-                f"[dfs5cli] 入力が一致しません。もう一度入力してください"
+                f"[dfscli] 入力が一致しません。もう一度入力してください"
                 f"（{attempt}/{max_tries}）",
                 file=sys.stderr,
             )
             continue
         if first == "":
-            print("[dfs5cli] 空のまま進めます（あとで設定できます）", file=sys.stderr)
+            print("[dfscli] 空のまま進めます（あとで設定できます）", file=sys.stderr)
             return ""
         return first.strip()
 
-    print("[dfs5cli] 何度も一致しませんでした。--secret で渡すか、あとで設定してください", file=sys.stderr)
+    print("[dfscli] 何度も一致しませんでした。--secret で渡すか、あとで設定してください", file=sys.stderr)
     return ""
 
 
@@ -887,7 +887,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         ]
 
         # --key が無ければ、その場で Ed25519 の鍵を作る。
-        # 書き手の鍵は dfs5cli が初めて使うものなので、利用者に用意させない。
+        # 書き手の鍵は dfscli が初めて使うものなので、利用者に用意させない。
         key_path: Path
         created_key = False
         if args.key:
@@ -903,7 +903,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             if not key_path.is_file():
                 res = subprocess.run(
                     ["ssh-keygen", "-t", "ed25519", "-N", "",
-                     "-C", f"dfs5cli-{args.name}@{socket.gethostname()}", "-f", str(key_path)],
+                     "-C", f"dfscli-{args.name}@{socket.gethostname()}", "-f", str(key_path)],
                     capture_output=True, text=True,
                 )
                 if res.returncode != 0:
@@ -979,7 +979,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             root_fingerprint=root_fingerprint,
         )
         store.set(remote)
-        print(f"[dfs5cli] リモート {remote.name!r} を保存しました: {store.path}")
+        print(f"[dfscli] リモート {remote.name!r} を保存しました: {store.path}")
         print(f"  registry    : {remote.registry}")
         if remote.registry_alternates:
             print(f"  代替名簿    : {', '.join(remote.registry_alternates)}")
@@ -1014,7 +1014,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     if args.action == "delete":
         if store.delete(args.name):
-            print(f"[dfs5cli] リモート {args.name!r} を削除しました")
+            print(f"[dfscli] リモート {args.name!r} を削除しました")
             return 0
         raise UsageError(f"Unknown remote {args.name!r}")
 
@@ -1077,7 +1077,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
         out = (
             Path(args.out).expanduser()
             if args.out
-            else Path.cwd() / f"dfs5-archive-{remote.name}-{int(time.time())}"
+            else Path.cwd() / f"dfs-archive-{remote.name}-{int(time.time())}"
         )
         try:
             result = create_archive(
@@ -1147,7 +1147,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     path = ("/" + sub.lstrip("/")) if sub else remote.path
     if not path:
         raise UsageError(
-            "history にはパスが必要です（例: dfs5cli history remote:/example.com/alice）"
+            "history にはパスが必要です（例: dfscli history remote:/example.com/alice）"
         )
     client = cli_mod.RemoteRegistryClient(remote.registry_urls())
     try:
@@ -1243,7 +1243,7 @@ def cmd_cat(args: argparse.Namespace) -> int:
 
 
 def _print_plan(action: str, items: List[str], dry_run: bool) -> None:
-    head = "[dfs5cli] " + ("(dry-run) " if dry_run else "")
+    head = "[dfscli] " + ("(dry-run) " if dry_run else "")
     print(f"{head}{action}: {len(items)} 件", file=sys.stderr)
     if dry_run:
         for i in items[:40]:
@@ -1265,7 +1265,7 @@ def cmd_copy(args: argparse.Namespace) -> int:
     path_filter = _path_filter(args)
     local = _filter_local(_collect_local(Path(args.src)), path_filter)
     if not local:
-        print("[dfs5cli] コピーするファイルがありません", file=sys.stderr)
+        print("[dfscli] コピーするファイルがありません", file=sys.stderr)
         return 0
 
     node = open_remote(remote, create=True)
@@ -1283,7 +1283,7 @@ def cmd_copy(args: argparse.Namespace) -> int:
         return 0
     if not writes:
         print(
-            f"[dfs5cli] copy: 変更なし（{len(unchanged)} ファイルが同じ）。新しい版は作りません",
+            f"[dfscli] copy: 変更なし（{len(unchanged)} ファイルが同じ）。新しい版は作りません",
             file=sys.stderr,
         )
         return 0
@@ -1293,7 +1293,7 @@ def cmd_copy(args: argparse.Namespace) -> int:
     log_env, sent = _push(node, remote)
     ms = (time.perf_counter() - t0) * 1000.0
     print(
-        f"[dfs5cli] copy OK -> v{log_env['payload']['version']} "
+        f"[dfscli] copy OK -> v{log_env['payload']['version']} "
         f"| 追加/更新 {len(writes)} 件（同じ {len(unchanged)} 件） | sent={sent} B | {ms:.1f} ms"
     )
     return 0
@@ -1319,7 +1319,7 @@ def cmd_copyto(args: argparse.Namespace) -> int:
     writes, _deletes, unchanged = plan_changes(node, "", {sub: src}, checksum=args.checksum)
     if not writes:
         print(
-            f"[dfs5cli] copyto: 変更なし（{sub} は同じ）。新しい版は作りません",
+            f"[dfscli] copyto: 変更なし（{sub} は同じ）。新しい版は作りません",
             file=sys.stderr,
         )
         return 0
@@ -1327,7 +1327,7 @@ def cmd_copyto(args: argparse.Namespace) -> int:
 
     log_env, sent = _push(node, remote)
     print(
-        f"[dfs5cli] copyto OK -> v{log_env['payload']['version']} "
+        f"[dfscli] copyto OK -> v{log_env['payload']['version']} "
         f"| {sub} | sent={sent} B"
     )
     return 0
@@ -1349,14 +1349,14 @@ def cmd_import_tar(args: argparse.Namespace) -> int:
     if not archive.is_file():
         raise UsageError(f"tar ファイルがありません: {archive}")
 
-    with tempfile.TemporaryDirectory(prefix="dfs5_import_tar_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="dfs_import_tar_") as tmp:
         staging = Path(tmp) / "extract"
         staging.mkdir()
         files, dirs = _extract_tar_safely(
             archive, staging, args.strip_components
         )
         if not files and not dirs:
-            print(f"[dfs5cli] import_tar: インポートするものがありません: {archive}")
+            print(f"[dfscli] import_tar: インポートするものがありません: {archive}")
             return 0
 
         node = open_remote(remote, create=True)
@@ -1389,7 +1389,7 @@ def cmd_import_tar(args: argparse.Namespace) -> int:
             return 0
         if not writes and not new_dirs:
             print(
-                f"[dfs5cli] import_tar: 変更なし（{len(unchanged)} ファイルが同じ）。"
+                f"[dfscli] import_tar: 変更なし（{len(unchanged)} ファイルが同じ）。"
                 "新しい版は作りません",
                 file=sys.stderr,
             )
@@ -1405,7 +1405,7 @@ def cmd_import_tar(args: argparse.Namespace) -> int:
 
         log_env, sent = _push(node, remote)
         print(
-            f"[dfs5cli] import_tar OK -> v{log_env['payload']['version']} "
+            f"[dfscli] import_tar OK -> v{log_env['payload']['version']} "
             f"| files={len(writes)} dirs={len(new_dirs)} same={len(unchanged)} "
             f"| sent={sent} B"
         )
@@ -1441,7 +1441,7 @@ def _configure_fuse_library(explicit: Optional[str] = None) -> None:
 def cmd_mount(args: argparse.Namespace) -> int:
     """リモートのサブツリーを fuse-t / fusepy でローカルにマウントする。
 
-    作業ツリーを FUSE に公開し、flush / fsync / unmount 時に DFS5 へ push する。
+    作業ツリーを FUSE に公開し、flush / fsync / unmount 時に DFS へ push する。
     """
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
@@ -1455,10 +1455,10 @@ def cmd_mount(args: argparse.Namespace) -> int:
     node = open_remote(remote, create=True)
     refresh_cache(node)
 
-    def flush_to_dfs5() -> None:
+    def flush_to_dfs() -> None:
         log_env, sent = _push(node, remote)
         print(
-            f"[dfs5cli] mount flush -> v{log_env['payload']['version']} "
+            f"[dfscli] mount flush -> v{log_env['payload']['version']} "
             f"| sent={sent} B",
             file=sys.stderr,
         )
@@ -1468,7 +1468,7 @@ def cmd_mount(args: argparse.Namespace) -> int:
     except ImportError as e:  # pragma: no cover - 依存環境
         raise UsageError(
             "mount には fusepy と fuse-t / FUSE が必要です "
-            "(pip install 'dfs5[fuse]')"
+            "(pip install 'dfs[fuse]')"
         ) from e
 
     _configure_fuse_library(args.fuse_library)
@@ -1482,13 +1482,13 @@ def cmd_mount(args: argparse.Namespace) -> int:
 
     operations = LocalTreeFuse(
         node.clayfs.work_tree,
-        flush_to_dfs5,
+        flush_to_dfs,
         read_only=args.read_only,
         sync_delay=0.5,
     )
     options = {
-        "fsname": f"dfs5:{name}:{node.sub_path}",
-        "volname": f"dfs5-{name}",
+        "fsname": f"dfs:{name}:{node.sub_path}",
+        "volname": f"dfs-{name}",
         "foreground": True,
         "nothreads": True,
     }
@@ -1501,7 +1501,7 @@ def cmd_mount(args: argparse.Namespace) -> int:
     try:
         FUSE(operations, str(mountpoint), **options)
     except KeyboardInterrupt:
-        print("\n[dfs5cli] mount を終了します", file=sys.stderr)
+        print("\n[dfscli] mount を終了します", file=sys.stderr)
     finally:
         operations.destroy("/")
     return 0
@@ -1525,7 +1525,7 @@ def cmd_mv(args: argparse.Namespace) -> int:
     if not src or not dst:
         raise UsageError("mv には移動元と移動先のパスが必要です（例: remote:old remote:new）")
     if src == dst:
-        print(f"[dfs5cli] mv: 移動元と移動先が同じです（{src_name}:{src}）", file=sys.stderr)
+        print(f"[dfscli] mv: 移動元と移動先が同じです（{src_name}:{src}）", file=sys.stderr)
         return 0
 
     remote = store.get(src_name)
@@ -1574,7 +1574,7 @@ def cmd_mv(args: argparse.Namespace) -> int:
 
     log_env, sent = _push(node, remote)
     print(
-        f"[dfs5cli] mv OK -> v{log_env['payload']['version']} "
+        f"[dfscli] mv OK -> v{log_env['payload']['version']} "
         f"| {src} -> {dst} | sent={sent} B"
     )
     return 0
@@ -1606,7 +1606,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             + [f"delete {remote.name}:{path}" for path in deletes])
     if not plan:
         print(
-            f"[dfs5cli] sync: 変更なし（{len(unchanged)} ファイルが同じ）。新しい版は作りません",
+            f"[dfscli] sync: 変更なし（{len(unchanged)} ファイルが同じ）。新しい版は作りません",
             file=sys.stderr,
         )
         return 0
@@ -1622,7 +1622,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     n_add = sum(1 for _p, _s, k in writes if k == "add")
     n_upd = sum(1 for _p, _s, k in writes if k == "update")
     print(
-        f"[dfs5cli] sync OK -> v{log_env['payload']['version']} "
+        f"[dfscli] sync OK -> v{log_env['payload']['version']} "
         f"| add={n_add} update={n_upd} delete={len(deletes)} "
         f"| same={len(unchanged)} | sent={sent} B"
     )
@@ -1659,7 +1659,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
         if item.name in (".DS_Store",) or item.name.startswith("._"):
             continue
         if item.is_symlink():
-            print(f"[dfs5cli] warning: skipping symlink: {item}", file=sys.stderr)
+            print(f"[dfscli] warning: skipping symlink: {item}", file=sys.stderr)
             continue
         rel_text = rel.as_posix()
         if not path_filter.allows(rel_text):
@@ -1677,7 +1677,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
             raise UsageError(f"Refusing symlink write: {rel_text!r} ({e})") from e
         count += 1
 
-    print(f"[dfs5cli] pull OK <- v{version} | {count} ファイル -> {dest}")
+    print(f"[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}")
     return 0
 
 
@@ -1714,11 +1714,11 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     if only_remote or only_local or size_diff:
         print(
-            f"[dfs5cli] check: 一致しません "
+            f"[dfscli] check: 一致しません "
             f"(remote のみ {len(only_remote)} / local のみ {len(only_local)} / 差 {len(size_diff)})"
         )
         return 1
-    print(f"[dfs5cli] check: 一致しました（{len(remote_files)} ファイル）")
+    print(f"[dfscli] check: 一致しました（{len(remote_files)} ファイル）")
     return 0
 
 
@@ -1811,13 +1811,13 @@ def cmd_mkdir(args: argparse.Namespace) -> int:
     refresh_cache(node)
     existing = _remote_dir_paths(node) | _remote_file_paths(node)
     if sub in existing:
-        print(f"[dfs5cli] mkdir: すでにあります: {name}:{sub}", file=sys.stderr)
+        print(f"[dfscli] mkdir: すでにあります: {name}:{sub}", file=sys.stderr)
         return 0
 
     target = _tree_path(node, sub)
     target.mkdir(parents=True, exist_ok=True)
     log_env, sent = _push(node, remote)
-    print(f"[dfs5cli] mkdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
+    print(f"[dfscli] mkdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
     return 0
 
 
@@ -1825,7 +1825,7 @@ def cmd_rm(args: argparse.Namespace) -> int:
     """リモートのファイル（または ``--recursive`` でディレクトリ）を消す。
 
     rclone の ``delete`` / ``deletefile`` に当たる。消した後に空になったディレクトリは、
-    ``--rmdirs`` を付けたときだけ片付ける（既定は空ディレクトリを残す。dfs5 は空の
+    ``--rmdirs`` を付けたときだけ片付ける（既定は空ディレクトリを残す。dfs は空の
     ディレクトリも版に残すため、消すか残すかを選べるようにしてある）。
     """
     store = RemoteStore()
@@ -1860,11 +1860,11 @@ def cmd_rm(args: argparse.Namespace) -> int:
 
     if not targets:
         if not args.rmdirs:
-            print(f"[dfs5cli] rm: 消すファイルがありません（{name}:{sub}）", file=sys.stderr)
+            print(f"[dfscli] rm: 消すファイルがありません（{name}:{sub}）", file=sys.stderr)
             return 0
         # --rmdirs なら、ファイルが無くても空ディレクトリの掃除に進む
         print(
-            f"[dfs5cli] rm: {name}:{sub} にファイルはありません。空ディレクトリを片付けます",
+            f"[dfscli] rm: {name}:{sub} にファイルはありません。空ディレクトリを片付けます",
             file=sys.stderr,
         )
 
@@ -1883,7 +1883,7 @@ def cmd_rm(args: argparse.Namespace) -> int:
     log_env, sent = _push(node, remote)
     extra = f" | 空になったディレクトリ {len(removed_dirs)} 件も削除" if removed_dirs else ""
     print(
-        f"[dfs5cli] rm OK -> v{log_env['payload']['version']} "
+        f"[dfscli] rm OK -> v{log_env['payload']['version']} "
         f"| 削除 {len(targets)} 件{extra} | sent={sent} B"
     )
     return 0
@@ -1921,7 +1921,7 @@ def cmd_rmdir(args: argparse.Namespace) -> int:
     parent = str(Path(sub).parent)
     prune_empty_dirs(node, start=_tree_path(node, parent) if parent != "." else node.clayfs.work_tree)
     log_env, sent = _push(node, remote)
-    print(f"[dfs5cli] rmdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
+    print(f"[dfscli] rmdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
     return 0
 
 
@@ -1946,7 +1946,7 @@ def cmd_purge(args: argparse.Namespace) -> int:
         target_dirs = sorted(dirs, key=lambda d: len(d.split("/")), reverse=True)
 
     if not targets and not target_dirs:
-        print(f"[dfs5cli] purge: 消すものがありません（{name}:{sub}）", file=sys.stderr)
+        print(f"[dfscli] purge: 消すものがありません（{name}:{sub}）", file=sys.stderr)
         return 0
 
     _print_plan(
@@ -1961,7 +1961,7 @@ def cmd_purge(args: argparse.Namespace) -> int:
     prune_empty_dirs(node)
     log_env, sent = _push(node, remote)
     print(
-        f"[dfs5cli] purge OK -> v{log_env['payload']['version']} "
+        f"[dfscli] purge OK -> v{log_env['payload']['version']} "
         f"| ファイル {len(targets)} 件・ディレクトリ {len(target_dirs)} 件 | sent={sent} B"
     )
     return 0
@@ -1973,7 +1973,7 @@ def cmd_touch(args: argparse.Namespace) -> int:
     name, _sub = split_remote_spec(args.remote, args.remote_name)
     remote = store.get(name)
     node = open_remote(remote, create=True)
-    print(f"[dfs5cli] 初期化しました: {node.clayfs.mount_root}")
+    print(f"[dfscli] 初期化しました: {node.clayfs.mount_root}")
     return 0
 
 
@@ -2004,7 +2004,7 @@ def cmd_libp2p_serve(args: argparse.Namespace) -> int:
         raise UsageError(f"libp2p-serve を開始できません: {e}") from e
 
     def ready(addrs: List[str]) -> None:
-        print("[dfs5cli] libp2p/QUIC ready")
+        print("[dfscli] libp2p/QUIC ready")
         for addr in addrs:
             print(f"  peer: {addr}")
 
@@ -2049,7 +2049,7 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     p.add_argument("--key", help="書き手の OpenSSH Ed25519 秘密鍵（省略すると作る）")
     p.add_argument(
         "--key-dir",
-        help="--key を省いたときに鍵を置く場所（既定 ~/.config/dfs5/keys）",
+        help="--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）",
     )
     p.add_argument(
         "--secret",
@@ -2059,7 +2059,7 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
         "--no-prompt", action="store_true",
         help="--secret を省いても端末から読まない（パイプで使うとき）",
     )
-    p.add_argument("--workdir", help="作業ディレクトリ（既定 ~/.cache/dfs5/<name>）")
+    p.add_argument("--workdir", help="作業ディレクトリ（既定 ~/.cache/dfs/<name>）")
     p.add_argument("--epoch", type=int, default=1, help="委譲のエポック（既定 1）")
     p.add_argument(
         "--role-epoch", type=int, default=1,
@@ -2076,11 +2076,11 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     )
     p.add_argument(
         "--dnssec-domain",
-        help="DNSSEC の _dfs5.<domain> TXT から root 公開鍵と registry 一覧を取得する",
+        help="DNSSEC の _dfs.<domain> TXT から root 公開鍵と registry 一覧を取得する",
     )
     p.add_argument(
         "--dnssec-name",
-        help="DNSSEC の TXT レコード名（既定 _dfs5.<domain>）",
+        help="DNSSEC の TXT レコード名（既定 _dfs.<domain>）",
     )
     p.add_argument(
         "--dnssec-no-ad", action="store_true",
@@ -2096,20 +2096,20 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="dfs5cli",
-        description="dfs5cli: dfs5 を rclone ライクに扱う CLI（リモート名で場所を指す）",
+        prog="dfscli",
+        description="dfscli: dfs を rclone ライクに扱う CLI（リモート名で場所を指す）",
     )
     parser.add_argument(
         "--remote", dest="remote_name", metavar="NAME",
         help="`path` だけを書いたときに使うリモート名（rclone の :backend: 相当）",
     )
-    parser.add_argument("--version", action="version", version=f"dfs5cli {_version()}")
+    parser.add_argument("--version", action="version", version=f"dfscli {_version()}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("listremotes", help="定義済みのリモートを一覧する")
     p.set_defaults(func=cmd_listremotes)
 
-    # `dfs5cli create NAME ...` は `dfs5cli config create NAME ...` と同じ。
+    # `dfscli create NAME ...` は `dfscli config create NAME ...` と同じ。
     # 登録は一番よく打つので短い入口を用意する。
     p = sub.add_parser("create", help="リモートを登録する（= config create）")
     _add_create_args(p, args_name_required=True)
@@ -2123,7 +2123,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_disc = sub.add_parser("discover", help="DNSSEC から root/registry 情報を取得して表示する")
     p_disc.add_argument("domain", help="例: example.com")
-    p_disc.add_argument("--dnssec-name", help="TXT レコード名（既定 _dfs5.<domain>）")
+    p_disc.add_argument("--dnssec-name", help="TXT レコード名（既定 _dfs.<domain>）")
     p_disc.add_argument("--dnssec-no-ad", action="store_true", help="AD ビットを要求しない")
     p_disc.add_argument(
         "--dnssec-no-validate",
@@ -2137,7 +2137,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_arch.add_argument("action", choices=["create", "verify", "extract", "catalog"])
     p_arch.add_argument("source", help="create は remote:path、verify/extract は bundle ディレクトリ")
     p_arch.add_argument("dest", nargs="?", help="extract の出力先")
-    p_arch.add_argument("--out", help="create の bundle 出力先（既定 .cwd/dfs5-archive-...）")
+    p_arch.add_argument("--out", help="create の bundle 出力先（既定 .cwd/dfs-archive-...）")
     p_arch.add_argument("--announce", help="torrent の announce URL（省略可）")
     p_arch.add_argument("--version", type=int, help="archive する版（省略時は先頭版）")
     p_arch.add_argument("--secret", help="extract の tree_secret")
@@ -2316,7 +2316,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--ost-port", type=int, default=9443)
     p_serve.add_argument("--root-anchor", default="/example.com")
     p_serve.add_argument("--root-pubkey", required=True)
-    p_serve.add_argument("--state-dir", default="~/.dfs5_server")
+    p_serve.add_argument("--state-dir", default="~/.dfs_server")
     p_serve.add_argument(
         "--ost-dir",
         help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）",
@@ -2336,7 +2336,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote = sub.add_parser(
         "promote", help="停止中の registry state を primary に昇格する"
     )
-    p_promote.add_argument("--state-dir", default="~/.dfs5_server")
+    p_promote.add_argument("--state-dir", default="~/.dfs_server")
     p_promote.add_argument("--role-epoch", type=int)
     p_promote.set_defaults(func=cmd_promote)
 
@@ -2382,24 +2382,24 @@ def _friendly_error(exc: BaseException) -> int:
     """例外を利用者向けの 1 行にして返す（終了コード付き）。"""
     if isinstance(exc, ConflictError):
         print(
-            f"[dfs5cli] 単一書き手の競合: {exc}\n"
-            "        他の端末が先に書きました。'dfs5cli pull' の後でやり直してください。",
+            f"[dfscli] 単一書き手の競合: {exc}\n"
+            "        他の端末が先に書きました。'dfscli pull' の後でやり直してください。",
             file=sys.stderr,
         )
         return 7
     if isinstance(exc, RollbackDetectedError):
-        print(f"[dfs5cli] 巻き戻しを検出しました（B6）: {exc}", file=sys.stderr)
+        print(f"[dfscli] 巻き戻しを検出しました（B6）: {exc}", file=sys.stderr)
         return 8
     if isinstance(exc, SilentDropDetectedError):
-        print(f"[dfs5cli] 黙った破棄を検出しました（B7）: {exc}", file=sys.stderr)
+        print(f"[dfscli] 黙った破棄を検出しました（B7）: {exc}", file=sys.stderr)
         return 9
     if isinstance(exc, ServiceUnavailableError):
-        print(f"[dfs5cli] L2/L3 に到達できません: {exc}", file=sys.stderr)
+        print(f"[dfscli] L2/L3 に到達できません: {exc}", file=sys.stderr)
         return 6
     if isinstance(exc, (UsageError, RemoteError)):
-        print(f"[dfs5cli] {exc}", file=sys.stderr)
+        print(f"[dfscli] {exc}", file=sys.stderr)
         return 2
-    print(f"[dfs5cli] 予期しないエラー: {type(exc).__name__}: {exc}", file=sys.stderr)
+    print(f"[dfscli] 予期しないエラー: {type(exc).__name__}: {exc}", file=sys.stderr)
     return 1
 
 
@@ -2409,7 +2409,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:
-        print("\n[dfs5cli] 中断しました", file=sys.stderr)
+        print("\n[dfscli] 中断しました", file=sys.stderr)
         return 130
     except SystemExit:
         raise

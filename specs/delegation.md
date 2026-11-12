@@ -2,13 +2,13 @@
 
 ## 0. 目的と位置づけ
 
-本文書は `dfs5` における **L1（権威の委譲: Authority Delegation）** の仕様と検証規則を定義する。
+本文書は `dfs` における **L1（権威の委譲: Authority Delegation）** の仕様と検証規則を定義する。
 L1 の役割は「どの公開鍵が、どの部分木（パス）に対して書き込み権限を持つか」を暗号学的に証明・検証することであり、次の 2 点を満たすことで設計を閉じる。
 
 1. 親から子への権限委譲（および再委譲）が、DNSSEC と同様の信頼チェーンとして単方向で検証できる。
 2. 鍵の交代や失効（Revocation）が起きたとき、L4（追記ログ）と連携して古い鍵による巻き戻しや偽装追記を拒否できる。
 
-**実装との対応**: `dfs5/l1_delegation.py`（検証）、`dfs5/crypto.py`（正規化・署名）、`tests/test_evil_suite.py::test_l1_delegation_invariants`（検証試験）。
+**実装との対応**: `dfs/l1_delegation.py`（検証）、`dfs/crypto.py`（正規化・署名）、`tests/test_evil_suite.py::test_l1_delegation_invariants`（検証試験）。
 
 ---
 
@@ -16,7 +16,7 @@ L1 の役割は「どの公開鍵が、どの部分木（パス）に対して�
 
 ### 1.1 ペイロード（署名対象）
 
-委譲記録の本体（ペイロード）は、キーを辞書順（ASCII コード順）にソートし、余分な空白を含まない 1 行の UTF-8 JSON（`dfs5.crypto.canonical_json()` の出力形式、末尾 LF 1 バイトを含む）とする。
+委譲記録の本体（ペイロード）は、キーを辞書順（ASCII コード順）にソートし、余分な空白を含まない 1 行の UTF-8 JSON（`dfs.crypto.canonical_json()` の出力形式、末尾 LF 1 バイトを含む）とする。
 
 ```json
 {"base_version":0,"epoch":1,"expires_at":1794436000,"issued_at":1762900000,"parent":"/example.com","path":"/example.com/alice","writer":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@example.com"}
@@ -45,14 +45,14 @@ L1 の役割は「どの公開鍵が、どの部分木（パス）に対して�
 }
 ```
 
-署名は OpenSSH の分離署名（SSHSIG）を用い、名前空間（namespace）`dfs5-delegation-v1` を必ず含める。これにより、L1 の署名を L2 や L4 の署名として流用できない。
+署名は OpenSSH の分離署名（SSHSIG）を用い、名前空間（namespace）`dfs-delegation-v1` を必ず含める。これにより、L1 の署名を L2 や L4 の署名として流用できない。
 
 ---
 
 ## 2. 署名と検証の手順
 
 1. ペイロードを `canonical_json` で正規化バイト列にする（キーソート・空白なし・末尾 LF）。
-2. 親の秘密鍵で、名前空間 `dfs5-delegation-v1` の分離署名を作る。
+2. 親の秘密鍵で、名前空間 `dfs-delegation-v1` の分離署名を作る。
 3. 検証では、同じ正規化バイト列に対して、**親の公開鍵**で署名を検証する。
 
 署名の実装は `cryptography`（Ed25519）を第一とし、復号できない鍵だけ `ssh-keygen -Y sign` にフォールバックする。`ssh-keygen` 呼び出しには必ずタイムアウトを付ける（無応答で停止しない）。
@@ -95,7 +95,7 @@ L1 の役割は「どの公開鍵が、どの部分木（パス）に対して�
 書き手を交代するとき、新しい書き手は前任者の履歴の続きから書き始める。これを保証するのが `base_version` である。
 
 - 委譲記録の `base_version` は、**交代時点の L4 ログの先頭版番号**と一致しなければならない。
-- L4 側は、`version > base_version` を満たす追記だけを受け付ける（`dfs5/l2_registry.py::announce_and_append`）。
+- L4 側は、`version > base_version` を満たす追記だけを受け付ける（`dfs/l2_registry.py::announce_and_append`）。
 - これがないと、新しい書き手が版 1 から書き直して履歴を巻き戻せてしまう。
 
 ---
@@ -149,9 +149,9 @@ TOFU は SSH の `known_hosts` と同じ強さで、**初回に攻撃者へ誘�
 
 ### 3.5.4 記録する場所
 
-root 公開鍵は**リモート定義**（`~/.config/dfs5/remotes.json`）に持つ。1 つの root を
-複数のリモートで共有できるため。作業ディレクトリの `dfs5_config.json` にも写しを置く
-（`dfs5` CLI が `--mount` から読むため）。
+root 公開鍵は**リモート定義**（`~/.config/dfs/remotes.json`）に持つ。1 つの root を
+複数のリモートで共有できるため。作業ディレクトリの `dfs_config.json` にも写しを置く
+（`dfs` CLI が `--mount` から読むため）。
 
 ### 3.5.5 DHT でノードを発見するときへ
 
@@ -194,6 +194,6 @@ root まで検証できる。検証に失敗したノードは攻撃ノードと
 
 - **`writer` は公開鍵全体である。** 表示や索引では鍵 ID（`SHA-256(公開鍵)` 等）を使い、委譲記録そのものには鍵を持つ（`DESIGN.md` §5.2 の方針）。
 - **名前（`user@domain`）は L1 の検証対象ではない。** L1 が保証するのは鍵と部分木の対応だけである。名前と鍵の結び付けは、ドメイン権威の署名または透過性ログ（`DESIGN.md` §6.1）で別に扱う。
-- **ルートアンカーの配布**: DNSSEC の `_dfs5.<domain>` TXT から root 公開鍵と
+- **ルートアンカーの配布**: DNSSEC の `_dfs.<domain>` TXT から root 公開鍵と
   registry 一覧を取得する方式を採用する。DNSSEC は root 鍵の配布に限定し、動的な
   head や primary 昇格の判断には使わない。詳細は `specs/dnssec.md`。

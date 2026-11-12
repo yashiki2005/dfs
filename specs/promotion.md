@@ -33,13 +33,13 @@ writer は `remotes.json` の `role_epoch` を `announce` に載せる。registr
 3. secondary の state を昇格する
 
 ```bash
-dfs5 promote --state-dir ~/.dfs5_server --role-epoch 2
+dfs promote --state-dir ~/.dfs_server --role-epoch 2
 ```
 
 4. secondary を primary として再起動する
 
 ```bash
-dfs5 serve ... --role primary --role-epoch 2
+dfs serve ... --role primary --role-epoch 2
 ```
 
 5. writer の `remotes.json` を更新する
@@ -48,7 +48,7 @@ dfs5 serve ... --role primary --role-epoch 2
    - `role_epoch` を 2 にする
 
 ```bash
-dfs5cli config create NAME \
+dfscli config create NAME \
   --registry http://secondary:9440 \
   --registry-alternate http://old-primary:9440 \
   --role-epoch 2 ...

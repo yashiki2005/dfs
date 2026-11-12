@@ -2,7 +2,7 @@
 
 ## 前提
 
-dfs5 はサブツリーごとに単一書き手を持つ。書き込みは書き手ノードの**主 OST**で完結させ、
+dfs はサブツリーごとに単一書き手を持つ。書き込みは書き手ノードの**主 OST**で完結させ、
 別ノードの OST は読み取り専用の複製として扱う。
 
 - 主 OST: 書き手がチャンクを最初に置く OST
@@ -60,7 +60,7 @@ locator の `endpoints` は主 OST を先頭に、複製 OST を続けて持つ�
 
 ```bash
 # 書き手: 主 OST と複製 OST を登録
-dfs5cli create scw \
+dfscli create scw \
   --registry http://primary-registry:9440 \
   --registry-alternate http://secondary-registry:9440 \
   --ost 127.0.0.1:19443 \

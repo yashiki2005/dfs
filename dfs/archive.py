@@ -3,7 +3,7 @@
 
 BitTorrent は「現在の OST を置き換えるもの」ではなく、版のチャンクと署名済み
 メタデータをまとめて長期保存・配布するための層として使う。torrent の内容は
-DFS5 の wire_id（SHA-256）で再検証する。
+DFS の wire_id（SHA-256）で再検証する。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from .l1_delegation import verify_delegation_chain
 from .l2_registry import verify_locator_envelope
 from .l4_log import MerkleTreeBuilder
 
-ARCHIVE_SCHEMA = "dfs5-archive-v1"
+ARCHIVE_SCHEMA = "dfs-archive-v1"
 DEFAULT_PIECE_LENGTH = 256 * 1024
 CHUNK_GROUP = 128
 
@@ -197,7 +197,7 @@ def create_archive(
 
     torrent = bundle.with_suffix(".torrent")
     name = (
-        f"dfs5-{_safe_name(node.sub_path)}-v{int(p['version'])}-"
+        f"dfs-{_safe_name(node.sub_path)}-v{int(p['version'])}-"
         f"{sha256_hex(meta_bytes)[:12]}"
     )
     infohash = _write_torrent(bundle, torrent, name, announce)
@@ -205,7 +205,7 @@ def create_archive(
     descriptor.write_text(
         json.dumps(
             {
-                "schema": "dfs5-archive-descriptor-v1",
+                "schema": "dfs-archive-descriptor-v1",
                 "bundle": str(bundle),
                 "created_at": int(time.time()),
                 "head_hash": head.get("entry_hash", ""),

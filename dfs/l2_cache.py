@@ -18,7 +18,7 @@ from .crypto import normalize_path
 from .l2_registry import ServiceUnavailableError
 from .private_io import write_private_json
 
-CACHE_SCHEMA = "dfs5-l2-cache-v1"
+CACHE_SCHEMA = "dfs-l2-cache-v1"
 
 
 class L2Cache:
@@ -148,7 +148,7 @@ class CachedRegistryClient:
                 raise
             self.last_cache_hit = True
             print(
-                f"[dfs5] L2 registry unavailable; using verified cache for {path}",
+                f"[dfs] L2 registry unavailable; using verified cache for {path}",
                 file=sys.stderr,
             )
             return cached

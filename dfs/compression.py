@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """フォルダ単位の圧縮ポリシー。
 
-``user.dfs5.compression`` xattr をローカル側の設定 UI として読み、継承した
+``user.dfs.compression`` xattr をローカル側の設定 UI として読み、継承した
 実効ポリシーを返す。xattr が失われても、push 時に署名済みマニフェストへ
 実効ポリシーを記録する。
 """
@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-XATTR_NAME = "user.dfs5.compression"
+XATTR_NAME = "user.dfs.compression"
 VALID_POLICIES = {"none", "zstd"}
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dfs5/l5_clayfs.py
+dfs/l5_clayfs.py
 L5 (clayfs ローカル実体化 & スナップショット連携) アダプタ。
 """
 
@@ -24,7 +24,7 @@ from .path_safety import safe_target, write_bytes_no_follow
 class ClayFSAdapter:
     """作業ツリーのスナップショット入出力。
 
-    実体のコピーは ``dfs5.fs.FileSystem`` に委譲する。CoW (clonefile / FICLONE /
+    実体のコピーは ``dfs.fs.FileSystem`` に委譲する。CoW (clonefile / FICLONE /
     block clone) が使える環境ではそれを自動で使い、無い環境では実コピーに落ちる。
     どちらでもスナップショットは作業ツリーから独立した inode になる。
     """
@@ -73,7 +73,7 @@ class ClayFSAdapter:
         )
 
 
-class DFS5Node:
+class DFSNode:
     def __init__(
         self,
         name: str,
@@ -208,7 +208,7 @@ class DFS5Node:
             preview = ", ".join(snapshot.skipped[:3])
             more = "" if len(snapshot.skipped) <= 3 else f" 他 {len(snapshot.skipped) - 3} 件"
             print(
-                f"[dfs5] スナップショットから {len(snapshot.skipped)} 件を除外しました"
+                f"[dfs] スナップショットから {len(snapshot.skipped)} 件を除外しました"
                 f"（ジャンクション / 特殊ファイル）: {preview}{more}",
                 file=sys.stderr,
             )
@@ -216,7 +216,7 @@ class DFS5Node:
         with self.ost.session():
             root_pid, root_wid = self.builder.upload_directory(snap_dir, delegated_mounts=delegated_mounts)
         for warning in self.builder.warnings:
-            print(f"[dfs5] warning: {warning}", file=sys.stderr)
+            print(f"[dfs] warning: {warning}", file=sys.stderr)
 
         log_env = self.l4.commit(
             registry=self.registry,
@@ -238,7 +238,7 @@ class DFS5Node:
         self.read_ost.reset_metrics()
 
         p = head_env["payload"]
-        with tempfile.TemporaryDirectory(prefix="dfs5_stage_") as staging:
+        with tempfile.TemporaryDirectory(prefix="dfs_stage_") as staging:
             staging_dir = Path(staging)
             with self.read_ost.session():
                 self.read_builder.download_directory(

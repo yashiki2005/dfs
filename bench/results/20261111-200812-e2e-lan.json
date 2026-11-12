@@ -1,5 +1,5 @@
 {
-  "schema": "dfs5-e2e-lan-v1",
+  "schema": "dfs-e2e-lan-v1",
   "measured_at_utc": "2026-11-11T11:08:00+00:00",
   "environment": {
     "mac_platform": "macOS-27.3-arm64-arm-64bit",
@@ -22,13 +22,13 @@
     {
       "step": "Mac push",
       "ok": true,
-      "detail": "[dfs5 push] OK v4 (epoch=1) | root=c6d635622129... | sent=1661 B | 70.5 ms\n  Snapshot saved at: /private/tmp/dfs5_e2e/mac_mount/.clayfs/snapshots/v4",
+      "detail": "[dfs push] OK v4 (epoch=1) | root=c6d635622129... | sent=1661 B | 70.5 ms\n  Snapshot saved at: /private/tmp/dfs_e2e/mac_mount/.clayfs/snapshots/v4",
       "elapsed_ms": 165.3
     },
     {
       "step": "Pi5 pull",
       "ok": true,
-      "detail": "[dfs5 pull] OK v4 (epoch=1) | recv=1015 B | 38.8 ms\n  Working tree updated : /home/yy/dfs5_e2e/pi5_mount/tree\n  Snapshot saved at    : /home/yy/dfs5_e2e/pi5_mount/.clayfs/snapshots/v4",
+      "detail": "[dfs pull] OK v4 (epoch=1) | recv=1015 B | 38.8 ms\n  Working tree updated : /home/yy/dfs_e2e/pi5_mount/tree\n  Snapshot saved at    : /home/yy/dfs_e2e/pi5_mount/.clayfs/snapshots/v4",
       "elapsed_ms": 643.5
     },
     {
@@ -39,7 +39,7 @@
     {
       "step": "同時書き込みを CAS で拒否",
       "ok": true,
-      "detail": "[REJECTED: Single-Writer Conflict] CAS conflict on '/example.com/alice/notes': expected version 6 (parent 5, 9128fe01ca...), got version 5 (parent 4, dadfb12d95...)\nHint: Run 'dfs5 pull' first."
+      "detail": "[REJECTED: Single-Writer Conflict] CAS conflict on '/example.com/alice/notes': expected version 6 (parent 5, 9128fe01ca...), got version 5 (parent 4, dadfb12d95...)\nHint: Run 'dfs pull' first."
     },
     {
       "step": "衝突コピー 0 件",

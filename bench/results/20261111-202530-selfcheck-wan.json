@@ -1,5 +1,5 @@
 {
-  "schema": "dfs5-e2e-wan-v1",
+  "schema": "dfs-e2e-wan-v1",
   "label": "selfcheck",
   "mode": "loopback",
   "measured_at_utc": "2026-11-11T11:25:24+00:00",
@@ -49,13 +49,13 @@
     {
       "step": "L1 委譲登録",
       "ok": true,
-      "detail": "[dfs5 delegate] Registered on http://127.0.0.1:19440: path=/example.com/alice/notes epoch=1 base_version=0",
+      "detail": "[dfs delegate] Registered on http://127.0.0.1:19440: path=/example.com/alice/notes epoch=1 base_version=0",
       "elapsed_ms": 121.4
     },
     {
       "step": "クライアント init",
       "ok": true,
-      "detail": "[dfs5 init] Initialized mount at /private/tmp/dfs5_wan/client_mount\n  Working tree : /private/tmp/dfs5_wan/client_mount/tree\n  Snapshots    : /private/tmp/dfs5_wan/client_mount/.clayfs/snapshots",
+      "detail": "[dfs init] Initialized mount at /private/tmp/dfs_wan/client_mount\n  Working tree : /private/tmp/dfs_wan/client_mount/tree\n  Snapshots    : /private/tmp/dfs_wan/client_mount/.clayfs/snapshots",
       "elapsed_ms": 68.7
     },
     {
@@ -67,19 +67,19 @@
     {
       "step": "クライアント push",
       "ok": true,
-      "detail": "[dfs5 push] OK v1 (epoch=1) | root=471dac42cdeb... | sent=10482 B | 38.3 ms\n  Snapshot saved at: /private/tmp/dfs5_wan/client_mount/.clayfs/snapshots/v1\n[dfs5 metrics] {\"blob_bytes_sent\": 10141, \"bytes_received\": 1, \"bytes_sent\": 10482, \"direction\": \"push\", \"elapsed_ms\": 38.332, \"get_count\": 0, \"payload_bytes\": 10482, \"put_count\": 4, \"round_trips\": 1, \"tls_handshakes\": 1, \"version\": 1}",
+      "detail": "[dfs push] OK v1 (epoch=1) | root=471dac42cdeb... | sent=10482 B | 38.3 ms\n  Snapshot saved at: /private/tmp/dfs_wan/client_mount/.clayfs/snapshots/v1\n[dfs metrics] {\"blob_bytes_sent\": 10141, \"bytes_received\": 1, \"bytes_sent\": 10482, \"direction\": \"push\", \"elapsed_ms\": 38.332, \"get_count\": 0, \"payload_bytes\": 10482, \"put_count\": 4, \"round_trips\": 1, \"tls_handshakes\": 1, \"version\": 1}",
       "elapsed_ms": 119.8
     },
     {
       "step": "読取側 init",
       "ok": true,
-      "detail": "[dfs5 init] Initialized mount at /private/tmp/dfs5_wan/reader_mount\n  Working tree : /private/tmp/dfs5_wan/reader_mount/tree\n  Snapshots    : /private/tmp/dfs5_wan/reader_mount/.clayfs/snapshots",
+      "detail": "[dfs init] Initialized mount at /private/tmp/dfs_wan/reader_mount\n  Working tree : /private/tmp/dfs_wan/reader_mount/tree\n  Snapshots    : /private/tmp/dfs_wan/reader_mount/.clayfs/snapshots",
       "elapsed_ms": 89.2
     },
     {
       "step": "読取側 pull",
       "ok": true,
-      "detail": "[dfs5 pull] OK v1 (epoch=1) | recv=10161 B | 39.6 ms\n  Working tree updated : /private/tmp/dfs5_wan/reader_mount/tree\n  Snapshot saved at    : /private/tmp/dfs5_wan/reader_mount/.clayfs/snapshots/v1\n[dfs5 metrics] {\"blob_bytes_sent\": 0, \"bytes_received\": 10161, \"bytes_sent\": 532, \"direction\": \"pull\", \"elapsed_ms\": 39.566, \"get_count\": 4, \"payload_bytes\": 10161, \"put_count\": 0, \"round_trips\": 4, \"tls_handshakes\": 1, \"version\": 1}",
+      "detail": "[dfs pull] OK v1 (epoch=1) | recv=10161 B | 39.6 ms\n  Working tree updated : /private/tmp/dfs_wan/reader_mount/tree\n  Snapshot saved at    : /private/tmp/dfs_wan/reader_mount/.clayfs/snapshots/v1\n[dfs metrics] {\"blob_bytes_sent\": 0, \"bytes_received\": 10161, \"bytes_sent\": 532, \"direction\": \"pull\", \"elapsed_ms\": 39.566, \"get_count\": 4, \"payload_bytes\": 10161, \"put_count\": 0, \"round_trips\": 4, \"tls_handshakes\": 1, \"version\": 1}",
       "elapsed_ms": 132.0
     },
     {
@@ -95,7 +95,7 @@
     {
       "step": "競合試験: 先着 push",
       "ok": true,
-      "detail": "[dfs5 push] OK v2 (epoch=1) | root=c92e4084dc18... | sent=10839 B | 76.7 ms\n  Snapshot saved at: /private/tmp/dfs5_wan/reader_mount/.clayfs/snapshots/v2",
+      "detail": "[dfs push] OK v2 (epoch=1) | root=c92e4084dc18... | sent=10839 B | 76.7 ms\n  Snapshot saved at: /private/tmp/dfs_wan/reader_mount/.clayfs/snapshots/v2",
       "elapsed_ms": 200.3
     },
     {
@@ -106,7 +106,7 @@
     {
       "step": "同時書き込みを CAS で拒否（後着）",
       "ok": true,
-      "detail": "先着=[dfs5 push] OK v2 (epoch=1) | root=c92e4084dc18... | sent=10839 B | 76.7 ms\n  Sn / 後着 rc=1: [REJECTED: Single-Writer Conflict] CAS conflict on '/example.com/alice/notes': expected version 3 (parent 2, 06c2e8126d...), got version 2 (parent 1, a1652bf91e",
+      "detail": "先着=[dfs push] OK v2 (epoch=1) | root=c92e4084dc18... | sent=10839 B | 76.7 ms\n  Sn / 後着 rc=1: [REJECTED: Single-Writer Conflict] CAS conflict on '/example.com/alice/notes': expected version 3 (parent 2, 06c2e8126d...), got version 2 (parent 1, a1652bf91e",
       "elapsed_ms": 239.0
     },
     {

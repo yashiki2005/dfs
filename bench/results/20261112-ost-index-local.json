@@ -1,5 +1,5 @@
 {
-  "schema": "dfs5-ost-index-bench-v1",
+  "schema": "dfs-ost-index-bench-v1",
   "measured_at_utc": "2026-11-12T12:20:00+00:00",
   "payload": {
     "files": 20,

@@ -1,4 +1,4 @@
-# L5 ファイルシステム抽象 (`dfs5.fs`)
+# L5 ファイルシステム抽象 (`dfs.fs`)
 
 ## 目的
 
@@ -36,7 +36,7 @@ NFS / SMB / 外付け exFAT 上では `copy` に落ちる。
 ## API
 
 ```python
-from dfs5.fs import fs, FileSystem
+from dfs.fs import fs, FileSystem
 
 f = fs("/path/to/mount")
 f.info()            # {'backend': 'reflink', 'cow': True, ...}
@@ -48,15 +48,15 @@ f.materialize(snapshot_path, "restored")
 CLI:
 
 ```
-dfs5cli fs info <dir>
-dfs5cli fs snapshot <dir> v1
-dfs5cli fs materialize <dir> out --src <snapshot>
+dfscli fs info <dir>
+dfscli fs snapshot <dir> v1
+dfscli fs materialize <dir> out --src <snapshot>
 ```
 
 ## 非対応と将来
 
 - Windows ReFS の block clone は実装済みだが、NTFS では使えない。
-  NTFS で CoW を得るには minifilter ドライバが必要で、dfs5 本体としては配布しない。
+  NTFS で CoW を得るには minifilter ドライバが必要で、dfs 本体としては配布しない。
 - btrfs subvolume / `btrfs send|receive` によるディレクトリ単位 CoW は未実装
   (`fast_clone` の別実装として予約)。
 - 透過圧縮・重複排除は L3 の責務であり、この層では扱わない。

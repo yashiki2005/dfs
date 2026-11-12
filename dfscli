@@ -1,0 +1,31 @@
+#!/bin/sh
+# dfscli: dfs をローカルで扱う CLI（rclone ライク）の起動ラッパー。
+#
+# `cryptography` の入った Python を探して dfs/cli_main.py を呼ぶ。
+# 環境変数 DFSCLI_PYTHON で明示してもよい。
+set -eu
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ -n "${DFSCLI_PYTHON:-}" ]; then
+    cd "$SELF_DIR"
+    exec "$DFSCLI_PYTHON" -m dfs.cli_main "$@"
+fi
+
+for candidate in \
+    "$HOME/dfs-venv/bin/python" \
+    "$SELF_DIR/.venv/bin/python" \
+    "$SELF_DIR/../.venv/bin/python" \
+    "$(command -v python3 2>/dev/null || true)"
+do
+    [ -n "$candidate" ] || continue
+    [ -x "$candidate" ] || continue
+    if "$candidate" -c 'import cryptography' >/dev/null 2>&1; then
+        cd "$SELF_DIR"
+        exec "$candidate" -m dfs.cli_main "$@"
+    fi
+done
+
+echo "dfscli: 'cryptography' の入った Python が見つかりません。" >&2
+echo "         DFSCLI_PYTHON=/path/to/python を指定してください。" >&2
+exit 127

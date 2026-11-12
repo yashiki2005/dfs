@@ -2,7 +2,7 @@
 
 ## 0. 目的と位置づけ
 
-本文書は `dfs5` の段階 3（L2: 所在地解決 — 名前から住所へ）の比較結果と仕様を記録する。
+本文書は `dfs` の段階 3（L2: 所在地解決 — 名前から住所へ）の比較結果と仕様を記録する。
 `DESIGN.md` §10 の問い 3「ロケータをどこに置くか」に答える。
 
 結論を先に書く。
@@ -18,11 +18,11 @@
 
 L2 がどのバックエンド（名簿 / DHT / DNS）で実装されていても、やり取りされるデータ構造は
 単一の正規化 JSON ペイロードと OpenSSH Ed25519 分離署名の組に統一する。
-実装は `dfs5/l2_registry.py` の `create_locator_envelope` / `verify_locator_envelope`。
+実装は `dfs/l2_registry.py` の `create_locator_envelope` / `verify_locator_envelope`。
 
 ### 1.1 ペイロード（署名対象）
 
-キーを辞書順にソートし、余白を含まない 1 行の UTF-8 JSON（`dfs5.crypto.canonical_json()`、末尾 LF 1 バイト）とする。
+キーを辞書順にソートし、余白を含まない 1 行の UTF-8 JSON（`dfs.crypto.canonical_json()`、末尾 LF 1 バイト）とする。
 
 ```json
 {"delegation_epoch":1,"endpoints":["tls://192.168.1.50:9443"],"expires_at":1763086400,"head_hash":"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9","head_version":2,"path":"/example.com/alice","ttl":300}
@@ -45,7 +45,7 @@ L2 がどのバックエンド（名簿 / DHT / DNS）で実装されていて�
 {"payload":{...上記...},"signature":"-----BEGIN SSH SIGNATURE-----\n...\n-----END SSH SIGNATURE-----\n"}
 ```
 
-署名の名前空間は `dfs5-l2-locator-v1`。L1（`dfs5-delegation-v1`）や L4 と混同できないよう、
+署名の名前空間は `dfs-l2-locator-v1`。L1（`dfs-delegation-v1`）や L4 と混同できないよう、
 名前空間を必ず含める。
 
 ---

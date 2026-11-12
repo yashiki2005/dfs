@@ -13,12 +13,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5.crypto import ContentAddressedCrypto, NS_L4_LOG, ssh_sign, ssh_verify
+from dfs.crypto import ContentAddressedCrypto, NS_L4_LOG, ssh_sign, ssh_verify
 
 
 class SshVerifyTests(unittest.TestCase):
     def test_ed25519_verify_is_in_process(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_crypto_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_crypto_") as tmp:
             key = Path(tmp) / "key"
             subprocess.run(
                 ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
@@ -28,7 +28,7 @@ class SshVerifyTests(unittest.TestCase):
             payload = b"in-process verify"
             signature = ssh_sign(key, NS_L4_LOG, payload)
             with patch(
-                "dfs5.crypto.subprocess.run",
+                "dfs.crypto.subprocess.run",
                 side_effect=AssertionError("ssh_verify must not spawn ssh-keygen"),
             ):
                 self.assertTrue(
@@ -36,7 +36,7 @@ class SshVerifyTests(unittest.TestCase):
                 )
 
     def test_tampered_payload_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_crypto_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_crypto_") as tmp:
             key = Path(tmp) / "key"
             subprocess.run(
                 ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],

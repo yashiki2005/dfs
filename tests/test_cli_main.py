@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-dfs5/tests/test_cli_main.py
-rclone ライク CLI (`dfs5/cli_main.py`) の試験。
+dfs/tests/test_cli_main.py
+rclone ライク CLI (`dfs/cli_main.py`) の試験。
 
-ローカルに L2 名簿 (HTTP) と L3 OST (TLS) を 1 つ立て、`dfs5cli` の主要な操作を
+ローカルに L2 名簿 (HTTP) と L3 OST (TLS) を 1 つ立て、`dfscli` の主要な操作を
 実際に呼ぶ。サーバは既存の `cli.py` の部品をそのまま使う。
 """
 
@@ -23,14 +23,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5 import cli as cli_mod
-from dfs5.crypto import ContentAddressedCrypto
-from dfs5.l1_delegation import create_delegation_envelope
-from dfs5.l3_store import ChunkStoreServer
-from dfs5.l4_log import MerkleTreeBuilder
-from dfs5.l5_clayfs import DFS5Node
-from dfs5.cli_main import main as cli_main
-from dfs5.remotes import Remote, RemoteStore
+from dfs import cli as cli_mod
+from dfs.crypto import ContentAddressedCrypto
+from dfs.l1_delegation import create_delegation_envelope
+from dfs.l3_store import ChunkStoreServer
+from dfs.l4_log import MerkleTreeBuilder
+from dfs.l5_clayfs import DFSNode
+from dfs.cli_main import main as cli_main
+from dfs.remotes import Remote, RemoteStore
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,7 +52,7 @@ class LocalServer:
         cert, key = base / "ost_cert.pem", base / "ost_key.pem"
         subprocess.run(
             ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
-             "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=dfs5-test"],
+             "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=dfs-test"],
             check=True, capture_output=True,
         )
         self.ost = ChunkStoreServer(cert, key)
@@ -91,7 +91,7 @@ class RcloneCase(unittest.TestCase):
     """共通の準備（鍵・委譲・サーバ・リモート定義・データ）。"""
 
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5cli_test_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfscli_test_")
         self.base = Path(self._tmp.name)
         self.root_key = _keypair(self.base, "root")
         self.alice_key = _keypair(self.base, "alice")
@@ -110,8 +110,8 @@ class RcloneCase(unittest.TestCase):
         self.server.pstate.service.register_delegation(env, now=now)
 
         self.config_file = self.base / "remotes.json"
-        self.old_config_env = os.environ.get("DFS5_CONFIG")
-        os.environ["DFS5_CONFIG"] = str(self.config_file)
+        self.old_config_env = os.environ.get("DFS_CONFIG")
+        os.environ["DFS_CONFIG"] = str(self.config_file)
 
         self.workdir = self.base / "wd"
         store = RemoteStore(self.config_file)
@@ -130,13 +130,13 @@ class RcloneCase(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.old_config_env is None:
-            os.environ.pop("DFS5_CONFIG", None)
+            os.environ.pop("DFS_CONFIG", None)
         else:
-            os.environ["DFS5_CONFIG"] = self.old_config_env
+            os.environ["DFS_CONFIG"] = self.old_config_env
         self._tmp.cleanup()
 
     def run_cli(self, *argv: str) -> int:
-        """`dfs5cli` を同じプロセスで実行する（出力はそのまま出る）。"""
+        """`dfscli` を同じプロセスで実行する（出力はそのまま出る）。"""
         return cli_main(list(argv))
 
     def test_config_can_omit_ost_and_path(self) -> None:
@@ -164,11 +164,11 @@ class RcloneCase(unittest.TestCase):
         # touch が L2 から ost と path を解決して初期化する
         self.assertEqual(self.run_cli("touch", "t:"), 0)
         cfg = json.loads(
-            (self.workdir / ".clayfs" / "dfs5_config.json").read_text(encoding="utf-8")
+            (self.workdir / ".clayfs" / "dfs_config.json").read_text(encoding="utf-8")
         )
         self.assertEqual(cfg["sub_path"], "/example.com/alice/notes")
         self.assertEqual(int(cfg["ost_port"]), self.server.ost.port)
-        cfg_path = self.workdir / ".clayfs" / "dfs5_config.json"
+        cfg_path = self.workdir / ".clayfs" / "dfs_config.json"
         if sys.platform != "win32":
             self.assertEqual(oct(cfg_path.stat().st_mode & 0o777), "0o600")
 
@@ -179,7 +179,7 @@ class RcloneCase(unittest.TestCase):
 
     def test_registry_host_only_gets_default_port(self) -> None:
         """--registry はホスト名だけでよい（ポートを補う）。"""
-        from dfs5.cli_main import normalize_registry
+        from dfs.cli_main import normalize_registry
 
         self.assertEqual(normalize_registry("172.16.1.60"), "http://172.16.1.60:9440")
         self.assertEqual(normalize_registry("http://host:1234"), "http://host:1234")
@@ -264,7 +264,7 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(rc, 2, "存在しない --key を受け入れた")
 
     def test_create_alias_exists(self) -> None:
-        """`dfs5cli create` は `dfs5cli config create` と同じ（短い入口）。"""
+        """`dfscli create` は `dfscli config create` と同じ（短い入口）。"""
         store = RemoteStore(self.config_file)
         store.remotes.pop("t", None)
         store.save()
@@ -303,10 +303,10 @@ class RcloneCase(unittest.TestCase):
                 warnings.simplefilter("ignore", DeprecationWarning)
                 pid, fd = pty.fork()
             if pid == 0:
-                os.environ["DFS5_CONFIG"] = str(config)
+                os.environ["DFS_CONFIG"] = str(config)
                 os.execv(
-                    str(ROOT / "dfs5cli"),
-                    ["./dfs5cli", "create", name,
+                    str(ROOT / "dfscli"),
+                    ["./dfscli", "create", name,
                      "--registry", self.server.registry_url,
                      "--key", str(self.alice_key),
                      "--key-dir", str(keys),
@@ -408,7 +408,7 @@ class RcloneCase(unittest.TestCase):
 
     def test_registry_advertises_ost_and_paths(self) -> None:
         """L2 が L3 の場所と、登録済みパス（書き手公開鍵つき）を返す。"""
-        from dfs5 import cli as cli_mod
+        from dfs import cli as cli_mod
 
         client = cli_mod.RemoteRegistryClient(self.server.registry_url)
         info = client.ost_info()
@@ -750,7 +750,7 @@ class RcloneCase(unittest.TestCase):
         self.assertIn("keep.txt", paths, "--delete なしの sync がリモートのファイルを消した")
 
     def test_rm_file_leaves_empty_dir(self) -> None:
-        """ファイルを消すと空ディレクトリが残る（dfs5 は空も版に残す）。"""
+        """ファイルを消すと空ディレクトリが残る（dfs は空も版に残す）。"""
         self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
 
         # docs/sub は空になるが、ディレクトリ自体は残る

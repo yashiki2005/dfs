@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-dfs5.fs
+dfs.fs
 OS のファイルシステム抽象 (CoW があれば CoW、無ければ OS 既定) のラッパ。
 
-dfs5 の L5 (ローカル実体化・スナップショット) は、このパッケージだけに依存する。
+dfs の L5 (ローカル実体化・スナップショット) は、このパッケージだけに依存する。
 呼び出し側は OS 固有の CoW API (clonefile / FICLONE / block clone) を意識せず、
 ``FileSystem`` の ``snapshot`` / ``clone`` / ``materialize`` を使う。
 

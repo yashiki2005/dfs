@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dfs5/tests/test_evil_suite.py
+dfs/tests/test_evil_suite.py
 段階 1・2・4 のセキュリティ・耐攻撃性（evil 試験 A2, A5, B6, B7、L1 5不変条件、単一書き手排他、委譲失効）回帰試験。
 """
 
@@ -13,16 +13,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5.crypto import ChunkIntegrityError
-from dfs5.l1_delegation import (
+from dfs.crypto import ChunkIntegrityError
+from dfs.l1_delegation import (
     DelegationError,
     create_delegation_envelope,
     verify_delegation_chain,
 )
-from dfs5.l2_registry import ConflictError, DirectoryRegistryService
-from dfs5.l3_store import ChunkStoreServer
-from dfs5.l4_log import RollbackDetectedError, SilentDropDetectedError
-from dfs5.l5_clayfs import DFS5Node
+from dfs.l2_registry import ConflictError, DirectoryRegistryService
+from dfs.l3_store import ChunkStoreServer
+from dfs.l4_log import RollbackDetectedError, SilentDropDetectedError
+from dfs.l5_clayfs import DFSNode
 
 
 def generate_ssh_keypair(dirpath: Path, name: str) -> tuple[Path, str]:
@@ -64,7 +64,7 @@ def generate_tls_cert(dirpath: Path) -> tuple[Path, Path]:
 class TestEvilSuite(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.tmpdir = tempfile.TemporaryDirectory(prefix="dfs5_evil_")
+        cls.tmpdir = tempfile.TemporaryDirectory(prefix="dfs_evil_")
         cls.base = Path(cls.tmpdir.name)
         cls.root_priv, cls.root_pub = generate_ssh_keypair(cls.base, "root")
         cls.alice_priv, cls.alice_pub = generate_ssh_keypair(cls.base, "alice")
@@ -76,7 +76,7 @@ class TestEvilSuite(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.tmpdir.cleanup()
 
-    def _create_env(self, test_id: str) -> tuple[ChunkStoreServer, DirectoryRegistryService, DFS5Node]:
+    def _create_env(self, test_id: str) -> tuple[ChunkStoreServer, DirectoryRegistryService, DFSNode]:
         ost = ChunkStoreServer(self.cert, self.key)
         reg = DirectoryRegistryService("/example.com", self.root_pub)
         del_env = create_delegation_envelope(
@@ -90,7 +90,7 @@ class TestEvilSuite(unittest.TestCase):
             expires_at=self.now + 10000,
         )
         reg.register_delegation(del_env, now=self.now)
-        node = DFS5Node(
+        node = DFSNode(
             name="alice_node",
             sub_path="/example.com/alice",
             mount_root=self.base / f"mount_{test_id}",
@@ -160,7 +160,7 @@ class TestEvilSuite(unittest.TestCase):
                 corrupted[-1] ^= 0xFF
                 ost.store[wid] = bytes(corrupted)
 
-            node_b = DFS5Node(
+            node_b = DFSNode(
                 "reader",
                 "/example.com/alice",
                 self.base / "mount_a2_b",

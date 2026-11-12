@@ -2,7 +2,7 @@
 """
 bench/e2e_wan.py
 WAN 実機試験: WireGuard 越しの拠点（Mac / Pi5 / Sakura）から Scaleway の
-dfs5 サーバへ push/pull し、高遅延・往復回数・耐障害性を測る。
+dfs サーバへ push/pull し、高遅延・往復回数・耐障害性を測る。
 
 `bench/e2e_lan.py` との違い:
   - L2/L3 の接続先と ssh 先を引数で指定できる（--server-host / --server-ssh）。
@@ -151,7 +151,7 @@ class Harness:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.result: dict = {
-            "schema": "dfs5-e2e-wan-v1",
+            "schema": "dfs-e2e-wan-v1",
             "label": args.label,
             "mode": args.mode,
             "measured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -175,7 +175,7 @@ class Harness:
         self.work = Path(args.work)
         self.remote_work = args.remote_work
         self.sub_path = "/example.com/alice/notes"
-        self.secret = "dfs5-wan-shared-secret"
+        self.secret = "dfs-wan-shared-secret"
         self.registry_url = f"http://{args.server_host}:{args.l2_port}"
         self.ost_endpoint = f"{args.server_host}:{args.l3_port}"
 
@@ -196,9 +196,9 @@ class Harness:
 
     def collect_metrics(self, out: str) -> None:
         for line in out.splitlines():
-            if line.startswith("[dfs5 metrics] "):
+            if line.startswith("[dfs metrics] "):
                 try:
-                    self.result["metrics"].append(json.loads(line[len("[dfs5 metrics] "):]))
+                    self.result["metrics"].append(json.loads(line[len("[dfs metrics] "):]))
                 except json.JSONDecodeError:
                     pass
 
@@ -223,15 +223,15 @@ class Harness:
             return self.args.remote_py
         return self.args.local_py
 
-    def client_dfs5(self, subcmd: str) -> str:
+    def client_dfs(self, subcmd: str) -> str:
         py = self.client_py()
         if self.args.client_ssh:
-            return f"cd {qpath(self.args.remote_src_path)} && {py} -m dfs5.cli {subcmd}"
-        return f"cd {shlex.quote(str(ROOT))} && {py} -m dfs5.cli {subcmd}"
+            return f"cd {qpath(self.args.remote_src_path)} && {py} -m dfs.cli {subcmd}"
+        return f"cd {shlex.quote(str(ROOT))} && {py} -m dfs.cli {subcmd}"
 
     def client_run(self, name: str, subcmd: str, expect: str | None = None,
                    timeout: float | None = None, metrics: bool = False) -> tuple[bool, str]:
-        cmd = self.client_dfs5(subcmd)
+        cmd = self.client_dfs(subcmd)
         if metrics:
             cmd += " --metrics"
         rc, out, ms = self.client_exec(cmd, timeout=timeout)
@@ -287,7 +287,7 @@ class Harness:
         (local_work / "keys").mkdir(parents=True, exist_ok=True)
 
         print("=" * 72)
-        print(f"dfs5 WAN 実機試験: label={args.label} mode={args.mode}")
+        print(f"dfs WAN 実機試験: label={args.label} mode={args.mode}")
         print(f"  サーバ : {args.server_host} (L2 {args.l2_port} / L3 {args.l3_port})")
         print(f"  クライアント: {'ssh ' + args.client_ssh if args.client_ssh else 'ローカル'}")
         print("=" * 72, flush=True)
@@ -345,13 +345,13 @@ class Harness:
 
         # ---- 7. push ----
         self.client_run("クライアント push", f"push --mount {qpath(client_mount)}",
-                        expect="[dfs5 push] OK", metrics=True)
+                        expect="[dfs push] OK", metrics=True)
         self.verdict("push_ok", self._last_ok())
 
         # ---- 8. reader init + pull ----
         self._init_mount("読取側 init", reader_mount, "wan-reader")
         self.client_run("読取側 pull", f"pull --mount {qpath(reader_mount)}",
-                        expect="[dfs5 pull] OK", metrics=True)
+                        expect="[dfs pull] OK", metrics=True)
         self.verdict("pull_ok", self._last_ok())
 
         # ---- 9. 内容一致 ----
@@ -450,7 +450,7 @@ class Harness:
             # 消すのはサーバ状態とマウントだけ。鍵 (keys/) は直前に配置済みなので残す。
             # 鍵まで消すと serve が root.pub を見つけられず起動に失敗する。
             self.server_exec(
-                "pkill -f 'dfs5[.]cli serve' 2>/dev/null; sleep 1; "
+                "pkill -f 'dfs[.]cli serve' 2>/dev/null; sleep 1; "
                 f"rm -rf {qpath(args.state_dir)} "
                 f"{qpath(self.remote_work)}/server_mount "
                 f"{qpath(self.remote_work)}/client_mount "
@@ -460,7 +460,7 @@ class Harness:
         launch = (
             f"mkdir -p {qpath(self.remote_work)} && "
             f"cd {qpath(args.remote_src_path)} && "
-            f"setsid nohup {args.remote_py} -m dfs5.cli serve --bind 0.0.0.0 "
+            f"setsid nohup {args.remote_py} -m dfs.cli serve --bind 0.0.0.0 "
             f"--registry-port {args.l2_port} --ost-port {args.l3_port} "
             f"--root-anchor /example.com --root-pubkey {qpath(self.remote_work)}/keys/root.pub "
             f"--state-dir {qpath(args.state_dir)} "
@@ -513,13 +513,13 @@ class Harness:
         args = self.args
         state_dir = self.work / "server_state"
         root_pub = self.work / "keys" / "root.pub"
-        sh(["pkill", "-f", "dfs5.cli serve"], timeout=30)
+        sh(["pkill", "-f", "dfs.cli serve"], timeout=30)
         time.sleep(1)
         if args.reset:
             shutil.rmtree(state_dir, ignore_errors=True)
         log = open(self.work / "serve.log", "w")
         proc = subprocess.Popen(
-            [args.local_py, "-m", "dfs5.cli", "serve", "--bind", "127.0.0.1",
+            [args.local_py, "-m", "dfs.cli", "serve", "--bind", "127.0.0.1",
              "--registry-port", str(args.l2_port), "--ost-port", str(args.l3_port),
              "--root-anchor", "/example.com", "--root-pubkey", str(root_pub),
              "--state-dir", str(state_dir)],
@@ -569,7 +569,7 @@ class Harness:
                    f"--signing-key {qpath(self.work)}/keys/root "
                    f"--writer-pubkey {qpath(self.work)}/keys/alice.pub "
                    f"--epoch 1 --base-version 0 --registry {self.registry_url}")
-            rc, out, ms = self.client_exec(self.client_dfs5(sub), timeout=self.args.timeout)
+            rc, out, ms = self.client_exec(self.client_dfs(sub), timeout=self.args.timeout)
             ok = rc == 0 and "Registered on" in out
             self.step("L1 委譲登録", ok, (f"rc={rc} " if rc else "") + out, ms)
             self.verdict("delegation_registered", ok)
@@ -580,7 +580,7 @@ class Harness:
                f"--signing-key {qpath(self.remote_work)}/keys/root "
                f"--writer-pubkey {qpath(self.remote_work)}/keys/alice.pub "
                f"--epoch 1 --base-version 0 --registry {self.registry_url}")
-        cmd = (f"cd {qpath(self.args.remote_src_path)} && {self.args.remote_py} -m dfs5.cli {sub}")
+        cmd = (f"cd {qpath(self.args.remote_src_path)} && {self.args.remote_py} -m dfs.cli {sub}")
         ok, out = self.server_exec(cmd, expect="Registered on", name="L1 委譲登録（サーバの L2）")
         self.verdict("delegation_registered", ok)
 
@@ -636,13 +636,13 @@ class Harness:
         self.step("競合試験の準備（reader 側の変更）", rc == 0, out)
 
         ok1, out1 = self.client_run("競合試験: 先着 push", f"push --mount {qpath(reader_mount)}",
-                                    expect="[dfs5 push] OK")
+                                    expect="[dfs push] OK")
         # 先着が成功して初めて、後着の拒否に意味がある
         touch2 = (f"printf '# concurrent from client\\n' > {qpath(client_mount)}/tree/todo.md && echo TOUCH2_OK")
         rc, out, ms = self.client_exec(touch2)
         self.step("競合試験の準備（client 側の変更）", rc == 0, out)
 
-        cmd = self.client_dfs5(f"push --mount {qpath(client_mount)}")
+        cmd = self.client_dfs(f"push --mount {qpath(client_mount)}")
         rc2, out2, ms2 = self.client_exec(cmd)
         rejected = rc2 != 0 and ("Conflict" in out2 or "REJECTED" in out2)
         ok = ok1 and rejected
@@ -664,7 +664,7 @@ class Harness:
             self.verdict("outage_handled", None)
             return
         ok_stop, _ = self.server_exec(
-            "pkill -f 'dfs5[.]cli serve'; sleep 1; "
+            "pkill -f 'dfs[.]cli serve'; sleep 1; "
             f"if curl -s -m 2 -o /dev/null -X POST http://127.0.0.1:{self.args.l2_port}/v1/resolve "
             "-H 'Content-Type: application/json' -d '{\"path\":\"/example.com\"}'; then "
             "echo STILL; else echo STOPPED; fi",
@@ -677,7 +677,7 @@ class Harness:
         self.client_exec(touch)
         budget_ms = (self.args.outage_timeout + 30.0) * 1000.0
         t0 = time.perf_counter()
-        rc, out, ms = self.client_exec(self.client_dfs5(f"push --mount {qpath(client_mount)}"),
+        rc, out, ms = self.client_exec(self.client_dfs(f"push --mount {qpath(client_mount)}"),
                                        timeout=self.args.outage_timeout + 20.0)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         handled = rc != 0 and elapsed_ms < budget_ms
@@ -718,7 +718,7 @@ class Harness:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="dfs5 WAN 実機試験ハーネス")
+    ap = argparse.ArgumentParser(description="dfs WAN 実機試験ハーネス")
     ap.add_argument("--mode", choices=["wan", "loopback"], default="wan")
     ap.add_argument("--label", default="wan", help="結果のラベル（ファイル名に使う）")
     ap.add_argument("--server-host", required=True, help="L2/L3 サーバの IP またはホスト名")
@@ -729,12 +729,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--l3-port", type=int, default=19443)
     ap.add_argument("--client-ssh", help="クライアントとして ssh する先（Pi5 など）。省略時はローカル")
     ap.add_argument("--client-key", default="~/.ssh/pi-mock-test")
-    ap.add_argument("--remote-src-path", default="~/src/dfs5", help="ssh 先の dfs5 リポジトリパス")
+    ap.add_argument("--remote-src-path", default="~/src/dfs", help="ssh 先の dfs リポジトリパス")
     ap.add_argument("--remote-py", default="python3")
     ap.add_argument("--local-py", default=str(Path.home() / "dfs-venv" / "bin" / "python"))
-    ap.add_argument("--work", default="/tmp/dfs5_wan", help="制御側（ローカル）の作業ディレクトリ")
-    ap.add_argument("--remote-work", default="~/dfs5_wan", help="ssh 先の作業ディレクトリ")
-    ap.add_argument("--state-dir", default="~/dfs5_wan/server_state")
+    ap.add_argument("--work", default="/tmp/dfs_wan", help="制御側（ローカル）の作業ディレクトリ")
+    ap.add_argument("--remote-work", default="~/dfs_wan", help="ssh 先の作業ディレクトリ")
+    ap.add_argument("--state-dir", default="~/dfs_wan/server_state")
     ap.add_argument("--files", type=int, default=20)
     ap.add_argument("--file-size", type=int, default=128 * 1024)
     ap.add_argument("--chunk-count", type=int, default=0,

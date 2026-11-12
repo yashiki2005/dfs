@@ -1,21 +1,21 @@
-# ローカルにサーバを立てる（`dfs5svc`）
+# ローカルにサーバを立てる（`dfssvc`）
 
 ## 0. 目的と位置づけ
 
-`dfs5 serve` は状態ディレクトリ・root 公開鍵・L2/L3 のポートをすべて自分で用意する。
+`dfs serve` は状態ディレクトリ・root 公開鍵・L2/L3 のポートをすべて自分で用意する。
 層を確かめるにはそれでよいが、「ローカルで 1 つ立てて試す」には手数が多い。
-`dfs5svc` はその入口で、次を肩代わりする。
+`dfssvc` はその入口で、次を肩代わりする。
 
 1. **連続した空きポートを 2 つ探し**、1 つ目を L2（名簿）、2 つ目を L3（OST）に割り当てる。
 2. root の鍵（L1 権威の Ed25519）と、**書き手の鍵**（L4 のログに署名する人）が無ければ作る。
-3. 状態ディレクトリを用意し、`dfs5 serve` を起動する。OST チャンクだけを
+3. 状態ディレクトリを用意し、`dfs serve` を起動する。OST チャンクだけを
    別ディスクへ置く場合は `--ost-dir` を使う。
 4. 立ち上がりを待って確認し、**書き手への委譲を登録する**。
-5. 接続に必要な値を記録する（`~/.config/dfs5/services.json`）。
+5. 接続に必要な値を記録する（`~/.config/dfs/services.json`）。
 6. `stop` / `list` / `status` / `env` / `dnssec` / `logs` で後始末と確認ができる。
 
-- 実装: `dfs5/svc.py`
-- エントリポイント: `./dfs5svc`
+- 実装: `dfs/svc.py`
+- エントリポイント: `./dfssvc`
 - 試験: `tests/test_svc_cli.py`
 
 ---
@@ -49,16 +49,16 @@ L2 と L3 は別のポートで待ち受ける。連続した空きを 2 つ取�
 ## 2. コマンド
 
 ```text
-dfs5svc start [--name NAME] [--host HOST] [--port N] [--advertise HOST]
+dfssvc start [--name NAME] [--host HOST] [--port N] [--advertise HOST]
               [--state-dir DIR] [--ost-dir DIR] [--root-key FILE] [--root-anchor PATH]
               [--wait SECONDS] [--foreground] [--force]
-dfs5svc list
-dfs5svc status [NAME]
-dfs5svc stop   [NAME] [--forget]
-dfs5svc env    [NAME] [--workdir DIR]
-dfs5svc dnssec [NAME] [--domain DOMAIN] [--primary-url URL]
+dfssvc list
+dfssvc status [NAME]
+dfssvc stop   [NAME] [--forget]
+dfssvc env    [NAME] [--workdir DIR]
+dfssvc dnssec [NAME] [--domain DOMAIN] [--primary-url URL]
                      [--secondary-url URL] [--ttl SECONDS] [--epoch N]
-dfs5svc logs   [NAME] [-n LINES]
+dfssvc logs   [NAME] [-n LINES]
 ```
 
 `--json` を付けると、`start` / `list` / `status` の結果を機械可読で出す。
@@ -71,12 +71,12 @@ dfs5svc logs   [NAME] [-n LINES]
 | `--host` | `127.0.0.1` | bind するアドレス。外から使うなら `0.0.0.0` |
 | `--advertise` | `--host` から推定 | L2 が L3 の場所として広告するホスト |
 | `--port` | `19440` | この番号から連続した空きを探す |
-| `--state-dir` | `~/dfs5svc/<name>/server` | サーバの状態（チャンクと名簿） |
+| `--state-dir` | `~/dfssvc/<name>/server` | サーバの状態（チャンクと名簿） |
 | `--ost-dir` | `<state-dir>/ost_chunks` | L3 OST チャンクの保存先。外付け SSD などに分離できる |
-| `--root-key` | `~/dfs5svc/<name>/keys/root` | L1 権威の Ed25519 鍵（無ければ作る） |
+| `--root-key` | `~/dfssvc/<name>/keys/root` | L1 権威の Ed25519 鍵（無ければ作る） |
 | `--root-anchor` | `/example.com` | 根のパス |
-| `--writer-key` | `~/dfs5svc/<name>/keys/writer` | 書き手の Ed25519 鍵（無ければ作る） |
-| `--path` | `<root-anchor>/<name>` | 委譲するサブツリー。`dfs5cli` は鍵から引く |
+| `--writer-key` | `~/dfssvc/<name>/keys/writer` | 書き手の Ed25519 鍵（無ければ作る） |
+| `--path` | `<root-anchor>/<name>` | 委譲するサブツリー。`dfscli` は鍵から引く |
 | `--no-delegate` | — | 委譲を登録しない（サーバだけ立てる） |
 | `--wait` | `30` | 起動を待つ秒数 |
 | `--foreground` | — | 前面で動かす（Ctrl-C で停止） |
@@ -84,12 +84,12 @@ dfs5svc logs   [NAME] [-n LINES]
 
 ### 2.2 記録
 
-`~/.config/dfs5/services.json`（600）に置く。`start` で書き、`stop` で PID を 0 にし、
+`~/.config/dfs/services.json`（600）に置く。`start` で書き、`stop` で PID を 0 にし、
 `--forget` で消す。
 
 ```json
 {
-  "schema": "dfs5-services-v1",
+  "schema": "dfs-services-v1",
   "services": {
     "dev": {
       "name": "dev",
@@ -97,13 +97,13 @@ dfs5svc logs   [NAME] [-n LINES]
       "ost_port": 19442,
       "bind": "127.0.0.1",
       "advertise": "127.0.0.1",
-      "state_dir": "~/dfs5svc/dev/server",
-      "root_key": "~/dfs5svc/dev/keys/root",
-      "writer_key": "~/dfs5svc/dev/keys/writer",
+      "state_dir": "~/dfssvc/dev/server",
+      "root_key": "~/dfssvc/dev/keys/root",
+      "writer_key": "~/dfssvc/dev/keys/writer",
       "sub_path": "/example.com/dev",
       "role": "primary",
       "role_epoch": 1,
-      "ost_dir": "/Volumes/ExtSSD/dfs5/ost/dev",
+      "ost_dir": "/Volumes/ExtSSD/dfs/ost/dev",
       "pid": 12345
     }
   }
@@ -117,15 +117,15 @@ dfs5svc logs   [NAME] [-n LINES]
 `--state-dir` に残り、L3 の暗号化チャンクだけが `--ost-dir` に置かれる。
 
 ```bash
-dfs5svc start --name dev --ost-dir /Volumes/ExtSSD/dfs5/ost/dev
+dfssvc start --name dev --ost-dir /Volumes/ExtSSD/dfs/ost/dev
 ```
 
 ### 2.3 委譲まで自動で登録する
 
-`dfs5 serve` を上げただけでは、リモートは空である（`/v1/paths` が空）。そのため
-`dfs5cli` はサブツリーを解決できない。`dfs5svc start` はここまで面倒を見る。
+`dfs serve` を上げただけでは、リモートは空である（`/v1/paths` が空）。そのため
+`dfscli` はサブツリーを解決できない。`dfssvc start` はここまで面倒を見る。
 
-- 書き手の Ed25519 鍵を `~/dfs5svc/<name>/keys/writer` に用意する。
+- 書き手の Ed25519 鍵を `~/dfssvc/<name>/keys/writer` に用意する。
 - 根から見て途中の階層にも委譲を張る（L1 は多段を要求する）。`/example.com/team/notes` なら
   `/example.com/team` を経て末端へ至る。中間は root の書き手で作る。
 - 末端は書き手の鍵へ委譲する。
@@ -142,10 +142,10 @@ dfs5svc start --name dev --ost-dir /Volumes/ExtSSD/dfs5/ost/dev
 ### 2.4 DNSSEC TXT を出力する
 
 `dnssec` は、サービス記録の root 公開鍵・root アンカー・registry URL から
-`_dfs5.<domain>` TXT に置く JSON を生成する。
+`_dfs.<domain>` TXT に置く JSON を生成する。
 
 ```bash
-dfs5svc dnssec dev
+dfssvc dnssec dev
 ```
 
 既定のドメインは `root_anchor` の先頭要素（`/example.com/dev` なら
@@ -153,7 +153,7 @@ dfs5svc dnssec dev
 必要に応じて上書きする。
 
 ```bash
-dfs5svc dnssec dev \
+dfssvc dnssec dev \
   --domain yashiki.top \
   --primary-url https://l2.yashiki.top \
   --secondary-url https://l2-b.yashiki.top \
@@ -162,7 +162,7 @@ dfs5svc dnssec dev \
 ```
 
 標準出力は TXT にそのまま入れる 1 行 JSON で、レコード名は標準エラーに出す。
-`--json` を付けると整形 JSON になる（`dfs5svc --json dnssec dev`）。
+`--json` を付けると整形 JSON になる（`dfssvc --json dnssec dev`）。
 生成値は discovery パーサで再検証し、primary がちょうど 1 つであること、
 URL と TTL が有効であることを確認する。
 
@@ -173,46 +173,46 @@ URL と TTL が有効であることを確認する。
 ### 3.1 立てて、つないで、書く
 
 ```bash
-cd ~/src/dfs5
+cd ~/src/dfs
 
 # 1. サーバを立てる（連続した空きポートを選び、鍵と委譲まで用意する）
-./dfs5svc start --name dev
+./dfssvc start --name dev
 
-# 2. dfs5cli につなぐ。L3 もサブツリーも L2 が知っているので --ost も --path も不要
-./dfs5cli config create dev \
+# 2. dfscli につなぐ。L3 もサブツリーも L2 が知っているので --ost も --path も不要
+./dfscli config create dev \
     --registry http://127.0.0.1:19441 \
-    --key ~/dfs5svc/dev/keys/writer \
+    --key ~/dfssvc/dev/keys/writer \
     --secret dev-secret
 
 # 3. 使う
 mkdir -p /tmp/sample
 echo "hello" > /tmp/sample/hello.txt
-./dfs5cli copy /tmp/sample dev:
-./dfs5cli ls   dev:
-./dfs5cli cat  dev:hello.txt
+./dfscli copy /tmp/sample dev:
+./dfscli ls   dev:
+./dfscli cat  dev:hello.txt
 ```
 
-`./dfs5svc env dev` を実行すると、4 の行（`--secret` を除く）をそのまま出せる。
+`./dfssvc env dev` を実行すると、4 の行（`--secret` を除く）をそのまま出せる。
 
 ```
-$ ./dfs5svc env dev
+$ ./dfssvc env dev
 # dev に接続する（L3 は L2 が広告するので --ost は不要）
-dfs5cli config create dev --registry http://127.0.0.1:19441 --key ~/dfs5svc/dev/keys/writer --secret <tree_secret>
+dfscli config create dev --registry http://127.0.0.1:19441 --key ~/dfssvc/dev/keys/writer --secret <tree_secret>
 
 # 参考: このサーバの L3 は tls://127.0.0.1:19442
-#        書き手の鍵 : ~/dfs5svc/dev/keys/writer（--key にそのまま使える）
+#        書き手の鍵 : ~/dfssvc/dev/keys/writer（--key にそのまま使える）
 #        サブツリー : /example.com/dev（L2 が鍵から引くので --path は不要）
-#        L1 の root : ~/dfs5svc/dev/keys/root（--signing-key に使う）
+#        L1 の root : ~/dfssvc/dev/keys/root（--signing-key に使う）
 ```
 
 ### 3.2 確認と後始末
 
 ```bash
-./dfs5svc list             # 記録済みのサービスと稼働状況
-./dfs5svc status dev       # 詳細と L2 の応答確認
-./dfs5svc logs dev -n 20   # ログの末尾
-./dfs5svc stop dev         # 止める（記録は残す）
-./dfs5svc stop dev --forget  # 止めて記録からも消す
+./dfssvc list             # 記録済みのサービスと稼働状況
+./dfssvc status dev       # 詳細と L2 の応答確認
+./dfssvc logs dev -n 20   # ログの末尾
+./dfssvc stop dev         # 止める（記録は残す）
+./dfssvc stop dev --forget  # 止めて記録からも消す
 ```
 
 `stop` は `SIGTERM` を送り、10 秒待って落ちなければ `SIGKILL` にする。
@@ -250,22 +250,22 @@ dfs5cli config create dev --registry http://127.0.0.1:19441 --key ~/dfs5svc/dev/
 
 - **認証は無い。** `--host 0.0.0.0` で立てるなら WireGuard / LAN の中に限ること。
   完全性は L4 の署名で担保する。
-- **`tree_secret` は `dfs5svc` が作らない。** サーバに置かない共有秘密なので、
-  `dfs5cli config create --secret` で自分で渡す。
+- **`tree_secret` は `dfssvc` が作らない。** サーバに置かない共有秘密なので、
+  `dfscli config create --secret` で自分で渡す。
 - **`stop` は記録を残す。** 同じ名前で立て直すと `--force` が要る。消すなら `--forget`。
 - **root 鍵は使い回す。** 同じ `--name` で立て直すと、以前の委譲がそのまま使える。
   作り直したいときは `--root-key` を別の場所にする。
-- **`dfs5cli` の参照系は作業ディレクトリを自動で作る。** `ls` / `cat` / `size` / `check` などは
+- **`dfscli` の参照系は作業ディレクトリを自動で作る。** `ls` / `cat` / `size` / `check` などは
   リモートの版を読むだけだが、接続情報（解決した ost と sub_path）と HeadPin を置く場所が
   要る。`touch` を先に打たせず、その場で作る。
 
 ## 6. 落とし穴の記録
 
 - **参照系に `touch` を要求していた。** 最初、`open_remote(create=False)` で実装したため、
-  `dfs5cli ls` が「not initialized、先に touch を打て」と返していた。読み取り専用なのに
+  `dfscli ls` が「not initialized、先に touch を打て」と返していた。読み取り専用なのに
   初期化を求めるのは筋が悪いので、参照系も `create=True` にした。
-- **`dfs5svc start` が委譲を登録していなかった。** サーバは立てば動くが、リモートが空なので
-  `ls` に出せるものが無く、`dfs5cli` はサブツリーを解決できない。start に含めた。
+- **`dfssvc start` が委譲を登録していなかった。** サーバは立てば動くが、リモートが空なので
+  `ls` に出せるものが無く、`dfscli` はサブツリーを解決できない。start に含めた。
 - **`SO_REUSEADDR` の bind で空きを誤判定していた。** §1.1 の 2 段判定に直した。
 - **多段委譲の有効期間が同じで、時刻のずれで落ちていた。** 中間と末端を別プロセスで
   署名するため、1 秒ずれるだけで子の `expires_at` が親を超え、Invariant 3 に落ちる。

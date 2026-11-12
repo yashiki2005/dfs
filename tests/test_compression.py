@@ -10,13 +10,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5.compression import effective_policy, set_xattr
+from dfs.compression import effective_policy, set_xattr
 
 
 @unittest.skipIf(sys.platform == "win32", "xattr test is POSIX-only")
 class CompressionPolicyTests(unittest.TestCase):
     def test_nearest_directory_xattr_wins(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_policy_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_policy_") as tmp:
             root = Path(tmp) / "tree"
             nested = root / "src" / "vendor"
             other = root / "docs"

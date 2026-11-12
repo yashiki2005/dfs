@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-dfs5/tests/test_svc_cli.py
-`dfs5svc`（ローカルにサーバを立てるコマンド）の試験。
+dfs/tests/test_svc_cli.py
+`dfssvc`（ローカルにサーバを立てるコマンド）の試験。
 
-実際に dfs5 サーバを起動するので、各試験では一時ディレクトリを HOME に見立てて
+実際に dfs サーバを起動するので、各試験では一時ディレクトリを HOME に見立てて
 他のサービスとぶつからないようにする。プロセスは必ず後始末する。
 """
 
@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5.svc import (
+from dfs.svc import (
     Service,
     ServiceError,
     ServiceStore,
@@ -113,10 +113,10 @@ class DnssecOutputTests(unittest.TestCase):
     """サーバを立てずに DNSSEC TXT を生成する。"""
 
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5svc_dnssec_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfssvc_dnssec_")
         self.home = Path(self._tmp.name)
-        self.old_home = os.environ.get("DFS5_HOME")
-        os.environ["DFS5_HOME"] = str(self.home)
+        self.old_home = os.environ.get("DFS_HOME")
+        os.environ["DFS_HOME"] = str(self.home)
         root_pub = self.home / "root.pub"
         root_pub.write_text(
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestRoot root@test\n",
@@ -142,9 +142,9 @@ class DnssecOutputTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.old_home is None:
-            os.environ.pop("DFS5_HOME", None)
+            os.environ.pop("DFS_HOME", None)
         else:
-            os.environ["DFS5_HOME"] = self.old_home
+            os.environ["DFS_HOME"] = self.old_home
         self._tmp.cleanup()
 
     def test_dnssec_outputs_txt_json(self) -> None:
@@ -153,14 +153,14 @@ class DnssecOutputTests(unittest.TestCase):
         with redirect_stdout(out), redirect_stderr(err):
             self.assertEqual(svc_main(["dnssec", "a"]), 0)
         record = json.loads(out.getvalue().strip())
-        self.assertEqual(record["schema"], "dfs5-discovery-v1")
+        self.assertEqual(record["schema"], "dfs-discovery-v1")
         self.assertEqual(record["domain"], "example.com")
         self.assertEqual(record["root_anchor"], "/example.com")
         self.assertEqual(record["epoch"], 3)
         self.assertEqual(record["registries"], [
             {"role": "primary", "url": "http://127.0.0.1:19440"}
         ])
-        self.assertIn("_dfs5.example.com", err.getvalue())
+        self.assertIn("_dfs.example.com", err.getvalue())
 
     def test_dnssec_json_and_secondary_primary_requirement(self) -> None:
         out = io.StringIO()
@@ -196,23 +196,23 @@ class StartStopTests(unittest.TestCase):
     """実際にサーバを立てて、stop で確実に落ちるところまで。"""
 
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5svc_test_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfssvc_test_")
         self.base = Path(self._tmp.name)
         self.home = self.base / "home"
         self.home.mkdir()
         # HOME を差し替えて、記録と状態をこの試験の中に閉じる。
         # Windows の Path.home() は HOME を見ない（USERPROFILE を見る）ので、
-        # dfs5 独自の DFS5_HOME も併せて差し替える。
+        # dfs 独自の DFS_HOME も併せて差し替える。
         self.old_home = os.environ.get("HOME")
-        self.old_dfs5_home = os.environ.get("DFS5_HOME")
+        self.old_dfs_home = os.environ.get("DFS_HOME")
         os.environ["HOME"] = str(self.home)
-        os.environ["DFS5_HOME"] = str(self.home)
+        os.environ["DFS_HOME"] = str(self.home)
         self.service: Service | None = None
 
     def tearDown(self) -> None:
         # 記録に残っているサービスを全部止める。addCleanup は一時ディレクトリの
         # 後始末より後に走ることがあり、その前に確実に落としておく必要がある。
-        from dfs5.svc import _stop_process
+        from dfs.svc import _stop_process
 
         try:
             store = ServiceStore()
@@ -230,10 +230,10 @@ class StartStopTests(unittest.TestCase):
             os.environ.pop("HOME", None)
         else:
             os.environ["HOME"] = self.old_home
-        if self.old_dfs5_home is None:
-            os.environ.pop("DFS5_HOME", None)
+        if self.old_dfs_home is None:
+            os.environ.pop("DFS_HOME", None)
         else:
-            os.environ["DFS5_HOME"] = self.old_dfs5_home
+            os.environ["DFS_HOME"] = self.old_dfs_home
         self._tmp.cleanup()
 
     def test_start_then_stop(self) -> None:
@@ -259,7 +259,7 @@ class StartStopTests(unittest.TestCase):
         self.service = None
 
     def test_start_registers_delegation(self) -> None:
-        """start は書き手の鍵と委譲まで用意する（dfs5cli がそのまま使える）。"""
+        """start は書き手の鍵と委譲まで用意する（dfscli がそのまま使える）。"""
         start_port, _ = find_consecutive_free_ports(23000, 2, "127.0.0.1")
         self.assertEqual(svc_main(["start", "--name", "d", "--port", str(start_port)]), 0)
         service = ServiceStore().get("d")
@@ -295,14 +295,14 @@ class StartStopTests(unittest.TestCase):
         self.service = service
 
         # リモートを定義して、touch せずに ls する
-        from dfs5.remotes import Remote, RemoteStore
+        from dfs.remotes import Remote, RemoteStore
 
         remotes = RemoteStore()
         remotes.set(Remote(
             name="e", registry=service.registry_url, key=service.writer_key,
             secret="test-secret", workdir=str(self.home / "wd-e"),
         ))
-        from dfs5.cli_main import main as rclone_main
+        from dfs.cli_main import main as rclone_main
 
         self.assertEqual(rclone_main(["ls", "e:"]), 0, "ls が初期化を要求して失敗した")
 

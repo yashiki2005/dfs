@@ -18,12 +18,12 @@
 
 | 要素 | 方式 |
 |---|---|
-| 内容アドレス | `plain_id = HMAC(K_addr, "dfs5-plain-id-v1:" \|\| plaintext)`。`K_addr` は長期固定 |
+| 内容アドレス | `plain_id = HMAC(K_addr, "dfs-plain-id-v1:" \|\| plaintext)`。`K_addr` は長期固定 |
 | 暗号 | ChaCha20-Poly1305。**Nonce は毎回 `os.urandom(12)`** |
-| 暗号化鍵 | `K_enc = HMAC(tree_secret, "dfs5-chunk-key-v1:" \|\| plain_id)`。epoch で回してよい |
+| 暗号化鍵 | `K_enc = HMAC(tree_secret, "dfs-chunk-key-v1:" \|\| plain_id)`。epoch で回してよい |
 | 保管キー | `wire_id = SHA256(ciphertext)` |
 | 検証 | `wire_id` の照合 → AEAD タグ → 復号後の `plain_id` 再計算（A2 を三段で検出） |
-| 圧縮 | `DFS5B3` ヘッダーに codec と元サイズを保存。平文を圧縮してから暗号化 |
+| 圧縮 | `DFSB3` ヘッダーに codec と元サイズを保存。平文を圧縮してから暗号化 |
 
 `plain_id` の導出鍵と暗号化鍵を分離しているので、鍵ローテーション後も過去のチャンクと重複排除できる。
 Nonce がランダムでも重複排除率は落ちない（判定は Nonce を使わない）。
@@ -86,8 +86,8 @@ LAN の計測（§2）だけでは往復回数の問題が見えなかった。R
   （ディレクトリ塊は子の `wire_id` を含むため、部分差し替えでは整合しない）。
 - 読み出しは `download_directory` を 2 段に分ける。**ディレクトリ塊は幅優先で 1 階層 1 往復**、
   **ファイル塊は最後に store ごと・上限ごとに一括取得**する。1 回の応答が大きくなりすぎないよう、
-  マニフェストの `size` から先に分かる見積りで組を切る（`DFS5_BATCH_CHUNKS` = 既定 1024、
-  `DFS5_BATCH_BYTES` = 既定 16 MiB）。同じ `wire_id` は 1 回しか取りに行かない。
+  マニフェストの `size` から先に分かる見積りで組を切る（`DFS_BATCH_CHUNKS` = 既定 1024、
+  `DFS_BATCH_BYTES` = 既定 16 MiB）。同じ `wire_id` は 1 回しか取りに行かない。
 
 WAN 実測（20 × 128KB、RTT 278〜285ms、`specs/e2e_wan.md`）:
 
@@ -121,7 +121,7 @@ batch 導入の前後（20 × 128KB = 2.13MB）:
 - `TestPullBatch::test_flat_pull_is_two_round_trips` — 100 ファイルの pull が 2 往復。
 - `TestPullBatch::test_nested_pull_is_one_round_trip_per_level` — 入れ子は 1 階層 1 往復。
 - `TestPullBatch::test_same_chunk_fetched_once` — 同一内容の塊は 1 回しか取らない。
-- `TestPullBatch::test_batch_get_split_by_size_cap` — `DFS5_BATCH_CHUNKS` で組を絞れる。
+- `TestPullBatch::test_batch_get_split_by_size_cap` — `DFS_BATCH_CHUNKS` で組を絞れる。
 - `TestPullBatch::test_missing_chunk_is_reported` — 欠落は黙って欠けず例外になる。
 
 ---
@@ -130,7 +130,7 @@ batch 導入の前後（20 × 128KB = 2.13MB）:
 
 **結論: そのままでは使えない。** `DESIGN-ANSWER.md` の「無改造流用」という記述は誤りだった。
 
-| 項目 | mini_lustre OST | dfs5 L3 |
+| 項目 | mini_lustre OST | dfs L3 |
 |---|---|---|
 | フレーム | `>II`（JSON 長、payload 長）+ JSON + payload | 1 バイト opcode + 64 バイト wire_id + `>I` 長 + 本体 |
 | 要求 | `{"action":"write_chunk","args":{...}}` | 独自バイナリ `H`/`P`/`G`/`B`/`M`/`F` |
@@ -138,7 +138,7 @@ batch 導入の前後（20 × 128KB = 2.13MB）:
 | 塊の識別 | `(file_id, chunk_index)` | `wire_id`（暗号文の SHA-256） |
 | 一括操作 | 無し（個別 `read_chunk` / `write_chunk`） | `batch_has` / `batch_put_if_absent` / `batch_get` |
 
-実測: dfs5 の `H` フレームを mini_lustre の OST に送ると、最初の 4 バイト（`H` + wire_id の先頭 3 バイト）が
+実測: dfs の `H` フレームを mini_lustre の OST に送ると、最初の 4 バイト（`H` + wire_id の先頭 3 バイト）が
 JSON 長として読まれ、`RPC JSON length exceeds limit` でエラーになる。
 一方、mini_lustre の正しいフレームはそのまま通り、`{"status":"ok","bytes_written":5}` を返す。
 
@@ -159,7 +159,7 @@ JSON 長として読まれ、`RPC JSON length exceeds limit` でエラーにな�
 ### 4.2 mini_lustre へは RPC アダプタを挟む
 
 無改造流用はできない。将来 mini_lustre の OST を保管先に使う場合は、
-**dfs5 の `wire_id` を `file_id`/`chunk_index` に写すアダプタ層**を置く。
+**dfs の `wire_id` を `file_id`/`chunk_index` に写すアダプタ層**を置く。
 
 ただしこの方法では mini_lustre 側の識別子が内容に依存しないため、
 重複排除は**書き手の索引（byte 単位の省略）だけ**に頼ることになる。
@@ -167,7 +167,7 @@ OST 側で同じ塊を共有させることはできない。
 
 ### 4.3 現行の独自 L3 を維持する
 
-初期実装では `dfs5/l3_ost_adapter.py`（クラス名は `ChunkStoreServer`、モジュール別名 `dfs5/l3_store.py`）の TLS/TCP を使う。
+初期実装では `dfs/l3_ost_adapter.py`（クラス名は `ChunkStoreServer`、モジュール別名 `dfs/l3_store.py`）の TLS/TCP を使う。
 
 理由:
 

@@ -10,13 +10,13 @@ libp2p は OST を置き換えない。既存の OST / 複製 OST に続く**読
 - libp2p/QUIC: peer から必要な chunk だけを取得
 - BitTorrent: 版単位の長期アーカイブ
 
-libp2p は HTTP 専用でも QUIC 専用でもないが、dfs5 では **QUIC transport** を使う。
+libp2p は HTTP 専用でも QUIC 専用でもないが、dfs では **QUIC transport** を使う。
 TCP はこの環境で別プロセス間のカスタムストリームが動作しなかったため採用しない。
 
 ## プロトコル
 
 ```text
-/dfs5/chunk/1.0.0
+/dfs/chunk/1.0.0
 
 request    = op(1) + count(4, BE) + wire_id[count](64 bytes)
 H response = "O" + flags[count](1 byte each)
@@ -28,12 +28,12 @@ G response = "O" + (length(4, BE) + blob)[count]
 
 ## サーバ
 
-py-libp2p のホストはプロセスごとの Trio ループで動かす。`dfs5 serve` のスレッドに
+py-libp2p のホストはプロセスごとの Trio ループで動かす。`dfs serve` のスレッドに
 同居させず、専用プロセスで起動する。
 
 ```bash
-dfs5cli libp2p-serve \
-  --chunks-dir ~/.dfs5_server/ost_chunks \
+dfscli libp2p-serve \
+  --chunks-dir ~/.dfs_server/ost_chunks \
   --listen /ip4/0.0.0.0/udp/0/quic-v1
 ```
 
@@ -47,12 +47,12 @@ announce 後に保存された chunk が対象になる。
 ## クライアント
 
 ```bash
-dfs5cli create scw \
+dfscli create scw \
   --registry http://primary:9440 \
   --libp2p-peer /ip4/203.0.113.10/udp/19443/quic-v1/p2p/12D3KooW...
 ```
 
-`DFS5Node` の読み取り候補は次の順になる。
+`DFSNode` の読み取り候補は次の順になる。
 
 1. 主 OST
 2. 複製 OST
@@ -69,7 +69,7 @@ pre-shared key を libp2p host に渡す。PSK は設定ファイル内で秘密
 ## 制約
 
 - peer discovery はまだ静的設定。Kademlia provider record / mDNS は未実装
-- libp2p サーバは独立プロセス。`dfs5 serve` からの自動起動は未実装
+- libp2p サーバは独立プロセス。`dfs serve` からの自動起動は未実装
 - サーバは chunk ディレクトリを読む。メモリ上の OST を直接配信するには IPC が必要
 - QUIC の UDP ポート、NAT、firewall、relay の運用が必要
 - libp2p 自体は retention / seeding incentive を持たない

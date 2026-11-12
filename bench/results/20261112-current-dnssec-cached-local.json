@@ -1,5 +1,5 @@
 {
-  "schema": "dfs5-dnssec-bench-v1",
+  "schema": "dfs-dnssec-bench-v1",
   "measured_at_utc": "2026-11-12T10:07:47+00:00",
   "environment": {
     "platform": "macOS-27.3-arm64-arm-64bit",

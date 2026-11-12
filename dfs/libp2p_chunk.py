@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""libp2p/QUIC 上の読み取り専用 dfs5 chunk source。
+"""libp2p/QUIC 上の読み取り専用 dfs chunk source。
 
-プロトコル ``/dfs5/chunk/1.0.0``:
+プロトコル ``/dfs/chunk/1.0.0``:
 
   request    = op(1) + count(4, BE) + wire_id[count](64 bytes)
   H response = "O" + flags[count](1 byte each)
@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence
 from .crypto import ChunkIntegrityError
 from .l2_registry import ServiceUnavailableError
 
-PROTOCOL_ID = "/dfs5/chunk/1.0.0"
+PROTOCOL_ID = "/dfs/chunk/1.0.0"
 MAX_BATCH_ITEMS = 65_536
 MAX_BLOB_BYTES = 256 * 1024 * 1024
 MAX_FRAME_BYTES = 512 * 1024 * 1024
@@ -83,7 +83,7 @@ class Libp2pChunkServer:
     """ローカルの chunk 辞書を libp2p/QUIC で配布する読み取り専用サーバ。
 
     py-libp2p のホストはプロセスごとの Trio ループで動かす必要があるため、
-    このサーバは専用プロセス（``python -m dfs5.libp2p_chunk``）で起動する。
+    このサーバは専用プロセス（``python -m dfs.libp2p_chunk``）で起動する。
     """
 
     def __init__(
@@ -310,8 +310,8 @@ def _main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="python -m dfs5.libp2p_chunk",
-        description="Serve a dfs5 chunk directory over libp2p/QUIC",
+        prog="python -m dfs.libp2p_chunk",
+        description="Serve a dfs chunk directory over libp2p/QUIC",
     )
     parser.add_argument("--chunks-dir", required=True)
     parser.add_argument(

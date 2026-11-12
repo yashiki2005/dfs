@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-dfs5/cli.py
-Mac と raspi5 のターミナルから直接実行できる dfs5 CLI エントリポイント。
+dfs/cli.py
+Mac と raspi5 のターミナルから直接実行できる dfs CLI エントリポイント。
 
 サブコマンド:
   - serve    : L2 名簿 (HTTP JSON RPC) と L3 OST (TLS/TCP) デーモンを起動
@@ -29,20 +29,20 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from dfs5.crypto import ChunkIntegrityError, normalize_path
-    from dfs5.l1_delegation import DelegationError, create_delegation_envelope
-    from dfs5.l2_registry import (
+    from dfs.crypto import ChunkIntegrityError, normalize_path
+    from dfs.l1_delegation import DelegationError, create_delegation_envelope
+    from dfs.l2_registry import (
         ConflictError,
         DirectoryRegistryService,
         RegistryError,
         ServiceUnavailableError,
     )
-    from dfs5.l2_cache import CachedRegistryClient
-    from dfs5.l3_store import ChunkStoreServer
-    from dfs5.l4_log import RollbackDetectedError, SilentDropDetectedError
-    from dfs5.l5_clayfs import DFS5Node
-    from dfs5.paths import restrict_to_owner
-    from dfs5.private_io import ensure_private_dir, write_private_json
+    from dfs.l2_cache import CachedRegistryClient
+    from dfs.l3_store import ChunkStoreServer
+    from dfs.l4_log import RollbackDetectedError, SilentDropDetectedError
+    from dfs.l5_clayfs import DFSNode
+    from dfs.paths import restrict_to_owner
+    from dfs.private_io import ensure_private_dir, write_private_json
 else:
     from .crypto import ChunkIntegrityError, normalize_path
     from .l1_delegation import DelegationError, create_delegation_envelope
@@ -55,7 +55,7 @@ else:
     from .l2_cache import CachedRegistryClient
     from .l3_store import ChunkStoreServer
     from .l4_log import RollbackDetectedError, SilentDropDetectedError
-    from .l5_clayfs import DFS5Node
+    from .l5_clayfs import DFSNode
     from .paths import restrict_to_owner
     from .private_io import ensure_private_dir, write_private_json
 
@@ -71,8 +71,8 @@ MAX_REGISTRY_BODY_BYTES = 8 * 1024 * 1024
 
 
 def l2_timeout() -> float:
-    """L2 HTTP タイムアウト秒（既定 10 秒、``DFS5_L2_TIMEOUT`` で変更）"""
-    raw = os.environ.get("DFS5_L2_TIMEOUT")
+    """L2 HTTP タイムアウト秒（既定 10 秒、``DFS_L2_TIMEOUT`` で変更）"""
+    raw = os.environ.get("DFS_L2_TIMEOUT")
     if raw is None or raw.strip() == "":
         return DEFAULT_L2_TIMEOUT
     try:
@@ -111,7 +111,7 @@ class RemoteRegistryClient:
         payload: Dict[str, Any],
         timeout: Optional[float],
     ) -> Dict[str, Any]:
-        """1 つの名簿へ POST する。タイムアウトは ``DFS5_L2_TIMEOUT``（既定 10 秒）。
+        """1 つの名簿へ POST する。タイムアウトは ``DFS_L2_TIMEOUT``（既定 10 秒）。
 
         高遅延 WAN では 1 往復だけで数百 ms かかるため、LAN 時代の 5 秒固定は
         切り詰めの原因になる。環境変数で伸ばせるようにしてある。
@@ -508,16 +508,16 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
 # ==========================================
 # 設定ロード・ノード構築ヘルパー
 # ==========================================
-CONFIG_FILENAME = "dfs5_config.json"
+CONFIG_FILENAME = "dfs_config.json"
 
 
 def load_node_from_mount(
     mount_dir: Path,
-) -> Tuple[DFS5Node, Dict[str, Any], CachedRegistryClient]:
+) -> Tuple[DFSNode, Dict[str, Any], CachedRegistryClient]:
     mount_root = mount_dir.expanduser().resolve()
     cfg_path = mount_root / ".clayfs" / CONFIG_FILENAME
     if not cfg_path.is_file():
-        raise SystemExit(f"Error: {mount_root} is not initialized (missing {cfg_path}). Run 'dfs5 init' first.")
+        raise SystemExit(f"Error: {mount_root} is not initialized (missing {cfg_path}). Run 'dfs init' first.")
 
     ensure_private_dir(cfg_path.parent)
     restrict_to_owner(cfg_path)
@@ -531,7 +531,7 @@ def load_node_from_mount(
         RemoteRegistryClient(reg_urls),
         mount_root / ".clayfs" / "l2_cache.json",
     )
-    node = DFS5Node(
+    node = DFSNode(
         name=cfg["node_name"],
         sub_path=cfg["sub_path"],
         mount_root=mount_root,
@@ -574,7 +574,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
             [
                 "openssl", "req", "-x509", "-newkey", "rsa:2048",
                 "-keyout", str(key), "-out", str(cert),
-                "-days", "365", "-nodes", "-subj", "/CN=dfs5-ost",
+                "-days", "365", "-nodes", "-subj", "/CN=dfs-ost",
             ],
             check=True,
             capture_output=True,
@@ -627,16 +627,16 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     threading.Thread(target=_watch_stop, daemon=True).start()
 
-    print(f"[dfs5 serve] Root Anchor : {args.root_anchor}")
-    print(f"[dfs5 serve] Role        : {pstate.role} (epoch={pstate.role_epoch})")
-    print(f"[dfs5 serve] State Dir   : {state_dir}")
-    print(f"[dfs5 serve] OST Dir     : {pstate.chunks_dir}")
-    print(f"[dfs5 serve] L2 Registry : http://{args.bind}:{args.registry_port}")
-    print(f"[dfs5 serve] L3 OST (TLS): {pstate.ost_endpoint}")
+    print(f"[dfs serve] Root Anchor : {args.root_anchor}")
+    print(f"[dfs serve] Role        : {pstate.role} (epoch={pstate.role_epoch})")
+    print(f"[dfs serve] State Dir   : {state_dir}")
+    print(f"[dfs serve] OST Dir     : {pstate.chunks_dir}")
+    print(f"[dfs serve] L2 Registry : http://{args.bind}:{args.registry_port}")
+    print(f"[dfs serve] L3 OST (TLS): {pstate.ost_endpoint}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[dfs5 serve] Shutting down...")
+        print("\n[dfs serve] Shutting down...")
     finally:
         with pstate.lock:
             pstate.save()
@@ -665,9 +665,9 @@ def cmd_promote(args: argparse.Namespace) -> None:
     data["role"] = "primary"
     data["role_epoch"] = requested
     write_private_json(state_file, data)
-    print(f"[dfs5 promote] primary role epoch -> {requested}")
-    print(f"[dfs5 promote] state: {state_file}")
-    print("[dfs5 promote] restart 'dfs5 serve' on this node with --role primary")
+    print(f"[dfs promote] primary role epoch -> {requested}")
+    print(f"[dfs promote] state: {state_file}")
+    print("[dfs promote] restart 'dfs serve' on this node with --role primary")
     print(f"               (or --role-epoch {requested})")
 
 
@@ -689,13 +689,13 @@ def cmd_delegate(args: argparse.Namespace) -> None:
 
     if args.output:
         Path(args.output).write_text(json.dumps(env, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        print(f"[dfs5 delegate] Wrote signed delegation envelope to {args.output}")
+        print(f"[dfs delegate] Wrote signed delegation envelope to {args.output}")
 
     if args.registry:
         client = RemoteRegistryClient(args.registry)
         verified = client.register_delegation(env, now=now)
         print(
-            f"[dfs5 delegate] Registered on {args.registry}: "
+            f"[dfs delegate] Registered on {args.registry}: "
             f"path={verified['path']} epoch={verified['epoch']} base_version={verified['base_version']}"
         )
 
@@ -720,7 +720,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     }
     cfg_path = clayfs_dir / CONFIG_FILENAME
     write_private_json(cfg_path, cfg)
-    print(f"[dfs5 init] Initialized mount at {mount_root}")
+    print(f"[dfs init] Initialized mount at {mount_root}")
     print(f"  Working tree : {tree_dir}")
     print(f"  Snapshots    : {clayfs_dir / 'snapshots'}")
 
@@ -750,7 +750,7 @@ def _emit_metrics(
         "tls_handshakes": int(ost.tls_handshakes),
         "payload_bytes": int(payload_bytes),
     }
-    print("[dfs5 metrics] " + json.dumps(row, sort_keys=True, ensure_ascii=False))
+    print("[dfs metrics] " + json.dumps(row, sort_keys=True, ensure_ascii=False))
 
 
 def cmd_push(args: argparse.Namespace) -> None:
@@ -769,7 +769,7 @@ def cmd_push(args: argparse.Namespace) -> None:
     try:
         log_env, snap_dir, wire_bytes = node.push(delegation_epoch=epoch, now=now, delegated_mounts=mounts)
     except ConflictError as e:
-        raise SystemExit(f"[REJECTED: Single-Writer Conflict] {e}\nHint: Run 'dfs5 pull' first.") from e
+        raise SystemExit(f"[REJECTED: Single-Writer Conflict] {e}\nHint: Run 'dfs pull' first.") from e
     except DelegationError as e:
         raise SystemExit(f"[REJECTED: L1 Delegation Error] {e}") from e
     except SilentDropDetectedError as e:
@@ -782,7 +782,7 @@ def cmd_push(args: argparse.Namespace) -> None:
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     p = log_env["payload"]
     print(
-        f"[dfs5 push] OK v{p['version']} (epoch={p['delegation_epoch']}) "
+        f"[dfs push] OK v{p['version']} (epoch={p['delegation_epoch']}) "
         f"| root={p['root_plain_id'][:12]}... | sent={wire_bytes} B | {elapsed_ms:.1f} ms"
     )
     print(f"  Snapshot saved at: {snap_dir}")
@@ -807,7 +807,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
         cfg["delegation_epoch"] = pin.delegation_epoch
         write_private_json(node.clayfs.clayfs_meta / CONFIG_FILENAME, cfg)
     print(
-        f"[dfs5 pull] OK v{pin.version} (epoch={pin.delegation_epoch}) "
+        f"[dfs pull] OK v{pin.version} (epoch={pin.delegation_epoch}) "
         f"| recv={node.read_ost.bytes_received} B | {elapsed_ms:.1f} ms"
     )
     print(f"  Working tree updated : {node.clayfs.work_tree}")
@@ -839,7 +839,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="dfs5", description="dfs5: Layered Single-Writer Distributed File System CLI")
+    parser = argparse.ArgumentParser(prog="dfs", description="dfs: Layered Single-Writer Distributed File System CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # serve
@@ -849,7 +849,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--ost-port", type=int, default=9443, help="L3 OST TLS port (default: 9443)")
     p_serve.add_argument("--root-anchor", default="/example.com", help="Root anchor path (default: /example.com)")
     p_serve.add_argument("--root-pubkey", required=True, help="Path to root anchor .pub file")
-    p_serve.add_argument("--state-dir", default="~/.dfs5_server", help="Server persistence directory")
+    p_serve.add_argument("--state-dir", default="~/.dfs_server", help="Server persistence directory")
     p_serve.add_argument(
         "--ost-dir",
         help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）",
@@ -877,7 +877,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote = sub.add_parser(
         "promote", help="停止中の registry state を primary に昇格する"
     )
-    p_promote.add_argument("--state-dir", default="~/.dfs5_server")
+    p_promote.add_argument("--state-dir", default="~/.dfs_server")
     p_promote.add_argument("--role-epoch", type=int)
     p_promote.set_defaults(func=cmd_promote)
 
@@ -895,7 +895,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_del.set_defaults(func=cmd_delegate)
 
     # init
-    p_init = sub.add_parser("init", help="Initialize a local dfs5 mount directory")
+    p_init = sub.add_parser("init", help="Initialize a local dfs mount directory")
     p_init.add_argument("--mount", required=True, help="Mount root directory")
     p_init.add_argument("--name", default="node", help="Node identifier (e.g. mac, raspi5)")
     p_init.add_argument("--path", required=True, help="Subtree path (e.g. /example.com/alice/notes)")

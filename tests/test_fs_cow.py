@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-dfs5/tests/test_fs_cow.py
-`dfs5.fs` (CoW があれば CoW、無ければ OS 既定) の試験。
+dfs/tests/test_fs_cow.py
+`dfs.fs` (CoW があれば CoW、無ければ OS 既定) の試験。
 
 CoW の有無によらず、スナップショットが作業ツリーから独立していることを確認する。
 ここが崩れるとロールバックの安全性が成立しない。
@@ -16,27 +16,27 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5.fs import CopyBackend, FileSystem, detect_backends, fs
-from dfs5.fs import core as fs_core
-from dfs5.fs.core import Capability
+from dfs.fs import CopyBackend, FileSystem, detect_backends, fs
+from dfs.fs import core as fs_core
+from dfs.fs.core import Capability
 
 
 class TestBackendDetection(unittest.TestCase):
     def test_copy_backend_is_always_available(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             infos = detect_backends(Path(tmp))
             names = [i.name for i in infos]
             self.assertIn("copy", names)
 
     def test_auto_never_raises_and_picks_something(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             f = fs(tmp)
             self.assertIsNotNone(f.backend)
             self.assertIn("capability", f.info())
 
     def test_detection_is_stable_across_calls(self) -> None:
         """probe の残留ファイルで 2 回目以降が誤検出しないこと。"""
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             root = Path(tmp)
             first = [i.name for i in detect_backends(root)]
             for _ in range(4):
@@ -48,7 +48,7 @@ class TestCopyBackendIsolation(unittest.TestCase):
     """実コピー backend で、スナップショットが独立していることを確かめる。"""
 
     def test_snapshot_survives_work_tree_overwrite(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             root = Path(tmp)
             f = FileSystem(root, backend="copy")
             target = f.work_tree / "note.txt"
@@ -61,7 +61,7 @@ class TestCopyBackendIsolation(unittest.TestCase):
             self.assertEqual(snap.read_text(encoding="utf-8"), "original")
 
     def test_snapshot_survives_file_deletion(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             f = FileSystem(Path(tmp), backend="copy")
             (f.work_tree / "a.txt").write_text("a", encoding="utf-8")
             (f.work_tree / "b.txt").write_text("b", encoding="utf-8")
@@ -72,7 +72,7 @@ class TestCopyBackendIsolation(unittest.TestCase):
             self.assertTrue((snap_dir / "b.txt").exists())
 
     def test_snapshot_excludes_clayfs_and_noise(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             root = Path(tmp)
             f = FileSystem(root, backend="copy")
             (f.work_tree / "keep.txt").write_text("k", encoding="utf-8")
@@ -84,7 +84,7 @@ class TestCopyBackendIsolation(unittest.TestCase):
             self.assertFalse((snap.path / "._keep.txt").exists())
 
     def test_symlink_is_recreated_not_followed(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             f = FileSystem(Path(tmp), backend="copy")
             (f.work_tree / "real.txt").write_text("real", encoding="utf-8")
             try:
@@ -98,7 +98,7 @@ class TestCopyBackendIsolation(unittest.TestCase):
             self.assertEqual(os.readlink(link), "real.txt")
 
     def test_take_snapshot_replaces_existing_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             f = FileSystem(Path(tmp), backend="copy")
             (f.work_tree / "a.txt").write_text("one", encoding="utf-8")
             f.take_snapshot("v1")
@@ -111,7 +111,7 @@ class TestCopyBackendIsolation(unittest.TestCase):
 
 class TestMaterialize(unittest.TestCase):
     def test_materialize_creates_independent_copy(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             root = Path(tmp)
             f = FileSystem(root, backend="copy")
             (f.work_tree / "a.txt").write_text("a", encoding="utf-8")
@@ -127,13 +127,13 @@ class TestMaterialize(unittest.TestCase):
 
 class TestBackendSelection(unittest.TestCase):
     def test_copy_forced_never_probes(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             f = FileSystem(Path(tmp), backend="copy")
             self.assertEqual(f.backend.name, "copy")
             self.assertFalse(f.is_cow)
 
     def test_unknown_backend_raises(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             with self.assertRaises(ValueError):
                 FileSystem(Path(tmp), backend="nonexistent")
 
@@ -141,7 +141,7 @@ class TestBackendSelection(unittest.TestCase):
         """Windows 以外で fast_clone を明示したら、黙って copy に落とさず断る。"""
         if sys.platform == "win32":
             self.skipTest("Windows では実機検出になるため対象外")
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             with self.assertRaises(RuntimeError):
                 FileSystem(Path(tmp), backend="fast_clone")
 
@@ -150,7 +150,7 @@ class TestSpecialFiles(unittest.TestCase):
     def test_fifo_is_skipped_not_copied(self) -> None:
         if not hasattr(os, "mkfifo"):
             self.skipTest("この OS に FIFO は無い")
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             f = FileSystem(Path(tmp), backend="copy")
             (f.work_tree / "a.txt").write_text("a", encoding="utf-8")
             os.mkfifo(f.work_tree / "pipe")
@@ -169,7 +169,7 @@ class TestReadOnlyAttribute(unittest.TestCase):
     """
 
     def test_snapshot_replacement_survives_read_only_file(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             f = FileSystem(Path(tmp), backend="copy")
             target = f.work_tree / "ro.txt"
             target.write_text("one", encoding="utf-8")
@@ -184,7 +184,7 @@ class TestReadOnlyAttribute(unittest.TestCase):
             )
 
     def test_materialize_twice_survives_read_only_file(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             root = Path(tmp)
             f = FileSystem(root, backend="copy")
             target = f.work_tree / "ro.txt"
@@ -208,7 +208,7 @@ class TestWindowsReparsePoints(unittest.TestCase):
             self.skipTest("Windows 専用")
         import subprocess
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             root = Path(tmp)
             outside = root / "outside"
             outside.mkdir()
@@ -232,7 +232,7 @@ class TestWindowsReparsePoints(unittest.TestCase):
 class TestWindowsBlockClone(unittest.TestCase):
     def test_fast_clone_is_only_advertised_when_probe_succeeds(self) -> None:
         """probe が成功したときだけ fast_clone を名乗る（NTFS では出ない）。"""
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             root = Path(tmp)
             probe = fs_core._probe_block_clone(root)
             names = [i.name for i in detect_backends(root)]
@@ -245,7 +245,7 @@ class TestWindowsBlockClone(unittest.TestCase):
 class TestCapabilityDoesNotAffectCorrectness(unittest.TestCase):
     def test_cow_and_copy_backends_agree_on_content(self) -> None:
         """CoW が使える環境と copy の両方で、同じ内容のスナップショットになる。"""
-        with tempfile.TemporaryDirectory(prefix="dfs5_fs_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_fs_") as tmp:
             root = Path(tmp)
             for backend in ("copy", "auto"):
                 f = FileSystem(root, backend=backend)

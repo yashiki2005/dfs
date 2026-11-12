@@ -18,9 +18,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5 import cli as cli_mod
-from dfs5.cli_main import UsageError, _norm_prefix, apply_writes, cmd_fs
-from dfs5.crypto import (
+from dfs import cli as cli_mod
+from dfs.cli_main import UsageError, _norm_prefix, apply_writes, cmd_fs
+from dfs.crypto import (
     EMPTY_SHA256,
     NS_L4_LOG,
     ContentAddressedCrypto,
@@ -29,19 +29,19 @@ from dfs5.crypto import (
     sha256_hex,
     ssh_sign,
 )
-from dfs5.fs import FileSystem
-from dfs5.l1_delegation import (
+from dfs.fs import FileSystem
+from dfs.l1_delegation import (
     DelegationError,
     create_delegation_envelope,
     verify_delegation_chain,
 )
-from dfs5.l2_registry import (
+from dfs.l2_registry import (
     ConflictError,
     DirectoryRegistryService,
     create_locator_envelope,
 )
-from dfs5.l4_log import L4LogClient, MerkleTreeBuilder
-from dfs5.path_safety import UnsafePathError, copyfile_no_follow, safe_target
+from dfs.l4_log import L4LogClient, MerkleTreeBuilder
+from dfs.path_safety import UnsafePathError, copyfile_no_follow, safe_target
 
 
 def _keypair(base: Path, name: str) -> tuple[Path, str]:
@@ -73,7 +73,7 @@ class _FakeOST:
 
 class TestL4PathBinding(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5_pathbind_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs_pathbind_")
         self.base = Path(self._tmp.name)
         self.root_key, self.root_pub = _keypair(self.base, "root")
         self.alice_key, self.alice_pub = _keypair(self.base, "alice")
@@ -171,7 +171,7 @@ class TestL4PathBinding(unittest.TestCase):
 
 class TestCasConcurrency(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5_cas_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs_cas_")
         self.base = Path(self._tmp.name)
         self.root_key, self.root_pub = _keypair(self.base, "root")
         self.alice_key, self.alice_pub = _keypair(self.base, "alice")
@@ -252,7 +252,7 @@ class TestCasConcurrency(unittest.TestCase):
 
 class TestSymlinkBoundaries(unittest.TestCase):
     def test_upload_skips_symlink(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_sym_up_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_sym_up_") as tmp:
             base = Path(tmp)
             outside = base / "outside.txt"
             outside.write_text("OUTSIDE-SECRET", encoding="utf-8")
@@ -272,7 +272,7 @@ class TestSymlinkBoundaries(unittest.TestCase):
             self.assertFalse((out / "leak.txt").exists())
 
     def test_safe_target_rejects_symlink_directory(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_sym_write_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_sym_write_") as tmp:
             base = Path(tmp)
             root = base / "root"
             outside = base / "outside"
@@ -284,7 +284,7 @@ class TestSymlinkBoundaries(unittest.TestCase):
             self.assertFalse((outside / "pwned.txt").exists())
 
     def test_copyfile_no_follow_rejects_symlink_destination(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_sym_copy_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_sym_copy_") as tmp:
             base = Path(tmp)
             src = base / "src.txt"
             outside = base / "outside.txt"
@@ -299,7 +299,7 @@ class TestSymlinkBoundaries(unittest.TestCase):
             self.assertEqual(outside.read_text(encoding="utf-8"), "old")
 
     def test_apply_writes_rejects_symlink_path(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_sym_apply_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_sym_apply_") as tmp:
             base = Path(tmp)
             root = base / "root"
             outside = base / "outside"
@@ -317,7 +317,7 @@ class TestSymlinkBoundaries(unittest.TestCase):
 
 class TestSnapshotAndPrefixValidation(unittest.TestCase):
     def test_snapshot_id_rejects_parent_traversal(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_snap_id_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_snap_id_") as tmp:
             root = Path(tmp)
             f = FileSystem(root, backend="copy")
             with self.assertRaises(ValueError):
@@ -326,7 +326,7 @@ class TestSnapshotAndPrefixValidation(unittest.TestCase):
                 f.read_snapshot("../escaped")
 
     def test_cli_snapshot_rejects_parent_traversal(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_snap_cli_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_snap_cli_") as tmp:
             root = Path(tmp)
             args = SimpleNamespace(
                 action="snapshot",
@@ -348,7 +348,7 @@ class TestSnapshotAndPrefixValidation(unittest.TestCase):
 
 class TestServerClock(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5_clock_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs_clock_")
         self.base = Path(self._tmp.name)
         self.root_key, self.root_pub = _keypair(self.base, "root")
         self.alice_key, self.alice_pub = _keypair(self.base, "alice")

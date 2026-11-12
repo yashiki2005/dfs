@@ -1,17 +1,17 @@
-# dfs5cli（`specs/cli.md`）
+# dfscli（`specs/cli.md`）
 
 ## 0. 目的と位置づけ
 
-`dfs5/cli.py` は層の試験用で、`serve` / `delegate` / `init` / `push` / `pull` という
+`dfs/cli.py` は層の試験用で、`serve` / `delegate` / `init` / `push` / `pull` という
 「層の操作」をそのまま見せる。日常のファイル操作には、もっと普通の道具が要る。
-そこで `dfs5/cli.py` の部品（L2 名簿クライアント、サーバ、ノード構築）をそのまま使い、
-**リモート名で場所を指す** CLI を被せたものが `dfs5cli` である。
+そこで `dfs/cli.py` の部品（L2 名簿クライアント、サーバ、ノード構築）をそのまま使い、
+**リモート名で場所を指す** CLI を被せたものが `dfscli` である。
 
-- 実装: `dfs5/cli_main.py`、`dfs5/remotes.py`
-- エントリポイント: `./dfs5cli`
+- 実装: `dfs/cli_main.py`、`dfs/remotes.py`
+- エントリポイント: `./dfscli`
 - 試験: `tests/test_cli_main.py`
 
-`dfs5/cli.py` は残す。層を直接確かめる用途（`serve` の起動、`delegate` の登録、
+`dfs/cli.py` は残す。層を直接確かめる用途（`serve` の起動、`delegate` の登録、
 `push`/`pull` の往復計測）では今もそちらを使う。
 
 ### インストール
@@ -20,8 +20,8 @@ pip / pipx で console script として入れられる。
 
 ```bash
 pipx install .
-dfs5cli --version
-dfs5svc --help
+dfscli --version
+dfssvc --help
 ```
 
 libp2p/QUIC も使う場合は optional extra を付ける。
@@ -48,7 +48,7 @@ macOS では fuse-t も必要になる。
 brew install macos-fuse-t/homebrew-cask/fuse-t
 ```
 
-リポジトリ直下の `./dfs5cli` / `./dfs5svc` は、開発中にそのまま使うための
+リポジトリ直下の `./dfscli` / `./dfssvc` は、開発中にそのまま使うための
 互換ラッパーとして残している。
 
 ---
@@ -57,7 +57,7 @@ brew install macos-fuse-t/homebrew-cask/fuse-t
 
 ### 1.1 リモート = 書き込み境界
 
-dfs5 の単一書き手の境界は「サブツリーのパス」である（`/example.com/alice/notes`）。
+dfs の単一書き手の境界は「サブツリーのパス」である（`/example.com/alice/notes`）。
 rclone のリモートはこれに対応させた。**ホスト名ではない。**
 
 1 つのリモートが持つ情報のうち、**L2 名簿に問い合わせれば分かるものは書かなくてよい**。
@@ -65,17 +65,17 @@ rclone のリモートはこれに対応させた。**ホスト名ではない�
 | 項目 | 例 | 省略したとき |
 |---|---|---|
 | L2 名簿 | `172.16.1.60` | **必須**（出発点。ホスト名だけでよい） |
-| 書き手の OpenSSH Ed25519 秘密鍵 | `~/.ssh/alice` | その場で作る（`~/.config/dfs5/keys/<名前>_ed25519`） |
+| 書き手の OpenSSH Ed25519 秘密鍵 | `~/.ssh/alice` | その場で作る（`~/.config/dfs/keys/<名前>_ed25519`） |
 | L3 OST の host:port | `172.16.1.60:19443` | L2 のロケータ（`endpoints`）から解決する |
 | サブツリーのパス | `/example.com/alice/notes` | L2 で書き手公開鍵から探す |
 | `tree_secret`（共有秘密） | — | 端末からエコーなしで読む |
-| 作業ディレクトリ | `~/.cache/dfs5/<名前>` | 既定（`--workdir` で変更） |
+| 作業ディレクトリ | `~/.cache/dfs/<名前>` | 既定（`--workdir` で変更） |
 
 最小の登録はこうなる。
 
 ```bash
 # ホスト名だけ。鍵は作り、secret は端末から読む
-dfs5cli config create scw --registry 172.16.1.60
+dfscli config create scw --registry 172.16.1.60
 ```
 
 #### レジストリはホスト名だけでよい
@@ -98,11 +98,11 @@ host --registry-port 19440 -> http://host:19440
 書き込み（`announce` / `delegate`）は常に `--registry` の主名簿だけに送る。
 
 ```bash
-dfs5cli create scw --registry 172.16.1.60 \
+dfscli create scw --registry 172.16.1.60 \
   --registry-alternate 172.16.1.61
 ```
 
-主名簿は `dfs5 serve --replica http://172.16.1.61:9440` のように起動すると、
+主名簿は `dfs serve --replica http://172.16.1.61:9440` のように起動すると、
 署名済みの委譲チェーン・L4 ログ・ロケータを代替名簿へ複製する。代替名簿は
 root アンカーから再検証し、古いバンドルで巻き戻さない。
 
@@ -113,13 +113,13 @@ root アンカーから再検証し、古いバンドルで巻き戻さない。
 
 #### DNSSEC から root 鍵と registry 一覧を取得する
 
-`--dnssec-domain` を指定すると、`_dfs5.<domain>` の DNSSEC 検証済み TXT レコードから
+`--dnssec-domain` を指定すると、`_dfs.<domain>` の DNSSEC 検証済み TXT レコードから
 root 公開鍵と primary/secondary registry を取得する。`--registry` は不要。
 
 ```bash
-dfs5cli discover example.com
+dfscli discover example.com
 
-dfs5cli config create scw \
+dfscli config create scw \
   --dnssec-domain example.com \
   --key ~/.ssh/alice \
   --secret <tree_secret>
@@ -135,11 +135,11 @@ DNSSEC は root 鍵と初期 registry 一覧の配布に限定し、L4 head や 
 BitTorrent はホットパスではなく、長期保存・最終復旧用である。
 
 ```bash
-dfs5cli archive create scw: --out ./scw-v1
-dfs5cli archive create scw: --version 3 --out ./scw-v3
-dfs5cli archive verify ./scw-v1
-dfs5cli archive extract ./scw-v1 ./restored
-dfs5cli archive catalog .
+dfscli archive create scw: --out ./scw-v1
+dfscli archive create scw: --version 3 --out ./scw-v3
+dfscli archive verify ./scw-v1
+dfscli archive extract ./scw-v1 ./restored
+dfscli archive catalog .
 ```
 
 実際の seeding / downloading は外部の BitTorrent クライアントで行う。
@@ -150,8 +150,8 @@ dfs5cli archive catalog .
 `history` は L2 が保持する署名済み L4 ログの履歴を新しい順に表示する。
 
 ```bash
-dfs5cli history scw:
-dfs5cli history scw:/example.com/alice --limit 20
+dfscli history scw:
+dfscli history scw:/example.com/alice --limit 20
 ```
 
 L2 の API では `/v1/history` と `/v1/resolve` の `version` 指定を使う。
@@ -162,8 +162,8 @@ secondary registry を primary に昇格する場合は、旧 primary を停止�
 secondary 側で state の role epoch を進める。
 
 ```bash
-dfs5 promote --state-dir ~/.dfs5_server --role-epoch 2
-dfs5 serve ... --role primary --role-epoch 2
+dfs promote --state-dir ~/.dfs_server --role-epoch 2
+dfs serve ... --role primary --role-epoch 2
 ```
 
 writer 側も `config create ... --role-epoch 2` で同じ世代に更新する。
@@ -176,11 +176,11 @@ OST の chunk ディレクトリを libp2p/QUIC で配布し、読み取り候�
 サーバは py-libp2p のプロセス制約のため専用プロセスで起動する。
 
 ```bash
-dfs5cli libp2p-serve \
-  --chunks-dir ~/.dfs5_server/ost_chunks \
+dfscli libp2p-serve \
+  --chunks-dir ~/.dfs_server/ost_chunks \
   --listen /ip4/0.0.0.0/udp/0/quic-v1
 
-dfs5cli create scw \
+dfscli create scw \
   --registry http://primary:9440 \
   --libp2p-peer /ip4/203.0.113.10/udp/19443/quic-v1/p2p/12D3KooW...
 ```
@@ -188,7 +188,7 @@ dfs5cli create scw \
 読み取りは主 OST → 複製 OST → libp2p の順に試す。書き込みは主 OST のみ。
 詳細は `specs/libp2p.md`。
 
-**L2 が OST の場所とパスを知っている理由**: L2 のロケータ（`dfs5-l2-locator-v1`）は
+**L2 が OST の場所とパスを知っている理由**: L2 のロケータ（`dfs-l2-locator-v1`）は
 `endpoints` を持ち、そこに L3 の場所（`tls://172.16.1.60:19443`）が入る。これは版を
 書くたびに更新される。委譲レコードは書き手の公開鍵（`writer`）を持つので、「この鍵が
 書くのはどのサブツリーか」を L2 に聞ける。最初の版を書く前はロケータがまだ無いため、
@@ -196,7 +196,7 @@ L2 は `--advertise`（または bind から推定したホスト）で自分の
 
 #### 書き手の鍵はその場で作る
 
-`--key` を省くと、`~/.config/dfs5/keys/<名前>_ed25519` に Ed25519 の鍵を作る
+`--key` を省くと、`~/.config/dfs/keys/<名前>_ed25519` に Ed25519 の鍵を作る
 （`--key-dir` で場所を変えられる）。OpenSSH 形式で、パーミッションは 600。
 
 `--key` を**渡した**のにそのパスが無い場合は、勝手に作らず使い方の誤り（終了コード 2）で
@@ -210,19 +210,19 @@ L2 は `--advertise`（または bind から推定したホスト）で自分の
 ものだけ採る。
 
 ```
-$ dfs5cli create scw --registry 172.16.1.60
+$ dfscli create scw --registry 172.16.1.60
 scw の tree_secret:                       ← 入力は画面に出ない
 scw の tree_secret（確認のためもう一度）:  ← 同じものを打つ
-[dfs5cli] リモート 'scw' を保存しました: ~/.config/dfs5/remotes.json
+[dfscli] リモート 'scw' を保存しました: ~/.config/dfs/remotes.json
   registry    : http://172.16.1.60:9440
-  書き手の鍵  : ~/.config/dfs5/keys/scw_ed25519（作った。OpenSSH 形式の Ed25519）
+  書き手の鍵  : ~/.config/dfs/keys/scw_ed25519（作った。OpenSSH 形式の Ed25519）
   tree_secret : *** （端末から読みました）
 ```
 
 一致しなければやり直す（3 回まで）。
 
 ```
-[dfs5cli] 入力が一致しません。もう一度入力してください（1/3）
+[dfscli] 入力が一致しません。もう一度入力してください（1/3）
 ```
 
 3 回とも一致しなければ、secret を空のまま登録し、あとで `--secret` を設定するよう促す。
@@ -233,10 +233,10 @@ scw の tree_secret（確認のためもう一度）:  ← 同じものを打つ
 登録は一番よく打つので、`config` を省いた入口を用意した。中身は同じ関数。
 
 ```bash
-dfs5cli create scw --registry 172.16.1.60       # = dfs5cli config create scw ...
-dfs5cli config show scw                         # 表示・削除・一覧は config の下
-dfs5cli config delete scw
-dfs5cli listremotes                             # config list と同じ
+dfscli create scw --registry 172.16.1.60       # = dfscli config create scw ...
+dfscli config show scw                         # 表示・削除・一覧は config の下
+dfscli config delete scw
+dfscli listremotes                             # config list と同じ
 ```
 
 実装は Python の `getpass`（標準ライブラリ）。`/dev/tty` からエコーなしで読む。
@@ -282,54 +282,54 @@ dfs5cli listremotes                             # config list と同じ
 ## 2. コマンド
 
 ```text
-dfs5cli listremotes
+dfscli listremotes
 # 最小（ホスト名だけ。鍵を作り、secret は端末から 2 回読む）
-dfs5cli create NAME --registry HOST
+dfscli create NAME --registry HOST
 # ↑ は config create と同じ。以下は明示したいときだけ
-dfs5cli config create NAME --registry HOST
+dfscli config create NAME --registry HOST
 
 # 省略したくないときだけ足す
 #   --registry-port N  ポートを補う番号（既定 9440）
 #   --key FILE         既存の Ed25519 秘密鍵（無ければ断る）
-#   --key-dir DIR      鍵を作る場所（既定 ~/.config/dfs5/keys）
+#   --key-dir DIR      鍵を作る場所（既定 ~/.config/dfs/keys）
 #   --secret VALUE     tree_secret（省くと端末から読む）
 #   --no-prompt        端末から読まない
 #   --ost / --path / --workdir / --epoch / --compression / --node-name
-dfs5cli config create NAME --registry HOST --key FILE --ost HOST:PORT --path /sub/path \
+dfscli config create NAME --registry HOST --key FILE --ost HOST:PORT --path /sub/path \
                           [--workdir DIR] [--epoch N] [--node-name NAME]
-dfs5cli config show|delete|list [NAME]
+dfscli config show|delete|list [NAME]
 
 # 読み出し（版を進めない）
-dfs5cli ls     REMOTE:path
-dfs5cli lsd    REMOTE:path
-dfs5cli mount  REMOTE:path LOCAL_MOUNT
-dfs5cli lsl    REMOTE:path
-dfs5cli lsjson REMOTE:path
-dfs5cli size   REMOTE:path
-dfs5cli cat    REMOTE:path/file
-dfs5cli about  REMOTE:
-dfs5cli check  REMOTE:path LOCAL_DIR
+dfscli ls     REMOTE:path
+dfscli lsd    REMOTE:path
+dfscli mount  REMOTE:path LOCAL_MOUNT
+dfscli lsl    REMOTE:path
+dfscli lsjson REMOTE:path
+dfscli size   REMOTE:path
+dfscli cat    REMOTE:path/file
+dfscli about  REMOTE:
+dfscli check  REMOTE:path LOCAL_DIR
 
 # 書き込み（1 版としてまとめる）
-dfs5cli copy   LOCAL REMOTE:path [--checksum [MODE]] [--include PATTERN] [--exclude PATTERN] [-n]
-dfs5cli copyto LOCAL_FILE REMOTE:path/file [--checksum [MODE]] [-n]
-dfs5cli import_tar ARCHIVE REMOTE:path [--strip-components N] [-n]
-dfs5cli mv     REMOTE:path REMOTE:path [--overwrite] [-n]
-dfs5cli sync   LOCAL_DIR REMOTE:path [--delete] [--checksum [MODE]] [--include PATTERN] [--exclude PATTERN] [-n]
+dfscli copy   LOCAL REMOTE:path [--checksum [MODE]] [--include PATTERN] [--exclude PATTERN] [-n]
+dfscli copyto LOCAL_FILE REMOTE:path/file [--checksum [MODE]] [-n]
+dfscli import_tar ARCHIVE REMOTE:path [--strip-components N] [-n]
+dfscli mv     REMOTE:path REMOTE:path [--overwrite] [-n]
+dfscli sync   LOCAL_DIR REMOTE:path [--delete] [--checksum [MODE]] [--include PATTERN] [--exclude PATTERN] [-n]
 
 # ディレクトリと削除
-dfs5cli mkdir  REMOTE:dir
-dfs5cli rm     REMOTE:path [-R|--recursive] [--rmdirs] [-n]
-dfs5cli rmdir  REMOTE:dir [-n]
-dfs5cli purge  REMOTE:path [-n]
+dfscli mkdir  REMOTE:dir
+dfscli rm     REMOTE:path [-R|--recursive] [--rmdirs] [-n]
+dfscli rmdir  REMOTE:dir [-n]
+dfscli purge  REMOTE:path [-n]
 
 # 取り出し
-dfs5cli pull   REMOTE:path LOCAL_DIR [--force] [--include PATTERN] [--exclude PATTERN]
+dfscli pull   REMOTE:path LOCAL_DIR [--force] [--include PATTERN] [--exclude PATTERN]
 
 # サーバ側は cli.py のものをそのまま使う
-dfs5cli serve    ... --advertise <L3 を広告するホスト>
-dfs5cli serve    ... --ost-dir /Volumes/ExtSSD/dfs5/ost/<name>
-dfs5cli delegate ...
+dfscli serve    ... --advertise <L3 を広告するホスト>
+dfscli serve    ... --ost-dir /Volumes/ExtSSD/dfs/ost/<name>
+dfscli delegate ...
 ```
 
 `REMOTE` は `config create` で付けた名前。`REMOTE:` はそのリモートの根、`REMOTE:docs` は
@@ -340,14 +340,14 @@ dfs5cli delegate ...
 
 ## 2.1 L2 が答える追加の問い合わせ
 
-`config create` を短くするために、L2 に 2 つの口を足した（`dfs5/cli.py`）。
+`config create` を短くするために、L2 に 2 つの口を足した（`dfs/cli.py`）。
 
 | エンドポイント | 返すもの |
 |---|---|
 | `POST /v1/ost` | L3 の場所（`tls://host:port`）と、パスごとのロケータの endpoint |
 | `POST /v1/paths` | 登録済みのサブツリー、書き手公開鍵、epoch、先頭版 |
 
-`dfs5cli` はこの 2 つを使って `--ost` と `--path` を解決する。
+`dfscli` はこの 2 つを使って `--ost` と `--path` を解決する。
 
 - **OST**: まずロケータの `endpoints` を見る。無ければ（初回）`/v1/ost` の広告を使う。
 - **パス**: 秘密鍵の公開鍵を作り（`ssh-keygen -y` または `.pub`）、`/v1/paths` で
@@ -365,7 +365,7 @@ dfs5cli delegate ...
 2. ローカルの変更を写しへ載せる。
 3. 1 版としてまとめて `push` する。
 
-途中で失敗しても、リモートの版は壊れない。dfs5 の push は「塊を送ってから CAS で 1 版を
+途中で失敗しても、リモートの版は壊れない。dfs の push は「塊を送ってから CAS で 1 版を
 追記する」順なので、CAS が失敗すれば版は増えない。
 
 primary / secondary registry が両方停止した場合は、`.clayfs/l2_cache.json` の
@@ -378,14 +378,14 @@ primary / secondary registry が両方停止した場合は、`.clayfs/l2_cache.
 `--checksum` は既存互換のため `plain_id` として扱う。
 
 ```
-$ dfs5cli copy ./sample local:
-[dfs5cli] copy OK -> v1 | 追加/更新 4 件（同じ 0 件） | sent=6303 B | 74.7 ms
+$ dfscli copy ./sample local:
+[dfscli] copy OK -> v1 | 追加/更新 4 件（同じ 0 件） | sent=6303 B | 74.7 ms
 
-$ dfs5cli copy ./sample local:
-[dfs5cli] copy: 変更なし（4 ファイルが同じ）。新しい版は作りません
+$ dfscli copy ./sample local:
+[dfscli] copy: 変更なし（4 ファイルが同じ）。新しい版は作りません
 ```
 
-dfs5 は書き手側の索引で塊を重複排除するので、内容が同じなら `push` しても本文は送られない。
+dfs は書き手側の索引で塊を重複排除するので、内容が同じなら `push` しても本文は送られない。
 それでも版が増えるのは無駄なので、CLI 側で「変わらないなら版を作らない」を決めている。
 
 #### 3.2.1 移動は 1 版
@@ -422,8 +422,8 @@ dfs5 は書き手側の索引で塊を重複排除するので、内容が同じ
 - 内容が同じファイルだけなら新しい版を作らない
 
 ```bash
-dfs5cli import_tar release.tar.gz backup:
-dfs5cli import_tar bundle.tar.xz backup:project --strip-components 1
+dfscli import_tar release.tar.gz backup:
+dfscli import_tar bundle.tar.xz backup:project --strip-components 1
 ```
 
 #### 3.2.4 FUSE マウント
@@ -432,14 +432,14 @@ dfs5cli import_tar bundle.tar.xz backup:project --strip-components 1
 macOS では fuse-t を優先し、Linux では libfuse を使う。
 
 ```bash
-dfs5cli mount scw:docs /mnt/dfs5-docs
-dfs5cli mount scw:docs /mnt/dfs5-docs --read-only
+dfscli mount scw:docs /mnt/dfs-docs
+dfscli mount scw:docs /mnt/dfs-docs --read-only
 ```
 
 読み書きは作業ツリー上で行い、ファイルを close したとき（FUSE の `release`）と
-アンマウント時に DFS5 へ push する。複数ファイルを同時に書く場合は、ファイルごとに
+アンマウント時に DFS へ push する。複数ファイルを同時に書く場合は、ファイルごとに
 版が増えることがある。マウント中も単一書き手の前提を維持するため、同じサブツリーを
-別の DFS5 書き手から同時に変更しないこと。
+別の DFS 書き手から同時に変更しないこと。
 
 `--allow-other`、`--debug`、`--fuse-library PATH` も指定できる。macOS で
 fusepy が macFUSE を選んでしまう場合は、`--fuse-library` に fuse-t の
@@ -447,18 +447,18 @@ fusepy が macFUSE を選んでしまう場合は、`--fuse-library` に fuse-t 
 
 #### 3.2.5 フォルダ単位の圧縮
 
-圧縮ポリシーはディレクトリの xattr `user.dfs5.compression` で指定できる。
+圧縮ポリシーはディレクトリの xattr `user.dfs.compression` で指定できる。
 値は `none` / `zstd`。子は最も近い親の設定を継承する。
 
 ```bash
-xattr -w user.dfs5.compression zstd /path/to/tree/src
-xattr -w user.dfs5.compression none /path/to/tree/archive
+xattr -w user.dfs.compression zstd /path/to/tree/src
+xattr -w user.dfs.compression none /path/to/tree/archive
 ```
 
 push 時には実効ポリシーを署名済みディレクトリ塊へ保存するため、xattr が後で
 失われてもリモート側の解釈は変わらない。圧縮は平文に対して行い、チャンクは
-`DFS5B3` の codec 付きヘッダーで保存する。実際の圧縮率が 95% 以上なら
-非圧縮の `DFS5B2` として保存する。
+`DFSB3` の codec 付きヘッダーで保存する。実際の圧縮率が 95% 以上なら
+非圧縮の `DFSB2` として保存する。
 
 リモート全体の既定値は `config create --compression zstd` で指定できる。
 xattr が無い場合にだけこの既定値を使う。
@@ -472,7 +472,7 @@ xattr が無い場合にだけこの既定値を使う。
 
 ### 3.4 削除と空ディレクトリ
 
-dfs5 は**空のディレクトリも版に残す**。ディレクトリ塊は `{"entries": [], "format": "dfs5-dir-v1"}`
+dfs は**空のディレクトリも版に残す**。ディレクトリ塊は `{"entries": [], "format": "dfs-dir-v1"}`
 として表現され、読み出し側はそれを見て実体を作る。つまり「中のファイルが全部消えた」だけでは
 ディレクトリは消えず、`pull` すると空のディレクトリごと降りてくる。
 
@@ -523,7 +523,7 @@ wd/
 │   ├── a.txt  b.bin  dup.txt
 │   └── docs/readme.md  docs/sub/deep.txt
 └── .clayfs/
-    ├── dfs5_config.json          L2 URL・OST・sub_path・tree_secret
+    ├── dfs_config.json          L2 URL・OST・sub_path・tree_secret
     ├── local_head.json           HeadPin（版番号 / entry_hash / epoch）
     ├── l2_cache.json             検証済みの delegation / locator / head
     ├── ost_index.json            書き手の plain_id -> (wire_id, store_id) 索引
@@ -592,7 +592,7 @@ fuse-t 不在時のエラー）。
 | `test_config_create_makes_key_when_omitted` | `--key` を省くと OpenSSH 形式の鍵を作る（600） |
 | `test_explicit_missing_key_is_refused` | `--key` の打ち間違いでは鍵を作らない |
 | `test_no_prompt_keeps_secret_empty` | `--no-prompt` なら端末から読まない |
-| `test_create_alias_exists` | `dfs5cli create` が `config create` と同じに動く |
+| `test_create_alias_exists` | `dfscli create` が `config create` と同じに動く |
 | `test_prompt_verifies_secret_twice` | 端末では secret を 2 回聞き、不一致ならやり直す |
 | `test_path_without_leading_slash_is_accepted` | `--path` は `/` で始まらなくてよい |
 | `test_empty_secret_is_refused_on_write` | `tree_secret` が空のまま書こうとすると止まる |
@@ -615,7 +615,7 @@ fuse-t 不在時のエラー）。
   無ければ断る（打ち間違いで新しい鍵を作らないため）。
 - **`--secret` を省くと端末から読む。** パイプの中で使うなら `--secret` か `--no-prompt` を
   明示する。
-- **`tree_secret` はリモートごとに独立**。WAN 試験のツリー（`dfs5-wan-shared-secret`）と
+- **`tree_secret` はリモートごとに独立**。WAN 試験のツリー（`dfs-wan-shared-secret`）と
   別の秘密で `config create` すれば、別のツリーとして扱われる。共有したい場合は同じ秘密を使う。
   L2 からは引けない（サーバに置かない共有秘密）ので、書く前に必ず設定する。
 - **`--path` は 1 つの鍵で 1 つの境界**を書く前提で省略できる。1 つの鍵を複数のサブツリーに

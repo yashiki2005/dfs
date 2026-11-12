@@ -32,8 +32,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dfs5.crypto import ssh_sign  # noqa: E402
-from dfs5.l2_registry import (  # noqa: E402
+from dfs.crypto import ssh_sign  # noqa: E402
+from dfs.l2_registry import (  # noqa: E402
     DirectoryRegistryService,
     create_locator_envelope,
     verify_locator_envelope,
@@ -167,7 +167,7 @@ def main() -> int:
     args = ap.parse_args()
 
     result = {
-        "schema": "dfs5-l2-bench-v1",
+        "schema": "dfs-l2-bench-v1",
         "measured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "environment": {
             "platform": platform.platform(),

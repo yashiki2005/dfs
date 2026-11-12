@@ -2,7 +2,7 @@
 
 ## 位置付け
 
-BitTorrent は dfs5 のホットパスを置き換えない。**版単位の読み取り専用アーカイブ**と、
+BitTorrent は dfs のホットパスを置き換えない。**版単位の読み取り専用アーカイブ**と、
 OST / registry が全滅したときの最終復旧経路として使う。
 
 - 主 OST: 書き込みと通常の読み取り
@@ -13,7 +13,7 @@ BitTorrent は最新版を保証しない。復元できるのは「infohash と
 
 ## bundle
 
-`dfs5cli archive create` は、現在の先頭版について次のディレクトリを作る。
+`dfscli archive create` は、現在の先頭版について次のディレクトリを作る。
 
 ```text
 <bundle>/
@@ -40,33 +40,33 @@ chunk は暗号化済み blob のまま保存する。平文パスや平文フ�
 - `meta.json` と `chunks/*` を 1 つの torrent にまとめる
 - piece length は 256 KiB
 - torrent の infohash は SHA-1（v1）
-- chunk 自体の真正性は DFS5 の `wire_id`（SHA-256）で再検証する
+- chunk 自体の真正性は DFS の `wire_id`（SHA-256）で再検証する
 
-v1 の SHA-1 は BitTorrent の transport 用であり、DFS5 の最終的な完全性判定には
+v1 の SHA-1 は BitTorrent の transport 用であり、DFS の最終的な完全性判定には
 使わない。BitTorrent v2 への移行は今後の課題。
 
 ## 作成・検証・復元
 
 ```bash
 # 現在の先頭版をアーカイブする
-dfs5cli archive create scw: --out ./scw-v1
+dfscli archive create scw: --out ./scw-v1
 
 # 過去の版を指定してアーカイブする
-dfs5cli archive create scw: --version 3 --out ./scw-v3
+dfscli archive create scw: --version 3 --out ./scw-v3
 
 # bundle の署名・chunk hash・サイズを検証する
-dfs5cli archive verify ./scw-v1
+dfscli archive verify ./scw-v1
 
 # ローカルに復元する（tree_secret が必要）
-dfs5cli archive extract ./scw-v1 ./restored
+dfscli archive extract ./scw-v1 ./restored
 
 # descriptor から archive 一覧を表示する
-dfs5cli archive catalog .
+dfscli archive catalog .
 ```
 
 `archive create` は torrent の infohash と magnet link を表示する。実際の seeding /
 downloading は qBittorrent、Transmission、libtorrent などの外部クライアントで行う。
-DFS5 は BitTorrent クライアントを内蔵しない。
+DFS は BitTorrent クライアントを内蔵しない。
 
 `archive create --version N` は、L2 の L4 履歴から指定版の署名済み head を取得する。
 過去版には現在の locator を流用せず、locator なしで bundle を作る。bundle の

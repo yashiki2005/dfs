@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
 """
-dfs5/svc.py
-ローカルに dfs5 サーバを簡単に立てるコマンド（`dfs5svc`）。
+dfs/svc.py
+ローカルに dfs サーバを簡単に立てるコマンド（`dfssvc`）。
 
-`dfs5 serve` は状態ディレクトリ・root 公開鍵・L2/L3 のポートをすべて自分で用意する。
+`dfs serve` は状態ディレクトリ・root 公開鍵・L2/L3 のポートをすべて自分で用意する。
 このコマンドは「ローカルで 1 つ立てて試す」ための最小の入口で、次を肩代わりする。
 
 1. 連続した空きポートを 2 つ探し、1 つ目を L2（名簿）、2 つ目を L3（OST）に割り当てる。
 2. root の鍵（L1 権威の Ed25519）が無ければ作る。
-3. 状態ディレクトリを用意し、`dfs5 serve` を起動する。
-4. 立ち上がったら、接続に必要な値を `~/.config/dfs5/services.json` に記録する
-   （`dfs5cli config create` に渡す値を自分で組み立てなくて済むように）。
+3. 状態ディレクトリを用意し、`dfs serve` を起動する。
+4. 立ち上がったら、接続に必要な値を `~/.config/dfs/services.json` に記録する
+   （`dfscli config create` に渡す値を自分で組み立てなくて済むように）。
 5. `stop` / `list` / `status` で後始末と確認ができる。
 
 使い方:
-    dfs5svc start                 # 連続した空きポートで1つ立てる（既定 19440 から探索）
-    dfs5svc start --name dev      # 名前を付ける（既定 "local"）
-    dfs5svc start --port 20000    # この番号から連続した空きを探す
-    dfs5svc start --ost-dir /Volumes/ExtSSD/dfs5/ost/dev  # OST を外部ディスクへ
-    dfs5svc start --foreground    # 前面で動かす（Ctrl-C で止まる）
-    dfs5svc list                  # 記録済みのサービス
-    dfs5svc status dev            # 状態と接続情報
-    dfs5svc stop dev              # 止める
-    dfs5svc env dev               # dfs5cli config create の行を出す
-    dfs5svc dnssec dev            # _dfs5.<domain> TXT の JSON を出す
+    dfssvc start                 # 連続した空きポートで1つ立てる（既定 19440 から探索）
+    dfssvc start --name dev      # 名前を付ける（既定 "local"）
+    dfssvc start --port 20000    # この番号から連続した空きを探す
+    dfssvc start --ost-dir /Volumes/ExtSSD/dfs/ost/dev  # OST を外部ディスクへ
+    dfssvc start --foreground    # 前面で動かす（Ctrl-C で止まる）
+    dfssvc list                  # 記録済みのサービス
+    dfssvc status dev            # 状態と接続情報
+    dfssvc stop dev              # 止める
+    dfssvc env dev               # dfscli config create の行を出す
+    dfssvc dnssec dev            # _dfs.<domain> TXT の JSON を出す
 
 出力は機械可読も兼ねる（`--json`）。
 
 配布:
-  `pyproject.toml` の console_scripts で `dfs5cli` / `dfs5svc` をインストールできる。
+  `pyproject.toml` の console_scripts で `dfscli` / `dfssvc` をインストールできる。
   リポジトリ直下のシェルラッパーは開発用の互換入口として残している。
 """
 
@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .dnssec import DEFAULT_RECORD_PREFIX, parse_discovery_text
-from .paths import config_dir, dfs5_home, restrict_to_owner
+from .paths import config_dir, dfs_home, restrict_to_owner
 
 CONFIG_FILENAME = "services.json"
 DEFAULT_START_PORT = 19440
@@ -61,7 +61,7 @@ DEFAULT_ROOT_ANCHOR = "/example.com"
 # なるようにする。日単位の粗さで足りる（ずれは高々数秒）。
 LEAF_TTL_DAYS = 365
 INTERMEDIATE_TTL_DAYS = LEAF_TTL_DAYS + 1
-BASE_DIR_NAME = "dfs5svc"
+BASE_DIR_NAME = "dfssvc"
 
 
 class ServiceError(Exception):
@@ -224,7 +224,7 @@ def _port_in_use_by_us(pid: int, port: int) -> bool:
 # --------------------------------------------------------------------------
 @dataclass
 class Service:
-    """立てた dfs5 サーバ 1 つぶんの記録。"""
+    """立てた dfs サーバ 1 つぶんの記録。"""
 
     name: str
     state_dir: str
@@ -276,7 +276,7 @@ class Service:
 
 
 class ServiceStore:
-    """`~/.config/dfs5/services.json` の読み書き。"""
+    """`~/.config/dfs/services.json` の読み書き。"""
 
     def __init__(self, path: Optional[Path] = None):
         self.path = path or (config_dir() / CONFIG_FILENAME)
@@ -302,7 +302,7 @@ class ServiceStore:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema": "dfs5-services-v1",
+            "schema": "dfs-services-v1",
             "services": {n: asdict(s) for n, s in sorted(self.services.items())},
         }
         tmp = self.path.with_suffix(".tmp")
@@ -326,7 +326,7 @@ def ensure_root_key(path: Path) -> Path:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     res = subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"dfs5svc-root@{socket.gethostname()}",
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"dfssvc-root@{socket.gethostname()}",
          "-f", str(path)],
         capture_output=True, text=True,
     )
@@ -342,7 +342,7 @@ def ensure_writer_key(path: Path) -> Path:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     res = subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"dfs5svc-writer@{socket.gethostname()}",
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"dfssvc-writer@{socket.gethostname()}",
          "-f", str(path)],
         capture_output=True, text=True,
     )
@@ -387,7 +387,7 @@ def register_delegation(
     env["PYTHONPATH"] = str(repo) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     parent = sub_path.rsplit("/", 1)[0] or "/"
     cmd = [
-        sys.executable, "-m", "dfs5.cli", "delegate",
+        sys.executable, "-m", "dfs.cli", "delegate",
         "--parent", parent,
         "--path", sub_path,
         "--signing-key", str(root_key),
@@ -453,7 +453,7 @@ def register_delegation_chain_step(
     env = dict(os.environ)
     env["PYTHONPATH"] = str(repo) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     cmd = [
-        sys.executable, "-m", "dfs5.cli", "delegate",
+        sys.executable, "-m", "dfs.cli", "delegate",
         "--parent", parent,
         "--path", child,
         "--signing-key", str(root_key),
@@ -494,7 +494,7 @@ def wait_for_l2(registry_url: str, timeout: float = 30.0) -> bool:
 # コマンド
 # --------------------------------------------------------------------------
 def _base_dir(name: str) -> Path:
-    return dfs5_home() / BASE_DIR_NAME / name
+    return dfs_home() / BASE_DIR_NAME / name
 
 
 def _read_serve_pid(state_dir: Path, timeout: float = 5.0) -> int:
@@ -523,7 +523,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     if name in store.services and not args.force:
         raise ServiceError(
             f"サービス {name!r} は既に記録にあります。"
-            f"止めるなら 'dfs5svc stop {name}'、作り直すなら --force を付けてください"
+            f"止めるなら 'dfssvc stop {name}'、作り直すなら --force を付けてください"
         )
 
     host = args.host
@@ -577,7 +577,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             pass
 
     cmd = [
-        sys.executable, "-m", "dfs5.cli", "serve",
+        sys.executable, "-m", "dfs.cli", "serve",
         "--bind", host,
         "--registry-port", str(registry_port),
         "--ost-port", str(ost_port),
@@ -594,14 +594,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     if getattr(args, "role_epoch", None) is not None:
         cmd.extend(["--role-epoch", str(args.role_epoch)])
 
-    print(f"[dfs5svc] 空きポート: L2={registry_port} / L3={ost_port}（連続した組）")
-    print(f"[dfs5svc] 状態      : {state_dir}")
-    print(f"[dfs5svc] OST       : {ost_dir}")
-    print(f"[dfs5svc] root 鍵   : {root_key}")
-    print(f"[dfs5svc] ログ      : {log_path}")
+    print(f"[dfssvc] 空きポート: L2={registry_port} / L3={ost_port}（連続した組）")
+    print(f"[dfssvc] 状態      : {state_dir}")
+    print(f"[dfssvc] OST       : {ost_dir}")
+    print(f"[dfssvc] root 鍵   : {root_key}")
+    print(f"[dfssvc] ログ      : {log_path}")
 
     if args.foreground:
-        print("[dfs5svc] 前面で起動します（Ctrl-C で停止）")
+        print("[dfssvc] 前面で起動します（Ctrl-C で停止）")
         env = dict(os.environ)
         repo = _repo_root()
         env["PYTHONPATH"] = str(repo) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -645,7 +645,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             # 根の直下でなければ、親のパスも委譲が要る（L1 は多段）
             _ensure_parent_delegations(root_key, root_pub, args.root_anchor, sub_path, registry_url)
             register_delegation(root_key, writer_pub, sub_path, registry_url)
-            print(f"[dfs5svc] 委譲を登録: {sub_path}（書き手 {writer_key.name}）")
+            print(f"[dfssvc] 委譲を登録: {sub_path}（書き手 {writer_key.name}）")
     except BaseException:
         _terminate(proc)
         raise
@@ -677,14 +677,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(service.to_dict(), ensure_ascii=False, indent=2))
     else:
-        print(f"[dfs5svc] 起動しました: {name}（PID {proc.pid}）")
+        print(f"[dfssvc] 起動しました: {name}（PID {proc.pid}）")
         print(f"  L2 Registry : {service.registry_url}")
         print(f"  L3 OST      : tls://{service.ost_endpoint}")
         print()
-        print("[dfs5svc] dfs5cli につなぐには:")
+        print("[dfssvc] dfscli につなぐには:")
         key_hint = service.writer_key or "<書き手の Ed25519 秘密鍵>"
         print(
-            f"  dfs5cli config create {name} --registry {service.registry_url} "
+            f"  dfscli config create {name} --registry {service.registry_url} "
             f"--key {key_hint} --secret <tree_secret>"
         )
         print(f"  # L3 の場所もサブツリーも L2 が知っているので --ost も --path も不要です")
@@ -761,12 +761,12 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if args.forget:
         store.services.pop(args.name, None)
         store.save()
-        print(f"[dfs5svc] 記録からも消しました: {args.name}")
+        print(f"[dfssvc] 記録からも消しました: {args.name}")
     else:
         # 状態は残す（再開できるように PID だけ 0 にする）
         s.pid = 0
         store.save()
-    print(f"[dfs5svc] {'停止しました' if stopped else 'もともと動いていません'}: {args.name}")
+    print(f"[dfssvc] {'停止しました' if stopped else 'もともと動いていません'}: {args.name}")
     return 0
 
 
@@ -874,13 +874,13 @@ def _stop_process(s: Service) -> bool:
 
 
 def cmd_env(args: argparse.Namespace) -> int:
-    """dfs5cli につなぐための設定行を出す。"""
+    """dfscli につなぐための設定行を出す。"""
     store = ServiceStore()
     s = store.get(args.name)
     writer = s.writer_key or "<書き手の Ed25519 秘密鍵>"
     print(f"# {s.name} に接続する（L3 は L2 が広告するので --ost は不要）")
     print(
-        f"dfs5cli create {s.name} --registry {s.registry_url} "
+        f"dfscli create {s.name} --registry {s.registry_url} "
         f"--key {writer} --secret <tree_secret>"
         f"{f' --root-pubkey {s.root_pub}' if s.root_pub else ''}"
         f"{f' --workdir {args.workdir}' if args.workdir else ''}"
@@ -906,7 +906,7 @@ def _domain_from_root_anchor(root_anchor: str) -> str:
 
 
 def cmd_dnssec(args: argparse.Namespace) -> int:
-    """DNSSEC の ``_dfs5.<domain>`` TXT に置く JSON を出力する。"""
+    """DNSSEC の ``_dfs.<domain>`` TXT に置く JSON を出力する。"""
     store = ServiceStore()
     service = store.get(args.name)
     domain = (args.domain or _domain_from_root_anchor(service.root_anchor)).strip().rstrip(".").lower()
@@ -945,7 +945,7 @@ def cmd_dnssec(args: argparse.Namespace) -> int:
         registries.append({"role": "secondary", "url": value})
 
     record = {
-        "schema": "dfs5-discovery-v1",
+        "schema": "dfs-discovery-v1",
         "domain": domain,
         "epoch": int(args.epoch) if args.epoch is not None else int(service.role_epoch),
         "registries": registries,
@@ -988,8 +988,8 @@ def _repo_root() -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="dfs5svc",
-        description="ローカルに dfs5 サーバ（L2 + L3）を 1 つ立てる",
+        prog="dfssvc",
+        description="ローカルに dfs サーバ（L2 + L3）を 1 つ立てる",
     )
     ap.add_argument("--json", action="store_true", help="結果を JSON で出す")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -999,18 +999,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1", help="bind するアドレス（既定 127.0.0.1）")
     p.add_argument("--advertise", help="L2 が L3 の場所として広告するホスト（既定は --host から推定）")
     p.add_argument("--port", type=int, help=f"この番号から連続した空きを探す（既定 {DEFAULT_START_PORT}）")
-    p.add_argument("--state-dir", help="状態ディレクトリ（既定 ~/dfs5svc/<name>/server）")
+    p.add_argument("--state-dir", help="状態ディレクトリ（既定 ~/dfssvc/<name>/server）")
     p.add_argument(
         "--ost-dir",
         help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）",
     )
-    p.add_argument("--root-key", help="root の Ed25519 鍵（既定 ~/dfs5svc/<name>/keys/root）")
+    p.add_argument("--root-key", help="root の Ed25519 鍵（既定 ~/dfssvc/<name>/keys/root）")
     p.add_argument("--root-anchor", default=DEFAULT_ROOT_ANCHOR, help=f"根のパス（既定 {DEFAULT_ROOT_ANCHOR}）")
-    p.add_argument("--writer-key", help="書き手の Ed25519 鍵（既定 ~/dfs5svc/<name>/keys/writer）")
+    p.add_argument("--writer-key", help="書き手の Ed25519 鍵（既定 ~/dfssvc/<name>/keys/writer）")
     p.add_argument(
         "--path",
         help=f"委譲するサブツリー（既定 {DEFAULT_ROOT_ANCHOR}/<name>）。"
-             "dfs5cli は書き手の鍵からこのパスを引く",
+             "dfscli は書き手の鍵からこのパスを引く",
     )
     p.add_argument("--no-delegate", action="store_true",
                    help="委譲を登録しない（サーバだけ立てる）")
@@ -1037,12 +1037,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--forget", action="store_true", help="記録からも消す")
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("env", help="dfs5cli の設定行を出す")
+    p = sub.add_parser("env", help="dfscli の設定行を出す")
     p.add_argument("name", nargs="?", default=DEFAULT_NAME)
     p.add_argument("--workdir", help="--workdir も付ける")
     p.set_defaults(func=cmd_env)
 
-    p = sub.add_parser("dnssec", help="_dfs5.<domain> TXT に置く JSON を出す")
+    p = sub.add_parser("dnssec", help="_dfs.<domain> TXT に置く JSON を出す")
     p.add_argument("name", nargs="?", default=DEFAULT_NAME)
     p.add_argument("--domain", help="TXT のドメイン（既定は root_anchor から推定）")
     p.add_argument(
@@ -1073,10 +1073,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         return int(args.func(args) or 0)
     except ServiceError as e:
-        print(f"[dfs5svc] {e}", file=sys.stderr)
+        print(f"[dfssvc] {e}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("\n[dfs5svc] 中断しました", file=sys.stderr)
+        print("\n[dfssvc] 中断しました", file=sys.stderr)
         return 130
 
 

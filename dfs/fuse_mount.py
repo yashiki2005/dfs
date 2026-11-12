@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""fuse-t / fusepy を使った dfs5 のローカルマウント。
+"""fuse-t / fusepy を使った dfs のローカルマウント。
 
-このモジュールは FUSE の操作だけを担当し、DFS5 固有の push は
-``flush_callback`` として受け取る。読み書きの実体は dfs5 の作業ツリー。
+このモジュールは FUSE の操作だけを担当し、DFS 固有の push は
+``flush_callback`` として受け取る。読み書きの実体は dfs の作業ツリー。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from .path_safety import UnsafePathError, safe_target
 class LocalTreeFuse:
     """1 つのローカルディレクトリを FUSE に公開する Operations。
 
-    ``flush_callback`` は、書き込み後に DFS5 の 1 版を作る処理。
+    ``flush_callback`` は、書き込み後に DFS の 1 版を作る処理。
     FUSE の flush / fsync / destroy で呼ばれる。
     """
 
@@ -78,7 +78,7 @@ class LocalTreeFuse:
             except Exception as e:  # noqa: BLE001 - バックグラウンド flush の失敗を隠さない
                 import sys
 
-                print(f"[dfs5cli] mount flush failed: {e}", file=sys.stderr)
+                print(f"[dfscli] mount flush failed: {e}", file=sys.stderr)
 
     def _schedule_flush(self) -> None:
         if self.sync_delay <= 0:

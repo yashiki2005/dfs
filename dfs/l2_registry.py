@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-dfs5/l2_registry.py
-specs/l2_comparison.md に基づく署名付きロケータ (`dfs5-l2-locator-v1`) と
+dfs/l2_registry.py
+specs/l2_comparison.md に基づく署名付きロケータ (`dfs-l2-locator-v1`) と
 名簿 (Directory) + L4 追記ログ CAS 調停サービス、および 2段キャッシュ対応リゾルバ。
 """
 
@@ -52,7 +52,7 @@ def create_locator_envelope(
     expires_at: int,
     ttl: int = 300,
 ) -> Dict[str, Any]:
-    """署名付きロケータエンベロープ (`dfs5-l2-locator-v1`) を生成する。"""
+    """署名付きロケータエンベロープ (`dfs-l2-locator-v1`) を生成する。"""
     norm_path = normalize_path(path)
     payload = {
         "delegation_epoch": int(delegation_epoch),

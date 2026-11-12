@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dfs5/l3_ost_adapter.py
+dfs/l3_ost_adapter.py
 macOS / Linux 両対応・デッドロック完全排除版 L3 OST サーバ & クライアント。
 明示的切断オペコード ('Q') により、サーバ側の recv ブロッキング待ちを確実に終了させる。
 """
@@ -31,8 +31,8 @@ MAX_BLOB_BYTES = 256 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # WAN（高遅延）向けタイムアウト。環境変数で上書きできる。
-#   DFS5_OST_SOCKET_TIMEOUT  : サーバ側ソケットの 1 操作あたりのタイムアウト秒
-#   DFS5_OST_CONNECT_TIMEOUT : クライアント側の TCP 接続タイムアウト秒
+#   DFS_OST_SOCKET_TIMEOUT  : サーバ側ソケットの 1 操作あたりのタイムアウト秒
+#   DFS_OST_CONNECT_TIMEOUT : クライアント側の TCP 接続タイムアウト秒
 # 既定はどちらも WAN（RTT 300ms 級）の直列処理に耐える値にしてある。
 # ---------------------------------------------------------------------------
 DEFAULT_OST_SOCKET_TIMEOUT = 30.0
@@ -51,23 +51,23 @@ def _env_positive_float(name: str, default: float) -> float:
 
 
 def ost_socket_timeout() -> float:
-    """サーバ側ソケットタイムアウト秒（既定 30 秒、``DFS5_OST_SOCKET_TIMEOUT`` で変更）"""
-    return _env_positive_float("DFS5_OST_SOCKET_TIMEOUT", DEFAULT_OST_SOCKET_TIMEOUT)
+    """サーバ側ソケットタイムアウト秒（既定 30 秒、``DFS_OST_SOCKET_TIMEOUT`` で変更）"""
+    return _env_positive_float("DFS_OST_SOCKET_TIMEOUT", DEFAULT_OST_SOCKET_TIMEOUT)
 
 
 def ost_connect_timeout() -> float:
-    """クライアント側 TCP 接続タイムアウト秒（既定 10 秒、``DFS5_OST_CONNECT_TIMEOUT`` で変更）"""
-    return _env_positive_float("DFS5_OST_CONNECT_TIMEOUT", DEFAULT_OST_CONNECT_TIMEOUT)
+    """クライアント側 TCP 接続タイムアウト秒（既定 10 秒、``DFS_OST_CONNECT_TIMEOUT`` で変更）"""
+    return _env_positive_float("DFS_OST_CONNECT_TIMEOUT", DEFAULT_OST_CONNECT_TIMEOUT)
 
 
 class ChunkStoreServer:
     """
     内容アドレス (wire_id) でチャンクを保管する TLS/TCP サーバ (L3 OST)。
 
-    DFS5 が自前で実装したものであり、mini_lustre の OST とは
+    DFS が自前で実装したものであり、mini_lustre の OST とは
     フレーム形式も塊の識別子も異なる（同一のポート上で TLS/TCP を使う点のみ共通）。
 
-    クライアントごとのソケットタイムアウトは ``DFS5_OST_SOCKET_TIMEOUT``（既定 30 秒）で
+    クライアントごとのソケットタイムアウトは ``DFS_OST_SOCKET_TIMEOUT``（既定 30 秒）で
     上書きできる。WAN では 1 往復が数百 ms になるため、LAN 時代の 2 秒固定から引き上げた。
     """
 
@@ -228,7 +228,7 @@ class OSTClient:
     L3 OST クライアントアダプタ。
     切断時は必ず QUIT_FRAME ('Q') を送ってから close() するため、サーバ側スレッドが一切残留しない。
 
-    接続タイムアウトは ``DFS5_OST_CONNECT_TIMEOUT``（既定 10 秒）で上書きできる。
+    接続タイムアウトは ``DFS_OST_CONNECT_TIMEOUT``（既定 10 秒）で上書きできる。
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 0):

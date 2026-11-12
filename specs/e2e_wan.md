@@ -2,7 +2,7 @@
 
 ## 0. 目的と位置づけ
 
-LAN（RTT 2ms）では動いていた dfs5 が、WAN（RTT 20〜285ms）でも動くか、
+LAN（RTT 2ms）では動いていた dfs が、WAN（RTT 20〜285ms）でも動くか、
 また WAN の遅延と往復回数がどこまで耐えられるかを実機で確かめる。
 
 - ハーネス: `bench/e2e_wan.py`
@@ -19,7 +19,7 @@ LAN（RTT 2ms）では動いていた dfs5 が、WAN（RTT 20〜285ms）でも�
 
 ```text
 [Mac]                [Sakura (172.16.1.254)]                 [Scaleway (172.16.1.60)]
-clayfs (L5)          dfs5 serve （比較用サーバ）              dfs5 serve
+clayfs (L5)          dfs serve （比較用サーバ）              dfs serve
   └ tree/ ──push──▶  L3 ChunkStore (TLS 19443) ─┐             L3 ChunkStore (TLS 19443)
   .clayfs/                                       │             L2 名簿 (HTTP 19440)
        ▲──pull──── L4 追記ログ ◀── L2 名簿 ───────┴─────────────┘
@@ -35,7 +35,7 @@ clayfs (L5)          dfs5 serve （比較用サーバ）              dfs5 serve
 |---|---|
 | L2 | `http://<host>:19440`（Symbolic Registry, HTTP） |
 | L3 | `tls://<host>:19443`（TLS 1.3） |
-| 状態ディレクトリ | 各拠点とも `~/dfs5_wan/server_state` |
+| 状態ディレクトリ | 各拠点とも `~/dfs_wan/server_state` |
 | 部屋の既存サービス | Scaleway の dfs4 資産とは別ポート。**止めていない** |
 | 3 拠点の共有 | `tree_secret` と委譲鍵を共有（単一書き手の試験） |
 
@@ -49,9 +49,9 @@ clayfs (L5)          dfs5 serve （比較用サーバ）              dfs5 serve
 
 | 箇所 | 旧 | 新（既定） | 環境変数 |
 |---|---|---|---|
-| L2 HTTP | 5.0 秒固定 | 10 秒 | `DFS5_L2_TIMEOUT` |
-| L3 サーバ側ソケット | 2.0 秒固定 | 30 秒 | `DFS5_OST_SOCKET_TIMEOUT` |
-| L3 クライアント接続 | 3.0 秒固定 | 10 秒 | `DFS5_OST_CONNECT_TIMEOUT` |
+| L2 HTTP | 5.0 秒固定 | 10 秒 | `DFS_L2_TIMEOUT` |
+| L3 サーバ側ソケット | 2.0 秒固定 | 30 秒 | `DFS_OST_SOCKET_TIMEOUT` |
+| L3 クライアント接続 | 3.0 秒固定 | 10 秒 | `DFS_OST_CONNECT_TIMEOUT` |
 
 不正値・負値を設定したときは既定に戻す（無制限に待たない）。
 
@@ -83,7 +83,7 @@ clayfs (L5)          dfs5 serve （比較用サーバ）              dfs5 serve
 | 平らなディレクトリ（20 / 100 / 500 ファイル） | 21 / 101 / 501 往復 | **2 往復**（根 1 + ファイル 1） |
 | 入れ子 3 階層 + 53 ファイル | 56 往復 | **4 往復** |
 
-`DFS5_BATCH_CHUNKS`（既定 1024）と `DFS5_BATCH_BYTES`（既定 16 MiB）で組を絞れる。
+`DFS_BATCH_CHUNKS`（既定 1024）と `DFS_BATCH_BYTES`（既定 16 MiB）で組を絞れる。
 同一内容の塊は 1 回しか取りに行かない（重複排除は読み出し側でも効く）。
 
 
@@ -151,7 +151,7 @@ L2 の往復は含まない。
 
 ## 4. 何が確かめられたか
 
-- **WAN で dfs5 が動く。** RTT 285ms・3 拠点で push/pull が完走した。
+- **WAN で dfs が動く。** RTT 285ms・3 拠点で push/pull が完走した。
 - **push の往復は固定。** チャンク数にも RTT にも依存せず 1 回で終わる。
 - **高遅延でも単一書き手が効く。** 後着は拒否され、三方向マージは起きない。
 - **通信断でハングしない。** すべて明示的な例外で返る。
@@ -177,8 +177,8 @@ L2 の往復は含まない。
 
 ```bash
 # サーバ側（例: Scaleway）
-cd ~/src/dfs5
-nohup python3 -m dfs5.cli serve --bind 0.0.0.0   --registry-port 19440 --ost-port 19443   --root-anchor /example.com --root-pubkey ~/dfs5_wan/keys/root.pub   --state-dir ~/dfs5_wan/server_state   > ~/dfs5_wan/serve.log 2>&1 < /dev/null &
+cd ~/src/dfs
+nohup python3 -m dfs.cli serve --bind 0.0.0.0   --registry-port 19440 --ost-port 19443   --root-anchor /example.com --root-pubkey ~/dfs_wan/keys/root.pub   --state-dir ~/dfs_wan/server_state   > ~/dfs_wan/serve.log 2>&1 < /dev/null &
 
 # Mac → Scaleway（ハーネスが配置・委譲・計測まで行う）
 python bench/e2e_wan.py --mode wan --label mac-to-scaleway \

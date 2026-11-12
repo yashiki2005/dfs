@@ -13,8 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5 import cli_main
-from dfs5.archive import (
+from dfs import cli_main
+from dfs.archive import (
     ArchiveError,
     bencode,
     catalog,
@@ -22,10 +22,10 @@ from dfs5.archive import (
     extract_bundle,
     verify_bundle,
 )
-from dfs5.l1_delegation import create_delegation_envelope
-from dfs5.l2_registry import DirectoryRegistryService
-from dfs5.l3_store import ChunkStoreServer
-from dfs5.l5_clayfs import DFS5Node
+from dfs.l1_delegation import create_delegation_envelope
+from dfs.l2_registry import DirectoryRegistryService
+from dfs.l3_store import ChunkStoreServer
+from dfs.l5_clayfs import DFSNode
 
 
 def _keypair(base: Path, name: str) -> tuple[Path, str]:
@@ -59,7 +59,7 @@ class TestBencode(unittest.TestCase):
 
 class TestArchive(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5_archive_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs_archive_")
         self.base = Path(self._tmp.name)
         self.root_key, self.root_pub = _keypair(self.base, "root")
         self.alice_key, self.alice_pub = _keypair(self.base, "alice")
@@ -82,7 +82,7 @@ class TestArchive(unittest.TestCase):
             ),
             now=self.now,
         )
-        self.node = DFS5Node(
+        self.node = DFSNode(
             "alice",
             self.path,
             self.base / "mount",

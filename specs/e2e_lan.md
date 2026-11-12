@@ -15,7 +15,7 @@
 
 ```text
 [Mac]                                         [Pi5 (Ubuntu 24.04, aarch64, 4 core, 16GB)]
-clayfs (L5)                                     dfs5 serve
+clayfs (L5)                                     dfs serve
   └ tree/  ── push ──▶ L3 ChunkStore (TLS 9443) ──┐
   .clayfs/snapshots/                             │
         ▲                                        │
@@ -36,9 +36,9 @@ clayfs (L5)                                     dfs5 serve
 ## 2. 手順
 
 1. `ssh-keygen` で root / alice の Ed25519 鍵を作る。
-2. Pi5 に root の公開鍵を置き、`dfs5 serve` を起動する（状態は `~/dfs5_e2e/server_state`）。
-3. Mac から `dfs5 delegate` で `/example.com` → `/example.com/alice/notes` を委譲し、Pi5 の L2 に登録する。
-4. Mac と Pi5 で `dfs5 init` し、同じ `tree_secret` を使う。
+2. Pi5 に root の公開鍵を置き、`dfs serve` を起動する（状態は `~/dfs_e2e/server_state`）。
+3. Mac から `dfs delegate` で `/example.com` → `/example.com/alice/notes` を委譲し、Pi5 の L2 に登録する。
+4. Mac と Pi5 で `dfs init` し、同じ `tree_secret` を使う。
 5. Mac で `push` → Pi5 で `pull` → 内容を SHA-256 で照合する。
 6. Pi5 で `push` → Mac で `pull`（逆方向）。
 7. 両方が同じ親版のまま同時に `push` し、片方が `ConflictError` で拒否されることを確認する。
@@ -104,12 +104,12 @@ OK   衝突コピー 0 件
 ```bash
 # Pi5 側
 ssh -i ~/.ssh/pi-mock-test yy@192.168.0.7
-cd ~/src/dfs5
-python3 -m dfs5.cli serve --bind 0.0.0.0 \
+cd ~/src/dfs
+python3 -m dfs.cli serve --bind 0.0.0.0 \
   --registry-port 9440 --ost-port 9443 \
   --root-anchor /example.com \
-  --root-pubkey ~/dfs5_e2e/root.pub \
-  --state-dir ~/dfs5_e2e/server_state
+  --root-pubkey ~/dfs_e2e/root.pub \
+  --state-dir ~/dfs_e2e/server_state
 
 # Mac 側
 python bench/e2e_lan.py

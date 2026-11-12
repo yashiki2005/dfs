@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dfs5/fs/core.py
+dfs/fs/core.py
 ファイルシステム抽象の実装。
 
 ``FileSystem`` は 1 つのルートディレクトリを扱い、
@@ -453,11 +453,11 @@ def _probe_reflink(path: Path) -> Optional[BackendInfo]:
     system = platform.system()
     if system not in ("Darwin", "Linux"):
         return None
-    with tempfile.TemporaryDirectory(prefix="dfs5_fs_probe_", dir=str(path)) as probe:
+    with tempfile.TemporaryDirectory(prefix="dfs_fs_probe_", dir=str(path)) as probe:
         probe_dir = Path(probe)
         src = probe_dir / "probe_src"
         dst = probe_dir / "probe_dst"
-        src.write_bytes(b"dfs5")
+        src.write_bytes(b"dfs")
         try:
             if system == "Darwin":
                 _macos_clonefile(str(src), str(dst))
@@ -486,7 +486,7 @@ def _probe_block_clone(path: Path) -> Optional[BackendInfo]:
     # block clone はクラスタ単位。1 クラスタ未満だと常に ENOTSUP になるので、
     # 1 MiB を書いて「本当に複製できたか」と「中身が一致するか」まで確かめる。
     payload = b"\x00" * (1024 * 1024)
-    with tempfile.TemporaryDirectory(prefix="dfs5_fs_clone_", dir=str(path)) as probe:
+    with tempfile.TemporaryDirectory(prefix="dfs_fs_clone_", dir=str(path)) as probe:
         probe_dir = Path(probe)
         src = probe_dir / "probe_src"
         dst = probe_dir / "probe_dst"

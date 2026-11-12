@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dfs5/tests/test_integration.py
+dfs/tests/test_integration.py
 段階 5: 2 台 ([Mac] と [Pi5]) で 1 つのツリーを共有する統合試験および最終 5 指標の計測スイート。
 """
 
@@ -13,10 +13,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5.l1_delegation import DelegationError, create_delegation_envelope
-from dfs5.l2_registry import ConflictError, DirectoryRegistryService, ServiceUnavailableError
-from dfs5.l3_store import ChunkStoreServer
-from dfs5.l5_clayfs import DFS5Node
+from dfs.l1_delegation import DelegationError, create_delegation_envelope
+from dfs.l2_registry import ConflictError, DirectoryRegistryService, ServiceUnavailableError
+from dfs.l3_store import ChunkStoreServer
+from dfs.l5_clayfs import DFSNode
 
 
 def generate_ssh_keypair(dirpath: Path, name: str) -> tuple[Path, str]:
@@ -35,11 +35,11 @@ class TestL3ContentDedup(unittest.TestCase):
 
     def test_same_content_is_not_reencrypted_inside_one_upload(self) -> None:
         import subprocess as sp
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_l3_") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="dfs_l3_") as tmpdir:
             base = Path(tmpdir)
             cert, key = base / "c.pem", base / "k.pem"
             sp.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
@@ -72,11 +72,11 @@ class TestL3ContentDedup(unittest.TestCase):
 
     def test_index_persists_across_builders(self) -> None:
         import subprocess as sp
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_index_") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="dfs_index_") as tmpdir:
             base = Path(tmpdir)
             cert, key = base / "c.pem", base / "k.pem"
             sp.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
@@ -118,12 +118,12 @@ class TestL3ContentDedup(unittest.TestCase):
 
     def test_folder_xattr_selects_zstd_codec(self) -> None:
         import subprocess as sp
-        from dfs5.compression import set_xattr
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.compression import set_xattr
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_compress_") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="dfs_compress_") as tmpdir:
             base = Path(tmpdir)
             cert, key = base / "c.pem", base / "k.pem"
             sp.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
@@ -173,11 +173,11 @@ class TestL3Striping(unittest.TestCase):
         return cert, key
 
     def test_single_store_is_the_default(self) -> None:
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_str1_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_str1_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
             ost = ChunkStoreServer(cert, key)
@@ -198,11 +198,11 @@ class TestL3Striping(unittest.TestCase):
                 ost.close()
 
     def test_two_stores_receive_disjoint_chunks(self) -> None:
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_str2_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_str2_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
             a = ChunkStoreServer(cert, key)
@@ -248,11 +248,11 @@ class TestPullBatch(unittest.TestCase):
 
     def test_flat_pull_is_two_round_trips(self) -> None:
         """平らなディレクトリ 100 ファイルの pull は 2 往復（根 1 + ファイル 1）。"""
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_pull_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_pull_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
             ost = ChunkStoreServer(cert, key)
@@ -280,11 +280,11 @@ class TestPullBatch(unittest.TestCase):
 
     def test_nested_pull_is_one_round_trip_per_level(self) -> None:
         """入れ子は「1 階層 = 1 往復」。root/d1/d2 に 3 ファイルなら 3 往復。"""
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_nest_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_nest_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
             ost = ChunkStoreServer(cert, key)
@@ -314,11 +314,11 @@ class TestPullBatch(unittest.TestCase):
 
     def test_same_chunk_fetched_once(self) -> None:
         """同一内容のファイルが 2 つあっても、塊は 1 回しか取りに行かない。"""
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_dup_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_dup_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
             ost = ChunkStoreServer(cert, key)
@@ -349,18 +349,18 @@ class TestPullBatch(unittest.TestCase):
                 ost.close()
 
     def test_batch_get_split_by_size_cap(self) -> None:
-        """DFS5_BATCH_CHUNKS で 1 回の batch_get の件数を絞れる（組が分かれる）。"""
+        """DFS_BATCH_CHUNKS で 1 回の batch_get の件数を絞れる（組が分かれる）。"""
         import os
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_cap_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_cap_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
             ost = ChunkStoreServer(cert, key)
-            old = os.environ.get("DFS5_BATCH_CHUNKS")
-            os.environ["DFS5_BATCH_CHUNKS"] = "4"
+            old = os.environ.get("DFS_BATCH_CHUNKS")
+            os.environ["DFS_BATCH_CHUNKS"] = "4"
             try:
                 tree = base / "tree"
                 tree.mkdir()
@@ -381,17 +381,17 @@ class TestPullBatch(unittest.TestCase):
             finally:
                 ost.close()
                 if old is None:
-                    os.environ.pop("DFS5_BATCH_CHUNKS", None)
+                    os.environ.pop("DFS_BATCH_CHUNKS", None)
                 else:
-                    os.environ["DFS5_BATCH_CHUNKS"] = old
+                    os.environ["DFS_BATCH_CHUNKS"] = old
 
     def test_missing_chunk_is_reported(self) -> None:
         """サーバから塊が消えていたら、黙って欠けずに ChunkIntegrityError になる。"""
-        from dfs5.crypto import ContentAddressedCrypto, ChunkIntegrityError
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto, ChunkIntegrityError
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_miss_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_miss_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
             ost = ChunkStoreServer(cert, key)
@@ -430,10 +430,10 @@ class TestWanRoundTrips(unittest.TestCase):
 
     def test_assume_absent_skips_has(self) -> None:
         """``assume_absent=True`` は内部の batch_has を送らず、1 往復で PUT する。"""
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_aa_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_aa_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
             ost = ChunkStoreServer(cert, key)
@@ -460,11 +460,11 @@ class TestWanRoundTrips(unittest.TestCase):
 
     def test_push_round_trips_do_not_scale_with_chunks(self) -> None:
         """チャンク 100 個でも push の L3 往復は 2 以下（HAS 1 + PUT 1）。"""
-        from dfs5.crypto import ContentAddressedCrypto
-        from dfs5.l3_store import ChunkStoreServer, OSTClient
-        from dfs5.l4_log import MerkleTreeBuilder
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_rt_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_rt_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
             ost = ChunkStoreServer(cert, key)
@@ -498,31 +498,31 @@ class TestWanRoundTrips(unittest.TestCase):
     def test_ost_timeout_env_vars_are_honored(self) -> None:
         """サーバ・クライアント双方のタイムアウトが環境変数で変わる。"""
         import os
-        from dfs5.l3_ost_adapter import ost_connect_timeout, ost_socket_timeout
+        from dfs.l3_ost_adapter import ost_connect_timeout, ost_socket_timeout
 
-        old_socket = os.environ.get("DFS5_OST_SOCKET_TIMEOUT")
-        old_connect = os.environ.get("DFS5_OST_CONNECT_TIMEOUT")
+        old_socket = os.environ.get("DFS_OST_SOCKET_TIMEOUT")
+        old_connect = os.environ.get("DFS_OST_CONNECT_TIMEOUT")
         try:
-            os.environ["DFS5_OST_SOCKET_TIMEOUT"] = "42.5"
-            os.environ["DFS5_OST_CONNECT_TIMEOUT"] = "7"
+            os.environ["DFS_OST_SOCKET_TIMEOUT"] = "42.5"
+            os.environ["DFS_OST_CONNECT_TIMEOUT"] = "7"
             self.assertEqual(ost_socket_timeout(), 42.5)
             self.assertEqual(ost_connect_timeout(), 7.0)
 
             # 不正値・負値は既定に戻す（壊れた設定で無制限待ちにしない）
-            os.environ["DFS5_OST_SOCKET_TIMEOUT"] = "not-a-number"
-            os.environ["DFS5_OST_CONNECT_TIMEOUT"] = "-1"
+            os.environ["DFS_OST_SOCKET_TIMEOUT"] = "not-a-number"
+            os.environ["DFS_OST_CONNECT_TIMEOUT"] = "-1"
             self.assertEqual(ost_socket_timeout(), 30.0)
             self.assertEqual(ost_connect_timeout(), 10.0)
 
             # 環境変数なしの既定
-            del os.environ["DFS5_OST_SOCKET_TIMEOUT"]
-            del os.environ["DFS5_OST_CONNECT_TIMEOUT"]
+            del os.environ["DFS_OST_SOCKET_TIMEOUT"]
+            del os.environ["DFS_OST_CONNECT_TIMEOUT"]
             self.assertEqual(ost_socket_timeout(), 30.0)
             self.assertEqual(ost_connect_timeout(), 10.0)
         finally:
             for name, value in (
-                ("DFS5_OST_SOCKET_TIMEOUT", old_socket),
-                ("DFS5_OST_CONNECT_TIMEOUT", old_connect),
+                ("DFS_OST_SOCKET_TIMEOUT", old_socket),
+                ("DFS_OST_CONNECT_TIMEOUT", old_connect),
             ):
                 if value is None:
                     os.environ.pop(name, None)
@@ -535,13 +535,13 @@ class TestWanRoundTrips(unittest.TestCase):
         import socket
         import ssl as ssl_mod
         import time as time_mod
-        from dfs5.l3_store import ChunkStoreServer
+        from dfs.l3_store import ChunkStoreServer
 
-        with tempfile.TemporaryDirectory(prefix="dfs5_srv_to_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="dfs_srv_to_") as tmp:
             base = Path(tmp)
             cert, key = self._cert(base)
-            old = os.environ.get("DFS5_OST_SOCKET_TIMEOUT")
-            os.environ["DFS5_OST_SOCKET_TIMEOUT"] = "0.5"
+            old = os.environ.get("DFS_OST_SOCKET_TIMEOUT")
+            os.environ["DFS_OST_SOCKET_TIMEOUT"] = "0.5"
             ost = ChunkStoreServer(cert, key)
             try:
                 # 何も送らずに放置すると、サーバ側は 0.5 秒で conn を閉じる
@@ -567,33 +567,33 @@ class TestWanRoundTrips(unittest.TestCase):
             finally:
                 ost.close()
                 if old is None:
-                    os.environ.pop("DFS5_OST_SOCKET_TIMEOUT", None)
+                    os.environ.pop("DFS_OST_SOCKET_TIMEOUT", None)
                 else:
-                    os.environ["DFS5_OST_SOCKET_TIMEOUT"] = old
+                    os.environ["DFS_OST_SOCKET_TIMEOUT"] = old
 
     def test_l2_timeout_env_var_is_honored(self) -> None:
         """L2 HTTP タイムアウトが環境変数で変わり、既存の ``_post`` がそれを使う。"""
         import os
-        from dfs5 import cli as cli_mod
+        from dfs import cli as cli_mod
 
-        old = os.environ.get("DFS5_L2_TIMEOUT")
+        old = os.environ.get("DFS_L2_TIMEOUT")
         try:
-            os.environ["DFS5_L2_TIMEOUT"] = "12.5"
+            os.environ["DFS_L2_TIMEOUT"] = "12.5"
             self.assertEqual(cli_mod.l2_timeout(), 12.5)
-            os.environ["DFS5_L2_TIMEOUT"] = "0"
+            os.environ["DFS_L2_TIMEOUT"] = "0"
             self.assertEqual(cli_mod.l2_timeout(), 10.0)
-            del os.environ["DFS5_L2_TIMEOUT"]
+            del os.environ["DFS_L2_TIMEOUT"]
             self.assertEqual(cli_mod.l2_timeout(), 10.0)
         finally:
             if old is None:
-                os.environ.pop("DFS5_L2_TIMEOUT", None)
+                os.environ.pop("DFS_L2_TIMEOUT", None)
             else:
-                os.environ["DFS5_L2_TIMEOUT"] = old
+                os.environ["DFS_L2_TIMEOUT"] = old
 
 
 class TestStage5Integration(unittest.TestCase):
     def test_two_node_sharing_and_final_metrics(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dfs5_int_") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="dfs_int_") as tmpdir:
             base = Path(tmpdir)
             root_priv, root_pub = generate_ssh_keypair(base, "root")
             alice_priv, alice_pub = generate_ssh_keypair(base, "alice")
@@ -639,10 +639,10 @@ class TestStage5Integration(unittest.TestCase):
                 )
                 reg.register_delegation(d_notes, now=now)
 
-                mac_node = DFS5Node(
+                mac_node = DFSNode(
                     "Mac", sub_path, base / "mac_mount", alice_priv, alice_pub, secret, reg, "127.0.0.1", ost.port
                 )
-                pi5_node = DFS5Node(
+                pi5_node = DFSNode(
                     "Pi5", sub_path, base / "pi5_mount", alice_priv, alice_pub, secret, reg, "127.0.0.1", ost.port
                 )
 
@@ -737,7 +737,7 @@ class TestStage5Integration(unittest.TestCase):
                 self.assertEqual((mac_snap_v3 / "bob.txt").read_bytes(), b"Written by bob at v3\n")
 
                 print("\n" + "=" * 72)
-                print("dfs5 Stage 5 Integration Metrics Summary")
+                print("dfs Stage 5 Integration Metrics Summary")
                 print("=" * 72)
                 print(f"  1. Sync Latency (Mac -> Pi5) : {sync_ms:.1f} ms (Target: < 1000 ms)")
                 print(f"  2. Wire Transfer Ratio       : {wire_ratio:.2f}x ({v1_wire_bytes} B / {raw_size} B, Target: <= 2.0x)")

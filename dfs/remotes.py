@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-dfs5/remotes.py
+dfs/remotes.py
 rclone ライク CLI のためのリモート定義の保存と取り出し。
 
-`~/.config/dfs5/remotes.json` に「名前 -> 接続情報」を置く。1 つのリモートは
+`~/.config/dfs/remotes.json` に「名前 -> 接続情報」を置く。1 つのリモートは
 L2 名簿の URL・L3 OST の host:port・サブツリーのパス・書き手鍵・tree_secret・
 作業ディレクトリを持つ。`remote:path` の形で参照する。
 """
@@ -20,8 +20,8 @@ from typing import Dict, List, Optional
 from .crypto import normalize_path
 from .paths import cache_dir, config_dir, restrict_to_owner
 
-CONFIG_ENV = "DFS5_CONFIG"
-DEFAULT_CONFIG = "~/.config/dfs5/remotes.json"
+CONFIG_ENV = "DFS_CONFIG"
+DEFAULT_CONFIG = "~/.config/dfs/remotes.json"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 # ``ost`` は必須にしない。L2 のロケータ（``endpoints``）から引けるため、
@@ -48,7 +48,7 @@ class Remote:
     libp2p_psk: str = ""                 # private swarm 用 pre-shared key
     path: str = ""                      # サブツリーのパス。空ならロケータの path を使う
     secret: str = ""                    # tree_secret。空なら --secret を後で渡す
-    workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs5/<name>）
+    workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs/<name>）
     epoch: int = 1                      # 委譲のエポック
     role_epoch: int = 1                 # registry primary/secondary の fencing 世代
     compression: str = "none"           # フォルダ xattr が無い場合の既定圧縮
@@ -158,7 +158,7 @@ class RemoteStore:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema": "dfs5-remotes-v1",
+            "schema": "dfs-remotes-v1",
             "remotes": {name: r.to_dict() for name, r in sorted(self.remotes.items())},
         }
         tmp = self.path.with_suffix(".tmp")

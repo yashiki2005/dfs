@@ -4,11 +4,11 @@ bench/e2e_lan.py
 PLAN.md 段階 5: Mac と Pi5 の実機で 1 つのツリーを共有する。
 
 前提:
-  - Pi5 で `dfs5 serve` が動いている（L2: HTTP 9440 / L3: TLS 9443）
+  - Pi5 で `dfs serve` が動いている（L2: HTTP 9440 / L3: TLS 9443）
   - 両端末で同じ委譲・同じ tree_secret を使う
   - ssh で Pi5 に鍵を置ける
 
-このスクリプトは Mac 側から操作し、Pi5 側は ssh 経由で dfs5 CLI を呼ぶ。
+このスクリプトは Mac 側から操作し、Pi5 側は ssh 経由で dfs CLI を呼ぶ。
 数値と結果を JSON で残す（環境・RTT・各版の所要時間）。
 
 使い方:
@@ -50,15 +50,15 @@ def main() -> int:
     ap.add_argument("--pi5", default="yy@192.168.0.7")
     ap.add_argument("--pi5-host", default="192.168.0.7")
     ap.add_argument("--key", default="~/.ssh/pi-mock-test")
-    ap.add_argument("--work", default="/tmp/dfs5_e2e")
+    ap.add_argument("--work", default="/tmp/dfs_e2e")
     ap.add_argument("--py", default=str(Path.home() / "dfs-venv" / "bin" / "python"))
     ap.add_argument("--remote-py", default="python3")
     args = ap.parse_args()
 
     work = Path(args.work)
-    remote_work = "~/dfs5_e2e"
+    remote_work = "~/dfs_e2e"
     result: dict = {
-        "schema": "dfs5-e2e-lan-v1",
+        "schema": "dfs-e2e-lan-v1",
         "measured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "environment": {
             "mac_platform": platform.platform(),
@@ -97,13 +97,13 @@ def main() -> int:
     # 2. 各版の push / pull
     mac_mount = work / "mac_mount"
     t0 = time.perf_counter()
-    rc, out = sh([args.py, "-m", "dfs5.cli", "push", "--mount", str(mac_mount)], timeout=120)
-    step("Mac push", rc == 0 and "[dfs5 push] OK" in out, out, (time.perf_counter() - t0) * 1000)
+    rc, out = sh([args.py, "-m", "dfs.cli", "push", "--mount", str(mac_mount)], timeout=120)
+    step("Mac push", rc == 0 and "[dfs push] OK" in out, out, (time.perf_counter() - t0) * 1000)
 
     t0 = time.perf_counter()
     rc, out = ssh(args.key, args.pi5,
-                  f"cd ~/src/dfs5 && {args.remote_py} -m dfs5.cli pull --mount {remote_work}/pi5_mount")
-    step("Pi5 pull", rc == 0 and "[dfs5 pull] OK" in out, out, (time.perf_counter() - t0) * 1000)
+                  f"cd ~/src/dfs && {args.remote_py} -m dfs.cli pull --mount {remote_work}/pi5_mount")
+    step("Pi5 pull", rc == 0 and "[dfs pull] OK" in out, out, (time.perf_counter() - t0) * 1000)
 
     # 3. 内容の一致（SHA-256）
     rc, out = sh(["sh", "-c", "cd " + str(mac_mount) + "/tree && find . -type f -exec shasum -a 256 {} \\; | sort"])
@@ -114,12 +114,12 @@ def main() -> int:
 
     # 4. 同時書き込みの排他
     (mac_mount / "tree" / "todo.md").write_text("# concurrent from mac\n", encoding="utf-8")
-    rc, out = sh([args.py, "-m", "dfs5.cli", "push", "--mount", str(mac_mount)], timeout=120)
+    rc, out = sh([args.py, "-m", "dfs.cli", "push", "--mount", str(mac_mount)], timeout=120)
     mac_won = rc == 0
 
     rc2, out2 = ssh(args.key, args.pi5,
-                    f"cd ~/src/dfs5 && printf '# concurrent from pi5\\n' > {remote_work}/pi5_mount/tree/todo.md && "
-                    f"{args.remote_py} -m dfs5.cli push --mount {remote_work}/pi5_mount")
+                    f"cd ~/src/dfs && printf '# concurrent from pi5\\n' > {remote_work}/pi5_mount/tree/todo.md && "
+                    f"{args.remote_py} -m dfs.cli push --mount {remote_work}/pi5_mount")
     rejected = rc2 != 0 and "Conflict" in out2
     step("同時書き込みを CAS で拒否", mac_won and rejected, out2, )
 

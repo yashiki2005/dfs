@@ -4,7 +4,7 @@ bench/l3_bench.py
 PLAN.md 段階 4: L3（データ平面）の判断材料を測る。
 
 測るのは次の 3 点。
-  1. 現行 dfs5 L3（wire_id で一括 PUT）の転送コスト
+  1. 現行 dfs L3（wire_id で一括 PUT）の転送コスト
   2. 同一内容の重複排除が効くか（同一バッチ・別バッチ）
   3. mini_lustre の OST を「そのまま」使えるか（プロトコル互換性の確認）
 
@@ -32,9 +32,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dfs5.crypto import ContentAddressedCrypto  # noqa: E402
-from dfs5.l3_store import ChunkStoreServer, OSTClient  # noqa: E402
-from dfs5.l4_log import MerkleTreeBuilder  # noqa: E402
+from dfs.crypto import ContentAddressedCrypto  # noqa: E402
+from dfs.l3_store import ChunkStoreServer, OSTClient  # noqa: E402
+from dfs.l4_log import MerkleTreeBuilder  # noqa: E402
 
 
 def _cert(directory: Path) -> tuple[Path, Path]:
@@ -79,7 +79,7 @@ def measure_transfer(cases: list[tuple[int, int]]) -> dict:
                 })
         finally:
             server.close()
-    return {"method": "dfs5-l3-batch", "cases": rows}
+    return {"method": "dfs-l3-batch", "cases": rows}
 
 
 def measure_dedup() -> dict:
@@ -107,7 +107,7 @@ def measure_dedup() -> dict:
         finally:
             server.close()
     return {
-        "method": "dfs5-content-dedup",
+        "method": "dfs-content-dedup",
         "same_batch_2_files_blob_bytes": first,
         "one_file_plus_dir_expected": 8192 + 32 + 12 + 16,  # 平文 + plain_id + nonce + tag
         "index_entries": index_size,
@@ -117,7 +117,7 @@ def measure_dedup() -> dict:
 
 
 def probe_mini_lustre() -> dict:
-    """mini_lustre の OST に dfs5 のフレームを送り、互換性を確認する。"""
+    """mini_lustre の OST に dfs のフレームを送り、互換性を確認する。"""
     mini = Path.home() / "src" / "mini_lustre"
     if not mini.exists():
         return {"available": False, "reason": "~/src/mini_lustre が無い"}
@@ -125,19 +125,19 @@ def probe_mini_lustre() -> dict:
     probe = {
         "available": True,
         "frame_8byte_header": "mini_lustre: >II (json_len, payload_len) + JSON + payload",
-        "frame_1byte_opcode": "dfs5: 1-byte opcode + 64-byte wire_id + >I length + body",
+        "frame_1byte_opcode": "dfs: 1-byte opcode + 64-byte wire_id + >I length + body",
         "chunk_identity": {
             "mini_lustre": "(file_id, chunk_index) — 内容では決まらない",
-            "dfs5": "wire_id = SHA256(ciphertext) — 内容アドレス",
+            "dfs": "wire_id = SHA256(ciphertext) — 内容アドレス",
         },
         "batch_ops": {
             "mini_lustre": "個別の read_chunk / write_chunk のみ",
-            "dfs5": "batch_has / batch_put_if_absent / batch_get",
+            "dfs": "batch_has / batch_put_if_absent / batch_get",
         },
         "compatible_without_change": False,
         "note": (
             "同じポートで TLS/TCP を使う点だけが共通で、アプリケーション層は別物。"
-            "DFS5 の 1-byte opcode は mini_lustre では JSON 長として読まれ、エラーになる。"
+            "DFS の 1-byte opcode は mini_lustre では JSON 長として読まれ、エラーになる。"
             "また mini_lustre は file_id/chunk_index で識別するため、wire_id による"
             "内容アドレス重複排除は行えない。"
         ),
@@ -151,7 +151,7 @@ def main() -> int:
     args = ap.parse_args()
 
     result = {
-        "schema": "dfs5-l3-bench-v1",
+        "schema": "dfs-l3-bench-v1",
         "measured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "environment": {
             "platform": platform.platform(),
@@ -168,7 +168,7 @@ def main() -> int:
             ),
             "use_mini_lustre_unchanged": False,
             "alternative": (
-                "プロトコルは独自実装のまま（dfs5/l3_ost_adapter.py）を使い、"
+                "プロトコルは独自実装のまま（dfs/l3_ost_adapter.py）を使い、"
                 "将来 mini_lustre へ載せる場合は RPC アダプタ層を挟む。"
             ),
         },

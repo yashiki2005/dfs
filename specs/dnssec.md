@@ -15,11 +15,11 @@ registry の即時フェイルオーバーを DNS に依存させない。
 
 ## レコード
 
-`_dfs5.<domain>` の TXT レコードに JSON を 1 つ置く。
+`_dfs.<domain>` の TXT レコードに JSON を 1 つ置く。
 
 ```json
 {
-  "schema": "dfs5-discovery-v1",
+  "schema": "dfs-discovery-v1",
   "domain": "example.com",
   "root_anchor": "/example.com",
   "root_pubkey": "ssh-ed25519 AAAA...",
@@ -36,7 +36,7 @@ registry の即時フェイルオーバーを DNS に依存させない。
 
 | フィールド | 意味 |
 |---|---|
-| `schema` | `dfs5-discovery-v1` 固定 |
+| `schema` | `dfs-discovery-v1` 固定 |
 | `domain` | このレコードが管理するドメイン |
 | `root_anchor` | L1 root のパス（例: `/example.com`） |
 | `root_pubkey` | L1 root の OpenSSH 公開鍵 |
@@ -49,7 +49,7 @@ URL は `http(s)://host:port` 形式で、重複を拒否する。
 
 ## 検証
 
-1. EDNS0 の DO ビットを付けて `_dfs5.<domain>` TXT を引く
+1. EDNS0 の DO ビットを付けて `_dfs.<domain>` TXT を引く
 2. TXT の RRSIG から署名ゾーンを特定する
 3. IANA の root trust anchor（KSK-2017 / KSK-2024 の DS）を根として、
    署名ゾーンまでの DNSKEY / DS チェーンをクライアント側で検証する
@@ -91,16 +91,16 @@ head の更新は L2 の署名付きログで行う。
 
 ```bash
 # discovery の内容を確認
-dfs5cli discover example.com
+dfscli discover example.com
 
 # DNSSEC から root 鍵・primary/secondary を取得してリモートを登録
-dfs5cli config create scw \
+dfscli config create scw \
   --dnssec-domain example.com \
   --key ~/.ssh/alice \
   --secret <tree_secret>
 
-# dfs5svc が管理するサービスの TXT JSON を生成
-dfs5svc dnssec scw --domain example.com
+# dfssvc が管理するサービスの TXT JSON を生成
+dfssvc dnssec scw --domain example.com
 ```
 
 `--registry` / `--registry-alternate` を併記した場合は、DNSSEC の内容と一致しなければ

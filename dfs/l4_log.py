@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dfs5/l4_log.py
+dfs/l4_log.py
 L4 (一貫性・単一書き手追記ログ・Merkle ディレクトリ塊・evil B6/B7 防御) モジュール。
 """
 
@@ -82,7 +82,7 @@ class HeadPin:
 
 class MerkleTreeBuilder:
     """
-    ローカルディレクトリ（またはメモリ辞書）と L3 OST の間で Merkle ディレクトリ塊 (`dfs5-dir-v1`) を読み書きする。
+    ローカルディレクトリ（またはメモリ辞書）と L3 OST の間で Merkle ディレクトリ塊 (`dfs-dir-v1`) を読み書きする。
     再委譲された境界 (`delegated_mounts`) はシンボリック参照として記録し、親のハッシュ計算から切り離す。
 
     ストライピング:
@@ -131,7 +131,7 @@ class MerkleTreeBuilder:
             data = json.loads(self.index_file.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             return {}
-        if not isinstance(data, dict) or data.get("schema") != "dfs5-ost-index-v1":
+        if not isinstance(data, dict) or data.get("schema") != "dfs-ost-index-v1":
             return {}
         if data.get("address_key") != self.index_key:
             return {}
@@ -158,7 +158,7 @@ class MerkleTreeBuilder:
             {
                 "address_key": self.index_key,
                 "entries": entries,
-                "schema": "dfs5-ost-index-v1",
+                "schema": "dfs-ost-index-v1",
             },
         )
 
@@ -263,7 +263,7 @@ class MerkleTreeBuilder:
                     if item.name in self.IGNORED_NAMES or item.name.startswith("._"):
                         continue
                     if item.is_symlink():
-                        # dfs5-dir-v1 に symlink 型はない。リンク先を読むとツリー外の
+                        # dfs-dir-v1 に symlink 型はない。リンク先を読むとツリー外の
                         # ファイルをアップロードしてしまうため、明示的に飛ばす。
                         self.warnings.append(f"skipping symlink: {item}")
                         continue
@@ -309,7 +309,7 @@ class MerkleTreeBuilder:
                     {
                         "compression": dir_policy,
                         "entries": items,
-                        "format": "dfs5-dir-v1",
+                        "format": "dfs-dir-v1",
                     }
                 )
                 return _stage(dir_bytes, dir_policy)
@@ -408,8 +408,8 @@ class MerkleTreeBuilder:
             if wire_id not in prev or (hint or 0) > (prev[wire_id] or 0):
                 prev[wire_id] = hint
 
-        chunk_cap = _env_positive_int("DFS5_BATCH_CHUNKS", self.DEFAULT_BATCH_CHUNKS)
-        byte_cap = _env_positive_int("DFS5_BATCH_BYTES", self.DEFAULT_BATCH_BYTES)
+        chunk_cap = _env_positive_int("DFS_BATCH_CHUNKS", self.DEFAULT_BATCH_CHUNKS)
+        byte_cap = _env_positive_int("DFS_BATCH_BYTES", self.DEFAULT_BATCH_BYTES)
 
         result: Dict[str, bytes] = {}
         for store_id, id_to_hint in by_store.items():
@@ -468,7 +468,7 @@ class MerkleTreeBuilder:
                     raise ChunkIntegrityError(f"Missing directory chunk during download: {wire_id}")
                 dir_bytes = self.crypto.unpack_chunk(plain_id, wire_id, blob)
                 dir_obj = json.loads(dir_bytes.decode("utf-8"))
-                if dir_obj.get("format") != "dfs5-dir-v1":
+                if dir_obj.get("format") != "dfs-dir-v1":
                     raise ChunkIntegrityError("Invalid directory chunk format")
 
                 # 各階層の対象ディレクトリは、塊を取る前に必ず用意する
@@ -525,7 +525,7 @@ class MerkleTreeBuilder:
         blob = self._client(store_id).get(wire_id)
         dir_bytes = self.crypto.unpack_chunk(plain_id, wire_id, blob)
         dir_obj = json.loads(dir_bytes.decode("utf-8"))
-        if dir_obj.get("format") != "dfs5-dir-v1":
+        if dir_obj.get("format") != "dfs-dir-v1":
             raise ChunkIntegrityError("Invalid directory chunk format")
         return dir_obj["entries"]
 

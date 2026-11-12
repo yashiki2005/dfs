@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dfs5/crypto.py
+dfs/crypto.py
 L1 / L2 / L3 / L4 共通の正規化・署名検証・内容アドレス決定論的暗号化 (Convergent AEAD) モジュール。
 """
 
@@ -23,13 +23,13 @@ SIGN_TIMEOUT_SECONDS: float = 30.0
 
 EMPTY_SHA256: str = hashlib.sha256(b"").hexdigest()
 
-NS_L1_DELEGATION: str = "dfs5-delegation-v1"
-NS_L2_LOCATOR: str = "dfs5-l2-locator-v1"
-NS_L4_LOG: str = "dfs5-l4-log-v1"
+NS_L1_DELEGATION: str = "dfs-delegation-v1"
+NS_L2_LOCATOR: str = "dfs-l2-locator-v1"
+NS_L4_LOG: str = "dfs-l4-log-v1"
 
 
 class CryptoError(Exception):
-    """dfs5 暗号・署名・整合性エラーの基底クラス"""
+    """dfs 暗号・署名・整合性エラーの基底クラス"""
 
 
 class SignatureVerificationError(CryptoError):
@@ -92,7 +92,7 @@ def ssh_key_fingerprint(pubkey_line: str) -> str:
 
 def _ssh_keygen_sign(priv_key_path: Path, namespace: str, payload: bytes) -> str:
     """ssh-keygen -Y sign によるフォールバック署名。必ずタイムアウトする。"""
-    with tempfile.TemporaryDirectory(prefix="dfs5_sign_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="dfs_sign_") as tmpdir:
         msg_file = Path(tmpdir) / "payload"
         msg_file.write_bytes(payload)
         try:
@@ -306,7 +306,7 @@ def ssh_verify(
     if in_process is not None:
         return in_process
 
-    with tempfile.TemporaryDirectory(prefix="dfs5_verify_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="dfs_verify_") as tmpdir:
         tmp_path = Path(tmpdir)
         allowed_signers = tmp_path / "allowed_signers"
         sig_file = tmp_path / "payload.sig"
@@ -361,8 +361,8 @@ class ContentAddressedCrypto:
       - 暗号化鍵は ``tree_secret`` から導出する（epoch で回してよい）。
     """
 
-    MAGIC_HEADER = b"DFS5B2"
-    MAGIC_HEADER_V3 = b"DFS5B3"
+    MAGIC_HEADER = b"DFSB2"
+    MAGIC_HEADER_V3 = b"DFSB3"
     CODEC_NONE = 0
     CODEC_ZSTD = 1
     ZSTD_LEVEL = 10
@@ -378,7 +378,7 @@ class ContentAddressedCrypto:
         # 内容アドレス鍵は暗号化鍵と分離する。未指定なら tree_secret から決定的に導出する。
         if address_secret is None:
             self.address_secret: bytes = hmac.new(
-                b"dfs5-address-key-v1", tree_secret, hashlib.sha256
+                b"dfs-address-key-v1", tree_secret, hashlib.sha256
             ).digest()
         elif isinstance(address_secret, str):
             self.address_secret = hashlib.sha256(address_secret.encode("utf-8")).digest()
@@ -386,11 +386,11 @@ class ContentAddressedCrypto:
             self.address_secret = address_secret
 
     def _enc_key(self, plain_id_bytes: bytes) -> bytes:
-        return hmac.new(self.tree_secret, b"dfs5-chunk-key-v1:" + plain_id_bytes, hashlib.sha256).digest()
+        return hmac.new(self.tree_secret, b"dfs-chunk-key-v1:" + plain_id_bytes, hashlib.sha256).digest()
 
     def compute_plain_id(self, plaintext: bytes) -> bytes:
         """平文の内容アドレス。暗号化鍵のローテーションに依存しない。"""
-        return hmac.new(self.address_secret, b"dfs5-plain-id-v1:" + plaintext, hashlib.sha256).digest()
+        return hmac.new(self.address_secret, b"dfs-plain-id-v1:" + plaintext, hashlib.sha256).digest()
 
     @staticmethod
     def _normalize_compression(compression: str | None) -> str:
@@ -410,7 +410,7 @@ class ContentAddressedCrypto:
             import zstandard as zstd
         except ImportError as e:
             raise CompressionError(
-                "zstd compression requires zstandard (pip install 'dfs5[compression]')"
+                "zstd compression requires zstandard (pip install 'dfs[compression]')"
             ) from e
         sample_size = cls.COMPRESSION_SAMPLE_BYTES
         if len(plaintext) <= sample_size * 3:
@@ -497,7 +497,7 @@ class ContentAddressedCrypto:
         if blob.startswith(self.MAGIC_HEADER_V3):
             m_len = len(self.MAGIC_HEADER_V3)
             if len(blob) < m_len + 1 + 32 + 8 + self.NONCE_LEN + self.TAG_LEN:
-                raise ChunkIntegrityError("Invalid or truncated DFS5B3 chunk header")
+                raise ChunkIntegrityError("Invalid or truncated DFSB3 chunk header")
             codec = blob[m_len]
             embedded_plain_id = blob[m_len + 1 : m_len + 33]
             plain_size = struct.unpack(">Q", blob[m_len + 33 : m_len + 41])[0]
@@ -511,7 +511,7 @@ class ContentAddressedCrypto:
             m_len = len(self.MAGIC_HEADER)
             head_len = m_len + 32 + self.NONCE_LEN
             if len(blob) < head_len + self.TAG_LEN or not blob.startswith(self.MAGIC_HEADER):
-                raise ChunkIntegrityError("Invalid or truncated DFS5 chunk header")
+                raise ChunkIntegrityError("Invalid or truncated DFS chunk header")
             codec = self.CODEC_NONE
             embedded_plain_id = blob[m_len : m_len + 32]
             plain_size = 0
@@ -522,7 +522,7 @@ class ContentAddressedCrypto:
             aad = self.MAGIC_HEADER + plain_id_bytes
 
         if len(blob) < head_len + self.TAG_LEN:
-            raise ChunkIntegrityError("Invalid or truncated DFS5 chunk header")
+            raise ChunkIntegrityError("Invalid or truncated DFS chunk header")
 
         key = self._enc_key(plain_id_bytes)
         try:

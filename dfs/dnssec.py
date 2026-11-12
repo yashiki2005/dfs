@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""DNSSEC で公開する dfs5 の root / registry 情報を読む。
+"""DNSSEC で公開する dfs の root / registry 情報を読む。
 
-レコード形式は ``_dfs5.<domain>`` の TXT に置く JSON:
+レコード形式は ``_dfs.<domain>`` の TXT に置く JSON:
 
 {
-  "schema": "dfs5-discovery-v1",
+  "schema": "dfs-discovery-v1",
   "domain": "example.com",
   "root_anchor": "/example.com",
   "root_pubkey": "ssh-ed25519 AAAA...",
@@ -32,8 +32,8 @@ from urllib.parse import urlparse
 
 from .crypto import normalize_path
 
-SCHEMA = "dfs5-discovery-v1"
-DEFAULT_RECORD_PREFIX = "_dfs5"
+SCHEMA = "dfs-discovery-v1"
+DEFAULT_RECORD_PREFIX = "_dfs"
 
 # IANA の root trust anchor（KSK-2017 / KSK-2024）。
 # https://data.iana.org/root-anchors/root-anchors.xml
@@ -331,7 +331,7 @@ def discover_domain(
     validate: bool = True,
     timeout: float = 5.0,
 ) -> Discovery:
-    """DNSSEC 対応リゾルバで ``_dfs5.<domain>`` TXT を読む。
+    """DNSSEC 対応リゾルバで ``_dfs.<domain>`` TXT を読む。
 
     既定ではクライアント自身が root trust anchor から DNSKEY/DS チェーンを
     検証する。``validate=False`` のときだけ、従来どおり ``require_ad=True`` で

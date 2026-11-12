@@ -16,22 +16,22 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs5 import cli as cli_mod
-from dfs5.crypto import (
+from dfs import cli as cli_mod
+from dfs.crypto import (
     EMPTY_SHA256,
     NS_L4_LOG,
     canonical_json,
     sha256_hex,
     ssh_sign,
 )
-from dfs5.l1_delegation import create_delegation_envelope
-from dfs5.l2_registry import (
+from dfs.l1_delegation import create_delegation_envelope
+from dfs.l2_registry import (
     DirectoryRegistryService,
     create_locator_envelope,
 )
-from dfs5.l3_store import ChunkStoreServer
-from dfs5.l5_clayfs import DFS5Node
-from dfs5.remotes import Remote, RemoteStore
+from dfs.l3_store import ChunkStoreServer
+from dfs.l5_clayfs import DFSNode
+from dfs.remotes import Remote, RemoteStore
 
 
 def _keypair(base: Path, name: str) -> tuple[Path, str]:
@@ -122,7 +122,7 @@ class _RegistryHTTP:
 
 class AvailabilityCase(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dfs5_avail_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dfs_avail_")
         self.base = Path(self._tmp.name)
         self.root_key, self.root_pub = _keypair(self.base, "root")
         self.alice_key, self.alice_pub = _keypair(self.base, "alice")
@@ -402,7 +402,7 @@ class AvailabilityCase(unittest.TestCase):
         replica_ost = ChunkStoreServer(cert, key)
         self.addCleanup(primary_ost.close)
         self.addCleanup(replica_ost.close)
-        writer = DFS5Node(
+        writer = DFSNode(
             "writer",
             self.path,
             self.base / "writer_mount",
@@ -426,7 +426,7 @@ class AvailabilityCase(unittest.TestCase):
         self.assertEqual(len(endpoints), 2)
 
         primary_ost.close()
-        reader = DFS5Node(
+        reader = DFSNode(
             "reader",
             self.path,
             self.base / "reader_mount",
