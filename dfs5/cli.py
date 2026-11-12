@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -87,27 +87,43 @@ class RemoteRegistryClient:
     """
     DirectoryRegistryService と同じメソッドシグネチャを持ち、
     HTTP 経由でリモート（またはローカル）の L2 名簿サーバと通信するクライアント。
+
     """
 
-    def __init__(self, registry_url: str):
-        self.registry_url = registry_url.rstrip("/")
+    def __init__(self, registry_url: str | Sequence[str]):
+        raw_urls = [registry_url] if isinstance(registry_url, str) else list(registry_url)
+        self.registry_urls: list[str] = []
+        for raw in raw_urls:
+            value = str(raw or "").strip().rstrip("/")
+            if value and value not in self.registry_urls:
+                self.registry_urls.append(value)
+        if not self.registry_urls:
+            raise ValueError("At least one L2 registry URL is required")
+        # 書き込み先は先頭（主名簿）に固定する。
+        self.registry_url = self.registry_urls[0]
 
-    def _post(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST する。タイムアウトは ``DFS5_L2_TIMEOUT``（既定 10 秒）。
+    def _post_one(
+        self,
+        url: str,
+        endpoint: str,
+        payload: Dict[str, Any],
+        timeout: Optional[float],
+    ) -> Dict[str, Any]:
+        """1 つの名簿へ POST する。タイムアウトは ``DFS5_L2_TIMEOUT``（既定 10 秒）。
 
         高遅延 WAN では 1 往復だけで数百 ms かかるため、LAN 時代の 5 秒固定は
         切り詰めの原因になる。環境変数で伸ばせるようにしてある。
         """
-        url = f"{self.registry_url}{endpoint}"
+        full_url = f"{url}{endpoint}"
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            url,
+            full_url,
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=l2_timeout()) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or l2_timeout()) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             try:
@@ -115,6 +131,8 @@ class RemoteRegistryClient:
                 err_type = err_body.get("error_type", "")
                 err_msg = err_body.get("message", str(e))
             except Exception:
+                if e.code >= 500:
+                    raise ServiceUnavailableError(f"HTTP {e.code}: {e.reason}") from e
                 raise RegistryError(f"HTTP {e.code}: {e.reason}") from e
 
             if err_type == "ConflictError":
@@ -125,12 +143,54 @@ class RemoteRegistryClient:
                 raise ChunkIntegrityError(err_msg) from e
             if err_type == "ServiceUnavailableError":
                 raise ServiceUnavailableError(err_msg) from e
+            if e.code >= 500:
+                raise ServiceUnavailableError(err_msg) from e
             raise RegistryError(err_msg) from e
         except urllib.error.URLError as e:
-            raise ServiceUnavailableError(f"Cannot reach L2 registry at {self.registry_url}: {e.reason}") from e
+            raise ServiceUnavailableError(f"Cannot reach L2 registry at {url}: {e.reason}") from e
         except (TimeoutError, OSError) as e:
             # 高遅延 WAN でのタイムアウトや経路断。呼び出し側は「サーバ停止」と同じ扱いにする。
-            raise ServiceUnavailableError(f"L2 registry timed out or is unreachable at {self.registry_url}: {e}") from e
+            raise ServiceUnavailableError(f"L2 registry timed out or is unreachable at {url}: {e}") from e
+
+    def _post(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+        read_failover: bool = False,
+    ) -> Dict[str, Any]:
+        """POST する。
+
+        ``read_failover=True`` の読み取り API は、主名簿が接続不能・5xx のときに
+        代替名簿を順に試す。書き込み API は常に主名簿だけを使う。
+        """
+        if not read_failover:
+            return self._post_one(self.registry_url, endpoint, payload, timeout)
+
+        last_error: Optional[ServiceUnavailableError] = None
+        empty_candidate: Optional[Dict[str, Any]] = None
+        for url in self.registry_urls:
+            try:
+                result = self._post_one(url, endpoint, payload, timeout)
+            except ServiceUnavailableError as e:
+                last_error = e
+                continue
+            # resolve は主がまだ空でも、代替が先頭版を持っていることがある。
+            # その場合は代替の応答を採用する。
+            if endpoint == "/v1/resolve" and result.get("head_log") is None:
+                if empty_candidate is None:
+                    empty_candidate = result
+                continue
+            return result
+
+        if empty_candidate is not None:
+            return empty_candidate
+        if last_error is not None:
+            raise ServiceUnavailableError(
+                f"All L2 registries are unreachable: {last_error}"
+            ) from last_error
+        raise ServiceUnavailableError("No L2 registries configured")
 
     def register_delegation(self, envelope: Dict[str, Any], now: int) -> Dict[str, Any]:
         # now は旧サーバとの互換用。現行サーバは認可判定に自分の時計を使う。
@@ -158,16 +218,16 @@ class RemoteRegistryClient:
     def resolve(
         self, path: str
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-        res = self._post("/v1/resolve", {"path": path})
+        res = self._post("/v1/resolve", {"path": path}, read_failover=True)
         return res.get("delegation"), res.get("locator"), res.get("head_log")
 
     def list_paths(self) -> Dict[str, Any]:
         """登録済みのサブツリーと書き手公開鍵の一覧（``/v1/paths``）。"""
-        return self._post("/v1/paths", {})
+        return self._post("/v1/paths", {}, read_failover=True)
 
     def ost_info(self) -> Dict[str, Any]:
         """L3 OST の場所（``/v1/ost``）。ロケータが無い初回でも引ける。"""
-        return self._post("/v1/ost", {})
+        return self._post("/v1/ost", {}, read_failover=True)
 
     def root_anchor_info(self) -> Dict[str, Any]:
         """root アンカーのパスと公開鍵（``/v1/paths`` の一部）。
@@ -175,8 +235,12 @@ class RemoteRegistryClient:
         クライアントは初回だけここから取り（TOFU）、以降は記録した値を信頼する。
         名簿が違う値を返しても、記録と食い違えば拒否する。
         """
-        res = self._post("/v1/paths", {})
+        res = self._post("/v1/paths", {}, read_failover=True)
         return {"root_anchor": res.get("root_anchor", ""), "root_pubkey": res.get("root_pubkey", "")}
+
+    def replicate_bundle(self, bundle: Dict[str, Any]) -> None:
+        """主名簿から複製名簿へ、署名済みバンドルを送る。"""
+        self._post("/v1/replicate", {"bundle": bundle}, timeout=3.0)
 
     def find_path_for_writer(self, writer_pubkey: str) -> Optional[str]:
         """書き手公開鍵に一致するサブツリーを探す（複数あれば最短のもの）。"""
@@ -208,6 +272,9 @@ class PersistentRegistryState:
         self.root_pubkey = root_pubkey.strip()
         # 書き込み系 API は「サービス更新 -> state 保存」まで同じ排他区間に入れる。
         self.lock = threading.RLock()
+        self.own_registry_url: str = ""
+        # 主名簿が受け取った署名済みバンドルを送る複製名簿。
+        self.replica_registries: list[str] = []
         self._load()
 
     def _load(self) -> None:
@@ -235,6 +302,18 @@ class PersistentRegistryState:
             p = self.chunks_dir / f"{wid}.blk"
             if not p.exists():
                 p.write_bytes(blob)
+
+    def push_to_replicas(self, bundle: Optional[Dict[str, Any]]) -> None:
+        """主名簿の更新を複製名簿へベストエフォートで送る。"""
+        if not bundle:
+            return
+        for url in self.replica_registries:
+            if self.own_registry_url and url.rstrip("/") == self.own_registry_url.rstrip("/"):
+                continue
+            try:
+                RemoteRegistryClient(url).replicate_bundle(bundle)
+            except Exception as e:  # noqa: BLE001 - 複製失敗で主の書き込みを落とさない
+                print(f"[L2] replica {url} failed: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreServer):
@@ -299,6 +378,9 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                     if self.path == "/v1/delegate":
                         verified = pstate.service.register_delegation(req["envelope"], now=now)
                         pstate.save()
+                        pstate.push_to_replicas(
+                            pstate.service.replication_bundle(verified["path"])
+                        )
                         self._send_json(200, {"ok": True, "verified": verified})
                     elif self.path == "/v1/announce":
                         pstate.service.announce_and_append(
@@ -309,7 +391,14 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                         )
                         pstate.save()
                         pstate.save_ost_chunks(ost)
+                        pstate.push_to_replicas(
+                            pstate.service.replication_bundle(req["path"])
+                        )
                         self._send_json(200, {"ok": True})
+                    elif self.path == "/v1/replicate":
+                        updated = pstate.service.ingest_replica(req["bundle"], now=now)
+                        pstate.save()
+                        self._send_json(200, {"ok": True, "updated": updated})
                     elif self.path == "/v1/resolve":
                         del_env, loc_env, head_env = pstate.service.resolve(req["path"])
                         self._send_json(
@@ -380,7 +469,8 @@ def load_node_from_mount(mount_dir: Path) -> Tuple[DFS5Node, Dict[str, Any], Rem
     pub_key_path = Path(cfg.get("pub_key") or f"{priv_key}.pub").expanduser().resolve()
     pub_key_str = pub_key_path.read_text(encoding="utf-8").strip()
 
-    reg_client = RemoteRegistryClient(cfg["registry_url"])
+    reg_urls = [cfg["registry_url"], *(cfg.get("registry_alternates") or [])]
+    reg_client = RemoteRegistryClient(reg_urls)
     node = DFS5Node(
         name=cfg["node_name"],
         sub_path=cfg["sub_path"],
@@ -422,10 +512,16 @@ def cmd_serve(args: argparse.Namespace) -> None:
     ost = ChunkStoreServer(cert, key, host=args.bind, port=args.ost_port)
     pstate = PersistentRegistryState(state_dir, args.root_anchor, root_pubkey)
     pstate.load_ost_chunks(ost)
+    pstate.replica_registries = [
+        value.strip().rstrip("/")
+        for value in (getattr(args, "replica", None) or [])
+        if value.strip()
+    ]
 
     # 自前の L3 の場所を広告する（--advertise があれば優先。無ければ bind から推定）
     advertised_host = args.advertise or ("127.0.0.1" if args.bind in ("0.0.0.0", "::") else args.bind)
     pstate.ost_endpoint = f"tls://{advertised_host}:{ost.port}"
+    pstate.own_registry_url = f"http://{advertised_host}:{args.registry_port}"
 
     handler = make_registry_http_handler(pstate, ost)
     httpd = ThreadingHTTPServer((args.bind, args.registry_port), handler)
@@ -655,6 +751,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument(
         "--advertise",
         help="L2 が L3 の場所として広告するホスト名/IP（既定は bind から推定）",
+    )
+    p_serve.add_argument(
+        "--replica",
+        action="append",
+        default=[],
+        help="主名簿から複製する代替名簿 URL（複数指定可。例: http://host:19440）",
     )
     p_serve.set_defaults(func=cmd_serve)
 

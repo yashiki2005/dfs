@@ -41,6 +41,7 @@ class Remote:
     name: str
     registry: str                       # L2 名簿 URL（例: http://172.16.1.60:19440）
     key: str                            # 書き手の OpenSSH Ed25519 秘密鍵
+    registry_alternates: List[str] = field(default_factory=list)  # 読み取り用の代替名簿
     ost: str = ""                       # L3 OST の host:port。空ならロケータから解決する
     path: str = ""                      # サブツリーのパス。空ならロケータの path を使う
     secret: str = ""                    # tree_secret。空なら --secret を後で渡す
@@ -60,16 +61,32 @@ class Remote:
         d["node_name"] = self.node_name or self.name
         return d
 
+    def registry_urls(self) -> List[str]:
+        """主名簿を先頭にした、重複なしの読み取り候補。"""
+        urls = [self.registry, *self.registry_alternates]
+        seen = set()
+        result = []
+        for url in urls:
+            value = str(url or "").strip().rstrip("/")
+            if value and value not in seen:
+                seen.add(value)
+                result.append(value)
+        return result
+
     @classmethod
     def from_dict(cls, data: dict) -> "Remote":
         missing = [f for f in ("name",) + REQUIRED_FIELDS if not data.get(f)]
         if missing:
             raise RemoteError(f"Remote definition is missing fields: {', '.join(missing)}")
         raw_path = str(data.get("path", "") or "")
+        raw_alternates = data.get("registry_alternates") or []
+        if isinstance(raw_alternates, str):
+            raw_alternates = [raw_alternates]
         return cls(
             name=str(data["name"]),
             registry=str(data["registry"]),
             key=str(data["key"]),
+            registry_alternates=[str(u) for u in raw_alternates if str(u).strip()],
             ost=str(data.get("ost", "") or ""),
             path=normalize_path(raw_path) if raw_path else "",
             secret=str(data.get("secret", "") or ""),

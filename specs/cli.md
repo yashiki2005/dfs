@@ -55,6 +55,20 @@ host --registry-port 19440 -> http://host:19440
 
 `urlparse` で判定するので、`host:port` と `host` を取り違えない。
 
+#### 読み取り用の代替名簿
+
+`--registry-alternate` を繰り返すと、読み取り時のフォールバック先を登録できる。
+書き込み（`announce` / `delegate`）は常に `--registry` の主名簿だけに送る。
+
+```bash
+dfs5cli create scw --registry 172.16.1.60 \
+  --registry-alternate 172.16.1.61
+```
+
+主名簿は `dfs5 serve --replica http://172.16.1.61:9440` のように起動すると、
+署名済みの委譲チェーン・L4 ログ・ロケータを代替名簿へ複製する。代替名簿は
+root アンカーから再検証し、古いバンドルで巻き戻さない。
+
 **L2 が OST の場所とパスを知っている理由**: L2 のロケータ（`dfs5-l2-locator-v1`）は
 `endpoints` を持ち、そこに L3 の場所（`tls://172.16.1.60:19443`）が入る。これは版を
 書くたびに更新される。委譲レコードは書き手の公開鍵（`writer`）を持つので、「この鍵が

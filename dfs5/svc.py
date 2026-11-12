@@ -560,6 +560,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         "--state-dir", str(state_dir),
         "--advertise", advertised,
     ]
+    for replica in (getattr(args, "replica", None) or []):
+        cmd.extend(["--replica", replica])
 
     print(f"[dfs5svc] 空きポート: L2={registry_port} / L3={ost_port}（連続した組）")
     print(f"[dfs5svc] 状態      : {state_dir}")
@@ -901,6 +903,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="委譲を登録しない（サーバだけ立てる）")
     p.add_argument("--wait", type=float, default=30.0, help="起動を待つ秒数（既定 30）")
     p.add_argument("--foreground", action="store_true", help="前面で動かす（Ctrl-C で停止）")
+    p.add_argument(
+        "--replica", action="append", default=[],
+        help="主名簿から複製する代替名簿 URL（複数指定可）",
+    )
     p.add_argument("--force", action="store_true", help="同じ名前の記録を上書きする")
     p.set_defaults(func=cmd_start)
 

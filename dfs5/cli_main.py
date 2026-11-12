@@ -106,7 +106,7 @@ def resolve_ost(remote: Remote, registry: Optional[cli_mod.RemoteRegistryClient]
     """
     if remote.ost:
         return remote.ost
-    client = registry or cli_mod.RemoteRegistryClient(remote.registry)
+    client = registry or cli_mod.RemoteRegistryClient(remote.registry_urls())
     # 1) 先頭版があれば、そのロケータに endpoints が入っている
     if remote.path:
         try:
@@ -136,7 +136,7 @@ def resolve_path(remote: Remote, registry: Optional[cli_mod.RemoteRegistryClient
     """
     if remote.path:
         return remote.path
-    client = registry or cli_mod.RemoteRegistryClient(remote.registry)
+    client = registry or cli_mod.RemoteRegistryClient(remote.registry_urls())
     priv_key = Path(remote.key).expanduser()
     if not priv_key.is_file():
         raise UsageError(f"Writer key does not exist: {priv_key}")
@@ -193,7 +193,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
                 f"Set it with 'dfs5cli config create {remote.name} ... --secret <共有秘密>' "
                 f"(or edit {RemoteStore().path})."
             )
-        registry = cli_mod.RemoteRegistryClient(remote.registry)
+        registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
         ost_value = resolve_ost(remote, registry)
         sub_path = resolve_path(remote, registry)
         host, _, port_str = ost_value.partition(":")
@@ -209,6 +209,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
             "ost_port": int(port_str),
             "priv_key": str(priv_key),
             "registry_url": remote.registry,
+            "registry_alternates": list(remote.registry_alternates),
             "root_pubkey": remote.root_pubkey,
             "sub_path": sub_path,
             "tree_secret": remote.secret,
@@ -216,6 +217,16 @@ def open_remote(remote: Remote, create: bool = False) -> DFS5Node:
         write_private_json(cfg_path, cfg)
 
     node, cfg, _reg = cli_mod.load_node_from_mount(mount_root)
+    # リモート定義は接続先の正本。既存の作業 config が古い場合も、
+    # 主名簿と代替名簿をリモート定義に合わせる。
+    if (
+        cfg.get("registry_url") != remote.registry
+        or list(cfg.get("registry_alternates") or []) != list(remote.registry_alternates)
+    ):
+        cfg["registry_url"] = remote.registry
+        cfg["registry_alternates"] = list(remote.registry_alternates)
+        write_private_json(cfg_path, cfg)
+        node.registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
     # 作業ディレクトリの config に root_pubkey が無い（古い形式）なら、リモート定義から
     # 補って書き戻す。信頼の根はリモート定義（remotes.json）が持つ。
     if not cfg.get("root_pubkey") and remote.root_pubkey:
@@ -643,6 +654,11 @@ def cmd_config(args: argparse.Namespace) -> int:
             raise UsageError("config create には --registry が必要です")
 
         registry = normalize_registry(args.registry, args.registry_port)
+        registry_alternates = [
+            normalize_registry(value, args.registry_port)
+            for value in (getattr(args, "registry_alternate", None) or [])
+            if value.strip()
+        ]
 
         # --key が無ければ、その場で Ed25519 の鍵を作る。
         # 書き手の鍵は dfs5cli が初めて使うものなので、利用者に用意させない。
@@ -675,7 +691,9 @@ def cmd_config(args: argparse.Namespace) -> int:
         root_pubkey = ""
         root_fingerprint = ""
         root_source = "未取得"
-        registry_client = cli_mod.RemoteRegistryClient(registry)
+        registry_client = cli_mod.RemoteRegistryClient(
+            [registry, *registry_alternates]
+        )
         if args.root_pubkey:
             rp = Path(args.root_pubkey).expanduser()
             if not rp.is_file():
@@ -705,6 +723,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         remote = Remote(
             name=args.name,
             registry=registry,
+            registry_alternates=registry_alternates,
             key=str(key_path),
             ost=args.ost or "",
             path=_normalize_path_arg(args.path),
@@ -718,6 +737,8 @@ def cmd_config(args: argparse.Namespace) -> int:
         store.set(remote)
         print(f"[dfs5cli] リモート {remote.name!r} を保存しました: {store.path}")
         print(f"  registry    : {remote.registry}")
+        if remote.registry_alternates:
+            print(f"  代替名簿    : {', '.join(remote.registry_alternates)}")
         if created_key:
             print(f"  書き手の鍵  : {key_path}（作った。OpenSSH 形式の Ed25519）")
         else:
@@ -751,8 +772,8 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     if args.action == "show":
         r = store.get(args.name)
-        for key in ("name", "registry", "ost", "path", "key", "workdir", "epoch", "node_name",
-                    "root_fingerprint"):
+        for key in ("name", "registry", "registry_alternates", "ost", "path", "key",
+                    "workdir", "epoch", "node_name", "root_fingerprint"):
             value = getattr(r, key)
             if key == "secret":
                 value = "***"
@@ -1344,6 +1365,10 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
         "--registry-port", type=int, default=DEFAULT_REGISTRY_PORT,
         help=f"--registry にポートが無いときに補う番号（既定 {DEFAULT_REGISTRY_PORT}）",
     )
+    p.add_argument(
+        "--registry-alternate", action="append", default=[],
+        help="読み取り用の代替 L2 名簿（複数指定可。書き込みは --registry のみ）",
+    )
     p.add_argument("--ost", help="L3 OST の host:port（例: 172.16.1.60:19443）")
     p.add_argument("--path", help="サブツリーのパス（例: /example.com/alice/notes）")
     p.add_argument("--key", help="書き手の OpenSSH Ed25519 秘密鍵（省略すると作る）")
@@ -1505,6 +1530,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--root-anchor", default="/example.com")
     p_serve.add_argument("--root-pubkey", required=True)
     p_serve.add_argument("--state-dir", default="~/.dfs5_server")
+    p_serve.add_argument(
+        "--replica", action="append", default=[],
+        help="主名簿から複製する代替名簿 URL（複数指定可）",
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     p_del = sub.add_parser("delegate", help="L1 委譲を作って L2 名簿へ登録する")

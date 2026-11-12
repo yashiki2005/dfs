@@ -23,7 +23,11 @@ from .crypto import (
     ssh_sign,
     ssh_verify,
 )
-from .l1_delegation import DelegationError, verify_single_delegation
+from .l1_delegation import (
+    DelegationError,
+    verify_delegation_chain,
+    verify_single_delegation,
+)
 
 
 class RegistryError(Exception):
@@ -225,6 +229,8 @@ class DirectoryRegistryService:
 
             # L2 ロケータ署名検証と整合確認
             loc_p = verify_locator_envelope(locator_envelope, norm_path, del_p["writer"], now)
+            if loc_p.get("delegation_epoch") != del_p["epoch"]:
+                raise DelegationError("Locator delegation_epoch does not match active delegation")
             if loc_p["head_version"] != log_p["version"] or loc_p["head_hash"] != log_envelope["entry_hash"]:
                 raise RegistryError("Locator head_version/head_hash does not match L4 log entry")
 
@@ -260,6 +266,123 @@ class DirectoryRegistryService:
                 cur = parent
             chain.reverse()
             return chain
+
+    def replication_bundle(self, path: str) -> Optional[Dict[str, Any]]:
+        """複製名簿へ送る、署名済みの委譲チェーン・ログ・ロケータの束。"""
+        with self._lock:
+            norm_path = normalize_path(path)
+            if norm_path not in self.delegations:
+                return None
+            return {
+                "root_anchor": self.root_anchor_path,
+                "path": norm_path,
+                "chain": self.delegation_chain(norm_path),
+                "logs": list(self.logs.get(norm_path, [])),
+                "locator": self.locators.get(norm_path),
+            }
+
+    def ingest_replica(self, bundle: Dict[str, Any], now: int) -> bool:
+        """主名簿から受け取ったバンドルを検証して保存する（読み取り専用の複製）。
+
+        署名済みの委譲チェーンと L4 ログを root アンカーから検証する。
+        既存のログがバンドルの prefix でない場合は fork として拒否する。
+        """
+        with self._lock:
+            self._ensure_online()
+            if not isinstance(bundle, dict):
+                raise RegistryError("Malformed replication bundle")
+            root_anchor = bundle.get("root_anchor")
+            if root_anchor != self.root_anchor_path:
+                raise RegistryError(
+                    f"Replication root anchor mismatch: expected {self.root_anchor_path!r}, "
+                    f"got {root_anchor!r}"
+                )
+            raw_path = bundle.get("path")
+            if not isinstance(raw_path, str):
+                raise RegistryError("Replication bundle has no path")
+            norm_path = normalize_path(raw_path)
+
+            chain = bundle.get("chain") or []
+            if not chain:
+                raise DelegationError("Replication bundle has no delegation chain")
+            leaf = verify_delegation_chain(
+                root_anchor_path=self.root_anchor_path,
+                root_anchor_pubkey=self.root_anchor_pubkey,
+                chain=chain,
+                now=now,
+                requested_path=norm_path,
+            )
+
+            raw_logs = bundle.get("logs") or []
+            if not isinstance(raw_logs, list):
+                raise RegistryError("Replication logs must be a list")
+            logs: List[Dict[str, Any]] = []
+            prev_version = 0
+            prev_hash = EMPTY_SHA256
+            for env in raw_logs:
+                if not isinstance(env, dict) or "payload" not in env or "signature" not in env:
+                    raise RegistryError("Malformed L4 log in replication bundle")
+                p = env["payload"]
+                try:
+                    log_path = normalize_path(p["path"])
+                except (KeyError, TypeError, ValueError) as e:
+                    raise DelegationError(f"Invalid L4 log path in replication: {e}") from e
+                if log_path != norm_path:
+                    raise DelegationError(
+                        f"Replication log path mismatch: expected {norm_path!r}, got {log_path!r}"
+                    )
+                raw = canonical_json(p)
+                if sha256_hex(raw) != env.get("entry_hash"):
+                    raise ChunkIntegrityError("Replication log entry_hash mismatch")
+                if p.get("delegation_epoch") != leaf["epoch"]:
+                    raise DelegationError("Replication log delegation_epoch mismatch")
+                if p.get("version") != prev_version + 1:
+                    raise ConflictError(
+                        f"Replication log version gap: expected {prev_version + 1}, "
+                        f"got {p.get('version')}"
+                    )
+                if p.get("version") <= leaf["base_version"]:
+                    raise DelegationError("Replication log version is at or below base_version")
+                if p.get("parent_version") != prev_version or p.get("parent_hash") != prev_hash:
+                    raise ConflictError("Replication log parent mismatch")
+                if not ssh_verify(
+                    leaf["writer"], norm_path, NS_L4_LOG, raw, env["signature"]
+                ):
+                    raise DelegationError("Invalid replication log signature")
+                logs.append(env)
+                prev_version = p["version"]
+                prev_hash = env["entry_hash"]
+
+            locator = bundle.get("locator")
+            if logs:
+                if not locator:
+                    raise RegistryError("Replication bundle has logs but no locator")
+                loc_p = verify_locator_envelope(locator, norm_path, leaf["writer"], now)
+                if loc_p.get("delegation_epoch") != leaf["epoch"]:
+                    raise DelegationError("Replication locator delegation_epoch mismatch")
+                if loc_p["head_version"] != prev_version or loc_p["head_hash"] != prev_hash:
+                    raise RegistryError("Replication locator does not match the log head")
+            elif locator is not None:
+                raise RegistryError("Replication bundle has a locator but no logs")
+
+            existing = self.logs.get(norm_path, [])
+            if len(existing) > len(logs):
+                # 複製名簿の方が進んでいる。古いバンドルで巻き戻さない。
+                return False
+            for i, old_env in enumerate(existing):
+                if old_env.get("entry_hash") != logs[i].get("entry_hash"):
+                    raise ConflictError("Replication fork detected")
+
+            self._store_replica_chain(chain)
+            if logs:
+                self.logs[norm_path] = logs
+                self.locators[norm_path] = locator
+            return True
+
+    def _store_replica_chain(self, chain: List[Dict[str, Any]]) -> None:
+        for env in chain:
+            p = env.get("payload", {})
+            self.delegations[normalize_path(p["path"])] = env
 
     def resolve(
         self, path: str

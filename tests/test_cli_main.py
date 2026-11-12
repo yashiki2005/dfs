@@ -175,6 +175,20 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(normalize_registry("host", 19440), "http://host:19440")
         self.assertEqual(normalize_registry("https://host/"), "https://host:9440")
 
+    def test_config_create_accepts_registry_alternate(self) -> None:
+        """--registry-alternate がリモート定義に保存される。"""
+        rc = self.run_cli(
+            "config", "create", "alt",
+            "--registry", self.server.registry_url,
+            "--registry-alternate", "127.0.0.1:19440",
+            "--key", str(self.alice_key),
+            "--secret", "s3cret",
+            "--workdir", str(self.base / "wd-alt"),
+        )
+        self.assertEqual(rc, 0)
+        saved = RemoteStore(self.config_file).get("alt")
+        self.assertEqual(saved.registry_alternates, ["http://127.0.0.1:19440"])
+
     def test_config_create_makes_key_when_omitted(self) -> None:
         """--key を省くと、その場で Ed25519 の鍵を作る。"""
         store = RemoteStore(self.config_file)
