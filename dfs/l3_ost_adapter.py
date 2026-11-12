@@ -22,6 +22,24 @@ from .l2_registry import ServiceUnavailableError
 
 ZERO_WIRE_ID = b"0" * 64
 QUIT_FRAME = b"Q" + ZERO_WIRE_ID + struct.pack(">I", 0)
+WIRE_ID_HEX = frozenset(b"0123456789abcdef")
+VALID_OPCODES = frozenset(b"HGPBMFQ")
+
+
+class OSTProtocolError(Exception):
+    """DFS の L3 フレームではないデータを受け取った。"""
+
+
+def _decode_wire_id(raw: bytes) -> str:
+    if len(raw) != 64 or any(ch not in WIRE_ID_HEX for ch in raw):
+        raise OSTProtocolError("invalid wire_id")
+    return raw.decode("ascii")
+
+
+def _decode_wire_ids(raw: bytes, count: int) -> List[str]:
+    if len(raw) != count * 64:
+        raise OSTProtocolError("invalid wire_id batch length")
+    return [_decode_wire_id(raw[i * 64 : (i + 1) * 64]) for i in range(count)]
 
 # 1 フレームで受け付ける上限。クライアント側の実装（batch_has / batch_put /
 # batch_get）は十分小さい単位に分割しているので、通常運用では引っかからない。
@@ -116,6 +134,8 @@ class ChunkStoreServer:
             ssl_conn = self.ctx.wrap_socket(raw_conn, server_side=True)
             while self.running:
                 hdr = self._recv_exact(ssl_conn, 69)
+                if hdr[0] not in VALID_OPCODES:
+                    raise OSTProtocolError(f"unknown opcode: {hdr[0]:#04x}")
                 op = chr(hdr[0])
 
                 # クライアントからの明示的切断要求 ('Q') で即座にループを抜ける
@@ -126,7 +146,7 @@ class ChunkStoreServer:
                     ssl_conn.sendall(b"U")
                     break
 
-                wire_id = hdr[1:65].decode("ascii")
+                wire_id = _decode_wire_id(hdr[1:65])
                 val = struct.unpack(">I", hdr[65:69])[0]
 
                 if op == "H":
@@ -155,8 +175,7 @@ class ChunkStoreServer:
                         break
                     raw_ids = self._recv_exact(ssl_conn, val * 64)
                     bitmap = bytearray(b"O")
-                    for i in range(val):
-                        wid = raw_ids[i * 64 : (i + 1) * 64].decode("ascii")
+                    for wid in _decode_wire_ids(raw_ids, val):
                         bitmap.extend(b"1" if wid in self.store else b"0")
                     ssl_conn.sendall(bytes(bitmap))
 
@@ -168,7 +187,7 @@ class ChunkStoreServer:
                     staged: Dict[str, bytes] = {}
                     for _ in range(val):
                         item_hdr = self._recv_exact(ssl_conn, 68)
-                        wid = item_hdr[:64].decode("ascii")
+                        wid = _decode_wire_id(item_hdr[:64])
                         blen = struct.unpack(">I", item_hdr[64:68])[0]
                         if blen > MAX_BLOB_BYTES:
                             ssl_conn.sendall(b"E")
@@ -190,14 +209,17 @@ class ChunkStoreServer:
                         break
                     raw_ids = self._recv_exact(ssl_conn, val * 64)
                     out = bytearray(b"O")
-                    for i in range(val):
-                        wid = raw_ids[i * 64 : (i + 1) * 64].decode("ascii")
+                    for wid in _decode_wire_ids(raw_ids, val):
                         blob = self.store.get(wid, b"")
                         out.extend(struct.pack(">I", len(blob)) + blob)
                     ssl_conn.sendall(bytes(out))
                 else:
                     break
         except OSError:
+            pass
+        except OSTProtocolError:
+            # 公開 L3 には DFS 以外の TLS クライアントやスキャンも届く。
+            # フレームとして解釈できない接続は、エラーログを出さずに閉じる。
             pass
         except Exception as e:
             print(

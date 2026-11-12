@@ -159,6 +159,61 @@ class TestL3ContentDedup(unittest.TestCase):
                 ost.close()
 
 
+class TestL3ProtocolValidation(unittest.TestCase):
+    """L3 の公開 TLS に非 DFS クライアントが来ても、本体を壊さない。"""
+
+    @staticmethod
+    def _cert(base: Path):
+        cert, key = base / "c.pem", base / "k.pem"
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
+             "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=l"],
+            check=True, capture_output=True,
+        )
+        return cert, key
+
+    def test_malformed_tls_frame_is_ignored_and_server_stays_healthy(self) -> None:
+        import contextlib
+        import io
+        import socket
+        import ssl
+        import struct
+
+        from dfs.crypto import sha256_hex
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+
+        with tempfile.TemporaryDirectory(prefix="dfs_l3_bad_frame_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            conn = None
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                raw = socket.create_connection(("127.0.0.1", ost.port), timeout=5.0)
+                conn = ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+                captured = io.StringIO()
+                with contextlib.redirect_stderr(captured):
+                    conn.sendall(b"B" + b"\xff" * 64 + struct.pack(">I", 0))
+                    try:
+                        conn.recv(1)
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
+
+                self.assertNotIn("UnicodeDecodeError", captured.getvalue())
+
+                client = OSTClient("127.0.0.1", ost.port)
+                wid = sha256_hex(b"healthy-after-bad-frame")
+                client.put_if_absent(wid, b"healthy-after-bad-frame")
+                self.assertEqual(client.get(wid), b"healthy-after-bad-frame")
+            finally:
+                if conn is not None:
+                    conn.close()
+                ost.close()
+
+
 class TestL3Striping(unittest.TestCase):
     """段階 4: 複数 OST へのストライピング。既定は 1 OST。"""
 
