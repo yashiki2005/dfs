@@ -137,6 +137,26 @@ class LocalTreeFuse:
             "st_blksize": getattr(st, "st_blksize", 4096),
         }
 
+    def statfs(self, path: str) -> dict[str, int]:
+        """マウント先の容量を、実体のあるファイルシステムから返す。"""
+        target = self._path(path)
+        try:
+            st = os.statvfs(target)
+        except FileNotFoundError:
+            raise OSError(errno.ENOENT, os.strerror(errno.ENOENT))
+        return {
+            "f_bsize": int(st.f_bsize),
+            "f_frsize": int(st.f_frsize or st.f_bsize),
+            "f_blocks": int(st.f_blocks),
+            "f_bfree": int(st.f_bfree),
+            "f_bavail": int(st.f_bavail),
+            "f_files": int(st.f_files),
+            "f_ffree": int(st.f_ffree),
+            "f_favail": int(st.f_favail),
+            "f_flag": int(st.f_flag),
+            "f_namemax": int(st.f_namemax),
+        }
+
     def readdir(self, path: str, fh: int | None = None) -> list[str]:
         target = self._path(path)
         if not target.is_dir():

@@ -50,6 +50,15 @@ class LocalTreeFuseTests(unittest.TestCase):
         self.assertEqual((self.root / "new.txt").read_bytes(), b"\x00" * 6 + b"new")
         self.assertEqual(self.flushes, 2)
 
+    def test_statfs_reports_backing_filesystem_capacity(self) -> None:
+        ops = LocalTreeFuse(self.root, self._flush)
+        attrs = ops.statfs("/")
+        expected = os.statvfs(self.root)
+        self.assertEqual(attrs["f_bsize"], expected.f_bsize)
+        self.assertEqual(attrs["f_blocks"], expected.f_blocks)
+        self.assertEqual(attrs["f_bavail"], expected.f_bavail)
+        self.assertGreater(attrs["f_blocks"], 0)
+
     def test_directory_operations(self) -> None:
         ops = LocalTreeFuse(self.root, self._flush)
         ops.mkdir("/d", 0o755)
