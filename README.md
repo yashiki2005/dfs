@@ -107,6 +107,29 @@ dfscli pull local:dataset ./restored-dataset
 
 ---
 
+## Compression & Filesystem Behavior
+
+### Compression (`auto`, `zstd`, `none`)
+- **Transparent zstd Compression**: File chunks are compressed using Zstandard (level 10) on the client **before** AEAD encryption.
+- **Deduplication Preserved**: Plaintext content identifiers (`plain_id`) are derived from uncompressed data, ensuring cross-version and cross-remote deduplication remains unaffected by compression state.
+- **Smart Adaptive Thresholds (`auto`)**: Chunks smaller than 4 KB or those achieving less than a 5% size reduction (e.g., pre-compressed media like MP4, JPEG, ZIP) automatically bypass compression to avoid CPU and storage overhead.
+- **Hierarchical Policy via xattr**: Set directory policies using `user.dfs.compression` (e.g. `xattr -w user.dfs.compression zstd ./src`), which children inherit automatically. Effective policies are preserved in signed manifests across machines.
+
+### Filesystem & OS Differences (macOS vs. Linux / ext4)
+- **Copy-on-Write (CoW) Snapshots**:
+  - **macOS (APFS)**: Uses `clonefile(2)` for instant, zero-byte copy-on-write workspace snapshots.
+  - **Linux (Btrfs / XFS / ZFS)**: Automatically probes and uses `ioctl(FICLONE)` for block-level reflinks.
+  - **Linux (ext4)**: **Fully supported.** When CoW is unavailable on ext4, `dfs` automatically falls back to standard file copying (`CopyBackend`). All synchronization, encryption, and CLI features work 100% identically, with standard copying during snapshot staging.
+  - **Windows (ReFS)**: Leverages `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block cloning where supported.
+- **FUSE Mount (`dfscli mount`)**:
+  - **Linux**: Mounts directly via kernel FUSE (`libfuse.so`).
+  - **macOS**: Probes and falls back in order: **macFUSE (FSKit backend)** → **fuse-t** (NFS/SMB loopback) → **macFUSE (legacy)**, selectable via `--backend`.
+- **Extended Attributes (xattr)**:
+  - **Linux**: Interacts through standard Linux `user.*` xattrs.
+  - **macOS**: Preserves `user.*` as well as macOS-specific `com.apple.*` metadata attributes via native libc hooks.
+
+---
+
 ## Command Overview
 
 ### `dfscli` (Client)
