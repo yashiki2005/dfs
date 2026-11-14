@@ -126,7 +126,12 @@ class RemoteRegistryClient:
 
     """
 
-    def __init__(self, registry_url: str | Sequence[str]):
+    def __init__(
+        self,
+        registry_url: str | Sequence[str],
+        *,
+        timeout: Optional[float] = None,
+    ):
         raw_urls = [registry_url] if isinstance(registry_url, str) else list(registry_url)
         self.registry_urls: list[str] = []
         for raw in raw_urls:
@@ -137,6 +142,7 @@ class RemoteRegistryClient:
             raise ValueError("At least one L2 registry URL is required")
         # 書き込み先は先頭（主名簿）に固定する。
         self.registry_url = self.registry_urls[0]
+        self.default_timeout = timeout
 
     def _post_one(
         self,
@@ -201,9 +207,10 @@ class RemoteRegistryClient:
         ``read_failover=True`` の読み取り API は、主名簿が接続不能・5xx のときに
         代替名簿を順に試す。書き込み API は常に主名簿だけを使う。
         """
+        effective_timeout = timeout if timeout is not None else self.default_timeout
         if not read_failover:
             try:
-                return self._post_one(self.registry_url, endpoint, payload, timeout)
+                return self._post_one(self.registry_url, endpoint, payload, effective_timeout)
             except ServiceUnavailableError as primary_err:
                 relay_urls = [u for u in self.registry_urls[1:] if "/relay/" in u]
                 if not relay_urls:
@@ -211,7 +218,7 @@ class RemoteRegistryClient:
                 last_err: ServiceUnavailableError = primary_err
                 for relay_url in relay_urls:
                     try:
-                        return self._post_one(relay_url, endpoint, payload, timeout)
+                        return self._post_one(relay_url, endpoint, payload, effective_timeout)
                     except ServiceUnavailableError as e:
                         last_err = e
                 raise last_err
@@ -220,7 +227,7 @@ class RemoteRegistryClient:
         empty_candidate: Optional[Dict[str, Any]] = None
         for url in self.registry_urls:
             try:
-                result = self._post_one(url, endpoint, payload, timeout)
+                result = self._post_one(url, endpoint, payload, effective_timeout)
             except ServiceUnavailableError as e:
                 last_error = e
                 continue

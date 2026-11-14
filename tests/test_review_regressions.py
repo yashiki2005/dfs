@@ -1128,6 +1128,58 @@ class TestReviewRegressions(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
+    def test_remote_domain_candidate_prefers_registry_over_dotted_alias(self) -> None:
+        from dfs.remotes import Remote
+
+        self.assertEqual(
+            cli_main._remote_domain_candidate(
+                Remote(name="backup.v1", registry="https://dfs.example.com", key="")
+            ),
+            "dfs.example.com",
+        )
+        self.assertEqual(
+            cli_main._remote_domain_candidate(
+                Remote(name="yashiki.top", registry="https://l2.yashiki.top", key="")
+            ),
+            "yashiki.top",
+        )
+        self.assertEqual(
+            cli_main._remote_domain_candidate(
+                Remote(name="backup.v1", registry="http://127.0.0.1:9440", key="")
+            ),
+            "",
+        )
+
+    def test_ensure_remote_secret_accepts_explicit_store_and_probe_timeout(self) -> None:
+        from unittest.mock import patch
+        from dfs.remotes import Remote, RemoteStore
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "custom_remotes.json"
+            store = RemoteStore(cfg)
+            remote = Remote(name="r1", registry="https://dfs.example.com", key="")
+            store.set(remote)
+            with patch.object(cli_main, "prompt_secret", return_value="explicit-sec"):
+                updated = cli_main._ensure_remote_secret(remote, store=store)
+            self.assertEqual(updated.secret, "explicit-sec")
+            self.assertEqual(store.get("r1").secret, "explicit-sec")
+
+        seen_timeouts = []
+
+        class SpyClient(cli_mod.RemoteRegistryClient):
+            def list_paths(self):
+                seen_timeouts.append(self.default_timeout)
+                return {"root_anchor": "/", "root_pubkey": "", "paths": {}}
+
+        with patch.object(cli_main, "_probe_registry_tcp", return_value=True), patch.object(
+            cli_mod, "RemoteRegistryClient", SpyClient
+        ), patch("dfs.dnssec.has_txt_record", return_value=False):
+            st = cli_main._probe_remote_status(
+                Remote(name="local", registry="http://127.0.0.1:9440", key="")
+            )
+        self.assertTrue(st["l2_ok"])
+        self.assertEqual(seen_timeouts, [1.5])
+
 
 if __name__ == "__main__":
     unittest.main()

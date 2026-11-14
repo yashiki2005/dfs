@@ -630,6 +630,151 @@ class RcloneCase(unittest.TestCase):
         node = cli_mod.load_node_from_mount(self.workdir)[0]
         self.assertEqual(node.list_remote(), [])
 
+    def test_import_command_and_import_tar_alias(self) -> None:
+        source = self.base / "alias_src"
+        source.mkdir()
+        (source / "hello.txt").write_text("hello import\n", encoding="utf-8")
+        archive = self.base / "alias.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(source, arcname="root")
+
+        self.assertEqual(
+            self.run_cli("import", str(archive), "t:", "--strip-components", "1"), 0
+        )
+        self.assertEqual(
+            self.run_cli("import-tar", str(archive), "t:sub", "--strip-components", "1"),
+            0,
+        )
+        node = cli_mod.load_node_from_mount(self.workdir)[0]
+        self.assertEqual(node.read_remote("hello.txt"), b"hello import\n")
+        self.assertEqual(node.read_remote("sub/hello.txt"), b"hello import\n")
+
+    def test_import_archive_bundle_tar_gz_and_dir(self) -> None:
+        store = RemoteStore(self.config_file)
+        remote_t = store.get("t")
+        remote_t.root_pubkey = self.root_pub
+        store.set(remote_t)
+
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        bundle_dir = self.base / "exported_bundle"
+        self.assertEqual(
+            self.run_cli("archive", "create", "t:", "--out", str(bundle_dir)), 0
+        )
+        # 既定ではディレクトリを残さず、tar.gz と .torrent を出力する
+        self.assertFalse(bundle_dir.exists())
+        bundle_tar = self.base / "exported_bundle.tar.gz"
+        self.assertTrue(bundle_tar.is_file())
+        self.assertTrue((self.base / "exported_bundle.torrent").is_file())
+
+        self.assertEqual(
+            self.run_cli(
+                "import",
+                str(bundle_tar),
+                "t:restored_from_tar",
+                "--source-secret",
+                "s3cret",
+            ),
+            0,
+        )
+        # --keep-dir 指定時はディレクトリも残り、直接指定でも import できる
+        kept_dir = self.base / "kept_bundle"
+        self.assertEqual(
+            self.run_cli(
+                "archive", "create", "t:", "--out", str(kept_dir), "--keep-dir"
+            ),
+            0,
+        )
+        self.assertTrue((kept_dir / "meta.json").is_file())
+        self.assertEqual(
+            self.run_cli("import", str(kept_dir), "t:restored_from_dir"), 0
+        )
+
+        node = cli_mod.load_node_from_mount(self.workdir)[0]
+        self.assertEqual(
+            node.read_remote("restored_from_tar/a.txt"),
+            (self.local / "a.txt").read_bytes(),
+        )
+        self.assertEqual(
+            node.read_remote("restored_from_dir/a.txt"),
+            (self.local / "a.txt").read_bytes(),
+        )
+
+    def test_archive_create_par2_recovery_and_auto_repair_on_import(self) -> None:
+        from dfs.archive import find_par2_binary
+
+        if not find_par2_binary():
+            self.skipTest("par2 is not installed")
+
+        store = RemoteStore(self.config_file)
+        remote_t = store.get("t")
+        remote_t.root_pubkey = self.root_pub
+        store.set(remote_t)
+
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        bundle_out = self.base / "par2_bundle"
+        self.assertEqual(
+            self.run_cli(
+                "archive", "create", "t:", "--out", str(bundle_out), "--recovery", "20"
+            ),
+            0,
+        )
+        bundle_tar = self.base / "par2_bundle.tar.gz"
+        par2_index = self.base / "par2_bundle.tar.gz.par2"
+        self.assertTrue(bundle_tar.is_file())
+        self.assertTrue(par2_index.is_file())
+        # vol*.par2 は par2_bundle.tar.gz.par2 に統合されている
+        self.assertEqual(
+            list(self.base.glob("par2_bundle.tar.gz*.par2")), [par2_index]
+        )
+        torrent_bytes = (self.base / "par2_bundle.torrent").read_bytes()
+        self.assertIn(b"par2_bundle.tar.gz", torrent_bytes)
+        self.assertIn(b"par2_bundle.tar.gz.par2", torrent_bytes)
+
+        # tar.gz の末尾付近を少し破損させても par2 で自動修復して import できる
+        raw = bytearray(bundle_tar.read_bytes())
+        raw[-8:] = b"\x00" * 8
+        bundle_tar.write_bytes(bytes(raw))
+
+        self.assertEqual(
+            self.run_cli(
+                "import",
+                str(bundle_tar),
+                "t:repaired",
+                "--source-secret",
+                "s3cret",
+            ),
+            0,
+        )
+        node = cli_mod.load_node_from_mount(self.workdir)[0]
+        self.assertEqual(
+            node.read_remote("repaired/a.txt"),
+            (self.local / "a.txt").read_bytes(),
+        )
+
+    def test_archive_create_without_par2_prints_notice_and_creates_tar_gz(self) -> None:
+        from unittest import mock
+
+        store = RemoteStore(self.config_file)
+        remote_t = store.get("t")
+        remote_t.root_pubkey = self.root_pub
+        store.set(remote_t)
+
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        bundle_out = self.base / "nopar2_bundle"
+        stderr_buf = io.StringIO()
+        with mock.patch("dfs.cli_main.find_par2_binary", return_value=None):
+            with mock.patch("sys.stderr", stderr_buf):
+                rc = self.run_cli("archive", "create", "t:", "--out", str(bundle_out))
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.base / "nopar2_bundle.tar.gz").is_file())
+        self.assertTrue((self.base / "nopar2_bundle.torrent").is_file())
+        self.assertFalse((self.base / "nopar2_bundle.tar.gz.par2").exists())
+        nopar2_torrent = (self.base / "nopar2_bundle.torrent").read_bytes()
+        self.assertIn(b"nopar2_bundle.tar.gz", nopar2_torrent)
+        self.assertNotIn(b".par2", nopar2_torrent)
+        self.assertIn("par2", stderr_buf.getvalue())
+        self.assertIn("リカバリレコード", stderr_buf.getvalue())
+
     def test_mv_file_uses_one_version(self) -> None:
         """mv は copy + rm ではなく、1 版でファイルを改名する。"""
         self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)

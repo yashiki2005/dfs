@@ -12,11 +12,13 @@ import hashlib
 import json
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .crypto import (
     NS_ARCHIVE,
@@ -138,6 +140,128 @@ class ArchiveResult:
     infohash: str
     version: int
     chunk_count: int
+    tarball: Optional[Path] = None
+    par2_files: Tuple[Path, ...] = ()
+
+
+def find_par2_binary() -> Optional[str]:
+    """利用可能な par2 CLI バイナリを返す。"""
+    return shutil.which("par2") or shutil.which("par2create")
+
+
+def _par2_matching_files(par2_index: Path, target_name: str) -> List[Path]:
+    stem = f"{target_name}."
+    return sorted(
+        p
+        for p in par2_index.parent.iterdir()
+        if p.is_file() and p.name.startswith(stem) and p.name.endswith(".par2")
+    )
+
+
+def create_par2_recovery(
+    target_file: Path,
+    *,
+    redundancy: int = 5,
+    par2_bin: Optional[str] = None,
+) -> Tuple[Path, ...]:
+    """対象ファイルに対する PAR2 リカバリファイル群を生成する。"""
+    if redundancy < 1 or redundancy > 100:
+        raise ArchiveError("PAR2 redundancy must be between 1 and 100")
+    exe = par2_bin or find_par2_binary()
+    if not exe:
+        raise ArchiveError(
+            "par2 command not found (install with `brew install par2` or `apt install par2`)"
+        )
+    target = Path(target_file).expanduser().resolve()
+    if not target.is_file():
+        raise ArchiveError(f"PAR2 target file does not exist: {target}")
+    par2_index = target.with_name(f"{target.name}.par2")
+    for old in _par2_matching_files(par2_index, target.name):
+        old.unlink()
+    cmd = [exe, "c", "-q", f"-r{redundancy}", "-n1", "--", par2_index.name, target.name]
+    try:
+        res = subprocess.run(
+            cmd,
+            cwd=str(target.parent),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as e:
+        raise ArchiveError(f"Cannot run par2: {e}") from e
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout).strip()
+        raise ArchiveError(f"par2 create failed (exit {res.returncode}): {detail}")
+    vol_prefix = f"{target.name}.vol"
+    vol_files = sorted(
+        p
+        for p in target.parent.iterdir()
+        if p.is_file() and p.name.startswith(vol_prefix) and p.name.endswith(".par2")
+    )
+    if vol_files:
+        with par2_index.open("ab") as out_f:
+            for vol in vol_files:
+                with vol.open("rb") as in_f:
+                    shutil.copyfileobj(in_f, out_f, length=1024 * 1024)
+                vol.unlink()
+    return (par2_index,) if par2_index.is_file() else ()
+
+
+def verify_with_par2(
+    par2_index: Path,
+    *,
+    par2_bin: Optional[str] = None,
+) -> None:
+    """PAR2 リカバリファイルで対象ファイルを検証する。"""
+    exe = par2_bin or find_par2_binary()
+    if not exe:
+        raise ArchiveError("par2 command not found")
+    idx = Path(par2_index).expanduser().resolve()
+    if not idx.is_file():
+        raise ArchiveError(f"PAR2 index file not found: {idx}")
+    res = subprocess.run(
+        [exe, "v", "-q", "--", idx.name],
+        cwd=str(idx.parent),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout).strip()
+        raise ArchiveError(f"par2 verify failed (exit {res.returncode}): {detail}")
+
+
+def repair_with_par2(
+    target_file: Path,
+    par2_index: Path,
+    work_dir: Path,
+    *,
+    par2_bin: Optional[str] = None,
+) -> Path:
+    """作業ディレクトリへコピーした上で PAR2 による修復を試みる。"""
+    exe = par2_bin or find_par2_binary()
+    if not exe:
+        raise ArchiveError("par2 command not found")
+    target = Path(target_file).expanduser().resolve()
+    idx = Path(par2_index).expanduser().resolve()
+    if not target.is_file() or not idx.is_file():
+        raise ArchiveError("PAR2 target or index file is missing")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    work_target = work_dir / target.name
+    shutil.copy2(target, work_target)
+    for par_file in _par2_matching_files(idx, target.name):
+        shutil.copy2(par_file, work_dir / par_file.name)
+    res = subprocess.run(
+        [exe, "r", "-q", "--", idx.name],
+        cwd=str(work_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout).strip()
+        raise ArchiveError(f"par2 repair failed (exit {res.returncode}): {detail}")
+    return work_target
 
 
 def magnet_for_descriptor(payload: Dict[str, Any]) -> str:
@@ -242,15 +366,90 @@ def verify_archive_descriptor(
     return payload
 
 
+def _write_single_file_torrent(
+    target_file: Path,
+    torrent_path: Path,
+    announce: Optional[str],
+) -> str:
+    piece_length = DEFAULT_PIECE_LENGTH
+    pieces = bytearray()
+    with target_file.open("rb") as fh:
+        while True:
+            chunk = fh.read(piece_length)
+            if not chunk:
+                break
+            pieces.extend(hashlib.sha1(chunk).digest())
+    info = {
+        "length": target_file.stat().st_size,
+        "name": target_file.name,
+        "piece length": piece_length,
+        "pieces": bytes(pieces),
+    }
+    torrent: Dict[str, Any] = {"info": info}
+    if announce:
+        torrent["announce"] = announce
+    torrent_path.write_bytes(bencode(torrent))
+    return hashlib.sha1(bencode(info)).hexdigest()
+
+
+def _write_files_torrent(
+    target_files: Sequence[Path],
+    torrent_path: Path,
+    name: str,
+    announce: Optional[str],
+) -> str:
+    if len(target_files) == 1:
+        return _write_single_file_torrent(target_files[0], torrent_path, announce)
+    piece_length = DEFAULT_PIECE_LENGTH
+    pieces = bytearray()
+    pending = bytearray()
+    file_rows = []
+    for path in target_files:
+        file_rows.append({"length": path.stat().st_size, "path": [path.name]})
+        with path.open("rb") as fh:
+            while True:
+                chunk = fh.read(piece_length)
+                if not chunk:
+                    break
+                pending.extend(chunk)
+                while len(pending) >= piece_length:
+                    pieces.extend(hashlib.sha1(pending[:piece_length]).digest())
+                    del pending[:piece_length]
+    if pending:
+        pieces.extend(hashlib.sha1(bytes(pending)).digest())
+    info = {
+        "files": file_rows,
+        "name": name,
+        "piece length": piece_length,
+        "pieces": bytes(pieces),
+    }
+    torrent: Dict[str, Any] = {"info": info}
+    if announce:
+        torrent["announce"] = announce
+    torrent_path.write_bytes(bencode(torrent))
+    return hashlib.sha1(bencode(info)).hexdigest()
+
+
 def create_archive(
     node: Any,
     out_dir: Path | str,
     *,
     announce: Optional[str] = None,
     version: Optional[int] = None,
+    keep_dir: bool = True,
+    recovery_percent: int = 0,
 ) -> ArchiveResult:
-    """指定版（省略時は先頭版）を、署名済みメタデータ + 全チャンク + torrent として保存する。"""
-    bundle = Path(out_dir).expanduser()
+    """指定版（省略時は先頭版）を、署名済みメタデータ + 全チャンク + torrent + tar.gz として保存する。"""
+    raw_out = Path(out_dir).expanduser()
+    if raw_out.name.endswith(".tar.gz"):
+        tarball = raw_out
+        bundle = raw_out.with_name(raw_out.name[:-7] or "dfs-archive")
+    elif raw_out.name.endswith(".tgz"):
+        tarball = raw_out
+        bundle = raw_out.with_name(raw_out.name[:-4] or "dfs-archive")
+    else:
+        bundle = raw_out
+        tarball = bundle.parent / f"{bundle.name}.tar.gz"
     if bundle.exists() and any(bundle.iterdir()):
         raise ArchiveError(f"Archive output is not empty: {bundle}")
     try:
@@ -319,7 +518,17 @@ def create_archive(
         f"dfs-{_safe_name(node.sub_path)}-v{int(p['version'])}-"
         f"{sha256_hex(meta_bytes)[:12]}"
     )
-    infohash = _write_torrent(bundle, torrent, name, announce)
+    with tarfile.open(tarball, "w:gz") as tf:
+        tf.add(bundle, arcname=bundle.name)
+    par2_files: Tuple[Path, ...] = ()
+    if recovery_percent > 0:
+        par2_files = create_par2_recovery(tarball, redundancy=recovery_percent)
+    if keep_dir:
+        infohash = _write_torrent(bundle, torrent, name, announce)
+    else:
+        shutil.rmtree(bundle)
+        torrent_targets = [tarball, *par2_files]
+        infohash = _write_files_torrent(torrent_targets, torrent, bundle.name, announce)
     descriptor_envelope = create_archive_descriptor_envelope(
         node.l4.priv_key_path,
         node.sub_path,
@@ -327,7 +536,7 @@ def create_archive(
         infohash=infohash,
         head_hash=str(head.get("entry_hash", "")),
         root_wire_id=root_wid,
-        bundle_name=name,
+        bundle_name=name if keep_dir else tarball.name,
         created_at=int(time.time()),
         announce=announce,
     )
@@ -336,13 +545,14 @@ def create_archive(
         json.dumps(
             {
                 "schema": "dfs-archive-descriptor-v1",
-                "bundle": str(bundle),
+                "bundle": str(bundle if keep_dir else tarball),
                 "created_at": int(time.time()),
                 "descriptor_envelope": descriptor_envelope,
                 "head_hash": head.get("entry_hash", ""),
                 "infohash": infohash,
                 "path": node.sub_path,
                 "root_wire_id": root_wid,
+                "tarball": str(tarball),
                 "torrent": str(torrent),
                 "version": int(p["version"]),
             },
@@ -353,13 +563,15 @@ def create_archive(
         encoding="utf-8",
     )
     return ArchiveResult(
-        bundle=bundle,
+        bundle=bundle if keep_dir else tarball,
         torrent=torrent,
         descriptor=descriptor,
         descriptor_envelope=descriptor_envelope,
         infohash=infohash,
         version=int(p["version"]),
         chunk_count=len(wire_ids),
+        tarball=tarball,
+        par2_files=par2_files,
     )
 
 
