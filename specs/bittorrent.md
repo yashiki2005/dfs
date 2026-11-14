@@ -64,9 +64,25 @@ dfscli archive extract ./scw-v1 ./restored
 dfscli archive catalog .
 ```
 
-`archive create` は torrent の infohash と magnet link を表示する。実際の seeding /
-downloading は qBittorrent、Transmission、libtorrent などの外部クライアントで行う。
-DFS は BitTorrent クライアントを内蔵しない。
+`archive create` は torrent の infohash と magnet link を表示する。`--publish` を
+付けると、書き手署名付き archive descriptor を L2 に登録する。descriptor は
+path、版、infohash、L4 entry hash、root wire ID を結び付ける。
+
+```bash
+# 作成と同時にL2へ公開
+dfscli archive create scw: --version 3 --out ./scw-v3 --publish
+
+# 既に作成済みのbundleを公開
+dfscli --remote scw archive publish ./scw-v3
+
+# L2からdescriptorを取得し、外部BT CLIのDHT/trackerで取得後に検証・復号
+dfscli archive fetch scw: --version 3 \
+  --out ./downloads --secret <tree_secret> ./restored
+```
+
+実際のpeer探索とdownloadingは `aria2c` または `transmission-cli` を使う。
+`archive fetch` は両者を自動検出し、標準機能のDHT/trackerを利用する。
+DFS はDHT・ピア交換を独自実装しない。
 
 `archive create --version N` は、L2 の L4 履歴から指定版の署名済み head を取得する。
 過去版には現在の locator を流用せず、locator なしで bundle を作る。bundle の
@@ -94,10 +110,12 @@ DFS は BitTorrent クライアントを内蔵しない。
 - 小さい版を大量に torrent 化すると overhead が大きい。版単位または一定期間単位で
   まとめる
 - tracker が無い場合は DHT / 手動 peer 設定を使う。DHT は seeder の存在を保証しない
+- DHTから得るのは既知infohashのpeer候補だけであり、最新版の判断には使わない
+- descriptorはL2から取得できるが、必ず書き手署名とL4 headへの束縛を検証する
 
 ## 制約
 
-- infohash の配布は descriptor / 外部共有が中心。L4 への archive descriptor 統合は未実装
+- infohash の配布はL2の署名済みdescriptorが中心。L4へのarchive descriptor統合は未実装
 - torrent は v1。v2、erasure coding、k-of-n 復元は未実装
 - bundle の自動 retention / garbage collection は未実装
 

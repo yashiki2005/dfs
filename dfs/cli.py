@@ -17,15 +17,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,11 +40,26 @@ if __package__ in (None, ""):
         ServiceUnavailableError,
     )
     from dfs.l2_cache import CachedRegistryClient
+    from dfs.l3_ost_adapter import (
+        MAX_OST_HTTP_BODY_BYTES,
+        OSTProtocolError,
+        ost_socket_timeout,
+    )
     from dfs.l3_store import ChunkStoreServer
     from dfs.l4_log import RollbackDetectedError, SilentDropDetectedError
-    from dfs.l5_clayfs import DFSNode
+    from dfs.l5_fs import DFSNode
     from dfs.paths import restrict_to_owner
     from dfs.private_io import ensure_private_dir, write_private_json
+    from dfs.relay import (
+        RelayAgent,
+        RelayAuthError,
+        RelayError,
+        RelayHub,
+        RelayNodeOfflineError,
+        RelayTimeoutError,
+        decode_relay_frame,
+        encode_relay_frame,
+    )
 else:
     from .crypto import ChunkIntegrityError, normalize_path
     from .l1_delegation import DelegationError, create_delegation_envelope
@@ -53,11 +70,26 @@ else:
         ServiceUnavailableError,
     )
     from .l2_cache import CachedRegistryClient
+    from .l3_ost_adapter import (
+        MAX_OST_HTTP_BODY_BYTES,
+        OSTProtocolError,
+        ost_socket_timeout,
+    )
     from .l3_store import ChunkStoreServer
     from .l4_log import RollbackDetectedError, SilentDropDetectedError
-    from .l5_clayfs import DFSNode
+    from .l5_fs import DFSNode
     from .paths import restrict_to_owner
     from .private_io import ensure_private_dir, write_private_json
+    from .relay import (
+        RelayAgent,
+        RelayAuthError,
+        RelayError,
+        RelayHub,
+        RelayNodeOfflineError,
+        RelayTimeoutError,
+        decode_relay_frame,
+        encode_relay_frame,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +100,8 @@ DEFAULT_L2_TIMEOUT = 10.0
 # L2 の JSON-RPC は小さなエンベロープだけを扱う。巨大な body で
 # サーバのメモリを消費させないよう、読み込み前に上限を設ける。
 MAX_REGISTRY_BODY_BYTES = 8 * 1024 * 1024
+MAX_REGISTRY_CONNECTIONS = 64
+REGISTRY_REQUEST_TIMEOUT = 10.0
 
 
 def l2_timeout() -> float:
@@ -168,7 +202,19 @@ class RemoteRegistryClient:
         代替名簿を順に試す。書き込み API は常に主名簿だけを使う。
         """
         if not read_failover:
-            return self._post_one(self.registry_url, endpoint, payload, timeout)
+            try:
+                return self._post_one(self.registry_url, endpoint, payload, timeout)
+            except ServiceUnavailableError as primary_err:
+                relay_urls = [u for u in self.registry_urls[1:] if "/relay/" in u]
+                if not relay_urls:
+                    raise
+                last_err: ServiceUnavailableError = primary_err
+                for relay_url in relay_urls:
+                    try:
+                        return self._post_one(relay_url, endpoint, payload, timeout)
+                    except ServiceUnavailableError as e:
+                        last_err = e
+                raise last_err
 
         last_error: Optional[ServiceUnavailableError] = None
         empty_candidate: Optional[Dict[str, Any]] = None
@@ -255,9 +301,40 @@ class RemoteRegistryClient:
         res = self._post("/v1/paths", {}, read_failover=True)
         return {"root_anchor": res.get("root_anchor", ""), "root_pubkey": res.get("root_pubkey", "")}
 
+    def publish_archive(
+        self, envelope: Dict[str, Any], role_epoch: int = 1
+    ) -> Dict[str, Any]:
+        """署名済みarchive descriptorを主名簿へ登録する。"""
+        res = self._post(
+            "/v1/archive",
+            {"envelope": envelope, "role_epoch": int(role_epoch)},
+        )
+        return res.get("verified", {})
+
+    def archives(
+        self, path: str, version: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """署名済みarchive descriptor一覧を取得する。"""
+        payload: Dict[str, Any] = {"path": path}
+        if version is not None:
+            payload["version"] = int(version)
+        res = self._post("/v1/archives", payload, read_failover=True)
+        rows = res.get("archives", [])
+        return rows if isinstance(rows, list) else []
+
     def replicate_bundle(self, bundle: Dict[str, Any]) -> None:
         """主名簿から複製名簿へ、署名済みバンドルを送る。"""
         self._post("/v1/replicate", {"bundle": bundle}, timeout=3.0)
+
+    def candidacy(self) -> Optional[Dict[str, Any]]:
+        """署名付き立候補エンベロープ (``/v1/candidacy``) を取得する。"""
+        res = self._post("/v1/candidacy", {}, read_failover=True)
+        return res.get("candidacy")
+
+    def announce_candidacy(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
+        """署名付き立候補エンベロープを主名簿へ登録する。"""
+        res = self._post("/v1/candidacy/announce", {"envelope": envelope})
+        return res.get("verified", {})
 
     def find_path_for_writer(self, writer_pubkey: str) -> Optional[str]:
         """書き手公開鍵に一致するサブツリーを探す（複数あれば最短のもの）。"""
@@ -270,6 +347,48 @@ class RemoteRegistryClient:
         if not found:
             return None
         return sorted(found, key=lambda p: (len(p), p))[0]
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """接続ごとのスレッド数を制限し、過負荷時は明示的に 503 を返す。"""
+
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler: type[BaseHTTPRequestHandler],
+        *,
+        max_workers: int = MAX_REGISTRY_CONNECTIONS,
+    ):
+        if max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        self._worker_slots = threading.BoundedSemaphore(max_workers)
+        super().__init__(server_address, handler)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._worker_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
 
 
 class PersistentRegistryState:
@@ -290,6 +409,9 @@ class PersistentRegistryState:
         self.service = DirectoryRegistryService(root_anchor, root_pubkey)
         # L3 OST の広告用。`serve` の起動時に埋める（ロケータが無い初回でも引けるように）。
         self.ost_endpoint: str = ""
+        self.ost_alternates: list[str] = []
+        self.relay_endpoint: str = ""
+        self.relay_endpoints: list[str] = []
         self.root_anchor = root_anchor
         # root アンカーの公開鍵。クライアントの初回（TOFU）が取得する。
         # ここから取った値をクライアントが記録し、以降は記録した値だけを信頼する。
@@ -310,12 +432,28 @@ class PersistentRegistryState:
         self.service.delegations = data.get("delegations", {})
         self.service.logs = data.get("logs", {})
         self.service.locators = data.get("locators", {})
+        raw_archives = data.get("archives", {})
+        self.service.archives = {}
+        if isinstance(raw_archives, dict):
+            for path, values in raw_archives.items():
+                if not isinstance(values, dict):
+                    continue
+                parsed: Dict[int, Dict[str, Any]] = {}
+                for version, envelope in values.items():
+                    try:
+                        parsed[int(version)] = envelope
+                    except (TypeError, ValueError):
+                        continue
+                self.service.archives[str(path)] = parsed
+        self.service.candidacy = data.get("candidacy")
         self.role = str(data.get("role", "primary"))
         self.role_epoch = int(data.get("role_epoch", 1))
 
     def save(self) -> None:
         data = {
             "delegations": self.service.delegations,
+            "archives": self.service.archives,
+            "candidacy": self.service.candidacy,
             "locators": self.service.locators,
             "logs": self.service.logs,
             "role": self.role,
@@ -328,10 +466,31 @@ class PersistentRegistryState:
             ost.store[f.stem] = f.read_bytes()
 
     def save_ost_chunks(self, ost: ChunkStoreServer) -> None:
-        for wid, blob in list(ost.store.items()):
+        store_lock = getattr(ost, "_store_lock", None)
+        if store_lock is not None:
+            with store_lock:
+                items = list(ost.store.items())
+        else:
+            items = list(ost.store.items())
+        for wid, blob in items:
             p = self.chunks_dir / f"{wid}.blk"
-            if not p.exists():
-                p.write_bytes(blob)
+            if p.exists():
+                continue
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{wid}.", suffix=".tmp", dir=str(self.chunks_dir)
+            )
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(blob)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, p)
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
 
     def push_to_replicas(self, bundle: Optional[Dict[str, Any]]) -> None:
         """主名簿の更新を複製名簿へベストエフォートで送る。"""
@@ -346,8 +505,25 @@ class PersistentRegistryState:
                 print(f"[L2] replica {url} failed: {type(e).__name__}: {e}", file=sys.stderr)
 
 
-def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreServer):
+def make_registry_http_handler(
+    pstate: PersistentRegistryState,
+    ost: ChunkStoreServer,
+    relay_hub: Optional[RelayHub] = None,
+):
+    ost_load_lock = threading.Lock()
+    ost_inflight = [0]
+    ost_overload_threshold = max(
+        1, int(os.environ.get("DFS_OST_OVERLOAD_INFLIGHT", "8") or "8")
+    )
+
     class RegistryHTTPHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        request_timeout = REGISTRY_REQUEST_TIMEOUT
+
+        def setup(self) -> None:
+            super().setup()
+            self.connection.settimeout(self.request_timeout)
+
         def log_message(self, fmt: str, *args: Any) -> None:
             sys.stderr.write(f"[L2-HTTP] {self.address_string()} - {fmt % args}\n")
 
@@ -358,6 +534,260 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+
+        def _send_binary(
+            self,
+            status: int,
+            body: bytes,
+            content_type: str = "application/octet-stream",
+            close: bool = False,
+        ) -> None:
+            with ost_load_lock:
+                inflight_now = ost_inflight[0]
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            if close:
+                self.send_header("Connection", "close")
+            self.send_header("X-DFS-Inflight", str(inflight_now))
+            if inflight_now >= ost_overload_threshold:
+                self.send_header("X-DFS-Overloaded", "1")
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _client_observed_ip(self) -> str:
+            xff = self.headers.get("X-Forwarded-For") or ""
+            if xff:
+                first = xff.split(",")[0].strip()
+                if first:
+                    return first
+            xri = (self.headers.get("X-Real-IP") or "").strip()
+            if xri:
+                return xri
+            if self.client_address and self.client_address[0]:
+                return str(self.client_address[0])
+            return ""
+
+        def _handle_ice(self) -> bool:
+            from urllib.parse import parse_qs, urlsplit
+
+            parsed = urlsplit(self.path)
+            if parsed.path == "/_ice/stun":
+                self._send_json(200, {"observed_ip": self._client_observed_ip()})
+                return True
+            if parsed.path == "/_ice/candidates":
+                if relay_hub is None:
+                    self._send_json(404, {"error_type": "RegistryError", "message": "Relay hub is not enabled"})
+                    return True
+                qs = parse_qs(parsed.query)
+                node_id = (qs.get("node") or [""])[0] or None
+                try:
+                    payload = relay_hub.get_ice_candidates(node_id)
+                except ValueError as e:
+                    self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+                self._send_json(200, payload)
+                return True
+            if parsed.path == "/_ice/announce":
+                if relay_hub is None:
+                    self._send_json(404, {"error_type": "RegistryError", "message": "Relay hub is not enabled"})
+                    return True
+                try:
+                    relay_hub.verify_token(self.headers.get("X-DFS-Relay-Token"))
+                except RelayAuthError as e:
+                    self._send_json(403, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+                req = self._read_json_body()
+                if req is None:
+                    return True
+                try:
+                    payload = relay_hub.announce_peer(
+                        node_id=str(req.get("node_id") or ""),
+                        direct_endpoints=req.get("direct_endpoints") or [],
+                        observed_ip=self._client_observed_ip(),
+                        role=str(req.get("role") or "seeder"),
+                    )
+                except (ValueError, TypeError) as e:
+                    self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+                self._send_json(200, payload)
+                return True
+            return False
+
+        def _handle_relay_control(self) -> bool:
+            from urllib.parse import parse_qs, urlsplit
+
+            parsed = urlsplit(self.path)
+            if not parsed.path.startswith("/_relay/"):
+                return False
+            if relay_hub is None:
+                self._send_json(404, {"error_type": "RegistryError", "message": "Relay hub is not enabled"})
+                return True
+            try:
+                relay_hub.verify_token(self.headers.get("X-DFS-Relay-Token"))
+            except RelayAuthError as e:
+                self._send_json(403, {"error_type": "RegistryError", "message": str(e)})
+                return True
+
+            qs = parse_qs(parsed.query)
+            if parsed.path == "/_relay/status":
+                self._send_json(200, relay_hub.status_snapshot())
+                return True
+            node_id = (qs.get("node") or [""])[0]
+            if parsed.path == "/_relay/pull":
+                self.connection.settimeout(35.0)
+                raw_eps = self.headers.get("X-DFS-Direct-Endpoints") or ""
+                direct_eps = [ep.strip() for ep in raw_eps.split(",") if ep.strip()]
+                try:
+                    req = relay_hub.pull_next(
+                        node_id,
+                        observed_ip=self._client_observed_ip(),
+                        direct_endpoints=direct_eps or None,
+                    )
+                except ValueError as e:
+                    self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+                finally:
+                    self.connection.settimeout(self.request_timeout)
+                if req is None:
+                    self.send_response(204)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return True
+                frame = encode_relay_frame(
+                    {
+                        "id": req.id,
+                        "method": req.method,
+                        "path": req.path,
+                        "content_type": req.content_type,
+                    },
+                    req.body,
+                )
+                self._send_binary(200, frame)
+                return True
+            if parsed.path == "/_relay/reply":
+                req_id = (qs.get("id") or [""])[0]
+                raw = self._read_binary_body(MAX_OST_HTTP_BODY_BYTES + 1024 * 1024)
+                if raw is None:
+                    return True
+                try:
+                    hdr, resp_body = decode_relay_frame(raw)
+                    ok = relay_hub.deliver_reply(
+                        node_id=node_id,
+                        req_id=req_id,
+                        status=int(hdr.get("status", 200)),
+                        content_type=str(hdr.get("content_type", "application/octet-stream")),
+                        body=resp_body,
+                    )
+                except (RelayError, ValueError, TypeError) as e:
+                    self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+                if not ok:
+                    self._send_json(404, {"error_type": "RegistryError", "message": "Unknown relay request id"})
+                    return True
+                self._send_json(200, {"ok": True})
+                return True
+            self._send_json(404, {"error_type": "RegistryError", "message": f"Unknown relay path {parsed.path}"})
+            return True
+
+        def _handle_relay_forward(self, method: str) -> bool:
+            if not self.path.startswith("/relay/"):
+                return False
+            if relay_hub is None:
+                self._send_json(404, {"error_type": "RegistryError", "message": "Relay hub is not enabled"})
+                return True
+            rest = self.path[len("/relay/") :]
+            node_id, sep, sub_path = rest.partition("/")
+            if not sep or not node_id:
+                self._send_json(404, {"error_type": "RegistryError", "message": "Malformed relay path"})
+                return True
+            target_path = "/" + sub_path
+            max_bytes = (
+                MAX_OST_HTTP_BODY_BYTES
+                if target_path.startswith("/v1/ost/")
+                else MAX_REGISTRY_BODY_BYTES
+            )
+            body = self._read_binary_body(max_bytes) if method == "POST" else b""
+            if body is None:
+                return True
+            self.connection.settimeout(45.0)
+            try:
+                status, ct, resp_body = relay_hub.forward(
+                    node_id=node_id,
+                    method=method,
+                    sub_path=target_path,
+                    content_type=self.headers.get("Content-Type", "application/octet-stream"),
+                    body=body,
+                )
+                self._send_binary(status, resp_body, content_type=ct)
+            except RelayNodeOfflineError as e:
+                self._send_json(503, {"error_type": "ServiceUnavailableError", "message": str(e)})
+            except RelayTimeoutError as e:
+                self._send_json(504, {"error_type": "ServiceUnavailableError", "message": str(e)})
+            except ValueError as e:
+                self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
+            finally:
+                self.connection.settimeout(self.request_timeout)
+            return True
+
+        def do_GET(self) -> None:
+            if self._handle_ice():
+                return
+            if self._handle_relay_control():
+                return
+            if self._handle_relay_forward("GET"):
+                return
+            self._send_json(404, {"error_type": "RegistryError", "message": f"Unknown path {self.path}"})
+
+        def _read_binary_body(self, max_bytes: int) -> Optional[bytes]:
+            if self.headers.get("Transfer-Encoding"):
+                self.close_connection = True
+                self._send_binary(400, b"ETransfer-Encoding is not supported", close=True)
+                return None
+            raw_length = self.headers.get("Content-Length", "0")
+            try:
+                length = int(raw_length)
+            except (TypeError, ValueError):
+                self.close_connection = True
+                self._send_binary(400, b"Einvalid Content-Length", close=True)
+                return None
+            if length < 0 or length > max_bytes:
+                self.close_connection = True
+                self._send_binary(413, b"Epayload too large", close=True)
+                return None
+            try:
+                return self.rfile.read(length) if length else b""
+            except (OSError, TimeoutError, socket.timeout):
+                self.close_connection = True
+                self._send_binary(408, b"Erequest body timed out", close=True)
+                return None
+
+        def _handle_ost_http(self) -> None:
+            self.connection.settimeout(max(self.request_timeout, ost_socket_timeout()))
+            with ost_load_lock:
+                ost_inflight[0] += 1
+            try:
+                raw_body = self._read_binary_body(MAX_OST_HTTP_BODY_BYTES)
+                if raw_body is None:
+                    return
+                if self.path == "/v1/ost/batch_has":
+                    self._send_binary(200, ost.batch_has_raw(raw_body))
+                elif self.path == "/v1/ost/batch_get":
+                    self._send_binary(200, ost.batch_get_raw(raw_body))
+                elif self.path == "/v1/ost/batch_put":
+                    ost.batch_put_raw(raw_body)
+                    self._send_binary(200, b"O")
+            except ServiceUnavailableError:
+                self._send_binary(503, b"U")
+            except (OSTProtocolError, ChunkIntegrityError, ValueError) as e:
+                self._send_binary(400, f"E{e}".encode("utf-8", errors="replace"))
+            except Exception as e:
+                self._send_binary(500, f"E{e}".encode("utf-8", errors="replace"))
+            finally:
+                with ost_load_lock:
+                    ost_inflight[0] = max(0, ost_inflight[0] - 1)
+                self.connection.settimeout(self.request_timeout)
 
         def _read_json_body(self) -> Optional[Dict[str, Any]]:
             raw_length = self.headers.get("Content-Length", "0")
@@ -378,7 +808,15 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                     },
                 )
                 return None
-            raw = self.rfile.read(length) if length else b""
+            try:
+                raw = self.rfile.read(length) if length else b""
+            except (OSError, TimeoutError, socket.timeout):
+                self.close_connection = True
+                self._send_json(
+                    408,
+                    {"error_type": "RegistryError", "message": "Request body timed out"},
+                )
+                return None
             if not raw:
                 return {}
             try:
@@ -398,11 +836,22 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
             return req
 
         def do_POST(self) -> None:
+            if self._handle_ice():
+                return
+            if self._handle_relay_control():
+                return
+            if self._handle_relay_forward("POST"):
+                return
+            if self.path in ("/v1/ost/batch_has", "/v1/ost/batch_get", "/v1/ost/batch_put"):
+                self._handle_ost_http()
+                return
             req = self._read_json_body()
             if req is None:
                 return
             # 認可時刻は必ずサーバ側の時計で決める。リクエストの "now" は使わない。
             now = int(time.time())
+            replica_bundle: Optional[Dict[str, Any]] = None
+            response_body: Optional[Dict[str, Any]] = None
             try:
                 with pstate.lock:
                     if self.path == "/v1/delegate":
@@ -412,10 +861,8 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                             )
                         verified = pstate.service.register_delegation(req["envelope"], now=now)
                         pstate.save()
-                        pstate.push_to_replicas(
-                            pstate.service.replication_bundle(verified["path"])
-                        )
-                        self._send_json(200, {"ok": True, "verified": verified})
+                        replica_bundle = pstate.service.replication_bundle(verified["path"])
+                        response_body = {"ok": True, "verified": verified}
                     elif self.path == "/v1/announce":
                         if pstate.role != "primary":
                             raise RegistryError(
@@ -435,35 +882,56 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                         )
                         pstate.save()
                         pstate.save_ost_chunks(ost)
-                        pstate.push_to_replicas(
-                            pstate.service.replication_bundle(req["path"])
-                        )
-                        self._send_json(200, {"ok": True})
+                        replica_bundle = pstate.service.replication_bundle(req["path"])
+                        response_body = {"ok": True}
                     elif self.path == "/v1/replicate":
                         updated = pstate.service.ingest_replica(req["bundle"], now=now)
                         pstate.save()
-                        self._send_json(200, {"ok": True, "updated": updated})
+                        response_body = {"ok": True, "updated": updated}
+                    elif self.path == "/v1/archive":
+                        if pstate.role != "primary":
+                            raise RegistryError(
+                                f"Registry is {pstate.role}; archive publishing requires primary"
+                            )
+                        if int(req.get("role_epoch", 1)) != pstate.role_epoch:
+                            raise ConflictError(
+                                f"Registry role epoch mismatch: expected {pstate.role_epoch}, "
+                                f"got {req.get('role_epoch')!r}"
+                            )
+                        verified = pstate.service.register_archive(
+                            req["envelope"], now=now
+                        )
+                        pstate.save()
+                        replica_bundle = pstate.service.replication_bundle(verified["path"])
+                        response_body = {"ok": True, "verified": verified}
+                    elif self.path == "/v1/archives":
+                        rows = pstate.service.list_archives(
+                            req["path"], version=req.get("version")
+                        )
+                        response_body = {
+                            "archives": rows,
+                            "count": len(rows),
+                            "path": req["path"],
+                        }
                     elif self.path == "/v1/resolve":
                         version = req.get("version")
                         del_env, loc_env, head_env = pstate.service.resolve(
                             req["path"], version=version
                         )
-                        self._send_json(
-                            200,
-                            {
-                                "delegation": del_env,
-                                "head_log": head_env,
-                                "locator": loc_env,
-                            },
-                        )
+                        response_body = {
+                            "delegation": del_env,
+                            "head_log": head_env,
+                            "locator": loc_env,
+                        }
                     elif self.path == "/v1/history":
                         rows = pstate.service.history(
                             req["path"], limit=int(req.get("limit", 50))
                         )
-                        self._send_json(
-                            200,
-                            {"path": req["path"], "history": rows, "count": len(rows)},
-                        )
+                        response_body = {
+                            "path": req["path"],
+                            "history": rows,
+                            "count": len(rows),
+                        }
                     elif self.path == "/v1/paths":
                         # 登録済みのサブツリーと、その書き手公開鍵を返す。
                         # CLI が --path を省略したとき、鍵の指紋から自分のパスを探すのに使う。
@@ -478,23 +946,42 @@ def make_registry_http_handler(pstate: PersistentRegistryState, ost: ChunkStoreS
                                 "base_version": p.get("base_version"),
                                 "head_version": head[-1]["payload"]["version"] if head else 0,
                             })
-                        self._send_json(200, {
+                        response_body = {
                             "root_anchor": pstate.root_anchor,
                             "root_pubkey": pstate.root_pubkey,
                             "paths": rows,
-                        })
+                        }
+                    elif self.path == "/v1/candidacy":
+                        response_body = {"candidacy": pstate.service.candidacy}
+                    elif self.path == "/v1/candidacy/announce":
+                        from .discovery import CandidacyError
+
+                        try:
+                            verified = pstate.service.set_candidacy(req["envelope"], now=now)
+                        except CandidacyError as e:
+                            raise RegistryError(str(e)) from e
+                        pstate.save()
+                        response_body = {"ok": True, "verified": verified}
                     elif self.path == "/v1/ost":
                         # L3 の場所を返す。ロケータ（endpoints）がまだ無い初回でも引けるように、
                         # サーバ自身が把握している endpoint を返す。
-                        self._send_json(200, {
+                        response_body = {
                             "endpoint": pstate.ost_endpoint,
+                            "alternates": list(pstate.ost_alternates),
+                            "relay_endpoint": pstate.relay_endpoint,
+                            "relay_endpoints": list(pstate.relay_endpoints),
                             "locators": {
                                 path: (env.get("payload", {}).get("endpoints") or [None])[0]
                                 for path, env in pstate.service.locators.items()
                             },
-                        })
+                        }
                     else:
                         self._send_json(404, {"error_type": "RegistryError", "message": f"Unknown path {self.path}"})
+                        return
+                if replica_bundle is not None:
+                    pstate.push_to_replicas(replica_bundle)
+                if response_body is not None:
+                    self._send_json(200, response_body)
             except (ConflictError, DelegationError, ChunkIntegrityError, ServiceUnavailableError, RegistryError) as e:
                 self._send_json(400, {"error_type": type(e).__name__, "message": str(e)})
             except (KeyError, TypeError, ValueError) as e:
@@ -522,9 +1009,13 @@ def load_node_from_mount(
     ensure_private_dir(cfg_path.parent)
     restrict_to_owner(cfg_path)
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    priv_key = Path(cfg["priv_key"]).expanduser().resolve()
-    pub_key_path = Path(cfg.get("pub_key") or f"{priv_key}.pub").expanduser().resolve()
-    pub_key_str = pub_key_path.read_text(encoding="utf-8").strip()
+    if cfg.get("read_only") or not cfg.get("priv_key"):
+        priv_key = Path("")
+        pub_key_str = ""
+    else:
+        priv_key = Path(cfg["priv_key"]).expanduser().resolve()
+        pub_key_path = Path(cfg.get("pub_key") or f"{priv_key}.pub").expanduser().resolve()
+        pub_key_str = pub_key_path.read_text(encoding="utf-8").strip()
 
     reg_urls = [cfg["registry_url"], *(cfg.get("registry_alternates") or [])]
     reg_client = CachedRegistryClient(
@@ -539,14 +1030,15 @@ def load_node_from_mount(
         pub_key_str=pub_key_str,
         tree_secret=cfg["tree_secret"],
         registry=reg_client,  # type: ignore[arg-type]
-        ost_host=cfg["ost_host"],
-        ost_port=int(cfg["ost_port"]),
+        ost_host=cfg.get("ost_host", ""),
+        ost_port=int(cfg.get("ost_port", 0) or 0),
+        ost_endpoint=cfg.get("ost_endpoint") or None,
         root_pubkey=cfg.get("root_pubkey"),
         ost_alternates=cfg.get("ost_alternates") or [],
         libp2p_peers=cfg.get("libp2p_peers") or [],
         libp2p_psk=cfg.get("libp2p_psk") or "",
         role_epoch=int(cfg.get("role_epoch", 1)),
-        compression=str(cfg.get("compression", "none") or "none"),
+        compression=str(cfg.get("compression", "auto") or "auto"),
     )
     return node, cfg, reg_client
 
@@ -598,11 +1090,61 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     # 自前の L3 の場所を広告する（--advertise があれば優先。無ければ bind から推定）
     advertised_host = args.advertise or ("127.0.0.1" if args.bind in ("0.0.0.0", "::") else args.bind)
-    pstate.ost_endpoint = f"tls://{advertised_host}:{ost.port}"
-    pstate.own_registry_url = f"http://{advertised_host}:{args.registry_port}"
+    endpoint_host = f"[{advertised_host}]" if ":" in advertised_host else advertised_host
+    pstate.ost_endpoint = f"tls://{endpoint_host}:{ost.port}"
+    pstate.own_registry_url = f"http://{endpoint_host}:{args.registry_port}"
 
-    handler = make_registry_http_handler(pstate, ost)
-    httpd = ThreadingHTTPServer((args.bind, args.registry_port), handler)
+    relay_token = getattr(args, "relay_token", None) or os.environ.get("DFS_RELAY_TOKEN", "")
+    enable_relay = bool(
+        getattr(args, "enable_relay", False)
+        or os.environ.get("DFS_ENABLE_RELAY", "").strip() in ("1", "true", "yes")
+        or relay_token
+    )
+    if (
+        enable_relay
+        and not relay_token
+        and args.bind not in ("127.0.0.1", "::1", "localhost")
+        and os.environ.get("DFS_RELAY_ALLOW_UNAUTH", "").strip() not in ("1", "true", "yes")
+    ):
+        raise SystemExit(
+            "Non-loopback relay hub requires --relay-token or DFS_RELAY_TOKEN "
+            "(set DFS_RELAY_ALLOW_UNAUTH=1 to override)"
+        )
+    relay_hub = RelayHub(token=relay_token) if enable_relay else None
+
+    raw_relays = getattr(args, "relay", None) or []
+    if isinstance(raw_relays, str):
+        raw_relays = [raw_relays]
+    relay_urls = [str(u).strip().rstrip("/") for u in raw_relays if str(u).strip()]
+    relay_node = (getattr(args, "relay_node", None) or "").strip()
+    if relay_urls and not relay_node:
+        raise SystemExit("--relay requires --relay-node")
+    if relay_urls and relay_node:
+        for r_url in relay_urls:
+            ep = f"{r_url}/relay/{relay_node}"
+            if ep not in pstate.relay_endpoints:
+                pstate.relay_endpoints.append(ep)
+            if ep not in pstate.ost_alternates:
+                pstate.ost_alternates.append(ep)
+        pstate.relay_endpoint = pstate.relay_endpoints[0]
+
+    handler = make_registry_http_handler(pstate, ost, relay_hub=relay_hub)
+    httpd = BoundedThreadingHTTPServer((args.bind, args.registry_port), handler)
+
+    relay_agents: List[RelayAgent] = []
+    if relay_urls and relay_node:
+        direct_eps = [ep for ep in (pstate.ost_endpoint, pstate.own_registry_url) if ep]
+        for r_url in relay_urls:
+            agent = RelayAgent(
+                relay_url=r_url,
+                node_id=relay_node,
+                local_port=httpd.server_port,
+                token=relay_token,
+                workers=int(getattr(args, "relay_workers", 4) or 4),
+                direct_endpoints=direct_eps,
+            )
+            agent.start()
+            relay_agents.append(agent)
 
     # 実際にサーバを動かしているプロセスの PID を残す。
     # Windows の venv 版 python.exe は本体を子プロセスで起動するため、
@@ -633,11 +1175,17 @@ def cmd_serve(args: argparse.Namespace) -> None:
     print(f"[dfs serve] OST Dir     : {pstate.chunks_dir}")
     print(f"[dfs serve] L2 Registry : http://{args.bind}:{args.registry_port}")
     print(f"[dfs serve] L3 OST (TLS): {pstate.ost_endpoint}")
+    if relay_hub is not None:
+        print(f"[dfs serve] Relay Hub   : enabled (token={'set' if relay_token else 'none'})")
+    if relay_agents:
+        print(f"[dfs serve] Relay Agent : {', '.join(pstate.relay_endpoints)}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[dfs serve] Shutting down...")
     finally:
+        for agent in relay_agents:
+            agent.close()
         with pstate.lock:
             pstate.save()
             pstate.save_ost_chunks(ost)
@@ -871,6 +1419,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="主名簿から複製する代替名簿 URL（複数指定可。例: http://host:19440）",
+    )
+    p_serve.add_argument(
+        "--enable-relay",
+        action="store_true",
+        help="root リレーハブ (/relay/<node>/..., /_relay/*) を有効にする",
+    )
+    p_serve.add_argument(
+        "--relay-token",
+        help="リレー認証トークン (未指定時は DFS_RELAY_TOKEN を参照)",
+    )
+    p_serve.add_argument(
+        "--relay",
+        action="append",
+        default=[],
+        help="NAT 裏からアウトバウンド接続するパブリックリレー URL（複数指定可。例: https://dfs.yashiki.top）",
+    )
+    p_serve.add_argument(
+        "--relay-node",
+        help="リレー上で名乗るノード ID (例: mac1 -> /relay/mac1/...)",
+    )
+    p_serve.add_argument(
+        "--relay-workers",
+        type=int,
+        default=4,
+        help="リレーの同時待ち受けワーカー数 (既定: 4)",
     )
     p_serve.set_defaults(func=cmd_serve)
 

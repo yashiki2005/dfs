@@ -7,15 +7,20 @@ macOS / Linux 両対応・デッドロック完全排除版 L3 OST サーバ & �
 
 from __future__ import annotations
 
+import http.client
+import json
 import os
 import socket
 import ssl
 import struct
 import sys
 import threading
-from contextlib import contextmanager
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from urllib.parse import urlsplit, urlunsplit
 
 from .crypto import ChunkIntegrityError, sha256_hex
 from .l2_registry import ServiceUnavailableError
@@ -45,6 +50,66 @@ def _decode_wire_ids(raw: bytes, count: int) -> List[str]:
 # batch_get）は十分小さい単位に分割しているので、通常運用では引っかからない。
 MAX_BATCH_ITEMS = 65_536
 MAX_BLOB_BYTES = 256 * 1024 * 1024
+MAX_OST_HTTP_BODY_BYTES = MAX_BLOB_BYTES + 4 * 1024 * 1024
+# クライアント側ではサーバ上限より小さく区切り、1 回の送受信が
+# メモリ上で無制限に膨らまないようにする。
+CLIENT_BATCH_ITEMS = 1024
+CLIENT_BATCH_BYTES = 64 * 1024 * 1024
+
+
+def parse_ost_endpoint(value: str) -> Tuple[str, int, str]:
+    """OST エンドポイントを ``(host, port, canonical_endpoint)`` に正規化する。
+
+    ``http://`` / ``https://`` は HTTP 経由の OST としてスキームとパスを保持し、
+    ``tls://host:port`` や ``host:port`` は ``tls://host:port`` に揃える。
+    """
+    text = str(value).strip()
+    if text.startswith("http://") or text.startswith("https://"):
+        parts = urlsplit(text)
+        if not parts.hostname:
+            raise ValueError(f"Invalid OST endpoint: {value!r}")
+        host = parts.hostname
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        host_fmt = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        netloc = f"{host_fmt}:{parts.port}" if parts.port is not None else host_fmt
+        canonical = urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), "", ""))
+        return host, int(port), canonical
+    if text.startswith("tls://"):
+        text = text[len("tls://"):]
+    host, sep, port_text = text.rpartition(":")
+    if not sep or not host or not port_text.isdigit():
+        raise ValueError(f"Invalid OST endpoint: {value!r}")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    port = int(port_text)
+    host_fmt = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return host, port, f"tls://{host_fmt}:{port}"
+
+
+def _group_put_chunks(chunks: Dict[str, bytes], missing_ids: Sequence[str]) -> List[List[str]]:
+    """PUT 対象チャンクを ``CLIENT_BATCH_ITEMS`` / ``CLIENT_BATCH_BYTES`` で分割する。"""
+    groups: List[List[str]] = []
+    group: List[str] = []
+    group_bytes = 0
+    for wid in missing_ids:
+        blob = chunks[wid]
+        if len(blob) > MAX_BLOB_BYTES:
+            raise ChunkIntegrityError(
+                f"Chunk {wid[:12]}... exceeds L3 limit: {len(blob)} > {MAX_BLOB_BYTES}"
+            )
+        encoded_size = 68 + len(blob)
+        if group and (
+            len(group) >= CLIENT_BATCH_ITEMS
+            or group_bytes + encoded_size > CLIENT_BATCH_BYTES
+        ):
+            groups.append(group)
+            group = []
+            group_bytes = 0
+        group.append(wid)
+        group_bytes += encoded_size
+    if group:
+        groups.append(group)
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +120,13 @@ MAX_BLOB_BYTES = 256 * 1024 * 1024
 # ---------------------------------------------------------------------------
 DEFAULT_OST_SOCKET_TIMEOUT = 30.0
 DEFAULT_OST_CONNECT_TIMEOUT = 10.0
+DEFAULT_PROBE_TIMEOUT = 1.5
+DEFAULT_TRANSPORT_CACHE_TTL = 300.0
+
+
+def ost_probe_timeout() -> float:
+    """適応プローブの接続タイムアウト秒（既定 1.5 秒、``DFS_PROBE_TIMEOUT`` で変更）"""
+    return _env_positive_float("DFS_PROBE_TIMEOUT", DEFAULT_PROBE_TIMEOUT)
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -91,6 +163,7 @@ class ChunkStoreServer:
 
     def __init__(self, certfile: Path | str, keyfile: Path | str, host: str = "127.0.0.1", port: int = 0):
         self.store: Dict[str, bytes] = {}
+        self._store_lock = threading.RLock()
         self.online: bool = True
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.load_cert_chain(certfile=str(certfile), keyfile=str(keyfile))
@@ -150,7 +223,9 @@ class ChunkStoreServer:
                 val = struct.unpack(">I", hdr[65:69])[0]
 
                 if op == "H":
-                    ssl_conn.sendall(b"1" if wire_id in self.store else b"0")
+                    with self._store_lock:
+                        exists = wire_id in self.store
+                    ssl_conn.sendall(b"1" if exists else b"0")
                 elif op == "P":
                     if val > MAX_BLOB_BYTES:
                         ssl_conn.sendall(b"E")
@@ -159,13 +234,15 @@ class ChunkStoreServer:
                     if sha256_hex(data) != wire_id:
                         ssl_conn.sendall(b"E")
                     else:
-                        self.store[wire_id] = data
+                        with self._store_lock:
+                            self.store[wire_id] = data
                         ssl_conn.sendall(b"O")
                 elif op == "G":
-                    if wire_id not in self.store:
+                    with self._store_lock:
+                        blob = self.store.get(wire_id)
+                    if blob is None:
                         ssl_conn.sendall(struct.pack(">I", 0))
                     else:
-                        blob = self.store[wire_id]
                         ssl_conn.sendall(struct.pack(">I", len(blob)) + blob)
 
                 # --- バッチオペコード ---
@@ -174,9 +251,11 @@ class ChunkStoreServer:
                         ssl_conn.sendall(b"E")
                         break
                     raw_ids = self._recv_exact(ssl_conn, val * 64)
+                    decoded_ids = _decode_wire_ids(raw_ids, val)
                     bitmap = bytearray(b"O")
-                    for wid in _decode_wire_ids(raw_ids, val):
-                        bitmap.extend(b"1" if wid in self.store else b"0")
+                    with self._store_lock:
+                        for wid in decoded_ids:
+                            bitmap.extend(b"1" if wid in self.store else b"0")
                     ssl_conn.sendall(bytes(bitmap))
 
                 elif op == "M":  # Multi-PUT
@@ -198,7 +277,8 @@ class ChunkStoreServer:
                         else:
                             staged[wid] = blob
                     if ok:
-                        self.store.update(staged)
+                        with self._store_lock:
+                            self.store.update(staged)
                         ssl_conn.sendall(b"O")
                     else:
                         ssl_conn.sendall(b"E")
@@ -208,10 +288,12 @@ class ChunkStoreServer:
                         ssl_conn.sendall(b"E")
                         break
                     raw_ids = self._recv_exact(ssl_conn, val * 64)
+                    decoded_ids = _decode_wire_ids(raw_ids, val)
                     out = bytearray(b"O")
-                    for wid in _decode_wire_ids(raw_ids, val):
-                        blob = self.store.get(wid, b"")
-                        out.extend(struct.pack(">I", len(blob)) + blob)
+                    with self._store_lock:
+                        for wid in decoded_ids:
+                            blob = self.store.get(wid, b"")
+                            out.extend(struct.pack(">I", len(blob)) + blob)
                     ssl_conn.sendall(bytes(out))
                 else:
                     break
@@ -236,6 +318,74 @@ class ChunkStoreServer:
                 raw_conn.close()
             except Exception:
                 pass
+
+    def batch_has_raw(self, raw_ids: bytes) -> bytes:
+        """HTTP / バイナリ共通の Batch HAS 処理。"""
+        if not self.online:
+            raise ServiceUnavailableError("L3 OST is offline")
+        if len(raw_ids) % 64 != 0:
+            raise OSTProtocolError("invalid wire_id batch length")
+        count = len(raw_ids) // 64
+        if count > MAX_BATCH_ITEMS:
+            raise OSTProtocolError(f"batch_has exceeds MAX_BATCH_ITEMS ({count})")
+        decoded_ids = _decode_wire_ids(raw_ids, count)
+        bitmap = bytearray(b"O")
+        with self._store_lock:
+            for wid in decoded_ids:
+                bitmap.extend(b"1" if wid in self.store else b"0")
+        return bytes(bitmap)
+
+    def batch_get_raw(self, raw_ids: bytes) -> bytes:
+        """HTTP / バイナリ共通の Batch GET 処理。"""
+        if not self.online:
+            raise ServiceUnavailableError("L3 OST is offline")
+        if len(raw_ids) % 64 != 0:
+            raise OSTProtocolError("invalid wire_id batch length")
+        count = len(raw_ids) // 64
+        if count > MAX_BATCH_ITEMS:
+            raise OSTProtocolError(f"batch_get exceeds MAX_BATCH_ITEMS ({count})")
+        decoded_ids = _decode_wire_ids(raw_ids, count)
+        unique_ids = list(dict.fromkeys(decoded_ids))
+        with self._store_lock:
+            blobs = [self.store.get(wid, b"") for wid in unique_ids]
+        total_bytes = 1 + sum(4 + len(blob) for blob in blobs)
+        if total_bytes > MAX_OST_HTTP_BODY_BYTES:
+            raise OSTProtocolError(
+                f"batch_get response exceeds MAX_OST_HTTP_BODY_BYTES ({total_bytes} > {MAX_OST_HTTP_BODY_BYTES})"
+            )
+        out = bytearray(b"O")
+        for blob in blobs:
+            out.extend(struct.pack(">I", len(blob)) + blob)
+        return bytes(out)
+
+    def batch_put_raw(self, raw_payload: bytes) -> None:
+        """HTTP / バイナリ共通の Multi-PUT 処理。"""
+        if not self.online:
+            raise ServiceUnavailableError("L3 OST is offline")
+        if len(raw_payload) < 4:
+            raise OSTProtocolError("truncated batch_put payload")
+        count = struct.unpack(">I", raw_payload[:4])[0]
+        if count > MAX_BATCH_ITEMS:
+            raise OSTProtocolError(f"batch_put exceeds MAX_BATCH_ITEMS ({count})")
+        offset = 4
+        staged: Dict[str, bytes] = {}
+        for _ in range(count):
+            if offset + 68 > len(raw_payload):
+                raise OSTProtocolError("truncated batch_put item header")
+            wid = _decode_wire_id(raw_payload[offset : offset + 64])
+            blen = struct.unpack(">I", raw_payload[offset + 64 : offset + 68])[0]
+            offset += 68
+            if blen > MAX_BLOB_BYTES or offset + blen > len(raw_payload):
+                raise OSTProtocolError("invalid batch_put blob length")
+            blob = raw_payload[offset : offset + blen]
+            offset += blen
+            if sha256_hex(blob) != wid:
+                raise ChunkIntegrityError(f"wire_id hash mismatch for {wid}")
+            staged[wid] = blob
+        if offset != len(raw_payload):
+            raise OSTProtocolError("trailing bytes in batch_put payload")
+        with self._store_lock:
+            self.store.update(staged)
 
     def close(self) -> None:
         self.running = False
@@ -263,6 +413,8 @@ class OSTClient:
         self.get_count: int = 0
         self.tls_handshakes: int = 0
         self.round_trips: int = 0
+        self.last_inflight: int = 0
+        self.last_overloaded: bool = False
 
         self._ssl_ctx = ssl.create_default_context()
         self._ssl_ctx.check_hostname = False
@@ -270,6 +422,29 @@ class OSTClient:
 
         self._pooled_conn: Optional[ssl.SSLSocket] = None
         self._session_depth: int = 0
+
+    @property
+    def endpoint_uri(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host and not self.host.startswith("[") else self.host
+        return f"tls://{host}:{self.port}"
+
+    def probe(self, timeout: Optional[float] = None) -> float:
+        """疎通確認して RTT (秒) を返す。失敗時は ServiceUnavailableError。"""
+        t0 = time.monotonic()
+        conn = self._open_new_conn(timeout=timeout if timeout is not None else ost_probe_timeout())
+        normal_exit = False
+        try:
+            hdr = b"B" + ZERO_WIRE_ID + struct.pack(">I", 0)
+            self._send_all(conn, hdr)
+            status = self._recv_exact(conn, 1)
+            if status == b"U":
+                raise ServiceUnavailableError("L3 OST is offline")
+            if status != b"O":
+                raise ServiceUnavailableError(f"Unexpected probe status {status!r}")
+            normal_exit = True
+        finally:
+            self._graceful_close(conn, send_quit=normal_exit)
+        return time.monotonic() - t0
 
     def reset_metrics(self) -> None:
         self.bytes_sent = 0
@@ -279,15 +454,18 @@ class OSTClient:
         self.get_count = 0
         self.tls_handshakes = 0
         self.round_trips = 0
+        self.last_inflight = 0
+        self.last_overloaded = False
 
-    def _open_new_conn(self) -> ssl.SSLSocket:
+    def _open_new_conn(self, timeout: Optional[float] = None) -> ssl.SSLSocket:
         """接続を張る。到達不能・タイムアウトは ServiceUnavailableError に正規化する。
 
         WAN では経路断（WireGuard の一時停止など）で生の OSError や socket.timeout が
         飛ぶ。呼び出し側が「サーバ停止」と同じ扱いにできるよう例外をそろえる。
         """
+        eff_timeout = timeout if timeout is not None else ost_connect_timeout()
         try:
-            raw = socket.create_connection((self.host, self.port), timeout=ost_connect_timeout())
+            raw = socket.create_connection((self.host, self.port), timeout=eff_timeout)
         except (OSError, TimeoutError) as e:
             raise ServiceUnavailableError(
                 f"Cannot reach L3 OST at {self.host}:{self.port}: {e}"
@@ -356,6 +534,13 @@ class OSTClient:
                 self._graceful_close(conn, send_quit=normal_exit)
 
     @staticmethod
+    def _send_all(conn: ssl.SSLSocket, data: bytes) -> None:
+        try:
+            conn.sendall(data)
+        except (OSError, TimeoutError, ssl.SSLError) as e:
+            raise ServiceUnavailableError(f"L3 OST write failed or timed out: {e}") from e
+
+    @staticmethod
     def _recv_exact(conn: ssl.SSLSocket, n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
@@ -378,22 +563,28 @@ class OSTClient:
             return {}
 
         with self._acquire_conn() as conn:
-            hdr = b"B" + ZERO_WIRE_ID + struct.pack(">I", len(unique_ids))
-            body = "".join(unique_ids).encode("ascii")
-            conn.sendall(hdr + body)
-            self.bytes_sent += len(hdr) + len(body)
-            self.round_trips += 1
+            result: Dict[str, bool] = {}
+            for start in range(0, len(unique_ids), CLIENT_BATCH_ITEMS):
+                group = unique_ids[start : start + CLIENT_BATCH_ITEMS]
+                hdr = b"B" + ZERO_WIRE_ID + struct.pack(">I", len(group))
+                body = "".join(group).encode("ascii")
+                self._send_all(conn, hdr + body)
+                self.bytes_sent += len(hdr) + len(body)
+                self.round_trips += 1
 
-            status = self._recv_exact(conn, 1)
-            self.bytes_received += 1
-            if status == b"U":
-                raise ServiceUnavailableError("L3 OST is offline")
-            if status != b"O":
-                raise ChunkIntegrityError(f"Batch HAS failed with status {status!r}")
+                status = self._recv_exact(conn, 1)
+                self.bytes_received += 1
+                if status == b"U":
+                    raise ServiceUnavailableError("L3 OST is offline")
+                if status != b"O":
+                    raise ChunkIntegrityError(f"Batch HAS failed with status {status!r}")
 
-            flags = self._recv_exact(conn, len(unique_ids))
-            self.bytes_received += len(flags)
-            return {wid: (flags[i : i + 1] == b"1") for i, wid in enumerate(unique_ids)}
+                flags = self._recv_exact(conn, len(group))
+                self.bytes_received += len(flags)
+                result.update(
+                    {wid: flags[i : i + 1] == b"1" for i, wid in enumerate(group)}
+                )
+            return result
 
     def batch_put_if_absent(self, chunks: Dict[str, bytes], assume_absent: bool = False) -> int:
         """未送信の塊をまとめて PUT する。
@@ -413,27 +604,35 @@ class OSTClient:
             if not missing_ids:
                 return 0
 
+        groups = _group_put_chunks(chunks, missing_ids)
+
         with self._acquire_conn() as conn:
-            payload_parts = [b"M" + ZERO_WIRE_ID + struct.pack(">I", len(missing_ids))]
-            for wid in missing_ids:
-                blob = chunks[wid]
-                payload_parts.append(wid.encode("ascii") + struct.pack(">I", len(blob)) + blob)
+            sent_count = 0
+            for current in groups:
+                payload_parts = [
+                    b"M" + ZERO_WIRE_ID + struct.pack(">I", len(current))
+                ]
+                for wid in current:
+                    blob = chunks[wid]
+                    payload_parts.append(
+                        wid.encode("ascii") + struct.pack(">I", len(blob)) + blob
+                    )
 
-            full_payload = b"".join(payload_parts)
-            conn.sendall(full_payload)
-            self.bytes_sent += len(full_payload)
-            self.blob_bytes_sent += sum(len(chunks[wid]) for wid in missing_ids)
-            self.round_trips += 1
+                full_payload = b"".join(payload_parts)
+                self._send_all(conn, full_payload)
+                self.bytes_sent += len(full_payload)
+                self.blob_bytes_sent += sum(len(chunks[wid]) for wid in current)
+                self.round_trips += 1
 
-            resp = self._recv_exact(conn, 1)
-            self.bytes_received += 1
-            if resp == b"U":
-                raise ServiceUnavailableError("L3 OST is offline")
-            if resp != b"O":
-                raise ChunkIntegrityError("Multi-PUT rejected by OST")
-
-            self.put_count += len(missing_ids)
-            return len(missing_ids)
+                resp = self._recv_exact(conn, 1)
+                self.bytes_received += 1
+                if resp == b"U":
+                    raise ServiceUnavailableError("L3 OST is offline")
+                if resp != b"O":
+                    raise ChunkIntegrityError("Multi-PUT rejected by OST")
+                self.put_count += len(current)
+                sent_count += len(current)
+            return sent_count
 
     def batch_get(self, wire_ids: Sequence[str]) -> Dict[str, bytes]:
         unique_ids = list(dict.fromkeys(wire_ids))
@@ -441,30 +640,38 @@ class OSTClient:
             return {}
 
         with self._acquire_conn() as conn:
-            hdr = b"F" + ZERO_WIRE_ID + struct.pack(">I", len(unique_ids))
-            body = "".join(unique_ids).encode("ascii")
-            conn.sendall(hdr + body)
-            self.bytes_sent += len(hdr) + len(body)
-            self.round_trips += 1
-
-            status = self._recv_exact(conn, 1)
-            self.bytes_received += 1
-            if status == b"U":
-                raise ServiceUnavailableError("L3 OST is offline")
-            if status != b"O":
-                raise ChunkIntegrityError(f"Batch GET failed with status {status!r}")
-
             result: Dict[str, bytes] = {}
-            for wid in unique_ids:
-                raw_len = self._recv_exact(conn, 4)
-                self.bytes_received += 4
-                blen = struct.unpack(">I", raw_len)[0]
-                if blen == 0:
-                    raise ChunkIntegrityError(f"Missing chunk on OST during batch_get: {wid}")
-                blob = self._recv_exact(conn, blen)
-                self.bytes_received += blen
-                self.get_count += 1
-                result[wid] = blob
+            for start in range(0, len(unique_ids), CLIENT_BATCH_ITEMS):
+                group = unique_ids[start : start + CLIENT_BATCH_ITEMS]
+                hdr = b"F" + ZERO_WIRE_ID + struct.pack(">I", len(group))
+                body = "".join(group).encode("ascii")
+                self._send_all(conn, hdr + body)
+                self.bytes_sent += len(hdr) + len(body)
+                self.round_trips += 1
+
+                status = self._recv_exact(conn, 1)
+                self.bytes_received += 1
+                if status == b"U":
+                    raise ServiceUnavailableError("L3 OST is offline")
+                if status != b"O":
+                    raise ChunkIntegrityError(f"Batch GET failed with status {status!r}")
+
+                for wid in group:
+                    raw_len = self._recv_exact(conn, 4)
+                    self.bytes_received += 4
+                    blen = struct.unpack(">I", raw_len)[0]
+                    if blen == 0:
+                        raise ChunkIntegrityError(
+                            f"Missing chunk on OST during batch_get: {wid}"
+                        )
+                    if blen > MAX_BLOB_BYTES:
+                        raise ChunkIntegrityError(
+                            f"L3 response chunk is too large: {blen} > {MAX_BLOB_BYTES}"
+                        )
+                    blob = self._recv_exact(conn, blen)
+                    self.bytes_received += blen
+                    self.get_count += 1
+                    result[wid] = blob
 
             return result
 
@@ -474,8 +681,333 @@ class OSTClient:
     def put_if_absent(self, wire_id: str, blob: bytes) -> bool:
         return self.batch_put_if_absent({wire_id: blob}) > 0
 
+
     def get(self, wire_id: str) -> bytes:
         return self.batch_get([wire_id])[wire_id]
+
+
+class HttpOSTClient:
+    """HTTP / HTTPS 経由の L3 OST クライアント。
+
+    ``OSTClient`` と同じバッチ単位・メトリクス・例外契約を持ち、
+    ``session()`` 中は HTTP keep-alive で接続を再利用する。
+    """
+
+    def __init__(self, base_url: str):
+        host, port, canonical = parse_ost_endpoint(base_url)
+        parts = urlsplit(canonical)
+        if parts.scheme not in ("http", "https"):
+            raise ValueError(f"HttpOSTClient requires http:// or https:// URL: {base_url!r}")
+        self.base_url: str = canonical
+        self.scheme: str = parts.scheme
+        self.host: str = host
+        self.port: int = port
+        self.base_path: str = parts.path.rstrip("/")
+
+        self.bytes_sent: int = 0
+        self.blob_bytes_sent: int = 0
+        self.bytes_received: int = 0
+        self.put_count: int = 0
+        self.get_count: int = 0
+        self.tls_handshakes: int = 0
+        self.round_trips: int = 0
+        self.last_inflight: int = 0
+        self.last_overloaded: bool = False
+
+        self._pooled_conn: Optional[http.client.HTTPConnection] = None
+        self._session_depth: int = 0
+
+    @property
+    def endpoint_uri(self) -> str:
+        return self.base_url
+
+    def probe(self, timeout: Optional[float] = None) -> float:
+        """疎通確認して RTT (秒) を返す。失敗時は ServiceUnavailableError。"""
+        t0 = time.monotonic()
+        eff = timeout if timeout is not None else ost_probe_timeout()
+        conn = self._open_new_conn(timeout=eff)
+        try:
+            target = (
+                f"{self.base_url}/v1/ost/batch_has"
+                if self.scheme == "http" and self._resolve_proxy()
+                else f"{self.base_path}/v1/ost/batch_has"
+            )
+            conn.request(
+                "POST",
+                target,
+                body=b"",
+                headers={"Content-Type": "application/octet-stream", "Content-Length": "0", "Connection": "close"},
+            )
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            if resp.status != 200 or resp_body != b"O":
+                raise ServiceUnavailableError(f"HTTP probe failed ({resp.status})")
+        except ServiceUnavailableError:
+            raise
+        except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException) as e:
+            raise ServiceUnavailableError(f"HTTP probe failed: {e}") from e
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return time.monotonic() - t0
+
+    def reset_metrics(self) -> None:
+        self.bytes_sent = 0
+        self.blob_bytes_sent = 0
+        self.bytes_received = 0
+        self.put_count = 0
+        self.get_count = 0
+        self.tls_handshakes = 0
+        self.round_trips = 0
+        self.last_inflight = 0
+        self.last_overloaded = False
+
+    def _resolve_proxy(self) -> Optional[str]:
+        import urllib.request
+
+        if urllib.request.proxy_bypass(self.host):
+            return None
+        proxies = urllib.request.getproxies()
+        return proxies.get(self.scheme) or proxies.get("all")
+
+    def _open_new_conn(self, timeout: Optional[float] = None) -> http.client.HTTPConnection:
+        eff_timeout = timeout if timeout is not None else ost_connect_timeout()
+        proxy_url = self._resolve_proxy()
+        try:
+            if proxy_url:
+                p = urlsplit(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
+                if not p.hostname:
+                    raise ServiceUnavailableError(f"Invalid proxy URL: {proxy_url!r}")
+                p_port = p.port or (443 if p.scheme == "https" else 80)
+                if self.scheme == "https":
+                    conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                        p.hostname, p_port, timeout=eff_timeout
+                    )
+                    conn.set_tunnel(self.host, self.port)
+                else:
+                    conn = http.client.HTTPConnection(p.hostname, p_port, timeout=eff_timeout)
+            elif self.scheme == "https":
+                conn = http.client.HTTPSConnection(self.host, self.port, timeout=eff_timeout)
+            else:
+                conn = http.client.HTTPConnection(self.host, self.port, timeout=eff_timeout)
+            conn.connect()
+        except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException) as e:
+            raise ServiceUnavailableError(
+                f"Cannot reach L3 OST over HTTP at {self.base_url}: {e}"
+            ) from e
+        if self.scheme == "https":
+            self.tls_handshakes += 1
+        return conn
+
+    def _close_pooled_conn(self) -> None:
+        if self._pooled_conn is not None:
+            try:
+                self._pooled_conn.close()
+            except Exception:
+                pass
+            self._pooled_conn = None
+
+    @contextmanager
+    def session(self) -> Iterator["HttpOSTClient"]:
+        self._session_depth += 1
+        try:
+            if self._pooled_conn is None:
+                self._pooled_conn = self._open_new_conn()
+            yield self
+        finally:
+            self._session_depth -= 1
+            if self._session_depth == 0:
+                self._close_pooled_conn()
+
+    def _request_once(
+        self, conn: http.client.HTTPConnection, path: str, body: bytes
+    ) -> Tuple[int, bytes]:
+        if self.scheme == "http" and self._resolve_proxy():
+            target = f"{self.base_url}{path}"
+        else:
+            target = f"{self.base_path}{path}"
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(body)),
+            "Connection": "keep-alive" if self._session_depth > 0 else "close",
+        }
+        # 転送フェーズは接続確立より長いソケットタイムアウトを使う
+        if conn.sock is not None:
+            conn.sock.settimeout(ost_socket_timeout())
+        conn.request("POST", target, body=body, headers=headers)
+        resp = conn.getresponse()
+        raw_cl = resp.getheader("Content-Length")
+        if raw_cl is not None:
+            try:
+                cl = int(raw_cl)
+            except ValueError as e:
+                conn.close()
+                raise ChunkIntegrityError(f"Invalid Content-Length from OST: {raw_cl!r}") from e
+            if cl < 0 or cl > MAX_OST_HTTP_BODY_BYTES:
+                conn.close()
+                raise ChunkIntegrityError(
+                    f"OST response Content-Length exceeds limit: {cl} > {MAX_OST_HTTP_BODY_BYTES}"
+                )
+        resp_body = resp.read(MAX_OST_HTTP_BODY_BYTES + 1)
+        if len(resp_body) > MAX_OST_HTTP_BODY_BYTES:
+            conn.close()
+            raise ChunkIntegrityError(
+                f"OST response body exceeds MAX_OST_HTTP_BODY_BYTES ({MAX_OST_HTTP_BODY_BYTES})"
+            )
+        raw_inflight = resp.getheader("X-DFS-Inflight")
+        if raw_inflight is not None:
+            try:
+                self.last_inflight = int(raw_inflight)
+            except ValueError:
+                pass
+        self.last_overloaded = (resp.getheader("X-DFS-Overloaded") or "").strip() == "1" or resp.status == 503
+        return resp.status, resp_body
+
+    def _post_binary(self, path: str, body: bytes) -> bytes:
+        self.bytes_sent += len(body)
+        self.round_trips += 1
+        if self._session_depth > 0:
+            for attempt in range(2):
+                if self._pooled_conn is None:
+                    self._pooled_conn = self._open_new_conn()
+                try:
+                    status, resp_body = self._request_once(self._pooled_conn, path, body)
+                    break
+                except (
+                    http.client.RemoteDisconnected,
+                    http.client.BadStatusLine,
+                    ConnectionResetError,
+                    BrokenPipeError,
+                ) as e:
+                    self._close_pooled_conn()
+                    if attempt == 0:
+                        continue
+                    raise ServiceUnavailableError(
+                        f"L3 HTTP OST connection failed at {self.base_url}: {e}"
+                    ) from e
+                except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException) as e:
+                    self._close_pooled_conn()
+                    raise ServiceUnavailableError(
+                        f"L3 HTTP OST request failed at {self.base_url}: {e}"
+                    ) from e
+        else:
+            conn = self._open_new_conn()
+            try:
+                status, resp_body = self._request_once(conn, path, body)
+            except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException) as e:
+                raise ServiceUnavailableError(
+                    f"L3 HTTP OST request failed at {self.base_url}: {e}"
+                ) from e
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        self.bytes_received += len(resp_body)
+        if status == 503 or resp_body == b"U":
+            raise ServiceUnavailableError("L3 OST is offline")
+        if status >= 500:
+            raise ServiceUnavailableError(f"L3 HTTP OST returned {status}")
+        if status != 200:
+            raise ChunkIntegrityError(
+                f"L3 HTTP OST rejected request ({status}): {resp_body[:120]!r}"
+            )
+        return resp_body
+
+    def batch_has(self, wire_ids: Sequence[str]) -> Dict[str, bool]:
+        unique_ids = list(dict.fromkeys(wire_ids))
+        if not unique_ids:
+            return {}
+        result: Dict[str, bool] = {}
+        for start in range(0, len(unique_ids), CLIENT_BATCH_ITEMS):
+            group = unique_ids[start : start + CLIENT_BATCH_ITEMS]
+            body = "".join(group).encode("ascii")
+            resp = self._post_binary("/v1/ost/batch_has", body)
+            if not resp.startswith(b"O") or len(resp) != 1 + len(group):
+                raise ChunkIntegrityError("Batch HAS over HTTP returned malformed response")
+            flags = resp[1:]
+            result.update(
+                {wid: flags[i : i + 1] == b"1" for i, wid in enumerate(group)}
+            )
+        return result
+
+    def batch_put_if_absent(self, chunks: Dict[str, bytes], assume_absent: bool = False) -> int:
+        if not chunks:
+            return 0
+        if assume_absent:
+            missing_ids = list(chunks.keys())
+        else:
+            presence = self.batch_has(list(chunks.keys()))
+            missing_ids = [wid for wid, exists in presence.items() if not exists]
+            if not missing_ids:
+                return 0
+
+        groups = _group_put_chunks(chunks, missing_ids)
+        sent_count = 0
+        for current in groups:
+            parts = [struct.pack(">I", len(current))]
+            for wid in current:
+                blob = chunks[wid]
+                parts.append(wid.encode("ascii") + struct.pack(">I", len(blob)) + blob)
+            full_payload = b"".join(parts)
+            self.blob_bytes_sent += sum(len(chunks[wid]) for wid in current)
+            resp = self._post_binary("/v1/ost/batch_put", full_payload)
+            if resp != b"O":
+                raise ChunkIntegrityError("Multi-PUT over HTTP rejected by OST")
+            self.put_count += len(current)
+            sent_count += len(current)
+        return sent_count
+
+    def batch_get(self, wire_ids: Sequence[str]) -> Dict[str, bytes]:
+        unique_ids = list(dict.fromkeys(wire_ids))
+        if not unique_ids:
+            return {}
+        result: Dict[str, bytes] = {}
+        for start in range(0, len(unique_ids), CLIENT_BATCH_ITEMS):
+            group = unique_ids[start : start + CLIENT_BATCH_ITEMS]
+            body = "".join(group).encode("ascii")
+            resp = self._post_binary("/v1/ost/batch_get", body)
+            if not resp.startswith(b"O"):
+                raise ChunkIntegrityError("Batch GET over HTTP returned malformed response")
+            offset = 1
+            for wid in group:
+                if offset + 4 > len(resp):
+                    raise ChunkIntegrityError("Truncated batch_get length over HTTP")
+                blen = struct.unpack(">I", resp[offset : offset + 4])[0]
+                offset += 4
+                if blen == 0:
+                    raise ChunkIntegrityError(
+                        f"Missing chunk on OST during batch_get: {wid}"
+                    )
+                if blen > MAX_BLOB_BYTES or offset + blen > len(resp):
+                    raise ChunkIntegrityError(
+                        f"L3 HTTP response chunk is invalid: {blen}"
+                    )
+                blob = resp[offset : offset + blen]
+                offset += blen
+                self.get_count += 1
+                result[wid] = blob
+            if offset != len(resp):
+                raise ChunkIntegrityError("Trailing bytes in batch_get HTTP response")
+        return result
+
+    def put_if_absent(self, wire_id: str, blob: bytes) -> bool:
+        return self.batch_put_if_absent({wire_id: blob}) > 0
+
+
+    def get(self, wire_id: str) -> bytes:
+        return self.batch_get([wire_id])[wire_id]
+
+
+def make_ost_client(endpoint: str) -> Union[OSTClient, HttpOSTClient]:
+    """エンドポイント文字列から ``OSTClient`` または ``HttpOSTClient`` を生成する。"""
+    host, port, canonical = parse_ost_endpoint(endpoint)
+    if canonical.startswith("http://") or canonical.startswith("https://"):
+        return HttpOSTClient(canonical)
+    return OSTClient(host=host, port=port)
 
 
 class FailoverOSTClient:
@@ -486,12 +1018,167 @@ class FailoverOSTClient:
     想定している。
     """
 
-    def __init__(self, clients: Sequence[OSTClient]):
+    def __init__(
+        self,
+        clients: Sequence[Union[OSTClient, HttpOSTClient]],
+        allow_write_failover: bool = False,
+        cache_file: Optional[Path | str] = None,
+        probe_ttl: float = DEFAULT_TRANSPORT_CACHE_TTL,
+    ):
         if not clients:
             raise ValueError("At least one OST client is required")
-        self.clients: List[OSTClient] = list(clients)
+        self.clients: List[Union[OSTClient, HttpOSTClient]] = list(clients)
         self.primary = self.clients[0]
-        self._active: Optional[OSTClient] = None
+        self._active: Optional[Union[OSTClient, HttpOSTClient]] = None
+        self.allow_write_failover = bool(allow_write_failover)
+        self.cache_file: Optional[Path] = Path(cache_file) if cache_file else None
+        self.probe_ttl: float = float(probe_ttl)
+        self._adapted: bool = False
+
+    @staticmethod
+    def _client_uri(client: Any) -> str:
+        uri = getattr(client, "endpoint_uri", None)
+        if uri:
+            return str(uri)
+        peers = getattr(client, "peers", None)
+        if peers:
+            return f"libp2p://{peers[0]}"
+        return f"ost://{getattr(client, 'host', '')}:{getattr(client, 'port', 0)}"
+
+    @staticmethod
+    def _is_relay_uri(uri: str) -> bool:
+        return "/relay/" in uri
+
+    @staticmethod
+    def _probe_one(client: Any, timeout: float) -> Tuple[bool, float]:
+        t0 = time.monotonic()
+        probe_fn = getattr(client, "probe", None)
+        try:
+            if callable(probe_fn):
+                rtt = float(probe_fn(timeout=timeout))
+                return True, rtt
+            batch_has_fn = getattr(client, "batch_has", None)
+            if callable(batch_has_fn):
+                batch_has_fn([])
+                return True, time.monotonic() - t0
+            return True, 0.0
+        except (ServiceUnavailableError, ChunkIntegrityError, OSError, TimeoutError):
+            return False, float("inf")
+
+    def _cache_key(self) -> str:
+        return "|".join(sorted(self._client_uri(c) for c in self.clients))
+
+    def _load_cached_order(self) -> Optional[List[str]]:
+        if self.cache_file is None or not self.cache_file.is_file():
+            return None
+        try:
+            data = json.loads(self.cache_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        entry = data.get(self._cache_key())
+        if not isinstance(entry, dict):
+            return None
+        updated_at = float(entry.get("updated_at", 0) or 0)
+        if time.time() - updated_at >= self.probe_ttl:
+            return None
+        order = entry.get("order")
+        return [str(u) for u in order] if isinstance(order, list) else None
+
+    def _save_cached_order(self, order: List[str]) -> None:
+        if self.cache_file is None:
+            return
+        try:
+            data: Dict[str, Any] = {}
+            if self.cache_file.is_file():
+                loaded = json.loads(self.cache_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+        except Exception:
+            data = {}
+        data[self._cache_key()] = {"updated_at": time.time(), "order": order}
+        try:
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            self.cache_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _invalidate_cache(self) -> None:
+        self._adapted = False
+        if self.cache_file is None or not self.cache_file.is_file():
+            return
+        try:
+            data = json.loads(self.cache_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and self._cache_key() in data:
+                del data[self._cache_key()]
+                self.cache_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def adapt_order(self, force: bool = False) -> List[Union[OSTClient, HttpOSTClient]]:
+        """通信環境・NAT・HTTP 制限を並列プローブして最適なクライアント順に並べる。"""
+        if len(self.clients) <= 1 or os.environ.get("DFS_AUTO_TRANSPORT", "1").strip() == "0":
+            return self.clients
+        if self._adapted and not force:
+            return self.clients
+
+        if not force:
+            cached = self._load_cached_order()
+            if cached:
+                by_uri = {self._client_uri(c): c for c in self.clients}
+                reordered = [by_uri[u] for u in cached if u in by_uri]
+                for c in self.clients:
+                    if c not in reordered:
+                        reordered.append(c)
+                self.clients = reordered
+                self._active = self.clients[0]
+                self._adapted = True
+                return self.clients
+
+        timeout = ost_probe_timeout()
+        direct = [c for c in self.clients if not self._is_relay_uri(self._client_uri(c))]
+        relay = [c for c in self.clients if self._is_relay_uri(self._client_uri(c))]
+
+        direct_ok: List[Tuple[int, float, Any]] = []
+        direct_bad: List[Any] = []
+        if direct:
+            with ThreadPoolExecutor(max_workers=min(8, len(direct))) as pool:
+                futs = {pool.submit(self._probe_one, c, timeout): c for c in direct}
+                for fut in as_completed(futs):
+                    c = futs[fut]
+                    ok, rtt = fut.result()
+                    if ok:
+                        pref = 0 if isinstance(c, OSTClient) else 1
+                        direct_ok.append((pref, rtt, c))
+                    else:
+                        direct_bad.append(c)
+            direct_ok.sort(key=lambda item: (item[0], item[1]))
+
+        if direct_ok:
+            new_order = [item[2] for item in direct_ok] + direct_bad + relay
+        else:
+            relay_ok: List[Tuple[float, Any]] = []
+            relay_bad: List[Any] = []
+            if relay:
+                with ThreadPoolExecutor(max_workers=min(8, len(relay))) as pool:
+                    futs = {pool.submit(self._probe_one, c, timeout): c for c in relay}
+                    for fut in as_completed(futs):
+                        c = futs[fut]
+                        ok, rtt = fut.result()
+                        if ok:
+                            relay_ok.append((rtt, c))
+                        else:
+                            relay_bad.append(c)
+                relay_ok.sort(key=lambda item: item[0])
+            new_order = [item[1] for item in relay_ok] + relay_bad + direct_bad
+
+        if new_order:
+            self.clients = new_order
+            self._active = self.clients[0]
+            self._save_cached_order([self._client_uri(c) for c in self.clients])
+        self._adapted = True
+        return self.clients
 
     @property
     def host(self) -> str:
@@ -536,19 +1223,27 @@ class FailoverOSTClient:
 
     @contextmanager
     def session(self) -> Iterator["FailoverOSTClient"]:
+        self.adapt_order()
         last_error: Optional[ServiceUnavailableError] = None
-        for client in self.clients:
+        stack = ExitStack()
+        entered = False
+        for idx, client in enumerate(self.clients):
             try:
-                with client.session():
-                    self._active = client
-                    yield self
-                    return
+                stack.enter_context(client.session())
+                self._active = client
+                entered = True
+                break
             except ServiceUnavailableError as e:
+                if idx == 0:
+                    self._invalidate_cache()
                 last_error = e
                 continue
-        if last_error is not None:
-            raise last_error
-        raise ServiceUnavailableError("No OST endpoint is available")
+        if not entered:
+            if last_error is not None:
+                raise last_error
+            raise ServiceUnavailableError("No OST endpoint is available")
+        with stack:
+            yield self
 
     def _read_candidates(self) -> List[OSTClient]:
         if self._active is None:
@@ -585,11 +1280,394 @@ class FailoverOSTClient:
         return self.batch_get([wire_id])[wire_id]
 
     def batch_put_if_absent(self, chunks: Dict[str, bytes], assume_absent: bool = False) -> int:
-        # 書き込みは主 OST のみ。レプリカへ直接書かない。
-        return self.primary.batch_put_if_absent(chunks, assume_absent=assume_absent)
+        if not self.allow_write_failover:
+            # 書き込みは主 OST のみ。レプリカへ直接書かない。
+            return self.primary.batch_put_if_absent(chunks, assume_absent=assume_absent)
+        last_error: Optional[BaseException] = None
+        for client in self._read_candidates():
+            try:
+                sent = client.batch_put_if_absent(chunks, assume_absent=assume_absent)
+                self._active = client
+                return sent
+            except (ServiceUnavailableError, OSError) as e:
+                last_error = e
+                continue
+        if last_error is not None:
+            raise last_error
+        return 0
 
     def put_if_absent(self, wire_id: str, blob: bytes) -> bool:
-        return self.primary.put_if_absent(wire_id, blob)
+        return self.batch_put_if_absent({wire_id: blob}) > 0
+
+
+class SwarmOSTClient(FailoverOSTClient):
+    """BitTorrent 式マルチピア並列取得 + Relay フォールバックを組み合わせた読み取りクライアント。
+
+    - 非リレー候補（Direct TLS/HTTP, 複製 OST, libp2p/QUIC ピア）が 2 つ以上ある場合、
+      ``batch_has`` で在庫を並列確認し、チャンクを複数ピアへラウンドロビンで並列分散取得する。
+    - 欠損や失敗したチャンクは別ピア、さらに最後の砦である ``/relay/`` 候補へフォールバックする。
+    - ``DFS_OST_SWARM=0`` で従来の単一フェイルオーバー (`FailoverOSTClient`) 挙動へ戻せる。
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.safe_mode: bool = os.environ.get("DFS_SAFE_MODE", "0").strip() == "1"
+        self.safe_mode_reason: str = "env:DFS_SAFE_MODE" if self.safe_mode else ""
+        self._overloaded_until: Dict[str, float] = {}
+        self._slow_hosts: set[str] = set()
+        self.overload_cooldown: float = float(
+            os.environ.get("DFS_OVERLOAD_COOLDOWN", "15.0") or "15.0"
+        )
+        self.min_single_bps: float = float(
+            os.environ.get("DFS_SWARM_MIN_SINGLE_BPS", str(3 * 1024 * 1024))
+            or str(3 * 1024 * 1024)
+        )
+
+    def enter_safe_mode(self, reason: str) -> None:
+        """自動発見・並列取得が機能しない環境向けに HTTP/HTTPS 単一フォールバックモードへ移行する。"""
+        self.safe_mode = True
+        self.safe_mode_reason = str(reason or "auto")
+        # HTTP/HTTPS クライアントを優先しつつ、非リレー → リレーの順を維持する
+        http_direct = [
+            c for c in self.clients
+            if not self._is_relay_client(c)
+            and str(getattr(c, "base_url", "")).startswith(("http://", "https://"))
+        ]
+        other_direct = [
+            c for c in self.clients
+            if not self._is_relay_client(c) and c not in http_direct
+        ]
+        relay = [c for c in self.clients if self._is_relay_client(c)]
+        self.clients = http_direct + other_direct + relay
+
+    @staticmethod
+    def _is_relay_client(client: Any) -> bool:
+        return "/relay/" in str(getattr(client, "base_url", ""))
+
+    def _partition_tiers(self) -> Tuple[List[Any], List[Any]]:
+        direct = [c for c in self.clients if not self._is_relay_client(c)]
+        relay = [c for c in self.clients if self._is_relay_client(c)]
+        return direct, relay
+
+    @contextmanager
+    def session(self) -> Iterator["SwarmOSTClient"]:
+        with super().session():
+            yield self
+
+    def _is_overloaded(self, client: Any, now: float) -> bool:
+        key = self._client_uri(client)
+        until = self._overloaded_until.get(key, 0.0)
+        if until > now:
+            return True
+        if key in self._overloaded_until:
+            del self._overloaded_until[key]
+        return False
+
+    def _mark_overloaded(self, client: Any) -> None:
+        self._overloaded_until[self._client_uri(client)] = (
+            time.monotonic() + self.overload_cooldown
+        )
+
+    def batch_get(self, wire_ids: Sequence[str]) -> Dict[str, bytes]:
+        unique_ids = list(dict.fromkeys(wire_ids))
+        if not unique_ids:
+            return {}
+        direct_tier, relay_tier = self._partition_tiers()
+        if (
+            self.safe_mode
+            or len(direct_tier) <= 1
+            or os.environ.get("DFS_OST_SWARM", "1").strip() == "0"
+        ):
+            return super().batch_get(unique_ids)
+
+        # Phase B: まず過負荷でない最速の直接ホスト 1 台 (keep-alive) で一括取得を試みる。
+        # 過負荷または極端に遅いホストしか残らない場合のみ Phase A (並列 keep-alive) へ移る。
+        now = time.monotonic()
+        active_direct = [c for c in direct_tier if not self._is_overloaded(c, now)]
+        if not active_direct:
+            self._overloaded_until.clear()
+            active_direct = list(direct_tier)
+
+        last_error: Optional[BaseException] = None
+        result: Dict[str, bytes] = {}
+        remaining = list(unique_ids)
+
+        # 過負荷除外の結果、既知の低速ホストしか残らず、かつ複数ホストで束ねられるなら最初から Phase A (並列) へ
+        skip_phase_b = (
+            len(active_direct) >= 2
+            and len(remaining) >= 8
+            and all(self._client_uri(c) in self._slow_hosts for c in active_direct)
+        )
+
+        for idx, client in enumerate([] if skip_phase_b else active_direct):
+            t0 = time.perf_counter()
+            try:
+                fetched = client.batch_get(remaining)
+                dt = max(0.001, time.perf_counter() - t0)
+                got_bytes = sum(len(v) for v in fetched.values())
+                if got_bytes >= 256 * 1024:
+                    bps = got_bytes / dt
+                    key = self._client_uri(client)
+                    if bps < self.min_single_bps:
+                        self._slow_hosts.add(key)
+                    else:
+                        self._slow_hosts.discard(key)
+                result.update(fetched)
+                self._active = client
+                remaining = [wid for wid in remaining if wid not in result]
+                overloaded = bool(getattr(client, "last_overloaded", False))
+                if overloaded:
+                    self._mark_overloaded(client)
+                if not remaining:
+                    if not overloaded:
+                        return result
+                    # 過負荷ホストから全件取れた場合でも、次回は別ホストへ逃がすため記録済み
+                    return result
+                # 一部欠損なら残りだけ他のピアへ（次のループまたは Phase A）
+            except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                last_error = e
+                if bool(getattr(client, "last_overloaded", False)) or isinstance(
+                    e, ServiceUnavailableError
+                ):
+                    self._mark_overloaded(client)
+                # 最初の高速ホストが失敗/過負荷なら次へ、または残りホストが少なければ Phase A へ
+                if len(active_direct) - idx - 1 >= 2 and len(remaining) >= 16:
+                    # 残りの複数ホストが低速な可能性があるため、ここで Phase A (並列) を検討
+                    break
+                continue
+
+        if not remaining:
+            return result
+
+        # Phase A: 単一高速ホストで完結しなかった残チャンクを複数直接ピアの並列 keep-alive Work Stealing で取得
+        # メインスレッドの pooled_conn を閉じて各ワーカースレッド専用の session() を張る
+        for c in direct_tier:
+            close_fn = getattr(c, "_close_pooled_conn", None)
+            if callable(close_fn):
+                close_fn()
+
+        availability: Dict[int, Dict[str, bool]] = {}
+        probe_rtt: Dict[int, float] = {}
+
+        def _probe_has(idx: int, client: Any) -> Tuple[Dict[str, bool], float]:
+            t0 = time.perf_counter()
+            with client.session():
+                res = client.batch_has(remaining)
+            return res, max(0.0005, time.perf_counter() - t0)
+
+        with ThreadPoolExecutor(max_workers=min(8, len(direct_tier))) as pool:
+            fut_map = {
+                pool.submit(_probe_has, idx, client): idx
+                for idx, client in enumerate(direct_tier)
+            }
+            for fut in as_completed(fut_map):
+                idx = fut_map[fut]
+                try:
+                    availability[idx], probe_rtt[idx] = fut.result()
+                except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                    last_error = e
+
+        healthy_indices = sorted(
+            (i for i in availability.keys() if not self._is_overloaded(direct_tier[i], time.monotonic())),
+            key=lambda i: probe_rtt.get(i, 999.0),
+        )
+        if not healthy_indices:
+            healthy_indices = sorted(availability.keys(), key=lambda i: probe_rtt.get(i, 999.0))
+
+        failed_clients: set[int] = set()
+        lock = threading.Lock()
+        pending: List[str] = []
+        owner_counts: Dict[str, int] = {}
+        unassigned: List[str] = []
+        for wid in remaining:
+            cnt = sum(1 for idx in healthy_indices if availability[idx].get(wid))
+            if cnt > 0:
+                owner_counts[wid] = cnt
+                pending.append(wid)
+            else:
+                unassigned.append(wid)
+        # BitTorrent 式 Rarest-first: 保有ピア数が少ない希少チャンクを優先して取得する
+        pending.sort(key=lambda w: owner_counts.get(w, 0))
+
+        if pending and healthy_indices:
+            min_rtt = max(0.001, probe_rtt[healthy_indices[0]])
+            base_q = max(4, min(16, len(pending) // max(1, len(healthy_indices) * 2)))
+            active_indices = [
+                idx for idx in healthy_indices
+                if any(availability[idx].get(wid) for wid in pending)
+            ]
+
+            def _worker(idx: int) -> None:
+                nonlocal last_error
+                client = direct_tier[idx]
+                ratio = min(1.0, min_rtt / max(0.001, probe_rtt.get(idx, min_rtt)))
+                quantum = max(1, int(round(base_q * ratio)))
+                avail = availability[idx]
+                with client.session():
+                    while True:
+                        batch: List[str] = []
+                        with lock:
+                            if not pending:
+                                return
+                            keep: List[str] = []
+                            for wid in pending:
+                                if len(batch) < quantum and avail.get(wid):
+                                    batch.append(wid)
+                                else:
+                                    keep.append(wid)
+                            pending[:] = keep
+                        if not batch:
+                            return
+                        t0 = time.perf_counter()
+                        try:
+                            fetched = client.batch_get(batch)
+                            dt = max(0.001, time.perf_counter() - t0)
+                            with lock:
+                                result.update(fetched)
+                                self._active = client
+                                missing_in_batch = [w for w in batch if w not in fetched]
+                                if missing_in_batch:
+                                    unassigned.extend(missing_in_batch)
+                            if getattr(client, "last_overloaded", False):
+                                self._mark_overloaded(client)
+                            if dt < 0.15 and len(batch) == quantum:
+                                quantum = min(24, quantum * 2)
+                            elif dt > 0.6 and quantum > 1:
+                                quantum = max(1, quantum // 2)
+                        except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                            with lock:
+                                last_error = e
+                                failed_clients.add(idx)
+                                pending.extend(batch)
+                            return
+
+            if active_indices:
+                with ThreadPoolExecutor(max_workers=min(8, len(active_indices))) as pool:
+                    futs = [pool.submit(_worker, idx) for idx in active_indices]
+                    for fut in as_completed(futs):
+                        fut.result()
+
+        # 失敗・欠損分は未試行の健全な直接ピア → 最後にリレー層へフォールバック
+        remaining = [wid for wid in (pending + unassigned) if wid not in result]
+        if remaining:
+            for idx in healthy_indices:
+                if idx in failed_clients or not remaining:
+                    continue
+                can_serve = [wid for wid in remaining if availability[idx].get(wid)]
+                if not can_serve:
+                    continue
+                try:
+                    fetched = direct_tier[idx].batch_get(can_serve)
+                    result.update(fetched)
+                    remaining = [wid for wid in remaining if wid not in result]
+                except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                    last_error = e
+
+        if remaining:
+            direct_got = len(result)
+            for r_client in relay_tier:
+                if not remaining:
+                    break
+                try:
+                    fetched = r_client.batch_get(remaining)
+                    result.update(fetched)
+                    remaining = [wid for wid in remaining if wid not in result]
+                except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                    last_error = e
+            if not remaining and direct_got == 0 and relay_tier:
+                self.enter_safe_mode("swarm_direct_failed")
+
+        if remaining:
+            if last_error is not None:
+                raise last_error
+            raise ChunkIntegrityError(
+                f"Missing chunk on all OST peers during swarm batch_get: {remaining[0]}"
+            )
+        return result
+
+    def discover_from_ice(
+        self,
+        registry_urls: Sequence[str],
+        node_id: Optional[str] = None,
+        timeout: float = 1.0,
+    ) -> List[str]:
+        """``/_ice/candidates`` から到達可能な直接ホストを発見して ``self.clients`` へ追加する。"""
+        if self.safe_mode:
+            return []
+        from urllib.parse import urlsplit
+        from .relay import discover_ice_candidates
+
+        existing_keys = {self._client_uri(c).rstrip("/") for c in self.clients}
+        raw_candidates: List[str] = []
+        seen_raw: set[str] = set()
+        seen_hubs: set[str] = set()
+        for reg_url in registry_urls:
+            base = str(reg_url or "").strip().rstrip("/")
+            if not base:
+                continue
+            if "/relay/" in base:
+                parts = urlsplit(base)
+                if parts.scheme and parts.netloc:
+                    base = f"{parts.scheme}://{parts.netloc}"
+            if base in seen_hubs:
+                continue
+            seen_hubs.add(base)
+            for cand in discover_ice_candidates(base, node_id=node_id, timeout=timeout):
+                ctype = str(cand.get("type") or "")
+                ep = str(cand.get("endpoint") or "").strip().rstrip("/")
+                if not ep or ctype == "relay":
+                    continue
+                if ep in seen_raw:
+                    continue
+                seen_raw.add(ep)
+                raw_candidates.append(ep)
+
+        pending: List[Tuple[str, Any]] = []
+        for ep in raw_candidates:
+            try:
+                client = make_ost_client(ep)
+            except Exception:
+                continue
+            key = self._client_uri(client).rstrip("/")
+            if key in existing_keys:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                continue
+            existing_keys.add(key)
+            pending.append((ep, client))
+
+        if not pending:
+            return []
+
+        added: List[str] = []
+        with ThreadPoolExecutor(max_workers=min(8, len(pending))) as pool:
+            fut_map = {
+                pool.submit(self._probe_one, client, timeout): (ep, client)
+                for ep, client in pending
+            }
+            for fut in as_completed(fut_map):
+                ep, client = fut_map[fut]
+                ok = False
+                try:
+                    ok, _rtt = fut.result()
+                except Exception:
+                    ok = False
+                if ok:
+                    self.clients.append(client)
+                    added.append(ep)
+                else:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+        if added:
+            self.adapt_order(force=True)
+        elif pending:
+            self.enter_safe_mode("ice_candidates_unreachable")
+        return added
 
 
 # 後方互換: 旧名。実体は ChunkStoreServer（mini_lustre の API ではない）。

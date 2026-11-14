@@ -26,6 +26,8 @@ EMPTY_SHA256: str = hashlib.sha256(b"").hexdigest()
 NS_L1_DELEGATION: str = "dfs-delegation-v1"
 NS_L2_LOCATOR: str = "dfs-l2-locator-v1"
 NS_L4_LOG: str = "dfs-l4-log-v1"
+NS_ARCHIVE: str = "dfs-archive-descriptor-v1"
+NS_CANDIDACY: str = "dfs-candidacy-v1"
 
 
 class CryptoError(Exception):
@@ -397,6 +399,8 @@ class ContentAddressedCrypto:
         value = str(compression or "none").strip().lower()
         if value in ("", "none", "off", "false", "0"):
             return "none"
+        if value == "auto":
+            return "auto"
         if value in ("zstd", "zstandard", "zstd:10"):
             return "zstd"
         raise CompressionError(f"Unsupported compression codec: {compression!r}")
@@ -459,7 +463,15 @@ class ContentAddressedCrypto:
         plain_id_bytes = self.compute_plain_id(plaintext)
         plain_id_hex = plain_id_bytes.hex()
         codec = self._normalize_compression(compression)
-        payload = self._compress_if_beneficial(plaintext) if codec == "zstd" else None
+        if codec == "auto":
+            try:
+                payload = self._compress_if_beneficial(plaintext)
+                codec = "zstd" if payload is not None else "none"
+            except CompressionError:
+                payload = None
+                codec = "none"
+        else:
+            payload = self._compress_if_beneficial(plaintext) if codec == "zstd" else None
         if payload is None:
             codec = "none"
             payload = plaintext

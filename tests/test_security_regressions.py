@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import socket
 import subprocess
@@ -19,7 +18,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfs import cli as cli_mod
-from dfs.cli_main import UsageError, _norm_prefix, apply_writes, cmd_fs
+from dfs.cli_main import UsageError, _collect_local, _norm_prefix, apply_writes, cmd_fs
 from dfs.crypto import (
     EMPTY_SHA256,
     NS_L4_LOG,
@@ -251,6 +250,34 @@ class TestCasConcurrency(unittest.TestCase):
 
 
 class TestSymlinkBoundaries(unittest.TestCase):
+    def test_collect_local_skips_source_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="dfs_sym_collect_") as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            source.mkdir()
+            outside = base / "outside.txt"
+            outside.write_text("OUTSIDE-SECRET", encoding="utf-8")
+            (source / "normal.txt").write_text("normal", encoding="utf-8")
+            os.symlink(outside, source / "leak.txt")
+
+            collected = _collect_local(source)
+            self.assertEqual(set(collected), {"normal.txt"})
+            with self.assertRaises(UsageError):
+                _collect_local(source / "leak.txt")
+
+    def test_copyfile_no_follow_rejects_symlink_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="dfs_sym_source_") as tmp:
+            base = Path(tmp)
+            outside = base / "outside.txt"
+            outside.write_text("OUTSIDE-SECRET", encoding="utf-8")
+            source = base / "source.txt"
+            os.symlink(outside, source)
+            destination = base / "destination.txt"
+
+            with self.assertRaises(UnsafePathError):
+                copyfile_no_follow(source, destination)
+            self.assertFalse(destination.exists())
+
     def test_upload_skips_symlink(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dfs_sym_up_") as tmp:
             base = Path(tmp)
@@ -391,6 +418,84 @@ class TestServerClock(unittest.TestCase):
             )
             response = sock.recv(4096)
         self.assertIn(b"413", response.split(b"\r\n", 1)[0])
+
+    def test_incomplete_body_times_out(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        handler = cli_mod.make_registry_http_handler(self.pstate, None)
+        handler.request_timeout = 0.2
+        self.httpd = cli_mod.BoundedThreadingHTTPServer(
+            ("127.0.0.1", 0), handler, max_workers=4
+        )
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+        with socket.create_connection(("127.0.0.1", self.port), timeout=2) as sock:
+            sock.sendall(
+                b"POST /v1/resolve HTTP/1.0\r\n"
+                b"Content-Length: 100\r\n"
+                b"\r\n"
+            )
+            sock.settimeout(2)
+            response = sock.recv(4096)
+        self.assertIn(b"408", response.split(b"\r\n", 1)[0])
+
+    def test_copyfile_no_follow_rejects_symlink_dst_cleanly(self) -> None:
+        from dfs.path_safety import UnsafePathError, copyfile_no_follow
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src.txt"
+            target = root / "target.txt"
+            dst = root / "dst_link"
+            src.write_bytes(b"hello")
+            target.write_bytes(b"keep")
+            dst.symlink_to(target)
+            with self.assertRaises(UnsafePathError):
+                copyfile_no_follow(src, dst)
+            self.assertEqual(target.read_bytes(), b"keep")
+
+    def test_failover_ost_session_propagates_body_service_unavailable(self) -> None:
+        from contextlib import contextmanager
+        from dfs.l2_registry import ServiceUnavailableError
+        from dfs.l3_ost_adapter import FailoverOSTClient
+
+        class _DummyClient:
+            host = "127.0.0.1"
+            port = 1
+            bytes_sent = 0
+            bytes_received = 0
+            blob_bytes_sent = 0
+            round_trips = 0
+            tls_handshakes = 0
+            put_count = 0
+            get_count = 0
+
+            def reset_metrics(self) -> None:
+                pass
+
+            @contextmanager
+            def session(self):
+                yield self
+
+        failover = FailoverOSTClient([_DummyClient(), _DummyClient()])  # type: ignore[list-item]
+        with self.assertRaises(ServiceUnavailableError):
+            with failover.session():
+                raise ServiceUnavailableError("primary went offline during write")
+
+    def test_verified_writer_rejects_missing_delegation_when_root_pinned(self) -> None:
+        from dfs.l1_delegation import DelegationError
+        from dfs.l4_log import L4LogClient
+
+        client = L4LogClient(
+            "/example.com/team",
+            Path("/nonexistent/key"),
+            "ssh-ed25519 AAAA",
+            root_pubkey="ssh-ed25519 AAAAroot",
+        )
+        with self.assertRaises(DelegationError):
+            client._verified_writer(None)
 
 
 if __name__ == "__main__":

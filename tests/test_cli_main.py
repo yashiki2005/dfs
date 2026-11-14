@@ -24,12 +24,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfs import cli as cli_mod
-from dfs.crypto import ContentAddressedCrypto
 from dfs.l1_delegation import create_delegation_envelope
 from dfs.l3_store import ChunkStoreServer
-from dfs.l4_log import MerkleTreeBuilder
-from dfs.l5_clayfs import DFSNode
-from dfs.cli_main import main as cli_main
+from dfs.cli_main import main as cli_main, normalize_registry, open_remote
 from dfs.remotes import Remote, RemoteStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,12 +176,30 @@ class RcloneCase(unittest.TestCase):
 
     def test_registry_host_only_gets_default_port(self) -> None:
         """--registry はホスト名だけでよい（ポートを補う）。"""
-        from dfs.cli_main import normalize_registry
-
         self.assertEqual(normalize_registry("172.16.1.60"), "http://172.16.1.60:9440")
         self.assertEqual(normalize_registry("http://host:1234"), "http://host:1234")
         self.assertEqual(normalize_registry("host", 19440), "http://host:19440")
         self.assertEqual(normalize_registry("https://host/"), "https://host:9440")
+        self.assertEqual(normalize_registry("http://[::1]:9440"), "http://[::1]:9440")
+
+    def test_existing_workdir_uses_updated_remote_definition(self) -> None:
+        self.assertEqual(self.run_cli("touch", "t:"), 0)
+        store = RemoteStore(self.config_file)
+        remote = store.get("t")
+        remote.path = "/example.com/alice/updated"
+        remote.secret = "rotated-secret"
+        remote.ost = self.server.ost_endpoint
+        store.set(remote)
+
+        node = open_remote(store.get("t"))
+        cfg = json.loads(
+            (
+                self.workdir / ".clayfs" / cli_mod.CONFIG_FILENAME
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(node.sub_path, "/example.com/alice/updated")
+        self.assertEqual(cfg["sub_path"], "/example.com/alice/updated")
+        self.assertEqual(cfg["tree_secret"], "rotated-secret")
 
     def test_config_create_accepts_registry_alternate(self) -> None:
         """--registry-alternate がリモート定義に保存される。"""
@@ -376,7 +391,6 @@ class RcloneCase(unittest.TestCase):
 
     def test_path_without_leading_slash_is_accepted(self) -> None:
         """--path は / で始まらなくてもよい。"""
-        store = RemoteStore(self.config_file)
         rc = self.run_cli(
             "config", "create", "nolead",
             "--registry", self.server.registry_url,
@@ -777,6 +791,18 @@ class RcloneCase(unittest.TestCase):
         paths = {e["path"] for e in node.list_remote()}
         self.assertNotIn("docs/sub", paths, "--rmdirs なのに空ディレクトリが残っている")
 
+    def test_rm_rmdirs_does_not_prune_unrelated_empty_dirs(self) -> None:
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        self.assertEqual(self.run_cli("mkdir", "t:unrelated-empty"), 0)
+
+        self.assertEqual(
+            self.run_cli("rm", "t:docs/readme.md", "--rmdirs"),
+            0,
+        )
+        node = cli_mod.load_node_from_mount(self.workdir)[0]
+        paths = {e["path"] for e in node.list_remote()}
+        self.assertIn("unrelated-empty", paths)
+
     def test_rm_dir_needs_recursive(self) -> None:
         """中身のあるディレクトリは --recursive 無しでは消さない。"""
         self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
@@ -788,6 +814,15 @@ class RcloneCase(unittest.TestCase):
         node = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
         paths = {e["path"] for e in node.list_remote() if e["type"] == "file"}
         self.assertFalse(any(p.startswith("docs/") for p in paths), "中身が残っている")
+
+    def test_rm_empty_dir_with_rmdirs(self) -> None:
+        self.assertEqual(self.run_cli("mkdir", "t:empty"), 0)
+        self.assertEqual(
+            self.run_cli("rm", "t:empty", "--recursive", "--rmdirs"),
+            0,
+        )
+        node = cli_mod.load_node_from_mount(self.workdir)[0]
+        self.assertNotIn("empty", {e["path"] for e in node.list_remote()})
 
     def test_rm_missing_is_an_error(self) -> None:
         self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)

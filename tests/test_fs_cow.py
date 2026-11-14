@@ -16,9 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfs.fs import CopyBackend, FileSystem, detect_backends, fs
+from dfs.fs import FileSystem, detect_backends, fs
 from dfs.fs import core as fs_core
-from dfs.fs.core import Capability
 
 
 class TestBackendDetection(unittest.TestCase):

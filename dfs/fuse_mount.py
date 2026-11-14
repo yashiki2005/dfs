@@ -49,6 +49,7 @@ class LocalTreeFuse:
         self.read_only = read_only
         self.sync_delay = max(0.0, float(sync_delay))
         self._lock = threading.RLock()
+        self._flush_lock = threading.Lock()
         self._dirty = False
         self._timer: Optional[threading.Timer] = None
 
@@ -66,53 +67,68 @@ class LocalTreeFuse:
             raise OSError(errno.EROFS, "read-only mount")
         self._dirty = True
 
-    def _flush_locked(self) -> None:
+    def _take_dirty_locked(self) -> bool:
         if not self._dirty or self.read_only:
-            return
-        self.flush_callback()
+            return False
         self._dirty = False
+        return True
+
+    def _run_flush_callback(self) -> None:
+        with self._flush_lock:
+            try:
+                self.flush_callback()
+            except Exception:
+                with self._lock:
+                    self._dirty = True
+                raise
 
     def _timer_flush(self) -> None:
         with self._lock:
             self._timer = None
-            try:
-                self._flush_locked()
-            except Exception as e:  # noqa: BLE001 - バックグラウンド flush の失敗を隠さない
-                import sys
-
-                print(f"[dfscli] mount flush failed: {e}", file=sys.stderr)
-
-    def _schedule_flush(self) -> None:
-        if self.sync_delay <= 0:
-            self._flush_locked()
+            should_flush = self._take_dirty_locked()
+        if not should_flush:
             return
-        if self._timer is not None:
-            self._timer.cancel()
-        self._timer = threading.Timer(self.sync_delay, self._timer_flush)
-        self._timer.daemon = True
-        self._timer.start()
+        try:
+            self._run_flush_callback()
+        except Exception as e:  # noqa: BLE001 - バックグラウンド flush の失敗を隠さない
+            import sys
+
+            print(f"[dfscli] mount flush failed: {e}", file=sys.stderr)
+
+    def _schedule_flush(self) -> bool:
+        with self._lock:
+            if self.sync_delay <= 0:
+                return self._take_dirty_locked()
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self.sync_delay, self._timer_flush)
+            self._timer.daemon = True
+            self._timer.start()
+            return False
 
     def flush(self, path: str, fh: int | None = None) -> None:
         # FUSE は close 前に flush を複数回呼ぶことがある。デバウンスして
         # release / fsync / destroy と同じ 1 回の push に合流させる。
-        with self._lock:
-            self._schedule_flush()
+        if self._schedule_flush():
+            self._run_flush_callback()
 
     def fsync(self, path: str, datasync: int, fh: int | None = None) -> None:
         # close 時の release で push する。fsync は同じデバウンスに合流させる。
-        with self._lock:
-            self._schedule_flush()
+        if self._schedule_flush():
+            self._run_flush_callback()
 
     def release(self, path: str, fh: int | None = None) -> None:
-        with self._lock:
-            self._schedule_flush()
+        if self._schedule_flush():
+            self._run_flush_callback()
 
     def destroy(self, path: str) -> None:
         with self._lock:
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
-            self._flush_locked()
+            should_flush = self._take_dirty_locked()
+        if should_flush:
+            self._run_flush_callback()
 
     def getattr(self, path: str, fh: int | None = None) -> dict[str, Any]:
         target = self._path(path)
@@ -230,7 +246,8 @@ class LocalTreeFuse:
                     f.truncate(length)
             except FileNotFoundError:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.touch()
+                with target.open("wb") as f:
+                    f.truncate(length)
 
     def unlink(self, path: str) -> None:
         with self._lock:

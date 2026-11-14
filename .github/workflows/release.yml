@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: darwin-arm64
+            archive: tar.gz
+            ext: ""
+          - os: ubuntu-22.04
+            target: linux-x86_64
+            archive: tar.gz
+            ext: ""
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            archive: tar.gz
+            ext: ""
+          - os: windows-latest
+            target: windows-x86_64
+            archive: zip
+            ext: ".exe"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime and PyInstaller
+        run: |
+          uv sync
+          uv pip install pyinstaller
+
+      - name: Build standalone binaries
+        shell: bash
+        run: |
+          uv run pyinstaller --onefile --clean --name dfscli scripts/pyinstaller_cli.py
+          uv run pyinstaller --onefile --clean --name dfssvc scripts/pyinstaller_svc.py
+          "./dist/dfscli${{ matrix.ext }}" --help >/dev/null
+          "./dist/dfssvc${{ matrix.ext }}" --help >/dev/null
+          mkdir -p stage
+          cp "dist/dfscli${{ matrix.ext }}" "stage/dfscli${{ matrix.ext }}"
+          cp "dist/dfssvc${{ matrix.ext }}" "stage/dfssvc${{ matrix.ext }}"
+          cp README.md LICENSE stage/ 2>/dev/null || true
+
+      - name: Package archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          NAME="dfs-${{ steps.ver.outputs.tag }}-${{ matrix.target }}.tar.gz"
+          tar -C stage -czf "${NAME}" .
+          echo "asset=${NAME}" >> "$GITHUB_OUTPUT"
+        id: pkg_unix
+
+      - name: Package archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "dfs-${{ steps.ver.outputs.tag }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "stage/*" -DestinationPath $name -Force
+          "asset=$name" >> $env:GITHUB_OUTPUT
+        id: pkg_win
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dfs-*.tar.gz
+            dfs-*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute SHA256SUMS and render Homebrew formula
+        run: |
+          cd artifacts
+          sha256sum dfs-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+          SHA_DARWIN_ARM64=$(grep "darwin-arm64.tar.gz" SHA256SUMS.txt | awk '{print $1}')
+          SHA_LINUX_X86_64=$(grep "linux-x86_64.tar.gz" SHA256SUMS.txt | awk '{print $1}')
+          SHA_LINUX_ARM64=$(grep "linux-arm64.tar.gz" SHA256SUMS.txt | awk '{print $1}')
+
+          sed -e "s/__VERSION__/${{ steps.ver.outputs.version }}/g" \
+              -e "s/__TAG__/${{ steps.ver.outputs.tag }}/g" \
+              -e "s/__SHA_DARWIN_ARM64__/${SHA_DARWIN_ARM64}/g" \
+              -e "s/__SHA_LINUX_X86_64__/${SHA_LINUX_X86_64}/g" \
+              -e "s/__SHA_LINUX_ARM64__/${SHA_LINUX_ARM64}/g" \
+              ../Formula/dfs.rb > dfs.rb
+
+      - name: Upload Homebrew formula artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: artifacts/dfs.rb
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: |
+            artifacts/dfs-*
+            artifacts/SHA256SUMS.txt
+            artifacts/dfs.rb
+          generate_release_notes: true

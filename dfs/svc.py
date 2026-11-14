@@ -37,18 +37,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .dnssec import DEFAULT_RECORD_PREFIX, parse_discovery_text
 from .paths import config_dir, dfs_home, restrict_to_owner
+from .private_io import ensure_private_dir
 
 CONFIG_FILENAME = "services.json"
 DEFAULT_START_PORT = 19440
@@ -249,11 +251,15 @@ class Service:
     @property
     def registry_url(self) -> str:
         host = self.advertise or "127.0.0.1"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
         return f"http://{host}:{self.registry_port}"
 
     @property
     def ost_endpoint(self) -> str:
         host = self.advertise or "127.0.0.1"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
         return f"{host}:{self.ost_port}"
 
     def is_running(self) -> bool:
@@ -516,15 +522,33 @@ def _read_serve_pid(state_dir: Path, timeout: float = 5.0) -> int:
     return 0
 
 
+def _normalize_hub_url(raw: str) -> str:
+    value = str(raw or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if "://" in value:
+        return value
+    # ポート番号付き (例: 172.16.1.254:19440) は http://、ドメインのみ (例: dfs.yashiki.top) は https://
+    if ":" in value and not value.startswith("["):
+        return f"http://{value}"
+    return f"https://{value}"
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     store = ServiceStore()
     name = args.name
+    existing = store.services.get(name)
 
     if name in store.services and not args.force:
         raise ServiceError(
             f"サービス {name!r} は既に記録にあります。"
             f"止めるなら 'dfssvc stop {name}'、作り直すなら --force を付けてください"
         )
+    if existing is not None and args.force and (
+        existing.is_running() or _recorded_server_is_alive(existing)
+    ):
+        if not _stop_process(existing):
+            raise ServiceError(f"既存のサービス {name!r} を停止できませんでした")
 
     host = args.host
     start_port = args.port if args.port is not None else DEFAULT_START_PORT
@@ -541,8 +565,48 @@ def cmd_start(args: argparse.Namespace) -> int:
         start_port = ost_port + 1
 
     base = _base_dir(name)
+    cfg_file = base / "dfssvc.json"
+    saved_cfg: Dict[str, Any] = {}
+    if cfg_file.is_file():
+        try:
+            loaded = json.loads(cfg_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                saved_cfg = loaded
+        except (OSError, ValueError, TypeError):
+            saved_cfg = {}
+
+    hub_arg = getattr(args, "hub", None)
+    join_arg = getattr(args, "join", None)
+    is_hub = bool(hub_arg) or bool(saved_cfg.get("hub"))
+    join_url = _normalize_hub_url(join_arg) if join_arg else str(saved_cfg.get("join") or "")
+    relay_token = (
+        getattr(args, "relay_token", None)
+        or str(saved_cfg.get("relay_token") or "")
+    )
+    if is_hub and not relay_token:
+        relay_token = secrets.token_urlsafe(24)
+    relay_node = (
+        getattr(args, "relay_node", None)
+        or str(saved_cfg.get("relay_node") or "")
+    )
+    if join_url and not relay_node:
+        relay_node = name if name != DEFAULT_NAME else socket.gethostname().split(".")[0]
+
+    effective_host = host
+    if is_hub and effective_host == "127.0.0.1":
+        effective_host = "0.0.0.0"
+
+    effective_advertise = args.advertise or str(saved_cfg.get("advertise") or "")
+    if not effective_advertise and isinstance(hub_arg, str) and hub_arg not in ("", "auto"):
+        from urllib.parse import urlsplit
+
+        parsed_hub = urlsplit(_normalize_hub_url(hub_arg))
+        if parsed_hub.hostname:
+            effective_advertise = parsed_hub.hostname
+    if not effective_advertise:
+        effective_advertise = "127.0.0.1" if effective_host in ("0.0.0.0", "::") else effective_host
+
     state_dir = Path(args.state_dir).expanduser() if args.state_dir else base / "server"
-    existing = store.services.get(name)
     raw_ost_dir = getattr(args, "ost_dir", None) or (existing.ost_dir if existing else "")
     ost_dir = (
         Path(raw_ost_dir).expanduser().resolve()
@@ -553,16 +617,40 @@ def cmd_start(args: argparse.Namespace) -> int:
     writer_key = Path(args.writer_key).expanduser() if args.writer_key else base / "keys" / "writer"
     log_path = base / "serve.log"
 
+    ensure_private_dir(base)
     state_dir.mkdir(parents=True, exist_ok=True)
     ost_dir.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_payload = (
+        json.dumps(
+            {
+                "hub": is_hub,
+                "join": join_url,
+                "relay_node": relay_node,
+                "relay_token": relay_token,
+                "advertise": effective_advertise,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+    cfg_tmp = cfg_file.with_suffix(".tmp")
+    fd = os.open(cfg_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, cfg_payload)
+    finally:
+        os.close(fd)
+    restrict_to_owner(cfg_tmp)
+    os.replace(cfg_tmp, cfg_file)
     ensure_root_key(root_key)
     ensure_writer_key(writer_key)
     root_pub = Path(f"{root_key}.pub")
     writer_pub = Path(f"{writer_key}.pub")
 
-    advertised = args.advertise or ("127.0.0.1" if host in ("0.0.0.0", "::") else host)
-    registry_url = f"http://{advertised}:{registry_port}"
+    advertised = effective_advertise
+    advertised_host = f"[{advertised}]" if ":" in advertised else advertised
+    registry_url = f"http://{advertised_host}:{registry_port}"
     service_role = args.role or "primary"
     service_role_epoch = args.role_epoch if args.role_epoch is not None else 1
     state_file = state_dir / "registry_state.json"
@@ -578,7 +666,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     cmd = [
         sys.executable, "-m", "dfs.cli", "serve",
-        "--bind", host,
+        "--bind", effective_host,
         "--registry-port", str(registry_port),
         "--ost-port", str(ost_port),
         "--root-anchor", args.root_anchor,
@@ -587,6 +675,12 @@ def cmd_start(args: argparse.Namespace) -> int:
         "--ost-dir", str(ost_dir),
         "--advertise", advertised,
     ]
+    if is_hub:
+        cmd.append("--relay-hub")
+    if join_url:
+        cmd.extend(["--relay", join_url])
+    if relay_node:
+        cmd.extend(["--relay-node", relay_node])
     for replica in (getattr(args, "replica", None) or []):
         cmd.extend(["--replica", replica])
     if getattr(args, "role", None):
@@ -605,6 +699,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         env = dict(os.environ)
         repo = _repo_root()
         env["PYTHONPATH"] = str(repo) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        if relay_token:
+            env["DFS_RELAY_TOKEN"] = relay_token
         try:
             return subprocess.call(cmd, env=env)
         except KeyboardInterrupt:
@@ -613,6 +709,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     env = dict(os.environ)
     repo = _repo_root()
     env["PYTHONPATH"] = str(repo) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    if relay_token:
+        env["DFS_RELAY_TOKEN"] = relay_token
     with open(log_path, "ab") as log:
         proc = subprocess.Popen(
             cmd, env=env, stdout=log, stderr=log,
@@ -687,7 +785,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             f"  dfscli config create {name} --registry {service.registry_url} "
             f"--key {key_hint} --secret <tree_secret>"
         )
-        print(f"  # L3 の場所もサブツリーも L2 が知っているので --ost も --path も不要です")
+        print("  # L3 の場所もサブツリーも L2 が知っているので --ost も --path も不要です")
         if service.sub_path:
             print(f"  # このサーバのサブツリー: {service.sub_path}")
         print(f"  # 書き手の鍵: {key_hint}" if service.writer_key else "")
@@ -850,27 +948,40 @@ def _request_stop(state_dir: Path) -> bool:
         return False
 
 
+def _recorded_server_is_alive(service: Service) -> bool:
+    """PID と serve.pid の一致を確認し、記録されたサーバプロセスかを判定する。"""
+    if not _process_alive(service.pid):
+        return False
+    try:
+        recorded = int(
+            (Path(service.state_dir) / "serve.pid").read_text(encoding="utf-8").strip()
+        )
+    except (OSError, ValueError):
+        return False
+    return recorded == service.pid
+
+
 def _stop_process(s: Service) -> bool:
-    if not s.is_running():
+    if not s.is_running() and not _recorded_server_is_alive(s):
         return False
     # まずは穏当に。サーバは stop.request を見て httpd.shutdown() し、
     # finally で状態とチャンクを保存してから終了する（データを落とさない）。
     _request_stop(Path(s.state_dir))
     deadline = time.time() + 10
     while time.time() < deadline:
-        if not _process_alive(s.pid):
+        if not s.is_running():
             return True
         time.sleep(0.3)
     # 応答が無ければ強制終了に切り替える。
     _signal_terminate(s.pid)
     deadline = time.time() + 3
     while time.time() < deadline:
-        if not _process_alive(s.pid):
+        if not s.is_running():
             return True
         time.sleep(0.3)
     _signal_kill(s.pid)
     time.sleep(0.5)
-    return not _process_alive(s.pid)
+    return not s.is_running()
 
 
 def cmd_env(args: argparse.Namespace) -> int:
@@ -887,7 +998,7 @@ def cmd_env(args: argparse.Namespace) -> int:
     )
     print()
     print(f"# 参考: このサーバの L3 は tls://{s.ost_endpoint}")
-    print(f"#        書き手の鍵 : {writer}" + (f"（--key にそのまま使える）" if s.writer_key else ""))
+    print(f"#        書き手の鍵 : {writer}" + ("（--key にそのまま使える）" if s.writer_key else ""))
     if s.sub_path:
         print(f"#        サブツリー : {s.sub_path}（L2 が鍵から引くので --path は不要）")
     if s.root_pub:
@@ -994,35 +1105,37 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--json", action="store_true", help="結果を JSON で出す")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("start", help="サーバを立てる")
+    p = sub.add_parser("start", help="サーバを立てる（引数なしでローカル単一起動）")
     p.add_argument("--name", default=DEFAULT_NAME, help=f"サービスの名前（既定 {DEFAULT_NAME}）")
-    p.add_argument("--host", default="127.0.0.1", help="bind するアドレス（既定 127.0.0.1）")
-    p.add_argument("--advertise", help="L2 が L3 の場所として広告するホスト（既定は --host から推定）")
+    p.add_argument(
+        "--hub",
+        nargs="?",
+        const="auto",
+        help="root / リレーハブとして公開起動する（例: --hub dfs.yashiki.top）",
+    )
+    p.add_argument(
+        "--join",
+        help="指定した root ハブへ参加する（例: --join https://dfs.yashiki.top）",
+    )
     p.add_argument("--port", type=int, help=f"この番号から連続した空きを探す（既定 {DEFAULT_START_PORT}）")
-    p.add_argument("--state-dir", help="状態ディレクトリ（既定 ~/dfssvc/<name>/server）")
-    p.add_argument(
-        "--ost-dir",
-        help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）",
-    )
-    p.add_argument("--root-key", help="root の Ed25519 鍵（既定 ~/dfssvc/<name>/keys/root）")
-    p.add_argument("--root-anchor", default=DEFAULT_ROOT_ANCHOR, help=f"根のパス（既定 {DEFAULT_ROOT_ANCHOR}）")
-    p.add_argument("--writer-key", help="書き手の Ed25519 鍵（既定 ~/dfssvc/<name>/keys/writer）")
-    p.add_argument(
-        "--path",
-        help=f"委譲するサブツリー（既定 {DEFAULT_ROOT_ANCHOR}/<name>）。"
-             "dfscli は書き手の鍵からこのパスを引く",
-    )
-    p.add_argument("--no-delegate", action="store_true",
-                   help="委譲を登録しない（サーバだけ立てる）")
-    p.add_argument("--wait", type=float, default=30.0, help="起動を待つ秒数（既定 30）")
+    p.add_argument("--ost-dir", help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）")
     p.add_argument("--foreground", action="store_true", help="前面で動かす（Ctrl-C で停止）")
-    p.add_argument(
-        "--replica", action="append", default=[],
-        help="主名簿から複製する代替名簿 URL（複数指定可）",
-    )
-    p.add_argument("--role", choices=["primary", "secondary"], help="registry role")
-    p.add_argument("--role-epoch", type=int, help="registry fencing epoch")
     p.add_argument("--force", action="store_true", help="同じ名前の記録を上書きする")
+    # 高度な設定・後方互換用（--help を簡潔に保つため既定では非表示）
+    p.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
+    p.add_argument("--advertise", help=argparse.SUPPRESS)
+    p.add_argument("--state-dir", help=argparse.SUPPRESS)
+    p.add_argument("--root-key", help=argparse.SUPPRESS)
+    p.add_argument("--root-anchor", default=DEFAULT_ROOT_ANCHOR, help=argparse.SUPPRESS)
+    p.add_argument("--writer-key", help=argparse.SUPPRESS)
+    p.add_argument("--path", help=argparse.SUPPRESS)
+    p.add_argument("--no-delegate", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--wait", type=float, default=30.0, help=argparse.SUPPRESS)
+    p.add_argument("--replica", action="append", default=[], help=argparse.SUPPRESS)
+    p.add_argument("--role", choices=["primary", "secondary"], help=argparse.SUPPRESS)
+    p.add_argument("--role-epoch", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--relay-node", help=argparse.SUPPRESS)
+    p.add_argument("--relay-token", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_start)
 
     p = sub.add_parser("list", help="記録済みのサービスを一覧する")

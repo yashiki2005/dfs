@@ -72,6 +72,12 @@ AD（Authenticated Data）ビットは既定の検証では使わない。`valid
 DNSSEC レコードは静的な discovery 情報であり、L4 head を載せない。
 head の更新は L2 の署名付きログで行う。
 
+DNSSEC は **必須ではない**。閉域・WireGuard・LAN の初期運用や小規模運用では、
+[specs/discovery.md](discovery.md) の「署名付き立候補モデル (`dfs-candidacy-v1`)」
+または `dfscli config create --registry ... --root-pubkey ...` を使う。
+中規模を超える運用になりそうな場合に DNSSEC へ移行する。
+DNSSEC を使う場合も、その役割は初期 root/registry discovery に限定する。
+
 ## 障害時の前提
 
 「registry は落ちない」とは仮定しない。

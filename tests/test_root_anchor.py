@@ -9,7 +9,6 @@ root アンカーによる委譲チェーン検証（穴を塞いだこと）の
   - TOFU（初回に名簿から取って記録）と、明示指定（本番）の両方。
 """
 
-import json
 import subprocess
 import sys
 import tempfile

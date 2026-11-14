@@ -10,3 +10,5 @@ dist/
 *.tmp-*
 mnt/
 chunks*/
+output/
+tmp/

@@ -30,7 +30,7 @@ from dfs.l2_registry import (
     create_locator_envelope,
 )
 from dfs.l3_store import ChunkStoreServer
-from dfs.l5_clayfs import DFSNode
+from dfs.l5_fs import DFSNode
 from dfs.remotes import Remote, RemoteStore
 
 

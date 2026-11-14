@@ -80,7 +80,7 @@ dfssvc logs   [NAME] [-n LINES]
 | `--no-delegate` | — | 委譲を登録しない（サーバだけ立てる） |
 | `--wait` | `30` | 起動を待つ秒数 |
 | `--foreground` | — | 前面で動かす（Ctrl-C で停止） |
-| `--force` | — | 同じ名前の記録を上書きする |
+| `--force` | — | 稼働中の同名サービスを停止してから記録を作り直す |
 
 ### 2.2 記録
 
@@ -252,7 +252,8 @@ dfscli config create dev --registry http://127.0.0.1:19441 --key ~/dfssvc/dev/ke
   完全性は L4 の署名で担保する。
 - **`tree_secret` は `dfssvc` が作らない。** サーバに置かない共有秘密なので、
   `dfscli config create --secret` で自分で渡す。
-- **`stop` は記録を残す。** 同じ名前で立て直すと `--force` が要る。消すなら `--forget`。
+- **`stop` は記録を残す。** 同じ名前で立て直すと `--force` が要る。`--force` は
+  旧プロセスを停止し、同じ状態ディレクトリを同時に使うプロセスを残さない。消すなら `--forget`。
 - **root 鍵は使い回す。** 同じ `--name` で立て直すと、以前の委譲がそのまま使える。
   作り直したいときは `--root-key` を別の場所にする。
 - **`dfscli` の参照系は作業ディレクトリを自動で作る。** `ls` / `cat` / `size` / `check` などは

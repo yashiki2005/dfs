@@ -136,13 +136,19 @@ BitTorrent はホットパスではなく、長期保存・最終復旧用であ
 
 ```bash
 dfscli archive create scw: --out ./scw-v1
+dfscli archive create scw: --out ./scw-v1-published --publish
 dfscli archive create scw: --version 3 --out ./scw-v3
+dfscli --remote scw archive publish ./scw-v3
+dfscli archive fetch scw: --version 3 --out ./downloads ./restored
 dfscli archive verify ./scw-v1
 dfscli archive extract ./scw-v1 ./restored
 dfscli archive catalog .
 ```
 
-実際の seeding / downloading は外部の BitTorrent クライアントで行う。
+`create --publish` は署名済みdescriptorをL2へ登録する。`fetch` はL2から
+descriptorを取得し、`aria2c` または `transmission-cli` のDHT/trackerでbundleを
+取得してからDFS署名を再検証する。DNSSECはroot公開鍵の初期取得経路の一つであり、
+通常の `--registry` と `remotes.json` だけでfetchできる。
 詳細は `specs/bittorrent.md`。
 
 #### L4 版履歴
@@ -488,8 +494,8 @@ dfs は**空のディレクトリも版に残す**。ディレクトリ塊は `{
 `--rmdirs` は「rclone のように、リモートをローカルの見た目に合わせたい」とき、
 付けなければ「空のディレクトリは資産として残したい」とき、と使い分ける。
 
-`rm` の `--rmdirs` は、掃除の起点を**消したディレクトリの位置**にする。作業ツリー全体を
-掃除すると、無関係な空ディレクトリまで巻き込んで消えてしまうため。
+`rm` の `--rmdirs` は、**消したパスの親ディレクトリ**だけを対象にする。作業ツリー全体や
+同じ親に並ぶ無関係な空ディレクトリは削除しない。
 
 `sync --delete` は「ローカルと一致させる」操作なので、消した結果として空になった
 ディレクトリも片付ける（`--rmdirs` は要らない）。
@@ -540,12 +546,16 @@ srv/
 └── registry_state.json          L1 委譲 + L2 ロケータ + L4 ログ
 ```
 
-ファイル塊は**ファイルごと**、ディレクトリ塊は**ディレクトリごと**に 1 つ。つまり塊は
-「ファイル本体」と「目次」の 2 種類しかない。`a.txt` と `dup.txt` が同一内容なら、
-同じ `wire_id` の塊 1 つを両方が指す（重複排除）。
+ファイル本体は **8 MiB ごと**、ディレクトリは**ディレクトリごと**に 1 塊へ分ける。
+ファイルエントリは `chunks` に各塊の `plain_id`、`wire_id`、`offset`、`size` を持つ。
+`a.txt` と `dup.txt` が同一内容なら、同じ `wire_id` の塊を両方が指す（重複排除）。
+旧形式の「ファイル全体を 1 塊」とするマニフェストも読める。
 
 各塊は平文 + 固定費 60B（plain_id 32 + nonce 12 + tag 16）+ フレームで、小さいファイルでは
-固定費の方が大きい。1MB のファイルの塊は 1,024B のチャンクに分かれる。
+固定費の方が大きい。
+
+ファイルとディレクトリの mode、mtime、`user.*` / `com.apple.*` xattr も署名済み
+ディレクトリ塊へ保存し、`pull` 時に復元する。所有者、ACL、特権 xattr は保存対象外。
 
 ---
 

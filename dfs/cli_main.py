@@ -47,6 +47,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import secrets
 import tarfile
 import tempfile
 import zlib
@@ -56,25 +57,45 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import cli as cli_mod
-from .archive import ArchiveError, catalog, create_archive, extract_bundle, verify_bundle
+from .archive import (
+    ArchiveError,
+    catalog,
+    create_archive,
+    download_torrent,
+    extract_bundle,
+    locate_downloaded_bundle,
+    magnet_for_descriptor,
+    verify_archive_descriptor,
+    verify_bundle,
+)
+from .discovery import (
+    CandidacyError,
+    create_candidacy_envelope,
+    fetch_candidacy,
+    verify_candidacy_envelope,
+)
 from .dnssec import Discovery, DiscoveryError, discover_domain
+from .invite import InviteError, decode_invite, encode_ro_invite, encode_rw_invite
 
 # L2 名簿の既定ポート。ホスト名だけで済むようにする（例: --registry 172.16.1.60）。
 DEFAULT_REGISTRY_PORT = 9440
 # dfssvc が立てるサーバの既定。こちらは連続した空きを選ぶので 19440 から。
 DEFAULT_LOCAL_REGISTRY_PORT = 19440
 from .l2_registry import ConflictError, ServiceUnavailableError
+from .l1_delegation import DelegationError, create_delegation_envelope, verify_delegation_chain
 from .l4_log import (
+    FILE_CHUNK_BYTES,
+    L4LogClient,
     RollbackDetectedError,
     SilentDropDetectedError,
 )
-from .l5_clayfs import DFSNode
-from .crypto import normalize_path, ssh_key_fingerprint
+from .l5_fs import DFSNode
+from .crypto import ssh_key_fingerprint
 from .fs.core import remove_tree
 from .path_safety import UnsafePathError, copyfile_no_follow, safe_target
 from .paths import config_dir, restrict_to_owner
 from .private_io import ensure_private_dir, write_private_json
-from .remotes import Remote, RemoteError, RemoteStore, split_remote_spec
+from .remotes import NAME_RE, Remote, RemoteError, RemoteStore, split_remote_spec
 
 CACHE_VERSION_FILENAME = "cache_version"
 CHECKSUM_MODES = ("size", "crc32", "sha1", "plain_id")
@@ -191,8 +212,12 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
                 f"Remote {remote.name!r} is not initialized at {mount_root}.\n"
                 f"Run 'dfscli touch {remote.name}:' or a write command first."
             )
-        priv_key = Path(remote.key).expanduser()
-        _ensure_keypair(priv_key)
+        if remote.read_only:
+            priv_key_value = ""
+        else:
+            priv_key = Path(remote.key).expanduser()
+            _ensure_keypair(priv_key)
+            priv_key_value = str(priv_key)
         if not remote.secret:
             # tree_secret はサーバに置かない共有秘密なので、L2 からは引けない。
             # 空のまま暗号化すると、誰でも復号できる木を作ってしまう。
@@ -203,10 +228,27 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
             )
         registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
         ost_value = resolve_ost(remote, registry)
+        ost_alternates = list(remote.ost_alternates)
+        if not remote.ost:
+            try:
+                info = registry.ost_info()
+                for alt in info.get("alternates") or []:
+                    norm_alt = Remote.normalize_ost(str(alt))
+                    if norm_alt and norm_alt != ost_value and norm_alt not in ost_alternates:
+                        ost_alternates.append(norm_alt)
+            except Exception:
+                pass
         sub_path = resolve_path(remote, registry)
-        host, _, port_str = ost_value.partition(":")
-        if not port_str:
-            raise UsageError(f"Cannot parse L3 OST endpoint {ost_value!r} for remote {remote.name!r}")
+        try:
+            host, port, canonical_ost = (
+                DFSNode._parse_ost_endpoint(ost_value)[0],
+                DFSNode._parse_ost_endpoint(ost_value)[1],
+                DFSNode._normalize_ost_endpoint(ost_value),
+            )
+        except ValueError as e:
+            raise UsageError(
+                f"Cannot parse L3 OST endpoint {ost_value!r} for remote {remote.name!r}: {e}"
+            ) from e
         mount_root.mkdir(parents=True, exist_ok=True)
         (mount_root / "tree").mkdir(exist_ok=True)
         ensure_private_dir(mount_root / ".clayfs")
@@ -215,12 +257,14 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
             "role_epoch": int(remote.role_epoch),
             "compression": remote.compression,
             "node_name": remote.node_name or remote.name,
-            "ost_alternates": list(remote.ost_alternates),
+            "ost_alternates": ost_alternates,
             "libp2p_peers": list(remote.libp2p_peers),
             "libp2p_psk": remote.libp2p_psk,
+            "ost_endpoint": canonical_ost,
             "ost_host": host,
-            "ost_port": int(port_str),
-            "priv_key": str(priv_key),
+            "ost_port": int(port),
+            "priv_key": priv_key_value,
+            "read_only": bool(remote.read_only),
             "registry_url": remote.registry,
             "registry_alternates": list(remote.registry_alternates),
             "root_pubkey": remote.root_pubkey,
@@ -233,6 +277,19 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     # リモート定義は接続先の正本。既存の作業 config が古い場合も、
     # 主名簿・代替名簿・複製 OST をリモート定義に合わせる。
     changed = False
+    desired_ost = remote.ost
+    if desired_ost:
+        desired_host, desired_port = DFSNode._parse_ost_endpoint(desired_ost)
+        desired_canonical = DFSNode._normalize_ost_endpoint(desired_ost)
+        if (
+            str(cfg.get("ost_endpoint", "")) != desired_canonical
+            or str(cfg.get("ost_host", "")) != desired_host
+            or int(cfg.get("ost_port", 0)) != int(desired_port)
+        ):
+            cfg["ost_endpoint"] = desired_canonical
+            cfg["ost_host"] = desired_host
+            cfg["ost_port"] = int(desired_port)
+            changed = True
     if (
         cfg.get("registry_url") != remote.registry
         or list(cfg.get("registry_alternates") or []) != list(remote.registry_alternates)
@@ -253,18 +310,34 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     if int(cfg.get("role_epoch", 1)) != int(remote.role_epoch):
         cfg["role_epoch"] = int(remote.role_epoch)
         changed = True
-    if str(cfg.get("compression", "none") or "none") != remote.compression:
+    if str(cfg.get("compression", "auto") or "auto") != remote.compression:
         cfg["compression"] = remote.compression
+        changed = True
+    if remote.path and cfg.get("sub_path") != remote.path:
+        cfg["sub_path"] = remote.path
+        changed = True
+    if remote.secret and cfg.get("tree_secret") != remote.secret:
+        cfg["tree_secret"] = remote.secret
+        changed = True
+    desired_priv_key = "" if remote.read_only else str(Path(remote.key).expanduser())
+    if cfg.get("priv_key") != desired_priv_key:
+        cfg["priv_key"] = desired_priv_key
+        changed = True
+    if bool(cfg.get("read_only", False)) != bool(remote.read_only):
+        cfg["read_only"] = bool(remote.read_only)
+        changed = True
+    if cfg.get("node_name") != (remote.node_name or remote.name):
+        cfg["node_name"] = remote.node_name or remote.name
+        changed = True
+    if int(cfg.get("delegation_epoch", 1)) != int(remote.epoch):
+        cfg["delegation_epoch"] = int(remote.epoch)
+        changed = True
+    if remote.root_pubkey and cfg.get("root_pubkey") != remote.root_pubkey:
+        cfg["root_pubkey"] = remote.root_pubkey
         changed = True
     if changed:
         write_private_json(cfg_path, cfg)
         node, cfg, _reg = cli_mod.load_node_from_mount(mount_root)
-    # 作業ディレクトリの config に root_pubkey が無い（古い形式）なら、リモート定義から
-    # 補って書き戻す。信頼の根はリモート定義（remotes.json）が持つ。
-    if not cfg.get("root_pubkey") and remote.root_pubkey:
-        cfg["root_pubkey"] = remote.root_pubkey
-        write_private_json(cfg_path, cfg)
-        node.l4.root_pubkey = remote.root_pubkey.strip()
     return node
 
 
@@ -323,7 +396,13 @@ def refresh_cache(node: DFSNode, force: bool = False) -> int:
     return version
 
 
+def _require_writable(remote: Remote) -> None:
+    if remote.read_only:
+        raise UsageError(f"Remote {remote.name!r} is read-only; writes are not allowed")
+
+
 def _push(node: DFSNode, remote: Remote, delegated_mounts: Optional[Dict[str, str]] = None) -> Tuple[dict, int]:
+    _require_writable(remote)
     log_env, _snap, wire_bytes = node.push(
         delegation_epoch=int(remote.epoch),
         now=int(time.time()),
@@ -422,6 +501,8 @@ def _collect_local(src: Path, include_root_name: bool = False) -> Dict[str, Path
     """
     src = src.expanduser()
     out: Dict[str, Path] = {}
+    if src.is_symlink():
+        raise UsageError(f"Local path is a symlink, which is not supported: {src}")
     if src.is_file():
         root_prefix = f"{src.parent.name}/" if include_root_name else ""
         out[f"{root_prefix}{src.name}"] = src
@@ -429,6 +510,8 @@ def _collect_local(src: Path, include_root_name: bool = False) -> Dict[str, Path
     if not src.is_dir():
         raise UsageError(f"Local path does not exist: {src}")
     for item in sorted(src.rglob("*")):
+        if item.is_symlink():
+            continue
         if item.is_dir():
             continue
         if item.name in (".DS_Store",) or item.name.startswith("._"):
@@ -438,6 +521,20 @@ def _collect_local(src: Path, include_root_name: bool = False) -> Dict[str, Path
         rel = item.relative_to(src).as_posix()
         out[f"{src.name}/{rel}" if include_root_name else rel] = item
     return out
+
+
+def _local_chunk_plain_ids(path: Path, crypto: Any) -> List[str]:
+    """ローカルファイルを送信時と同じ境界で区切り、各塊の plain_id を返す。"""
+    result: List[str] = []
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(FILE_CHUNK_BYTES)
+            if not chunk and result:
+                break
+            result.append(crypto.compute_plain_id(chunk).hex())
+            if len(chunk) < FILE_CHUNK_BYTES:
+                break
+    return result
 
 
 def _tar_member_path(name: str, strip_components: int) -> str:
@@ -573,8 +670,12 @@ def plan_changes(
         if checksum in ("plain_id", "crc32", "sha1"):
             data = src.read_bytes()
         if checksum == "plain_id":
-            pid = node.crypto.compute_plain_id(data).hex()
-            if pid != entry.get("plain_id", ""):
+            local_ids = _local_chunk_plain_ids(src, node.crypto)
+            remote_ids = [
+                str(chunk.get("plain_id", ""))
+                for chunk in (entry.get("chunks") or [entry])
+            ]
+            if local_ids != remote_ids:
                 to_write.append((path, src, "update"))
                 continue
         elif checksum in ("crc32", "sha1"):
@@ -620,7 +721,7 @@ def apply_deletes(node: DFSNode, paths: List[str], prune_empty: bool = True) -> 
         if victim.exists():
             victim.unlink()
     if prune_empty:
-        prune_empty_dirs(node)
+        prune_empty_parents(node, paths)
 
 
 def prune_empty_dirs(node: DFSNode, start: Optional[Path] = None) -> List[str]:
@@ -635,6 +736,37 @@ def prune_empty_dirs(node: DFSNode, start: Optional[Path] = None) -> List[str]:
             if not any(d.iterdir()):
                 d.rmdir()
                 removed.append(str(d.relative_to(node.clayfs.work_tree)))
+        except OSError:
+            pass
+    return removed
+
+
+def prune_empty_parents(node: DFSNode, paths: List[str]) -> List[str]:
+    """削除したファイルの先祖だけを、下から順に空なら取り除く。"""
+    work_root = node.clayfs.work_tree.resolve(strict=False)
+    candidates: set[Path] = set()
+    for rel in paths:
+        try:
+            target = _tree_path(node, rel)
+        except UsageError:
+            continue
+        current = target.parent
+        while True:
+            try:
+                current.resolve(strict=False).relative_to(work_root)
+            except ValueError:
+                break
+            if current == work_root:
+                break
+            candidates.add(current)
+            current = current.parent
+
+    removed: List[str] = []
+    for directory in sorted(candidates, key=lambda p: len(p.parts), reverse=True):
+        try:
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+                removed.append(str(directory.relative_to(node.clayfs.work_tree)))
         except OSError:
             pass
     return removed
@@ -707,11 +839,115 @@ def _all_entries(node: DFSNode, prefix: str) -> List[Dict[str, Any]]:
 # ==========================================
 # サブコマンド
 # ==========================================
+def _probe_registry_tcp(url: str, timeout: float = 0.4) -> bool:
+    """名簿 URL の host:port へ短時間で TCP 到達できるか調べる。"""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    host = parts.hostname
+    if not host:
+        return False
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def cmd_listremotes(args: argparse.Namespace) -> int:
+    from concurrent.futures import ThreadPoolExecutor
+    from .svc import ServiceStore
+
     store = RemoteStore()
-    for name in store.names():
+    names = store.names()
+    if not names:
+        print("(登録済みリモートはありません。'dfssvc start' または 'dfscli join <url>' を実行してください)")
+        return 0
+
+    svc_store = ServiceStore()
+    running_svcs = {n for n, s in svc_store.services.items() if s.is_running()}
+    urls = {n: store.remotes[n].registry for n in names}
+
+    if getattr(args, "no_check", False):
+        reachable = {n: None for n in names}
+    else:
+        with ThreadPoolExecutor(max_workers=min(8, len(names))) as pool:
+            futs = {n: pool.submit(_probe_registry_tcp, urls[n]) for n in names}
+            reachable = {n: futs[n].result() for n in names}
+
+    if getattr(args, "json", False):
+        out = []
+        for n in names:
+            r = store.remotes[n]
+            out.append({
+                "name": n,
+                "registry": r.registry,
+                "path": r.path or "/",
+                "read_only": bool(r.read_only),
+                "online": reachable[n],
+                "dfssvc": n in running_svcs,
+            })
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+
+    if getattr(args, "prune", False):
+        protected = set(svc_store.services) if not getattr(args, "all", False) else set(running_svcs)
+        targets = [
+            n for n in names
+            if reachable[n] is False and n not in protected
+        ]
+        if not targets:
+            skipped = [n for n in names if reachable[n] is False and n in protected]
+            if skipped:
+                print(
+                    f"削除対象の unreachable リモートはありません（dfssvc 管理下を保護: {', '.join(skipped)}）。"
+                )
+            else:
+                print("削除対象の unreachable リモートはありません。")
+            return 0
+
+        print("以下の unreachable リモートを削除します:")
+        for n in targets:
+            r = store.remotes[n]
+            print(f"  - dfs://{n}/ ({r.registry} {r.path or '/'})")
+        if not getattr(args, "yes", False):
+            if not sys.stdin.isatty():
+                raise UsageError("非対話環境で削除するには -y / --yes を付けてください")
+            ans = input("削除してよろしいですか? [y/N]: ").strip().lower()
+            if ans not in ("y", "yes"):
+                print("中止しました")
+                return 0
+        for n in targets:
+            store.delete(n)
+        print(f"削除しました: {', '.join(targets)}")
+        return 0
+
+    first_online = None
+    unreachable_count = 0
+    for name in names:
         r = store.remotes[name]
-        print(f"{name}: {r.registry} {r.path}")
+        tags = []
+        if reachable[name] is True:
+            tags.append("online")
+            if first_online is None:
+                first_online = name
+        elif reachable[name] is False:
+            tags.append("unreachable")
+            unreachable_count += 1
+        tags.append("ro" if r.read_only else "rw")
+        if name in running_svcs:
+            tags.append("dfssvc")
+        tag_str = ", ".join(tags)
+        print(f"dfs://{name}/ -> {r.registry} {r.path or '/'} [{tag_str}]")
+
+    hint_name = first_online or names[0]
+    print(
+        "\nScheme: dfs://<リモート名>/<パス>  (従来の <リモート名>:<パス> も利用可)\n"
+        f"使い方例: dfscli ls dfs://{hint_name}/  /  dfscli copy ./file.txt dfs://{hint_name}/"
+    )
+    if unreachable_count:
+        print("※ 到達できないリモートを削除するには: dfscli listremotes --prune")
     return 0
 
 
@@ -736,7 +972,10 @@ def normalize_registry(value: str, default_port: int = DEFAULT_REGISTRY_PORT) ->
     parts = urlsplit(text)
     if not parts.hostname:
         raise UsageError(f"--registry のホスト名が読み取れません: {value!r}")
-    netloc = parts.hostname
+    host = parts.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = host
     if parts.port is None:
         netloc = f"{netloc}:{default_port}"
     else:
@@ -832,14 +1071,35 @@ def normalize_subtree_path(text: str) -> str:
     return "/" + "/".join(parts)
 
 
+def _read_root_pubkey_arg(raw_value: str) -> str:
+    text = str(raw_value or "").strip()
+    if text.startswith("ssh-"):
+        return text
+    rp = Path(text).expanduser()
+    if not rp.is_file():
+        raise UsageError(f"--root-pubkey のファイルがありません: {rp}")
+    return rp.read_text(encoding="utf-8").strip()
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     store = RemoteStore()
     if args.action == "create":
         dnssec_domain = getattr(args, "dnssec_domain", None)
-        if not args.registry and not dnssec_domain:
-            raise UsageError("config create には --registry か --dnssec-domain が必要です")
+        candidacy_urls = [
+            value.strip()
+            for value in (getattr(args, "candidacy_url", None) or [])
+            if value.strip()
+        ]
+        candidacy_file = getattr(args, "candidacy_file", None)
+        if dnssec_domain and (candidacy_urls or candidacy_file):
+            raise UsageError("--dnssec-domain と --candidacy-url / --candidacy-file は併用できません")
+        if not args.registry and not dnssec_domain and not candidacy_urls and not candidacy_file:
+            raise UsageError(
+                "config create には --registry、--dnssec-domain、--candidacy-url、--candidacy-file のいずれかが必要です"
+            )
 
         discovery: Optional[Discovery] = None
+        candidacy_mode = bool(candidacy_urls or candidacy_file)
         if dnssec_domain:
             try:
                 discovery = discover_domain(
@@ -868,6 +1128,24 @@ def cmd_config(args: argparse.Namespace) -> int:
                 raise UsageError(
                     "--registry-alternate が DNSSEC discovery の secondary 一覧と一致しません"
                 )
+        elif candidacy_mode:
+            if not args.root_pubkey:
+                raise UsageError(
+                    "--candidacy-url / --candidacy-file を使うときは --root-pubkey が必須です"
+                )
+            expected_pub = _read_root_pubkey_arg(args.root_pubkey)
+            try:
+                if candidacy_file:
+                    env_data = json.loads(
+                        Path(candidacy_file).expanduser().read_text(encoding="utf-8")
+                    )
+                    discovery = verify_candidacy_envelope(env_data, expected_pub)
+                else:
+                    discovery = fetch_candidacy(candidacy_urls, expected_pub)
+            except (OSError, json.JSONDecodeError, CandidacyError) as e:
+                raise UsageError(f"立候補情報の検証に失敗しました: {e}") from e
+            registry = discovery.primary_url
+            registry_alternates = discovery.alternate_urls
         else:
             registry = normalize_registry(args.registry, args.registry_port)
             registry_alternates = [
@@ -920,23 +1198,17 @@ def cmd_config(args: argparse.Namespace) -> int:
         if discovery is not None:
             root_pubkey = discovery.root_pubkey
             root_fingerprint = ssh_key_fingerprint(root_pubkey)
-            root_source = "DNSSEC"
+            root_source = "署名付き立候補" if candidacy_mode else "DNSSEC"
             if args.root_pubkey:
-                rp = Path(args.root_pubkey).expanduser()
-                if not rp.is_file():
-                    raise UsageError(f"--root-pubkey のファイルがありません: {rp}")
-                explicit_root = rp.read_text(encoding="utf-8").strip()
-                if explicit_root != root_pubkey:
+                explicit_root = _read_root_pubkey_arg(args.root_pubkey)
+                if " ".join(explicit_root.split()) != " ".join(root_pubkey.split()):
                     raise UsageError(
-                        "--root-pubkey が DNSSEC discovery の root 公開鍵と一致しません"
+                        f"--root-pubkey が {root_source} の root 公開鍵と一致しません"
                     )
         elif args.root_pubkey:
-            rp = Path(args.root_pubkey).expanduser()
-            if not rp.is_file():
-                raise UsageError(f"--root-pubkey のファイルがありません: {rp}")
-            root_pubkey = rp.read_text(encoding="utf-8").strip()
+            root_pubkey = _read_root_pubkey_arg(args.root_pubkey)
             root_fingerprint = ssh_key_fingerprint(root_pubkey)
-            root_source = f"指定（{rp}）"
+            root_source = f"指定（{args.root_pubkey}）"
         else:
             registry_client = cli_mod.RemoteRegistryClient(
                 [registry, *registry_alternates]
@@ -946,8 +1218,6 @@ def cmd_config(args: argparse.Namespace) -> int:
             if root_pubkey:
                 root_fingerprint = ssh_key_fingerprint(root_pubkey)
                 root_source = "名簿から取得（TOFU）"
-                # 上書きされた root アンカーも記録して、あとで気づけるようにする
-                info_anchor = info.get("root_anchor") or ""
 
         # --secret が無ければ端末から読む（エコーなし）。
         secret = args.secret
@@ -959,6 +1229,11 @@ def cmd_config(args: argparse.Namespace) -> int:
             )
             secret_from_prompt = bool(secret)
 
+        effective_role_epoch = (
+            int(discovery.epoch)
+            if candidacy_mode and discovery is not None
+            else int(getattr(args, "role_epoch", 1))
+        )
         remote = Remote(
             name=args.name,
             registry=registry,
@@ -972,8 +1247,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             secret=secret or "",
             workdir=args.workdir or "",
             epoch=int(args.epoch),
-            role_epoch=int(getattr(args, "role_epoch", 1)),
-            compression=str(getattr(args, "compression", "none") or "none"),
+            role_epoch=effective_role_epoch,
+            compression=str(getattr(args, "compression", "auto") or "auto"),
             node_name=args.node_name or args.name,
             root_pubkey=root_pubkey,
             root_fingerprint=root_fingerprint,
@@ -1007,7 +1282,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             print("  tree_secret : （未指定。書く前に設定してください）")
         if root_pubkey:
             print(f"  root アンカー: {root_fingerprint} （{root_source}）")
-            print(f"                 これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）")
+            print("                 これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）")
         else:
             print("  root アンカー: （取得できませんでした。--root-pubkey で指定してください）")
         return 0
@@ -1067,8 +1342,159 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_candidacy(args: argparse.Namespace) -> int:
+    """小規模運用向けの署名付き立候補レコードを作成・取得する。"""
+    if args.action == "create":
+        if not args.root_key or not args.primary:
+            raise UsageError("candidacy create には --root-key と --primary が必要です")
+        root_pub = _read_root_pubkey_arg(args.root_pubkey)
+        registries: List[Dict[str, str]] = [
+            {"role": "primary", "url": normalize_registry(args.primary, args.registry_port)}
+        ]
+        for sec in (args.secondary or []):
+            if sec.strip():
+                registries.append(
+                    {"role": "secondary", "url": normalize_registry(sec, args.registry_port)}
+                )
+        try:
+            envelope = create_candidacy_envelope(
+                args.root_key,
+                args.root_anchor,
+                root_pub,
+                registries,
+                epoch=int(args.epoch),
+                ttl_days=int(args.ttl_days),
+            )
+        except (CandidacyError, ValueError) as e:
+            raise UsageError(f"立候補レコードの生成に失敗しました: {e}") from e
+        if args.out:
+            out_path = Path(args.out).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                json.dumps(envelope, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        for reg_url in (args.announce or []):
+            if reg_url.strip():
+                client = cli_mod.RemoteRegistryClient(normalize_registry(reg_url, args.registry_port))
+                client.announce_candidacy(envelope)
+        if args.json or not args.out:
+            print(json.dumps(envelope, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+
+    if args.action == "discover":
+        root_pub = _read_root_pubkey_arg(args.root_pubkey)
+        urls = [
+            normalize_registry(u, args.registry_port)
+            for u in (args.url or [])
+            if u.strip()
+        ]
+        try:
+            discovery = fetch_candidacy(
+                urls,
+                root_pub,
+                expected_root_anchor=args.root_anchor,
+                min_epoch=args.min_epoch,
+            )
+        except CandidacyError as e:
+            raise UsageError(f"立候補情報の取得・検証に失敗しました: {e}") from e
+        if args.json:
+            print(json.dumps(discovery.raw, indent=2, sort_keys=True, ensure_ascii=False))
+            return 0
+        print(f"root_anchor : {discovery.root_anchor}")
+        print(f"root_pubkey : {ssh_key_fingerprint(discovery.root_pubkey)}")
+        print(f"epoch       : {discovery.epoch}")
+        print(f"ttl         : {discovery.ttl}")
+        for row in discovery.registries:
+            print(f"{row.role:10}: {row.url}")
+        return 0
+
+    raise UsageError(f"Unknown candidacy action: {args.action}")
+
+
+def _archive_registry_context(
+    store: RemoteStore,
+    remote: Remote,
+    version: Optional[int],
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """ローカル設定を起点に、L2公開descriptorと対応L4 headを検証して返す。"""
+    registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
+    path = resolve_path(remote, registry)
+    if not remote.root_pubkey:
+        info = registry.root_anchor_info()
+        root_pubkey = str(info.get("root_pubkey", "") or "").strip()
+        if not root_pubkey:
+            raise UsageError(
+                f"Registry {remote.registry} did not provide a root public key; "
+                "pass --root-pubkey when creating the remote"
+            )
+        remote.root_pubkey = root_pubkey
+        remote.root_fingerprint = ssh_key_fingerprint(root_pubkey)
+        store.set(remote)
+
+    entries = registry.archives(path, version=version)
+    if not entries:
+        label = f"v{version}" if version is not None else "latest"
+        raise UsageError(f"No published archive descriptor for {path!r} ({label})")
+
+    pubkey = public_key_of(Path(remote.key).expanduser()) if remote.key else ""
+    verifier = L4LogClient(
+        path,
+        remote.key,
+        pubkey,
+        pin_file=None,
+        root_pubkey=remote.root_pubkey,
+    )
+    candidates = sorted(
+        (
+            envelope
+            for envelope in entries
+            if isinstance(envelope, dict)
+            and isinstance(envelope.get("payload"), dict)
+            and isinstance(envelope["payload"].get("version"), int)
+            and (
+                version is None
+                or int(envelope["payload"]["version"]) == int(version)
+            )
+        ),
+        key=lambda envelope: int(envelope["payload"]["version"]),
+        reverse=True,
+    )
+    if not candidates:
+        raise UsageError("Registry returned only malformed archive descriptors")
+
+    last_error: Optional[BaseException] = None
+    for selected in candidates:
+        selected_version = int(selected["payload"]["version"])
+        try:
+            head, delegation, _locator = verifier.resolve_verified(
+                registry, version=selected_version
+            )
+            leaf = verify_delegation_chain(
+                root_anchor_path=str(delegation.get("root_anchor") or ""),
+                root_anchor_pubkey=remote.root_pubkey,
+                chain=list(delegation.get("chain") or []),
+                now=int(head["payload"]["timestamp"]),
+                requested_path=path,
+            )
+            verify_archive_descriptor(
+                selected,
+                path,
+                str(leaf["writer"]),
+                head_log=head,
+            )
+            return path, selected, head
+        except ServiceUnavailableError:
+            raise
+        except Exception as e:  # noqa: BLE001 - 名簿の候補ごとに検証して不正候補を読み飛ばす
+            last_error = e
+    raise UsageError(
+        f"すべてのpublished archive descriptorを検証できません: {last_error}"
+    )
+
+
 def cmd_archive(args: argparse.Namespace) -> int:
-    """版単位の archive bundle / torrent を作成・検証・復元する。"""
+    """版単位の archive bundle / torrent を作成・公開・取得・復元する。"""
     if args.action == "create":
         store = RemoteStore()
         name, _sub = split_remote_spec(args.source, args.remote_name)
@@ -1095,6 +1521,16 @@ def cmd_archive(args: argparse.Namespace) -> int:
             f"magnet      : magnet:?xt=urn:btih:{result.infohash}"
             f"&dn={result.bundle.name}"
         )
+        if args.publish:
+            registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
+            registry.publish_archive(
+                result.descriptor_envelope,
+                role_epoch=int(remote.role_epoch),
+            )
+            print(
+                f"published   : {remote.registry} "
+                f"{remote.path or node.sub_path} v{result.version}"
+            )
         return 0
 
     if args.action == "catalog":
@@ -1107,6 +1543,38 @@ def cmd_archive(args: argparse.Namespace) -> int:
                 f"{row.get('path', '?')} v{row.get('version', '?')} "
                 f"{row.get('infohash', '?')} {row.get('bundle', '')}"
             )
+        return 0
+
+    if args.action == "publish":
+        if not args.remote_name:
+            raise UsageError("archive publish には --remote NAME が必要です")
+        store = RemoteStore()
+        remote = store.get(args.remote_name)
+        bundle = Path(args.source).expanduser()
+        descriptor_path = bundle.with_suffix(".archive.json")
+        try:
+            descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise UsageError(
+                f"archive descriptor を読めません: {descriptor_path}: {e}"
+            ) from e
+        envelope = (
+            descriptor.get("descriptor_envelope")
+            if isinstance(descriptor, dict)
+            else None
+        )
+        if not isinstance(envelope, dict):
+            raise UsageError(
+                "この bundle には署名済みdescriptorがありません。作成し直してください"
+            )
+        registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
+        verified = registry.publish_archive(
+            envelope, role_epoch=int(remote.role_epoch)
+        )
+        print(
+            f"published   : {remote.registry} "
+            f"{verified['path']} v{verified['version']}"
+        )
         return 0
 
     bundle = Path(args.source).expanduser()
@@ -1136,6 +1604,62 @@ def cmd_archive(args: argparse.Namespace) -> int:
         print(f"extracted   : {out}")
         return 0
 
+    if args.action == "fetch":
+        store = RemoteStore()
+        name, _sub = split_remote_spec(args.source, args.remote_name)
+        remote = store.get(name)
+        try:
+            path, descriptor, _head = _archive_registry_context(
+                store, remote, args.version
+            )
+        except ArchiveError as e:
+            raise UsageError(
+                f"archive descriptor の検証に失敗しました: {e}"
+            ) from e
+        payload = descriptor["payload"]
+        version = int(payload["version"])
+        out = (
+            Path(args.out).expanduser()
+            if args.out
+            else Path.cwd() / f"dfs-fetch-{remote.name}-v{version}"
+        )
+        if int(args.torrent_timeout) <= 0:
+            raise UsageError("--torrent-timeout は正の秒数にしてください")
+        magnet = magnet_for_descriptor(payload)
+        print(
+            f"[dfscli] archive fetch: {path} v{version} "
+            f"infohash={payload['infohash'][:12]}..."
+        )
+        try:
+            download_torrent(
+                magnet,
+                out,
+                torrent_client=args.torrent_client,
+                timeout=int(args.torrent_timeout),
+            )
+            bundle = locate_downloaded_bundle(out, descriptor)
+            meta = verify_bundle(bundle)
+        except ArchiveError as e:
+            raise UsageError(f"archive fetch に失敗しました: {e}") from e
+        print(f"archive     : {bundle}")
+        print(f"verified    : v{meta['version']} ({len(meta['chunks'])} chunks)")
+        if args.dest:
+            secret = args.secret or remote.secret
+            if not secret and not args.no_prompt:
+                secret = prompt_secret("tree_secret: ", "tree_secret（確認）: ")
+            if not secret:
+                raise UsageError("archive fetch --dest には tree_secret が必要です")
+            try:
+                restored = extract_bundle(
+                    bundle, Path(args.dest).expanduser(), secret
+                )
+            except ArchiveError as e:
+                raise UsageError(
+                    f"archive fetch の復号に失敗しました: {e}"
+                ) from e
+            print(f"extracted   : {restored}")
+        return 0
+
     raise UsageError(f"unknown archive action: {args.action}")
 
 
@@ -1143,7 +1667,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     """L2 の署名済み L4 ログ履歴を表示する。"""
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    remote = store.get(name)
+    remote = _resolve_remote(store, name)
     path = ("/" + sub.lstrip("/")) if sub else remote.path
     if not path:
         raise UsageError(
@@ -1165,7 +1689,7 @@ def cmd_history(args: argparse.Namespace) -> int:
 def cmd_ls(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    node = open_remote(store.get(name), create=True)
+    node = open_remote(_resolve_remote(store, name), create=True)
     for e in _rel_entries(node, _norm_prefix(sub)):
         if e["type"] == "dir":
             print(e["rel"] + "/")
@@ -1178,7 +1702,7 @@ def cmd_lsd(args: argparse.Namespace) -> int:
     """リモートの直下にあるディレクトリだけを一覧する。"""
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    node = open_remote(store.get(name), create=True)
+    node = open_remote(_resolve_remote(store, name), create=True)
     for e in _rel_entries(node, _norm_prefix(sub)):
         if e["type"] == "dir":
             print(e["rel"] + "/")
@@ -1188,7 +1712,7 @@ def cmd_lsd(args: argparse.Namespace) -> int:
 def cmd_lsl(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    node = open_remote(store.get(name), create=True)
+    node = open_remote(_resolve_remote(store, name), create=True)
     for e in _rel_entries(node, _norm_prefix(sub)):
         rel = e["rel"] + ("/" if e["type"] == "dir" else "")
         size = e.get("size", 0)
@@ -1199,7 +1723,7 @@ def cmd_lsl(args: argparse.Namespace) -> int:
 def cmd_lsjson(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    node = open_remote(store.get(name), create=True)
+    node = open_remote(_resolve_remote(store, name), create=True)
     rows = []
     for e in _all_entries(node, _norm_prefix(sub)):
         row = {
@@ -1209,6 +1733,7 @@ def cmd_lsjson(args: argparse.Namespace) -> int:
             "IsDir": e["type"] == "dir",
             "Type": e["type"],
             "WireId": e.get("wire_id", ""),
+            "Chunks": e.get("chunks", []),
         }
         rows.append(row)
     print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -1218,12 +1743,17 @@ def cmd_lsjson(args: argparse.Namespace) -> int:
 def cmd_size(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
-    node = open_remote(store.get(name), create=True)
+    node = open_remote(_resolve_remote(store, name), create=True)
     files = [e for e in _all_entries(node, _norm_prefix(sub)) if e["type"] == "file"]
     total = sum(int(e.get("size", 0)) for e in files)
     print(f"Total objects: {len(files)}")
     print(f"Total size: {total} ({_human_size(total)})")
-    print(f"Unique chunks (wire_id): {len({e['wire_id'] for e in files})}")
+    unique_chunks = {
+        chunk["wire_id"]
+        for entry in files
+        for chunk in (entry.get("chunks") or [entry])
+    }
+    print(f"Unique chunks (wire_id): {len(unique_chunks)}")
     return 0
 
 
@@ -1232,7 +1762,7 @@ def cmd_cat(args: argparse.Namespace) -> int:
     name, sub = split_remote_spec(args.remote, args.remote_name)
     if not sub:
         raise UsageError("cat にはファイルのパスが必要です（例: remote:dir/file.txt）")
-    node = open_remote(store.get(name), create=True)
+    node = open_remote(_resolve_remote(store, name), create=True)
     try:
         data = node.read_remote(sub)
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
@@ -1261,6 +1791,7 @@ def cmd_copy(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.dest, args.remote_name)
     remote = store.get(name)
+    _require_writable(remote)
     prefix = _norm_prefix(sub)
     path_filter = _path_filter(args)
     local = _filter_local(_collect_local(Path(args.src)), path_filter)
@@ -1304,6 +1835,7 @@ def cmd_copyto(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.dest, args.remote_name)
     remote = store.get(name)
+    _require_writable(remote)
     if not sub:
         raise UsageError("copyto の宛先にはファイル名が必要です（例: remote:dir/name.txt）")
     src = Path(args.src).expanduser()
@@ -1344,6 +1876,7 @@ def cmd_import_tar(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.dest, args.remote_name)
     remote = store.get(name)
+    _require_writable(remote)
     prefix = _norm_prefix(sub)
     archive = Path(args.archive).expanduser()
     if not archive.is_file():
@@ -1480,10 +2013,11 @@ def cmd_mount(args: argparse.Namespace) -> int:
             "macOS では FUSE-T をインストールし、必要なら --fuse-library を指定してください"
         ) from e
 
+    effective_read_only = bool(args.read_only or remote.read_only)
     operations = LocalTreeFuse(
         node.clayfs.work_tree,
         flush_to_dfs,
-        read_only=args.read_only,
+        read_only=effective_read_only,
         sync_delay=0.5,
     )
     options = {
@@ -1494,7 +2028,7 @@ def cmd_mount(args: argparse.Namespace) -> int:
     }
     if args.allow_other:
         options["allow_other"] = True
-    if args.read_only:
+    if effective_read_only:
         options["ro"] = True
     if args.debug:
         options["debug"] = True
@@ -1529,6 +2063,7 @@ def cmd_mv(args: argparse.Namespace) -> int:
         return 0
 
     remote = store.get(src_name)
+    _require_writable(remote)
     node = open_remote(remote, create=True)
     refresh_cache(node)
 
@@ -1589,6 +2124,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.dest, args.remote_name)
     remote = store.get(name)
+    _require_writable(remote)
     prefix = _norm_prefix(sub)
     path_filter = _path_filter(args)
     local = _filter_local(_collect_local(Path(args.src)), path_filter)
@@ -1629,16 +2165,16 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_pull(args: argparse.Namespace) -> int:
-    """リモートの指定パスを、ローカルディレクトリへ取り出す。"""
-    store = RemoteStore()
-    name, sub = split_remote_spec(args.src, args.remote_name)
-    remote = store.get(name)
-    prefix = _norm_prefix(sub)
-    node = open_remote(remote, create=True)
-    version = refresh_cache(node, force=args.force)
-    path_filter = _path_filter(args)
-
+def _pull_once(
+    node: DFSNode,
+    remote: Remote,
+    prefix: str,
+    dest: Path,
+    path_filter: Any,
+    *,
+    force: bool = False,
+) -> Tuple[int, int]:
+    version = refresh_cache(node, force=force)
     work_root = node.clayfs.work_tree.resolve(strict=False)
     src_root = work_root if not prefix else work_root / prefix
     try:
@@ -1648,9 +2184,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     if not src_root.exists():
         raise UsageError(f"Remote path does not exist: {remote.name}:{prefix}")
 
-    dest = Path(args.dest).expanduser()
     dest.mkdir(parents=True, exist_ok=True)
-
     count = 0
     for item in sorted(src_root.rglob("*")):
         rel = item.relative_to(src_root)
@@ -1676,8 +2210,491 @@ def cmd_pull(args: argparse.Namespace) -> int:
         except UnsafePathError as e:
             raise UsageError(f"Refusing symlink write: {rel_text!r} ({e})") from e
         count += 1
+    return version, count
 
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    """リモートの指定パスを、ローカルディレクトリへ取り出す。"""
+    store = RemoteStore()
+    name, sub = split_remote_spec(args.src, args.remote_name)
+    remote = store.get(name)
+    prefix = _norm_prefix(sub)
+    node = open_remote(remote, create=True)
+    path_filter = _path_filter(args)
+    dest = Path(args.dest).expanduser()
+
+    version, count = _pull_once(
+        node, remote, prefix, dest, path_filter, force=args.force
+    )
     print(f"[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}")
+    if not getattr(args, "watch", False):
+        return 0
+
+    poll = max(1, int(getattr(args, "poll", 30) or 30))
+    last_version = version
+    try:
+        while True:
+            time.sleep(poll)
+            try:
+                latest = node.remote_version()
+            except Exception as e:  # noqa: BLE001 - 一時的な通信断では終了しない
+                print(f"[dfscli] watch poll failed: {e}", file=sys.stderr)
+                continue
+            if latest > last_version:
+                version, count = _pull_once(
+                    node, remote, prefix, dest, path_filter, force=False
+                )
+                last_version = version
+                print(f"[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}")
+    except KeyboardInterrupt:
+        print("\n[dfscli] watch を終了します", file=sys.stderr)
+    return 0
+
+
+def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
+    """リモート定義から招待トークン (`dfs-ro-v1:...` / `dfs-rw-v1:...`) を生成する。"""
+    if not remote.root_pubkey:
+        raise UsageError(
+            f"Remote {remote.name!r} に root_pubkey がありません。TOFU を避けるため必須です"
+        )
+    if not remote.secret:
+        raise UsageError(f"Remote {remote.name!r} に tree_secret がありません")
+    write_path = getattr(args, "write_path", None)
+    registries = list(remote.registry_urls())
+    ost_primary = remote.ost
+    ost_alts = list(remote.ost_alternates)
+    try:
+        info = cli_mod.RemoteRegistryClient(registries).ost_info()
+        if not ost_primary and info.get("endpoint"):
+            ost_primary = Remote.normalize_ost(str(info["endpoint"]))
+        raw_relays = list(info.get("relay_endpoints") or [])
+        if info.get("relay_endpoint"):
+            raw_relays.insert(0, info["relay_endpoint"])
+        for raw_ep in raw_relays:
+            relay_ep = str(raw_ep or "").strip().rstrip("/")
+            if not relay_ep:
+                continue
+            if relay_ep not in registries:
+                registries.append(relay_ep)
+            if relay_ep != ost_primary and relay_ep not in ost_alts:
+                ost_alts.append(relay_ep)
+        for alt in info.get("alternates") or []:
+            norm_alt = Remote.normalize_ost(str(alt))
+            if norm_alt and norm_alt != ost_primary and norm_alt not in ost_alts:
+                ost_alts.append(norm_alt)
+    except Exception:
+        pass
+    try:
+        if write_path:
+            root_key_arg = getattr(args, "root_key", None)
+            if not root_key_arg:
+                raise UsageError(
+                    "--write-path を使うときは L1 委譲署名用の --root-key が必須です"
+                )
+            root_key_path = Path(root_key_arg).expanduser()
+            if not root_key_path.is_file():
+                raise UsageError(f"--root-key が見つかりません: {root_key_path}")
+            norm_write_path = _normalize_path_arg(write_path)
+            parent_path = norm_write_path.rsplit("/", 1)[0] or "/"
+
+            reg_client = cli_mod.RemoteRegistryClient(remote.registry_urls())
+            existing_row = next(
+                (
+                    r
+                    for r in reg_client.list_paths().get("paths", [])
+                    if r.get("path") == norm_write_path
+                ),
+                None,
+            )
+            curr_epoch = int(existing_row.get("epoch") or 0) if existing_row else 0
+            curr_head_ver = int(existing_row.get("head_version") or 0) if existing_row else 0
+            write_epoch = (
+                int(args.write_epoch)
+                if getattr(args, "write_epoch", None) is not None
+                else curr_epoch + 1
+            )
+
+            with tempfile.TemporaryDirectory(prefix="dfs_inv_key_") as tmpdir:
+                eph_key = Path(tmpdir) / "ephemeral_ed25519"
+                res = subprocess.run(
+                    [
+                        "ssh-keygen", "-t", "ed25519", "-N", "",
+                        "-C", f"dfs-ephemeral@{norm_write_path}",
+                        "-f", str(eph_key),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if res.returncode != 0:
+                    raise UsageError(f"一時鍵の生成に失敗しました: {res.stderr.strip()}")
+                eph_priv_text = eph_key.read_text(encoding="utf-8")
+                eph_pub_text = Path(f"{eph_key}.pub").read_text(encoding="utf-8").strip()
+
+            now = int(time.time())
+            ttl_days = max(1, int(getattr(args, "ttl_days", 1) or 1))
+            del_env = create_delegation_envelope(
+                parent_priv_key=root_key_path,
+                parent=parent_path,
+                path=norm_write_path,
+                writer_pubkey=eph_pub_text,
+                epoch=write_epoch,
+                base_version=curr_head_ver,
+                issued_at=now - 5,
+                expires_at=now + ttl_days * 86400,
+            )
+            reg_client.register_delegation(del_env, now=now)
+            write_name = getattr(args, "write_name", None) or f"{args.name or remote.name}-out"
+            return encode_rw_invite(
+                name=args.name or remote.name,
+                registries=registries,
+                root_pubkey=remote.root_pubkey,
+                tree_secret=remote.secret,
+                write_name=write_name,
+                write_path=norm_write_path,
+                write_priv_key=eph_priv_text,
+                write_pub_key=eph_pub_text,
+                write_epoch=write_epoch,
+                path=remote.path,
+                ost=ost_primary,
+                ost_alternates=ost_alts,
+                role_epoch=remote.role_epoch,
+                poll_seconds=int(args.poll),
+                use_candidacy=bool(args.candidacy),
+            )
+        return encode_ro_invite(
+            name=args.name or remote.name,
+            registries=registries,
+            root_pubkey=remote.root_pubkey,
+            tree_secret=remote.secret,
+            path=remote.path,
+            ost=ost_primary,
+            ost_alternates=ost_alts,
+            role_epoch=remote.role_epoch,
+            poll_seconds=int(args.poll),
+            use_candidacy=bool(args.candidacy),
+        )
+    except (InviteError, DelegationError, cli_mod.RegistryError) as e:
+        raise UsageError(f"招待トークンを作成できませんでした: {e}") from e
+
+
+def _default_bootstrap_url(remote: Remote) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
+    env_url = os.environ.get("DFS_BOOTSTRAP_URL", "").strip()
+    if env_url:
+        return env_url
+    parts = urlsplit(remote.registry)
+    return urlunsplit((parts.scheme or "https", parts.netloc, "/bootstrap.sh", "", ""))
+
+
+def cmd_share(args: argparse.Namespace) -> int:
+    """RunPod 等向けの 1 行ブートストラップコマンドを簡潔に発行する。"""
+    store = RemoteStore()
+    remote = store.get(args.remote)
+    token = _create_invite_token(args, remote)
+    if getattr(args, "token_only", False):
+        print(token)
+        return 0
+    bootstrap_url = getattr(args, "bootstrap_url", None) or _default_bootstrap_url(remote)
+    print(f"curl -sSL {bootstrap_url} | bash -s -- {token}")
+    return 0
+
+
+def cmd_invite(args: argparse.Namespace) -> int:
+    """読み取り専用 / 出力委譲付きの招待トークンを作成・参加する（RunPod 等の使い捨て環境向け）。"""
+    store = RemoteStore()
+    if args.action == "create":
+        if not args.target:
+            raise UsageError("invite create にはリモート名が必要です")
+        remote = store.get(args.target)
+        token = _create_invite_token(args, remote)
+        if args.bootstrap_url:
+            print(f"curl -sSL {args.bootstrap_url} | bash -s -- {token}")
+        else:
+            print(token)
+        return 0
+
+    if args.action == "join":
+        if not args.target:
+            raise UsageError("invite join には招待トークンが必要です")
+        try:
+            info = decode_invite(args.target)
+        except InviteError as e:
+            raise UsageError(f"招待トークンが不正です: {e}") from e
+
+        registries = list(info["registries"])
+        role_epoch = int(info["role_epoch"])
+        if info.get("use_candidacy"):
+            try:
+                disc = fetch_candidacy(
+                    registries,
+                    info["root_pubkey"],
+                    expected_root_anchor=None,
+                    min_epoch=role_epoch,
+                )
+                registries = [disc.primary_url, *disc.alternate_urls]
+                role_epoch = disc.epoch
+            except CandidacyError as e:
+                print(
+                    f"[dfscli] warning: candidacy refresh skipped ({e})",
+                    file=sys.stderr,
+                )
+
+        remote_name = (args.name or info["name"]).strip()
+        workdir = str(Path(args.workdir).expanduser()) if args.workdir else ""
+        remote = Remote(
+            name=remote_name,
+            registry=registries[0],
+            registry_alternates=registries[1:],
+            key="",
+            ost=info["ost"],
+            ost_alternates=info["ost_alternates"],
+            path=info["path"],
+            secret=info["tree_secret"],
+            workdir=workdir,
+            role_epoch=role_epoch,
+            node_name=remote_name,
+            root_pubkey=info["root_pubkey"],
+            root_fingerprint=ssh_key_fingerprint(info["root_pubkey"]),
+            read_only=True,
+        )
+        store.set(remote)
+        print(f"[dfscli] 読み取り専用リモート {remote.name!r} を登録しました: {store.path}")
+
+        write_info = info.get("write")
+        if isinstance(write_info, dict):
+            write_name = str(write_info.get("name") or "")
+            if not NAME_RE.match(write_name):
+                raise UsageError(
+                    f"招待トークン内の write.name が不正です: {write_name!r}"
+                )
+            key_dir = (config_dir() / "keys").resolve()
+            ensure_private_dir(key_dir)
+            eph_key_path = (key_dir / f"{write_name}_ed25519").resolve()
+            eph_pub_path = (key_dir / f"{write_name}_ed25519.pub").resolve()
+            if (
+                not eph_key_path.is_relative_to(key_dir)
+                or not eph_pub_path.is_relative_to(key_dir)
+            ):
+                raise UsageError(
+                    f"招待トークン内の write.name が鍵ディレクトリ外を指しています: {write_name!r}"
+                )
+            if eph_key_path.exists() or eph_pub_path.exists():
+                raise UsageError(
+                    f"既存の鍵ファイルが既に存在するため上書きを拒否しました: {eph_key_path}"
+                )
+            eph_key_path.write_text(write_info["priv_key"], encoding="utf-8")
+            restrict_to_owner(eph_key_path)
+            eph_pub_path.write_text(write_info["pub_key"] + "\n", encoding="utf-8")
+            write_workdir = (
+                str(Path(args.workdir).expanduser() / write_name)
+                if args.workdir
+                else ""
+            )
+            out_remote = Remote(
+                name=write_name,
+                registry=registries[0],
+                registry_alternates=registries[1:],
+                key=str(eph_key_path),
+                ost=info["ost"],
+                ost_alternates=info["ost_alternates"],
+                path=write_info["path"],
+                secret=info["tree_secret"],
+                workdir=write_workdir,
+                epoch=int(write_info["epoch"]),
+                role_epoch=role_epoch,
+                node_name=write_name,
+                root_pubkey=info["root_pubkey"],
+                root_fingerprint=ssh_key_fingerprint(info["root_pubkey"]),
+                read_only=False,
+            )
+            store.set(out_remote)
+            print(
+                f"[dfscli] 出力用リモート {out_remote.name!r} ({out_remote.path}, "
+                f"epoch={out_remote.epoch}) を登録しました"
+            )
+
+        if args.sync or args.watch:
+            node = open_remote(remote, create=True)
+            dest = Path(args.dest).expanduser() if args.dest else remote.resolved_workdir() / "out"
+            path_filter = _path_filter(argparse.Namespace(include=[], exclude=[]))
+            version, count = _pull_once(
+                node, remote, "", dest, path_filter, force=False
+            )
+            print(f"[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}")
+            if args.watch:
+                poll = max(1, int(args.poll or info["poll_seconds"]))
+                last_version = version
+                try:
+                    while True:
+                        time.sleep(poll)
+                        try:
+                            latest = node.remote_version()
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[dfscli] watch poll failed: {e}", file=sys.stderr)
+                            continue
+                        if latest > last_version:
+                            version, count = _pull_once(
+                                node, remote, "", dest, path_filter, force=False
+                            )
+                            last_version = version
+                            print(f"[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}")
+                except KeyboardInterrupt:
+                    print("\n[dfscli] watch を終了します", file=sys.stderr)
+        return 0
+
+    raise UsageError(f"Unknown invite action: {args.action}")
+
+
+def cmd_join(args: argparse.Namespace) -> int:
+    """別のドメイン / root ハブ / 招待 URI に後から参加する。"""
+    target = str(args.target or "").strip()
+    if not target:
+        raise UsageError("参加先のドメイン・URL または招待 URI を指定してください")
+    if target.startswith("dfs-invite://") or target.startswith("dfs://"):
+        clean_target = (
+            target[len("dfs-invite://"):]
+            if target.startswith("dfs-invite://")
+            else target[len("dfs://"):]
+        ).lstrip("/")
+        inv_args = argparse.Namespace(
+            action="join",
+            target=clean_target,
+            name=args.name,
+            workdir=getattr(args, "workdir", None),
+            sync=getattr(args, "sync", False),
+            dest=getattr(args, "dest", None),
+            watch=False,
+            poll=30,
+            candidacy=True,
+        )
+        return cmd_invite(inv_args)
+
+    from urllib.parse import urlsplit
+    from .relay import discover_ice_candidates
+
+    if "://" not in target:
+        base_url = f"http://{target}" if (":" in target and not target.startswith("[")) else f"https://{target}"
+    else:
+        base_url = target
+    base_url = base_url.rstrip("/")
+    parsed = urlsplit(base_url)
+    host_label = parsed.hostname or "remote"
+
+    # 1) /_ice/candidates から直接ピア候補を取得
+    cands = discover_ice_candidates(base_url, timeout=2.0)
+    direct_eps = [
+        str(c["endpoint"])
+        for c in cands
+        if c.get("type") in ("host", "srflx") and c.get("endpoint")
+    ]
+
+    # 2) ローカルの dfssvc 設定があれば join 先を保存
+    svc_name = getattr(args, "svc", None) or "local"
+    svc_dir = Path.home() / "dfssvc" / svc_name
+    cfg_file = svc_dir / "dfssvc.json"
+    if svc_dir.is_dir():
+        cfg: Dict[str, Any] = {}
+        if cfg_file.is_file():
+            try:
+                loaded = json.loads(cfg_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg = loaded
+            except (OSError, ValueError, TypeError):
+                cfg = {}
+        cfg["join"] = base_url
+        if not cfg.get("relay_node"):
+            import socket as _sock
+
+            cfg["relay_node"] = svc_name if svc_name != "local" else _sock.gethostname().split(".")[0]
+        cfg_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"[dfscli] dfssvc ({svc_name}) の参加先を {base_url} に設定しました: {cfg_file}")
+
+    # 3) --path / --secret があれば RemoteStore にもリモートを登録
+    if args.path or args.secret:
+        store = RemoteStore()
+        remote_name = (args.name or host_label).strip()
+        primary_ost = direct_eps[0] if direct_eps else base_url
+        alt_osts = direct_eps[1:] if len(direct_eps) > 1 else []
+        remote = Remote(
+            name=remote_name,
+            registry=base_url,
+            key=str(args.key or ""),
+            ost=primary_ost,
+            ost_alternates=alt_osts,
+            path=str(args.path or f"/{host_label}"),
+            secret=str(args.secret or ""),
+            node_name=remote_name,
+            read_only=not bool(args.key),
+        )
+        store.set(remote)
+        print(f"[dfscli] リモート {remote.name!r} を登録しました: {store.path}")
+
+    print(f"[dfscli] join 対象: {base_url}")
+    if direct_eps:
+        print(f"[dfscli] 発見した直接 OST 候補 ({len(direct_eps)} 件): {', '.join(direct_eps)}")
+    if svc_dir.is_dir():
+        print(f"[dfscli] 反映するには 'dfssvc start --name {svc_name} --force' を実行してください")
+    return 0
+
+
+def cmd_quit(args: argparse.Namespace) -> int:
+    """参加中のドメインから安全に離脱し、ローカル単独モードへ戻す。"""
+    svc_name = getattr(args, "svc", None) or "local"
+    svc_dir = Path.home() / "dfssvc" / svc_name
+    cfg_file = svc_dir / "dfssvc.json"
+    prev_join = ""
+    cleared_svc = False
+
+    if cfg_file.is_file():
+        try:
+            cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            cfg = {}
+        if isinstance(cfg, dict):
+            prev_join = str(cfg.get("join") or "")
+            if prev_join or cfg.get("relay_node") or cfg.get("relay_token"):
+                cfg["join"] = ""
+                cfg["relay_node"] = ""
+                cfg["relay_token"] = ""
+                cfg_file.write_text(
+                    json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                cleared_svc = True
+                print(f"[dfscli] dfssvc ({svc_name}) の参加設定 ({prev_join or 'relay'}) を解除しました")
+
+    store = RemoteStore()
+    targets: List[str] = []
+    if getattr(args, "name", None):
+        targets.append(str(args.name).strip())
+    elif getattr(args, "all", False) and prev_join:
+        norm_prev = prev_join.rstrip("/")
+        for rname in store.names():
+            r = store.get(rname)
+            if r.registry.rstrip("/") == norm_prev:
+                targets.append(rname)
+
+    removed_remotes: List[str] = []
+    for rname in targets:
+        if rname not in store.names():
+            continue
+        r = store.get(rname)
+        if r.workdir:
+            cache_file = Path(r.workdir).expanduser() / ".clayfs" / "transport_cache.json"
+            if cache_file.is_file():
+                try:
+                    cache_file.unlink()
+                except OSError:
+                    pass
+        if store.delete(rname):
+            removed_remotes.append(rname)
+            print(f"[dfscli] リモート {rname!r} と接続キャッシュを削除しました")
+
+    if not cleared_svc and not removed_remotes:
+        print("[dfscli] 離脱対象のドメイン設定・リモートは見つかりませんでした")
+    elif cleared_svc:
+        print(f"[dfscli] 反映するには 'dfssvc start --name {svc_name} --force' を実行してください")
     return 0
 
 
@@ -1803,6 +2820,7 @@ def cmd_mkdir(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
     remote = store.get(name)
+    _require_writable(remote)
     sub = _norm_prefix(sub)
     if not sub:
         raise UsageError("mkdir にはディレクトリのパスが必要です（例: remote:dir/sub）")
@@ -1831,6 +2849,7 @@ def cmd_rm(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
     remote = store.get(name)
+    _require_writable(remote)
     sub = _norm_prefix(sub)
     if not sub:
         raise UsageError("rm にはパスが必要です（例: remote:dir/file.txt）")
@@ -1875,10 +2894,9 @@ def cmd_rm(args: argparse.Namespace) -> int:
     _remove_from_tree(node, targets)
     removed_dirs: List[str] = []
     if args.rmdirs:
-        # 掃除の起点は、消したディレクトリがある位置にする。
-        # 作業ツリー全体を掃除すると、無関係な空ディレクトリまで消えてしまう。
-        start = _tree_path(node, sub) if is_dir and sub else node.clayfs.work_tree
-        removed_dirs = prune_empty_dirs(node, start=start)
+        if is_dir:
+            _remove_from_tree(node, [sub])
+        removed_dirs.extend(prune_empty_parents(node, [sub]))
 
     log_env, sent = _push(node, remote)
     extra = f" | 空になったディレクトリ {len(removed_dirs)} 件も削除" if removed_dirs else ""
@@ -1894,6 +2912,7 @@ def cmd_rmdir(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
     remote = store.get(name)
+    _require_writable(remote)
     sub = _norm_prefix(sub)
     if not sub:
         raise UsageError("rmdir にはディレクトリのパスが必要です（例: remote:dir/sub）")
@@ -1918,8 +2937,7 @@ def cmd_rmdir(args: argparse.Namespace) -> int:
         return 0
 
     _remove_from_tree(node, [sub])
-    parent = str(Path(sub).parent)
-    prune_empty_dirs(node, start=_tree_path(node, parent) if parent != "." else node.clayfs.work_tree)
+    prune_empty_parents(node, [sub])
     log_env, sent = _push(node, remote)
     print(f"[dfscli] rmdir OK -> v{log_env['payload']['version']} | {sub}/ | sent={sent} B")
     return 0
@@ -1930,6 +2948,7 @@ def cmd_purge(args: argparse.Namespace) -> int:
     store = RemoteStore()
     name, sub = split_remote_spec(args.remote, args.remote_name)
     remote = store.get(name)
+    _require_writable(remote)
     sub = _norm_prefix(sub)
 
     node = open_remote(remote, create=True)
@@ -2066,8 +3085,8 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
         help="registry primary/secondary の fencing 世代（既定 1）",
     )
     p.add_argument(
-        "--compression", choices=["none", "zstd"], default="none",
-        help="フォルダ xattr が無い場合の既定圧縮（既定 none）",
+        "--compression", choices=["auto", "none", "zstd"], default="auto",
+        help="フォルダ xattr が無い場合の既定圧縮（既定 auto）",
     )
     p.add_argument("--node-name", help="端末名（既定はリモート名）")
     p.add_argument(
@@ -2090,6 +3109,14 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
         "--dnssec-no-validate", action="store_true",
         help="クライアント側 DNSSEC 検証を省略する（診断用。本番では使わない）",
     )
+    p.add_argument(
+        "--candidacy-url", action="append", default=[],
+        help="小規模運用向けの署名付き立候補名簿 (/v1/candidacy) を取得する URL（複数指定可）",
+    )
+    p.add_argument(
+        "--candidacy-file",
+        help="小規模運用向けの署名付き立候補ファイル (dfs-candidacy-v1 JSON)",
+    )
     if args_name_required:
         p.add_argument("name", help="リモートの名前（例: scw）")
 
@@ -2101,12 +3128,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--remote", dest="remote_name", metavar="NAME",
-        help="`path` だけを書いたときに使うリモート名（rclone の :backend: 相当）",
+        help="リモート名（例: local、`dfscli listremotes` で確認）。省略時は dfs://remote/path 形式で指定",
     )
     parser.add_argument("--version", action="version", version=f"dfscli {_version()}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("listremotes", help="定義済みのリモートを一覧する")
+    p = sub.add_parser("listremotes", help="定義済みのリモートと接続状態・権限を一覧する")
+    p.add_argument("--no-check", action="store_true", help="接続確認を省略して高速表示する")
+    p.add_argument("--prune", action="store_true", help="到達できないリモートを削除する（dfssvc 管理下は保護）")
+    p.add_argument("--all", action="store_true", help="--prune 時に停止中の dfssvc 管理リモートも対象にする")
+    p.add_argument("-y", "--yes", action="store_true", help="--prune 時に確認なしで削除する")
+    p.add_argument("--json", action="store_true", help="JSON で出力する")
     p.set_defaults(func=cmd_listremotes)
 
     # `dfscli create NAME ...` は `dfscli config create NAME ...` と同じ。
@@ -2133,28 +3165,74 @@ def build_parser() -> argparse.ArgumentParser:
     p_disc.add_argument("--json", action="store_true", help="レコード JSON をそのまま出す")
     p_disc.set_defaults(func=cmd_discover)
 
-    p_arch = sub.add_parser("archive", help="版の archive bundle / BitTorrent を作る")
-    p_arch.add_argument("action", choices=["create", "verify", "extract", "catalog"])
-    p_arch.add_argument("source", help="create は remote:path、verify/extract は bundle ディレクトリ")
-    p_arch.add_argument("dest", nargs="?", help="extract の出力先")
-    p_arch.add_argument("--out", help="create の bundle 出力先（既定 .cwd/dfs-archive-...）")
+    p_cand = sub.add_parser(
+        "candidacy",
+        help="小規模運用向けの署名付き立候補レコードを作成・取得する",
+    )
+    p_cand.add_argument("action", choices=["create", "discover"])
+    p_cand.add_argument("--root-key", help="root の OpenSSH 秘密鍵 (create 用)")
+    p_cand.add_argument("--root-anchor", default="/example.com", help="root アンカーパス")
+    p_cand.add_argument("--root-pubkey", required=True, help="root 公開鍵ファイルまたは文字列")
+    p_cand.add_argument("--primary", help="primary registry URL (create 用)")
+    p_cand.add_argument("--secondary", action="append", default=[], help="secondary registry URL (複数可)")
+    p_cand.add_argument("--epoch", type=int, default=1, help="立候補世代 / role_epoch (create 用)")
+    p_cand.add_argument("--ttl-days", type=int, default=30, help="有効期間（日）")
+    p_cand.add_argument("--out", help="出力 JSON ファイルパス (create 用)")
+    p_cand.add_argument("--announce", action="append", default=[], help="登録先の registry URL (create 用)")
+    p_cand.add_argument("--url", action="append", default=[], help="問い合わせる候補 registry URL (discover 用)")
+    p_cand.add_argument("--min-epoch", type=int, help="受け入れる最小 epoch (discover 用)")
+    p_cand.add_argument("--registry-port", type=int, default=DEFAULT_REGISTRY_PORT)
+    p_cand.add_argument("--json", action="store_true", help="JSON をそのまま出す")
+    p_cand.set_defaults(func=cmd_candidacy)
+
+    p_arch = sub.add_parser(
+        "archive", help="版の archive bundle / BitTorrent を作成・公開・取得する"
+    )
+    p_arch.add_argument(
+        "action",
+        choices=["create", "publish", "verify", "extract", "catalog", "fetch"],
+    )
+    p_arch.add_argument(
+        "source",
+        help="create/fetch は remote:path、verify/extract は bundle ディレクトリ",
+    )
+    p_arch.add_argument("dest", nargs="?", help="extract/fetch の出力先")
+    p_arch.add_argument(
+        "--out",
+        help="create の bundle 出力先、または fetch のダウンロード先",
+    )
     p_arch.add_argument("--announce", help="torrent の announce URL（省略可）")
     p_arch.add_argument("--version", type=int, help="archive する版（省略時は先頭版）")
     p_arch.add_argument("--secret", help="extract の tree_secret")
     p_arch.add_argument("--no-prompt", action="store_true", help="secret を端末から読まない")
+    p_arch.add_argument(
+        "--publish",
+        action="store_true",
+        help="create 後、署名済みdescriptorをL2へ公開する",
+    )
+    p_arch.add_argument(
+        "--torrent-client",
+        help="fetchで使う外部BT CLI（既定: aria2c、次に transmission-cli）",
+    )
+    p_arch.add_argument(
+        "--torrent-timeout",
+        type=int,
+        default=7200,
+        help="fetchのダウンロードタイムアウト秒（既定 7200）",
+    )
     p_arch.set_defaults(func=cmd_archive)
 
     p_history = sub.add_parser("history", help="L4 の版履歴を表示する")
-    p_history.add_argument("remote", help="remote:path")
+    p_history.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p_history.add_argument("--limit", type=int, default=50, help="表示件数（既定 50）")
     p_history.set_defaults(func=cmd_history)
 
     p = sub.add_parser("ls", help="リモートの直下を一覧する（内容は取らない）")
-    p.add_argument("remote")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_ls)
 
     p = sub.add_parser("lsd", help="リモートの直下にあるディレクトリだけを一覧する")
-    p.add_argument("remote")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_lsd)
 
     p = sub.add_parser("mount", help="リモートを fuse-t / FUSE でマウントする")
@@ -2170,15 +3248,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_mount)
 
     p = sub.add_parser("lsl", help="リモートの直下を大きさ付きで一覧する")
-    p.add_argument("remote")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_lsl)
 
     p = sub.add_parser("lsjson", help="リモートの一覧を JSON で出す")
-    p.add_argument("remote")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_lsjson)
 
     p = sub.add_parser("size", help="リモートの合計と重複排除後の塊の数を出す")
-    p.add_argument("remote")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_size)
 
     p = sub.add_parser("cat", help="リモートの 1 ファイルを標準出力へ出す")
@@ -2253,11 +3331,77 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("src", help="remote:path")
     p.add_argument("dest", help="ローカルのディレクトリ")
     p.add_argument("--force", action="store_true", help="写しが同じ版でも取り直す")
+    p.add_argument("--watch", action="store_true", help="更新を監視して自動同期し続ける")
+    p.add_argument("--poll", type=int, default=30, help="--watch 時のポーリング間隔（秒）")
     p.add_argument("--include", action="append", default=[], metavar="PATTERN",
                    help="含める相対パターン（複数指定可）")
     p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
                    help="除外する相対パターン（複数指定可、include より優先）")
     p.set_defaults(func=cmd_pull)
+
+    p_inv = sub.add_parser(
+        "invite",
+        help="RunPod 等向けの読み取り専用招待トークン (Base64) を作成・参加する",
+    )
+    p_inv.add_argument("action", choices=["create", "join"])
+    p_inv.add_argument("target", nargs="?", default="", help="create 時はリモート名、join 時はトークン")
+    p_inv.add_argument("--name", help="作成先 / 参加先のリモート名")
+    p_inv.add_argument("--bootstrap-url", help="create 時に curl | bash 用の 1 行コマンドを生成する URL")
+    p_inv.add_argument("--write-path", help="create 時に RunPod 出力専用のサブパスを L1 委譲してトークンに含める")
+    p_inv.add_argument("--write-name", help="join 時に登録する出力用リモート名（既定 <name>-out）")
+    p_inv.add_argument("--root-key", help="--write-path 用の L1 委譲を署名する親/root 秘密鍵")
+    p_inv.add_argument("--ttl-days", type=int, default=1, help="一時書き手委譲の有効期間（日、既定 1）")
+    p_inv.add_argument("--write-epoch", type=int, help="一時書き手委譲の epoch（省略時は自動 +1）")
+    p_inv.add_argument("--candidacy", action="store_true", help="join 時に /v1/candidacy で primary を再解決する")
+    p_inv.add_argument("--workdir", help="join 時の作業ディレクトリ")
+    p_inv.add_argument("--dest", help="join --sync/--watch 時の出力先ディレクトリ")
+    p_inv.add_argument("--sync", action="store_true", help="join 後に初回 pull を実行する")
+    p_inv.add_argument("--watch", action="store_true", help="join 後に自動同期ループを開始する")
+    p_inv.add_argument("--poll", type=int, default=30, help="自動同期のポーリング間隔（秒）")
+    p_inv.set_defaults(func=cmd_invite)
+
+    p_share = sub.add_parser(
+        "share",
+        help="RunPod 等向けの 1 行ブートストラップコマンド (curl | bash) を発行する",
+    )
+    p_share.add_argument("remote", help="共有元のリモート名")
+    p_share.add_argument("--name", help="参加先のリモート名")
+    p_share.add_argument(
+        "--bootstrap-url",
+        help="bootstrap.sh の URL（省略時は DFS_BOOTSTRAP_URL または registry の /bootstrap.sh）",
+    )
+    p_share.add_argument("--token-only", action="store_true", help="curl コマンドではなくトークン文字列だけを出す")
+    p_share.add_argument("--write-path", help="RunPod 出力専用のサブパスを L1 委譲してトークンに含める")
+    p_share.add_argument("--write-name", help="参加先に登録する出力用リモート名（既定 <name>-out）")
+    p_share.add_argument("--root-key", help="--write-path 用の L1 委譲を署名する親/root 秘密鍵")
+    p_share.add_argument("--ttl-days", type=int, default=1, help="一時書き手委譲の有効期間（日、既定 1）")
+    p_share.add_argument("--write-epoch", type=int, help="一時書き手委譲の epoch（省略時は自動 +1）")
+    p_share.add_argument("--candidacy", action="store_true", help="join 時に /v1/candidacy で primary を再解決する")
+    p_share.add_argument("--poll", type=int, default=30, help="自動同期のポーリング間隔（秒）")
+    p_share.set_defaults(func=cmd_share)
+
+    p_join = sub.add_parser(
+        "join",
+        help="後から別ドメイン / root ハブ / 招待 URI に参加する",
+    )
+    p_join.add_argument("target", help="参加先ドメイン・URL または dfs-invite:// URI")
+    p_join.add_argument("--name", help="登録するリモート名（既定: 接続先ホスト名）")
+    p_join.add_argument("--path", help="サブツリーパス（例: /example.com/shared）")
+    p_join.add_argument("--key", help="書き込み用 Ed25519 秘密鍵パス")
+    p_join.add_argument("--secret", help="ツリー共有シークレット")
+    p_join.add_argument("--svc", default="local", help="設定を更新するローカル dfssvc 名（既定: local）")
+    p_join.add_argument("--workdir", help="作業ディレクトリ（招待 URI 利用時）")
+    p_join.add_argument("--sync", action="store_true", help="join 後に即時 pull する（招待 URI 利用時）")
+    p_join.set_defaults(func=cmd_join)
+
+    p_quit = sub.add_parser(
+        "quit",
+        help="参加中のドメインから離脱し、ローカル単独モードへ戻す",
+    )
+    p_quit.add_argument("name", nargs="?", help="削除するリモート名（省略時は dfssvc の参加設定のみ解除）")
+    p_quit.add_argument("--svc", default="local", help="解除するローカル dfssvc 名（既定: local）")
+    p_quit.add_argument("--all", action="store_true", help="同じドメインの登録済みリモートも一括削除する")
+    p_quit.set_defaults(func=cmd_quit)
 
     p_fs = sub.add_parser("fs", help="ローカルの CoW 検出・スナップショット（リモート不要）")
     p_fs.add_argument("action", choices=["info", "snapshot", "materialize"])
@@ -2275,11 +3419,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_fs.set_defaults(func=cmd_fs)
 
     p = sub.add_parser("mkdir", help="リモートにディレクトリを作る")
-    p.add_argument("remote", help="remote:dir")
+    p.add_argument("remote", nargs="?", default="", help="remote:dir（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_mkdir)
 
     p = sub.add_parser("rm", help="リモートのファイル（または --recursive でディレクトリ）を消す")
-    p.add_argument("remote", help="remote:path")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.add_argument("-R", "--recursive", action="store_true", help="ディレクトリを中身ごと消す")
     p.add_argument("--rmdirs", action="store_true",
                    help="消した後に空になったディレクトリも片付ける")
@@ -2287,12 +3431,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_rm)
 
     p = sub.add_parser("rmdir", help="空のディレクトリを消す（中身があれば断る）")
-    p.add_argument("remote", help="remote:dir")
+    p.add_argument("remote", nargs="?", default="", help="remote:dir（--remote 指定時は省略可）")
     p.add_argument("-n", "--dry-run", action="store_true")
     p.set_defaults(func=cmd_rmdir)
 
     p = sub.add_parser("purge", help="指定パスの中身をすべて消す")
-    p.add_argument("remote", help="remote:path")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.add_argument("-n", "--dry-run", action="store_true")
     p.set_defaults(func=cmd_purge)
 
@@ -2302,11 +3446,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("about", help="リモートの設定と先頭版を表示する")
-    p.add_argument("remote")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_about)
 
     p = sub.add_parser("touch", help="リモートの作業ディレクトリを初期化する")
-    p.add_argument("remote")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_touch)
 
     # サーバ側は cli.py のものをそのまま使う
@@ -2366,7 +3510,291 @@ def build_parser() -> argparse.ArgumentParser:
     p_del.add_argument("--output")
     p_del.set_defaults(func=cmd_delegate)
 
+    p_web = sub.add_parser(
+        "web",
+        help="スマホ等から使えるブラウザ向けファイル共有 & Web CLI サーバを起動する",
+    )
+    p_web.add_argument(
+        "remote",
+        nargs="?",
+        help="対象リモート名（登録が 1 つだけなら省略可）",
+    )
+    p_web.add_argument(
+        "--bind",
+        default=None,
+        help="待機アドレス（既定 0.0.0.0、--base-path/--public-url 指定時は 127.0.0.1）",
+    )
+    p_web.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="待機ポート（省略時は 8080 から空きポートを自動選択）",
+    )
+    p_web.add_argument(
+        "--read-only",
+        action="store_true",
+        help="閲覧・ダウンロード専用で公開する",
+    )
+    p_web.add_argument(
+        "--token",
+        help="アクセストークン（省略時は起動ごとにランダム生成）",
+    )
+    p_web.add_argument(
+        "--ttl",
+        type=int,
+        default=0,
+        help="共有リンクの有効期限（秒。0 は無期限、既定 0）",
+    )
+    p_web.add_argument(
+        "--base-path",
+        default="",
+        help="Caddy 等のリバースプロキシ配下プレフィックス（例: /dfs）",
+    )
+    p_web.add_argument(
+        "--public-url",
+        default="",
+        help="案内表示用の公開 URL（例: https://yashiki.top/dfs）",
+    )
+    p_web.add_argument(
+        "--secure-cookie",
+        action="store_true",
+        help="セッションクッキーに常に Secure 属性を付ける",
+    )
+    p_web.set_defaults(func=cmd_web)
+
     return parser
+
+
+def _lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+def _resolve_self_claimed_domain_remote(name: str) -> Optional[Remote]:
+    """未登録のドメイン名（例: yashiki.top）を解決する。
+
+    実在する公開 root の偽装を防ぐため、先に ``_dfs.<domain>`` の TXT レコード有無を確認し、
+    存在する場合は DNSSEC 検証済みレコードのみを受け入れる。TXT が無い場合のみ自称ドメインを許可する。
+    """
+    if "." not in name or "/" in name:
+        return None
+    from .dnssec import DEFAULT_RECORD_PREFIX, has_txt_record
+    import ipaddress
+
+    is_ip = False
+    try:
+        ipaddress.ip_address(name.strip("[]"))
+        is_ip = True
+    except ValueError:
+        pass
+
+    record_name = f"{DEFAULT_RECORD_PREFIX}.{name}"
+    if not is_ip and has_txt_record(record_name):
+        try:
+            disc = discover_domain(name, record_name=record_name)
+        except DiscoveryError as e:
+            raise UsageError(
+                f"{record_name} に TXT レコードが存在するため DNSSEC 検証が必須ですが失敗しました: {e}"
+            ) from e
+        return Remote(
+            name=name,
+            registry=disc.primary_url,
+            registry_alternates=list(disc.alternate_urls),
+            key="",
+            path=disc.root_anchor,
+            secret="",
+            role_epoch=int(disc.epoch),
+            root_pubkey=disc.root_pubkey,
+            root_fingerprint=ssh_key_fingerprint(disc.root_pubkey),
+            read_only=True,
+        )
+
+    candidates = [f"http://{name}:{DEFAULT_REGISTRY_PORT}", f"https://{name}"]
+    for url in candidates:
+        if not _probe_registry_tcp(url, timeout=1.0):
+            continue
+        try:
+            reg = cli_mod.RemoteRegistryClient([url])
+            info = reg.root_anchor_info()
+            root_pub = str(info.get("root_pubkey") or "").strip()
+            anchor = str(info.get("root_anchor") or f"/{name}").strip() or f"/{name}"
+            if root_pub:
+                return Remote(
+                    name=name,
+                    registry=url,
+                    key="",
+                    path=anchor,
+                    secret="",
+                    root_pubkey=root_pub,
+                    root_fingerprint=ssh_key_fingerprint(root_pub),
+                    read_only=True,
+                )
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _resolve_remote(store: RemoteStore, name: str) -> Remote:
+    """登録済みリモート・dfssvc・自称ドメインの順に解決する。"""
+    if name in store.remotes:
+        return store.remotes[name]
+    svc_remote = _ensure_remote_from_service(store, name)
+    if svc_remote is not None:
+        return svc_remote
+    domain_remote = _resolve_self_claimed_domain_remote(name)
+    if domain_remote is not None:
+        return domain_remote
+    return store.get(name)
+
+
+def _ensure_remote_from_service(store: RemoteStore, service_name: str) -> Optional[Remote]:
+    """dfssvc の起動済みサービスからリモート定義を自動生成して登録する。"""
+    from .svc import ServiceStore
+
+    svc_store = ServiceStore()
+    svc = svc_store.services.get(service_name)
+    if svc is None:
+        return None
+    root_pub_text = ""
+    if svc.root_pub and Path(svc.root_pub).is_file():
+        root_pub_text = Path(svc.root_pub).read_text(encoding="utf-8").strip()
+    remote = Remote(
+        name=svc.name,
+        registry=svc.registry_url,
+        key=svc.writer_key,
+        ost=svc.ost_endpoint,
+        path=svc.sub_path or f"{svc.root_anchor.rstrip('/')}/{svc.name}",
+        secret=secrets.token_urlsafe(18),
+        role_epoch=int(svc.role_epoch or 1),
+        root_pubkey=root_pub_text,
+        root_fingerprint=ssh_key_fingerprint(root_pub_text) if root_pub_text else "",
+        read_only=not bool(svc.writer_key),
+    )
+    store.set(remote)
+    print(f"[dfscli web] dfssvc '{svc.name}' からリモート設定を自動登録しました")
+    return remote
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    """スマホ等のブラウザ向けファイル共有 & Web CLI サーバを起動する。"""
+    from .svc import ServiceStore
+    from .web import DFSWebBackend, WebConfig, find_free_port, start_web_server
+
+    store = RemoteStore()
+    remote_name = args.remote
+    if remote_name:
+        if remote_name not in store.remotes:
+            _ensure_remote_from_service(store, remote_name)
+        remote = store.get(remote_name)
+    else:
+        svc_store = ServiceStore()
+        running_svcs = [n for n, s in svc_store.services.items() if s.is_running()]
+        names = store.names()
+        if running_svcs:
+            pick = "local" if "local" in running_svcs else running_svcs[0]
+            if pick not in store.remotes:
+                _ensure_remote_from_service(store, pick)
+            remote_name = pick
+        elif names:
+            remote_name = "local" if "local" in names else names[0]
+        elif svc_store.services:
+            pick = "local" if "local" in svc_store.services else next(iter(svc_store.services))
+            _ensure_remote_from_service(store, pick)
+            remote_name = pick
+        else:
+            raise UsageError(
+                "リモートが未登録です。先に 'dfssvc start' または 'dfscli config create' を実行してください。"
+            )
+        print(f"[dfscli web] 自動選択: {remote_name}")
+        remote = store.get(remote_name)
+    read_only = bool(args.read_only or remote.read_only)
+    node = open_remote(remote, create=True)
+
+    def _sync(force: bool) -> int:
+        return refresh_cache(node, force=force)
+
+    def _push_now() -> int:
+        env, _wire = _push(node, remote)
+        return int(env["payload"]["version"])
+
+    def _status_now() -> Dict[str, Any]:
+        return {
+            "registry": remote.registry,
+            "path": remote.path or "/",
+            "workdir": str(node.clayfs.work_tree),
+        }
+
+    backend = DFSWebBackend(
+        work_tree=node.clayfs.work_tree,
+        remote_name=remote.name,
+        read_only=read_only,
+        sync_fn=_sync,
+        push_fn=_push_now,
+        status_fn=_status_now,
+    )
+    version = backend.sync(force=False)
+    token = (args.token or "").strip() or secrets.token_urlsafe(18)
+    base_path = (args.base_path or "").strip()
+    if base_path and not base_path.startswith("/"):
+        base_path = "/" + base_path
+    base_path = base_path.rstrip("/")
+
+    bind = args.bind
+    if bind is None:
+        bind = "127.0.0.1" if (base_path or args.public_url) else "0.0.0.0"
+    port = int(args.port) if args.port is not None else find_free_port(bind, 8080)
+
+    cfg = WebConfig(
+        remote_name=remote.name,
+        token=token,
+        read_only=read_only,
+        ttl_seconds=max(0, int(args.ttl or 0)),
+        base_path=base_path,
+        secure_cookie=bool(args.secure_cookie),
+    )
+    httpd = start_web_server(backend, cfg, bind=bind, port=port)
+    bound_port = httpd.server_address[1]
+    host_display = _lan_ip() if bind in ("0.0.0.0", "::") else bind
+    host_display = f"[{host_display}]" if ":" in host_display else host_display
+    prefix_display = base_path + "/" if base_path else "/"
+    access_url = f"http://{host_display}:{bound_port}{prefix_display}?token={token}"
+
+    print(f"[dfscli web] Remote   : {remote.name} (v{version}, {'read-only' if read_only else 'read-write'})")
+    print(f"[dfscli web] Listen   : {bind}:{bound_port}")
+    print(f"[dfscli web] Open URL : {access_url}")
+    if args.public_url:
+        pub_base = args.public_url.rstrip("/")
+        qr_target = f"{pub_base}/?token={token}"
+        print(f"[dfscli web] Public   : {qr_target}")
+    else:
+        qr_target = access_url
+    if cfg.ttl_seconds > 0:
+        print(f"[dfscli web] TTL      : {cfg.ttl_seconds}s")
+    if shutil.which("qrencode"):
+        try:
+            qr = subprocess.run(
+                ["qrencode", "-t", "UTF8", qr_target],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if qr.returncode == 0 and qr.stdout.strip():
+                print(qr.stdout.rstrip())
+        except OSError:
+            pass
+    print("[dfscli web] Ctrl-C で停止します")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[dfscli web] 停止しました")
+    finally:
+        httpd.server_close()
+    return 0
 
 
 def _version() -> str:

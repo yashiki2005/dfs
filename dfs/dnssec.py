@@ -323,6 +323,23 @@ def parse_discovery_text(
     )
 
 
+def has_txt_record(record_name: str, timeout: float = 1.5) -> bool:
+    """``record_name`` に TXT レコードが存在するか確認する。"""
+    try:
+        import dns.resolver
+    except ImportError:
+        return False
+    resolver = dns.resolver.Resolver(configure=True)
+    resolver.lifetime = timeout
+    try:
+        answer = resolver.resolve(record_name, "TXT")
+        return len(answer) > 0
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def discover_domain(
     domain: str,
     *,

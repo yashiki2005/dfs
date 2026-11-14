@@ -51,10 +51,11 @@ class Remote:
     workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs/<name>）
     epoch: int = 1                      # 委譲のエポック
     role_epoch: int = 1                 # registry primary/secondary の fencing 世代
-    compression: str = "none"           # フォルダ xattr が無い場合の既定圧縮
+    compression: str = "auto"           # フォルダ xattr が無い場合の既定圧縮
     node_name: str = ""                 # 端末名（既定: リモート名）
     root_pubkey: str = ""               # root アンカーの公開鍵（信頼の根。TOFU で記録）
     root_fingerprint: str = ""          # 表示・比較用の指紋
+    read_only: bool = False             # True のときは秘密鍵を持たず読み取り専用にする
 
     def resolved_workdir(self) -> Path:
         if self.workdir:
@@ -80,7 +81,9 @@ class Remote:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Remote":
-        missing = [f for f in ("name",) + REQUIRED_FIELDS if not data.get(f)]
+        read_only = bool(data.get("read_only", False))
+        req = ("name", "registry") if read_only else ("name",) + REQUIRED_FIELDS
+        missing = [f for f in req if not data.get(f)]
         if missing:
             raise RemoteError(f"Remote definition is missing fields: {', '.join(missing)}")
         raw_path = str(data.get("path", "") or "")
@@ -96,7 +99,7 @@ class Remote:
         return cls(
             name=str(data["name"]),
             registry=str(data["registry"]),
-            key=str(data["key"]),
+            key=str(data.get("key", "") or ""),
             registry_alternates=[str(u) for u in raw_alternates if str(u).strip()],
             ost=str(data.get("ost", "") or ""),
             ost_alternates=[
@@ -111,19 +114,21 @@ class Remote:
             workdir=str(data.get("workdir", "")),
             epoch=int(data.get("epoch", 1)),
             role_epoch=int(data.get("role_epoch", 1)),
-            compression=str(data.get("compression", "none") or "none"),
+            compression=str(data.get("compression", "auto") or "auto"),
             node_name=str(data.get("node_name", "") or data["name"]),
             root_pubkey=str(data.get("root_pubkey", "") or ""),
             root_fingerprint=str(data.get("root_fingerprint", "") or ""),
+            read_only=read_only,
         )
 
     @staticmethod
     def normalize_ost(endpoint: str) -> str:
-        """ロケータの endpoint（``tls://host:port``）を ``host:port`` に直す。"""
+        """ロケータの endpoint（``tls://host:port`` や ``https://...``）を正規化する。"""
         value = endpoint.strip()
-        for prefix in ("tls://", "http://", "https://"):
-            if value.startswith(prefix):
-                value = value[len(prefix):]
+        if value.startswith("http://") or value.startswith("https://"):
+            return value.rstrip("/")
+        if value.startswith("tls://"):
+            value = value[len("tls://"):]
         return value.rstrip("/")
 
 
@@ -169,7 +174,12 @@ class RemoteStore:
     def get(self, name: str) -> Remote:
         if name not in self.remotes:
             known = ", ".join(sorted(self.remotes)) or "(none)"
-            raise RemoteError(f"Unknown remote {name!r}. Known remotes: {known}")
+            hint = (
+                " (hint: pass a remote name like 'dfs://local/path', not a subtree path)"
+                if name.startswith("/")
+                else ""
+            )
+            raise RemoteError(f"Unknown remote {name!r}. Known remotes: {known}{hint}")
         return self.remotes[name]
 
     def set(self, remote: Remote) -> None:
@@ -192,10 +202,26 @@ class RemoteStore:
 
 
 def split_remote_spec(spec: str, default_remote: Optional[str] = None) -> tuple[str, str]:
-    """``remote:path`` を (リモート名, パス) に分ける。
+    """``dfs://<remote>/<path>``、``dfs://<remote>:<path>``、または ``<remote>:<path>`` を (リモート名, パス) に分ける。
 
-    ``:path`` だけなら ``default_remote`` を使う。``remote:`` はパスが空。
+    ``:path`` や ``dfs:///path`` だけなら ``default_remote`` を使う。
+    ``remote:`` や ``dfs://remote/``、``dfs://remote:`` はパスが空。
     """
+    if spec.startswith("dfs://"):
+        rest = spec[len("dfs://"):]
+        if ":" in rest and "/" not in rest.split(":", 1)[0]:
+            name, _, sub = rest.partition(":")
+            name = name or (default_remote or "")
+            if not name:
+                raise RemoteError(f"Remote name is required in {spec!r} (or pass --remote)")
+            return name, sub.lstrip("/")
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(spec)
+        name = parsed.netloc or (default_remote or "")
+        if not name:
+            raise RemoteError(f"Remote name is required in {spec!r} (or pass --remote)")
+        return name, parsed.path.lstrip("/")
     if ":" in spec:
         name, _, sub = spec.partition(":")
         name = name or (default_remote or "")
@@ -205,6 +231,6 @@ def split_remote_spec(spec: str, default_remote: Optional[str] = None) -> tuple[
     if not default_remote:
         raise RemoteError(
             f"Cannot tell if {spec!r} is a remote or a local path. "
-            "Use 'remote:path' or pass --remote."
+            "Use 'dfs://remote/path', 'remote:path', or pass --remote."
         )
     return default_remote, spec.lstrip("/")

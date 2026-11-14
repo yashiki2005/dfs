@@ -165,6 +165,11 @@ DNSSEC は **root 鍵と初期 registry 一覧の配布**に限定し、L4 head 
 `archive create` を実装した。BitTorrent はホットパスではなく、過去版の長期保存・
 最終復旧用とする。`archive verify` と `archive extract` も利用できる。
 
+署名済みarchive descriptorのL2公開、複製名簿への伝播、`archive fetch` を追加した。
+`fetch` は外部 `aria2c` / `transmission-cli` のDHT/trackerで取得し、取得後に
+descriptorのL4束縛、bundle署名、chunk hashを再検証する。通常の `--registry` 設定だけで
+動作し、DNSSECは必須ではない。
+
 詳細は `specs/bittorrent.md`。v1 torrent の SHA-1 は transport 用で、chunk の
 真正性は DFS の SHA-256 で検証する。BitTorrent v2、L4 への archive descriptor
 統合、erasure coding は未実装。

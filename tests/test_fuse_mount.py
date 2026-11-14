@@ -76,6 +76,11 @@ class LocalTreeFuseTests(unittest.TestCase):
             ops.write("/hello.txt", b"x", 0, 0)
         self.assertEqual(ctx.exception.errno, errno.EROFS)
 
+    def test_truncate_creates_file_with_requested_length(self) -> None:
+        ops = LocalTreeFuse(self.root, self._flush)
+        ops.truncate("/sized.bin", 16)
+        self.assertEqual((self.root / "sized.bin").stat().st_size, 16)
+
 
 class FuseRequirementTests(unittest.TestCase):
     def test_macos_without_fuse_t_reports_clear_error(self) -> None:

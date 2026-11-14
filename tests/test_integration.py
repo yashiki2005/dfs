@@ -10,13 +10,14 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfs.l1_delegation import DelegationError, create_delegation_envelope
 from dfs.l2_registry import ConflictError, DirectoryRegistryService, ServiceUnavailableError
 from dfs.l3_store import ChunkStoreServer
-from dfs.l5_clayfs import DFSNode
+from dfs.l5_fs import DFSNode
 
 
 def generate_ssh_keypair(dirpath: Path, name: str) -> tuple[Path, str]:
@@ -158,6 +159,67 @@ class TestL3ContentDedup(unittest.TestCase):
             finally:
                 ost.close()
 
+    def test_chunked_file_roundtrip_preserves_metadata(self) -> None:
+        import os
+        import stat
+
+        from dfs.compression import get_raw_xattr, set_raw_xattr
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs_multichunk_") as tmpdir:
+            base = Path(tmpdir)
+            cert, key = base / "c.pem", base / "k.pem"
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048",
+                 "-keyout", str(key), "-out", str(cert), "-days", "1",
+                 "-nodes", "-subj", "/CN=l"],
+                check=True, capture_output=True,
+            )
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                os.chmod(tree, 0o750)
+                target = tree / "large.bin"
+                payload = bytes(range(50))
+                target.write_bytes(payload)
+                os.chmod(target, 0o640)
+                mtime_ns = 1_600_000_000_123_456_789
+                os.utime(target, ns=(mtime_ns, mtime_ns))
+                xattr_name = (
+                    "com.apple.dfs-test" if sys.platform == "darwin" else "user.dfs-test"
+                )
+                xattr_supported = set_raw_xattr(target, xattr_name, b"metadata")
+
+                client = OSTClient("127.0.0.1", ost.port)
+                with patch("dfs.l4_log.FILE_CHUNK_BYTES", 16):
+                    builder = MerkleTreeBuilder(
+                        ContentAddressedCrypto("multichunk-secret"), client
+                    )
+                    root_pid, root_wid = builder.upload_directory(tree)
+                    rows = builder.list_tree(root_pid, root_wid)
+                    file_row = next(row for row in rows if row["path"] == "large.bin")
+                    self.assertEqual(len(file_row["chunks"]), 4)
+                    out = base / "out"
+                    builder.download_directory(root_pid, root_wid, out)
+
+                self.assertEqual((out / "large.bin").read_bytes(), payload)
+                self.assertEqual(
+                    stat.S_IMODE((out / "large.bin").stat().st_mode), 0o640
+                )
+                self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o750)
+                self.assertLessEqual(
+                    abs((out / "large.bin").stat().st_mtime_ns - mtime_ns), 1000
+                )
+                if xattr_supported:
+                    self.assertEqual(
+                        get_raw_xattr(out / "large.bin", xattr_name), b"metadata"
+                    )
+            finally:
+                ost.close()
+
 
 class TestL3ProtocolValidation(unittest.TestCase):
     """L3 の公開 TLS に非 DFS クライアントが来ても、本体を壊さない。"""
@@ -211,6 +273,38 @@ class TestL3ProtocolValidation(unittest.TestCase):
             finally:
                 if conn is not None:
                     conn.close()
+                ost.close()
+
+    def test_client_splits_batches_at_server_limit(self) -> None:
+        import dfs.l3_ost_adapter as adapter
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+
+        with tempfile.TemporaryDirectory(prefix="dfs_batch_limit_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                crypto = ContentAddressedCrypto("batch-limit-secret")
+                chunks = {}
+                for i in range(5):
+                    _pid, wid, blob = crypto.pack_chunk(f"chunk-{i}".encode())
+                    chunks[wid] = blob
+
+                client = OSTClient("127.0.0.1", ost.port)
+                with (
+                    patch.object(adapter, "MAX_BATCH_ITEMS", 2),
+                    patch.object(adapter, "CLIENT_BATCH_ITEMS", 2),
+                ):
+                    self.assertEqual(
+                        client.batch_put_if_absent(chunks, assume_absent=True), 5
+                    )
+                    self.assertEqual(len(ost.store), 5)
+                    client.reset_metrics()
+                    self.assertTrue(all(client.batch_has(list(chunks)).values()))
+                    client.reset_metrics()
+                    self.assertEqual(set(client.batch_get(list(chunks))), set(chunks))
+            finally:
                 ost.close()
 
 
@@ -600,7 +694,6 @@ class TestWanRoundTrips(unittest.TestCase):
             ost = ChunkStoreServer(cert, key)
             try:
                 # 何も送らずに放置すると、サーバ側は 0.5 秒で conn を閉じる
-                takes = os.urandom(1)
                 ctx = ssl_mod.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl_mod.CERT_NONE
@@ -727,9 +820,8 @@ class TestStage5Integration(unittest.TestCase):
                 # 2b. 変更のないファイルは再暗号化も再送もしない（書き手側の内容アドレス索引）。
                 #     初回に同じ内容を 2 ファイル置いていないので重複排除は働かないが、
                 #     2 回目の push で変更のない部分木が送られないことを確認する。
-                mac_before = mac_node.ost.blob_bytes_sent
                 mac_node.ost.reset_metrics()
-                _, _, v2_wire_bytes = mac_node.push(delegation_epoch=1, now=now + 2)
+                mac_node.push(delegation_epoch=1, now=now + 2)
                 self.assertEqual(
                     mac_node.ost.blob_bytes_sent, 0,
                     "変更のないツリーを再 push しても暗号文本体は送らない（重複排除）",

@@ -22,7 +22,7 @@ from dfs.l1_delegation import (
 from dfs.l2_registry import ConflictError, DirectoryRegistryService
 from dfs.l3_store import ChunkStoreServer
 from dfs.l4_log import RollbackDetectedError, SilentDropDetectedError
-from dfs.l5_clayfs import DFSNode
+from dfs.l5_fs import DFSNode
 
 
 def generate_ssh_keypair(dirpath: Path, name: str) -> tuple[Path, str]:

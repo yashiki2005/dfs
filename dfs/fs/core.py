@@ -354,6 +354,10 @@ class CopyBackend(Backend):
             else:
                 # FIFO / socket / device はコピーしない (呼び出し側が warnings で知る)
                 raise OSError(errno.ENOTSUP, f"unsupported file type: {entry}")
+        try:
+            shutil.copystat(src, dst, follow_symlinks=False)
+        except OSError:
+            pass
         return files, total
 
 
@@ -408,6 +412,10 @@ class ReflinkBackend(Backend):
                 files += 1
             else:
                 raise OSError(errno.ENOTSUP, f"unsupported file type: {entry}")
+        try:
+            shutil.copystat(src, dst, follow_symlinks=False)
+        except OSError:
+            pass
         return files, total
 
 
@@ -686,6 +694,10 @@ class FileSystem:
             else:
                 # FIFO / socket / device はスナップショットに含めない。
                 skipped.append(str(entry))
+        try:
+            shutil.copystat(src, dst, follow_symlinks=False)
+        except OSError:
+            pass
         return files, total
 
     # -- 単体コピー ---------------------------------------------------------

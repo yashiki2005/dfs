@@ -6,8 +6,11 @@ L4 (一貫性・単一書き手追記ログ・Merkle ディレクトリ塊・evi
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import stat
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -26,7 +29,13 @@ from .crypto import (
     ssh_sign,
     ssh_verify,
 )
-from .compression import effective_policy, normalize_policy, set_xattr
+from .compression import (
+    effective_policy,
+    list_raw_xattrs,
+    normalize_policy,
+    set_raw_xattr,
+    set_xattr,
+)
 from .l1_delegation import DelegationError, verify_delegation_chain
 from .l2_registry import (
     DirectoryRegistryService,
@@ -34,6 +43,7 @@ from .l2_registry import (
     verify_locator_envelope,
 )
 from .l3_ost_adapter import OSTClient
+from .path_safety import UnsafePathError, _open_no_follow
 from .private_io import write_private_json
 
 
@@ -57,6 +67,10 @@ class SilentDropDetectedError(Exception):
     """evil B7: 書き込み成功応答直後の Read-after-Write 照合で不一致を検出"""
 
 
+FILE_CHUNK_BYTES = 8 * 1024 * 1024
+UPLOAD_BATCH_BYTES = 64 * 1024 * 1024
+
+
 @dataclass
 class HeadPin:
     """B6 / B7 を防ぐためクライアントが手元に保持する 1 行の状態 (local_head.json)"""
@@ -66,7 +80,23 @@ class HeadPin:
     delegation_epoch: int = 0
 
     def save(self, path: Path) -> None:
-        path.write_bytes(canonical_json(asdict(self)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = canonical_json(asdict(self))
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
     @classmethod
     def load(cls, path: Path) -> "HeadPin":
@@ -93,6 +123,22 @@ class MerkleTreeBuilder:
 
     IGNORED_NAMES = {".clayfs", ".DS_Store"}
 
+    @staticmethod
+    def _metadata(path: Path) -> Dict[str, Any]:
+        """版に保存する POSIX メタデータ。所有者・特権 xattr は含めない。"""
+        info = path.stat(follow_symlinks=False)
+        result: Dict[str, Any] = {
+            "mode": stat.S_IMODE(info.st_mode),
+            "mtime_ns": int(info.st_mtime_ns),
+        }
+        xattrs = {
+            name: base64.b64encode(value).decode("ascii")
+            for name, value in list_raw_xattrs(path).items()
+        }
+        if xattrs:
+            result["xattrs"] = xattrs
+        return result
+
     def __init__(
         self,
         crypto: ContentAddressedCrypto,
@@ -102,7 +148,7 @@ class MerkleTreeBuilder:
         index: Optional[Dict[str, Any]] = None,
         replicas: Optional[List[OSTClient]] = None,
         index_file: Optional[Path] = None,
-        compression: str = "none",
+        compression: str = "auto",
     ):
         self.crypto = crypto
         # 後方互換: ost は既定の OST を指す
@@ -228,10 +274,21 @@ class MerkleTreeBuilder:
             走査がすべて終わってからまとめて行う。
             """
             pending: Dict[str, Dict[str, bytes]] = {sid: {} for sid in self.stores}
+            pending_bytes: Dict[str, int] = {sid: 0 for sid in self.stores}
             reused: Dict[str, Tuple[str, str, str]] = {}
             packed: Dict[str, Tuple[str, str, str]] = {}
             # 同じ走査中の重複排除。同一内容の 2 ファイル目以降は再暗号化しない。
             staged: Dict[str, Tuple[str, str, str]] = {}
+            all_wire_ids: set[str] = set()
+
+            def _flush(store_id: str) -> None:
+                chunks = pending.get(store_id) or {}
+                if chunks:
+                    self._client(store_id).batch_put_if_absent(
+                        chunks, assume_absent=True
+                    )
+                pending[store_id] = {}
+                pending_bytes[store_id] = 0
 
             def _stage(plaintext: bytes, policy: str) -> Tuple[str, str, str, str]:
                 plain_id = self.crypto.compute_plain_id(plaintext).hex()
@@ -244,6 +301,7 @@ class MerkleTreeBuilder:
                     store_id = known_store or self.default_store
                     reused[plain_id] = (known_wire, store_id, known_codec)
                     staged[plain_id] = (known_wire, store_id, known_codec)
+                    all_wire_ids.add(known_wire)
                     return plain_id, known_wire, store_id, known_codec
                 store_id = self._store_for_new_chunk()
                 pack_pid, wire_id, blob = self.crypto.pack_chunk(
@@ -253,7 +311,13 @@ class MerkleTreeBuilder:
                 codec = self.crypto.chunk_codec(blob)
                 packed[plain_id] = (wire_id, store_id, codec)
                 staged[plain_id] = (wire_id, store_id, codec)
+                all_wire_ids.add(wire_id)
                 pending.setdefault(store_id, {})[wire_id] = blob
+                pending_bytes[store_id] = (
+                    pending_bytes.get(store_id, 0) + len(blob)
+                )
+                if pending_bytes[store_id] >= UPLOAD_BATCH_BYTES:
+                    _flush(store_id)
                 return plain_id, wire_id, store_id, codec
 
             def _walk(directory: Path, mounts: Dict[str, str]) -> Tuple[str, str, str, str]:
@@ -277,19 +341,48 @@ class MerkleTreeBuilder:
                             }
                         )
                     elif item.is_file():
-                        raw_data = item.read_bytes()
                         item_policy = effective_policy(item, source_dir, self.compression)
-                        pid, wid, sid, codec = _stage(raw_data, item_policy)
+                        chunks: List[Dict[str, Any]] = []
+                        offset = 0
+                        with item.open("rb") as source:
+                            while True:
+                                raw_chunk = source.read(FILE_CHUNK_BYTES)
+                                if not raw_chunk and chunks:
+                                    break
+                                pid, wid, sid, codec = _stage(raw_chunk, item_policy)
+                                chunk_entry = {
+                                    "codec": codec,
+                                    "offset": offset,
+                                    "plain_id": pid,
+                                    "size": len(raw_chunk),
+                                    "wire_id": wid,
+                                }
+                                chunk_entry.update(_entry(sid))
+                                chunks.append(chunk_entry)
+                                offset += len(raw_chunk)
+                                if len(raw_chunk) < FILE_CHUNK_BYTES:
+                                    break
+                        codecs = {chunk["codec"] for chunk in chunks}
+                        codec = next(iter(codecs)) if len(codecs) == 1 else "mixed"
                         item_entry = {
                             "codec": codec,
                             "compression": item_policy,
+                            "metadata": self._metadata(item),
                             "name": norm_name,
-                            "plain_id": pid,
-                            "size": len(raw_data),
+                            "size": offset,
                             "type": "file",
-                            "wire_id": wid,
+                            "chunks": chunks,
                         }
-                        item_entry.update(_entry(sid))
+                        if len(chunks) == 1:
+                            item_entry.update({
+                                "plain_id": chunks[0]["plain_id"],
+                                "wire_id": chunks[0]["wire_id"],
+                                **(
+                                    {}
+                                    if "store" not in chunks[0]
+                                    else {"store": chunks[0]["store"]}
+                                ),
+                            })
                         items.append(item_entry)
                     elif item.is_dir():
                         item_policy = effective_policy(item, source_dir, self.compression)
@@ -297,6 +390,7 @@ class MerkleTreeBuilder:
                         item_entry = {
                             "codec": sub_codec,
                             "compression": item_policy,
+                            "metadata": self._metadata(item),
                             "name": norm_name,
                             "plain_id": sub_pid,
                             "type": "dir",
@@ -305,25 +399,33 @@ class MerkleTreeBuilder:
                         item_entry.update(_entry(sub_sid))
                         items.append(item_entry)
                 items.sort(key=lambda e: e["name"])
+                has_multichunk = any(
+                    e.get("type") == "file" and len(e.get("chunks", [])) > 1
+                    for e in items
+                )
                 dir_bytes = canonical_json(
                     {
                         "compression": dir_policy,
                         "entries": items,
-                        "format": "dfs-dir-v1",
+                        "format": "dfs-dir-v2" if has_multichunk else "dfs-dir-v1",
+                        "metadata": self._metadata(directory),
                     }
                 )
                 return _stage(dir_bytes, dir_policy)
 
             root = _walk(source_dir, delegated_mounts)
-            wire_ids: set[str] = set()
-            for chunks in pending.values():
-                wire_ids.update(chunks)
-            wire_ids.update(wire for wire, _store, _codec in reused.values())
-            self._last_wire_ids = wire_ids
+            self._last_wire_ids = set(all_wire_ids)
+            for store_id in list(pending):
+                _flush(store_id)
             return pending, reused, packed, root
 
         # ---- 1 回目の走査: 索引ヒットは「サーバに在る」と仮定して記録だけする ----
         pending, reused, packed, (root_pid, root_wid, root_sid, _root_codec) = _one_pass(force_new=set())
+
+        # 第一走査で暗号化・送信した塊を索引へ仮登録する。後段で欠損が分かって
+        # 再走査する場合も、同じ内容をランダム nonce で再暗号化せず再利用できる。
+        for plain_id, (wire_id, store_id, codec) in packed.items():
+            self.index[plain_id] = (wire_id, store_id, codec)
 
         # ---- 索引ヒットした塊の存在確認を 1 往復の一括 HAS にまとめる ----
         # ここが WAN 対応の要。チャンクごとに HAS を撃つ実装では往復がチャンク数に比例する。
@@ -352,11 +454,6 @@ class MerkleTreeBuilder:
         # 索引ヒットした塊は既存の索引をそのまま維持し、今回暗号化した塊だけ貼り替える。
         for plain_id, (wire_id, store_id, codec) in packed.items():
             self.index[plain_id] = (wire_id, store_id, codec)
-
-        # ---- 送信: すべて「未確認（今回暗号化したか、無いと分かっている）」塊なので HAS を省く ----
-        for sid, chunks in pending.items():
-            if chunks:
-                self._client(sid).batch_put_if_absent(chunks, assume_absent=True)
 
         # 根の配置先を呼び出し側が知れるよう、既定と異なるときは属性に残す
         self.root_store = root_sid
@@ -394,12 +491,12 @@ class MerkleTreeBuilder:
     # 大きさの分からない塊（ディレクトリ塊など）の見積り。小さめに倒して安全側に置く。
     UNKNOWN_CHUNK_ESTIMATE = 4096
 
-    def _fetch_grouped(self, wanted: Sequence[Tuple[str, str, Optional[int]]]) -> Dict[str, bytes]:
-        """``(store_id, wire_id, size_hint)`` の並びを、store ごとにまとめて ``batch_get`` する。
+    def _iter_fetch_groups(
+        self, wanted: Sequence[Tuple[str, str, Optional[int]]]
+    ):
+        """取得対象を上限ごとに区切り、1 組ずつ結果を返す。
 
-        往復回数は「store ごとの組の数」だけで決まる。同じ ``wire_id`` が複数回現れても
-        1 回しか取りに行かない。``size_hint`` があるものは 1 回の応答がバイト数の上限を
-        超えないよう組を切る。返り値は ``wire_id -> blob``。
+        呼び出し側が全結果を保持せず、ファイルへ順次書き出せるようにする。
         """
         by_store: Dict[str, Dict[str, Optional[int]]] = {}
         for store_id, wire_id, hint in wanted:
@@ -411,7 +508,6 @@ class MerkleTreeBuilder:
         chunk_cap = _env_positive_int("DFS_BATCH_CHUNKS", self.DEFAULT_BATCH_CHUNKS)
         byte_cap = _env_positive_int("DFS_BATCH_BYTES", self.DEFAULT_BATCH_BYTES)
 
-        result: Dict[str, bytes] = {}
         for store_id, id_to_hint in by_store.items():
             client = self._client(store_id)
             items = list(id_to_hint.items())
@@ -428,9 +524,92 @@ class MerkleTreeBuilder:
                     group.append(wid)
                     est += size
                     i += 1
-                got = client.batch_get(group)
-                result.update(got)
+                yield client.batch_get(group)
+
+    def _fetch_grouped(self, wanted: Sequence[Tuple[str, str, Optional[int]]]) -> Dict[str, bytes]:
+        result: Dict[str, bytes] = {}
+        for got in self._iter_fetch_groups(wanted):
+            result.update(got)
         return result
+
+    @staticmethod
+    def _entry_chunks(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """新旧マニフェストから、正規化した塊一覧を取り出す。"""
+        raw = entry.get("chunks")
+        if raw is None:
+            return [
+                {
+                    "codec": entry.get("codec", "none"),
+                    "offset": 0,
+                    "plain_id": entry.get("plain_id", ""),
+                    "size": entry.get("size"),
+                    "store": entry.get("store", ""),
+                    "wire_id": entry.get("wire_id", ""),
+                }
+            ]
+        if not isinstance(raw, list) or not raw:
+            raise ChunkIntegrityError("File entry has no chunks")
+        result: List[Dict[str, Any]] = []
+        cursor = 0
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ChunkIntegrityError("Invalid file chunk entry")
+            try:
+                offset = int(item.get("offset", 0))
+                size = int(item["size"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ChunkIntegrityError("Invalid file chunk size or offset") from exc
+            if offset != cursor or size < 0:
+                raise ChunkIntegrityError("File chunks must be contiguous")
+            result.append(
+                {
+                    "codec": item.get("codec", "none"),
+                    "offset": offset,
+                    "plain_id": str(item.get("plain_id", "")),
+                    "size": size,
+                    "store": str(item.get("store", "")),
+                    "wire_id": str(item.get("wire_id", "")),
+                }
+            )
+            cursor += size
+        if entry.get("size") is not None and int(entry["size"]) != cursor:
+            raise ChunkIntegrityError("File chunk sizes do not match file size")
+        return result
+
+    @staticmethod
+    def _apply_metadata(target: Path, metadata: Any) -> None:
+        """版に記録された mode / 時刻 / 安全な xattr を best-effort で戻す。"""
+        if not isinstance(metadata, dict):
+            return
+        mode = metadata.get("mode")
+        if isinstance(mode, int) and 0 <= mode <= 0o7777:
+            try:
+                os.chmod(target, mode)
+            except OSError:
+                pass
+
+        xattrs = metadata.get("xattrs")
+        if isinstance(xattrs, dict):
+            for name, encoded in list(xattrs.items())[:64]:
+                if not isinstance(name, str) or not (
+                    name.startswith("user.") or name.startswith("com.apple.")
+                ):
+                    continue
+                if not isinstance(encoded, str):
+                    continue
+                try:
+                    value = base64.b64decode(encoded, validate=True)
+                except (ValueError, TypeError):
+                    continue
+                if len(value) <= 64 * 1024:
+                    set_raw_xattr(target, name, value)
+
+        mtime_ns = metadata.get("mtime_ns")
+        if isinstance(mtime_ns, int) and mtime_ns >= 0:
+            try:
+                os.utime(target, ns=(target.stat().st_atime_ns, mtime_ns))
+            except OSError:
+                pass
 
     def download_directory(
         self,
@@ -454,7 +633,8 @@ class MerkleTreeBuilder:
         level: List[Tuple[str, str, str, Path]] = [
             (root_plain_id, root_wire_id, root_store_id, dest_dir)
         ]
-        files: List[Tuple[str, str, str, Path, Optional[int], str]] = []
+        files: List[Dict[str, Any]] = []
+        directory_metadata: List[Tuple[Path, Any]] = []
         depth = 0
         while level:
             depth += 1
@@ -468,55 +648,109 @@ class MerkleTreeBuilder:
                     raise ChunkIntegrityError(f"Missing directory chunk during download: {wire_id}")
                 dir_bytes = self.crypto.unpack_chunk(plain_id, wire_id, blob)
                 dir_obj = json.loads(dir_bytes.decode("utf-8"))
-                if dir_obj.get("format") != "dfs-dir-v1":
+                if dir_obj.get("format") not in ("dfs-dir-v1", "dfs-dir-v2"):
                     raise ChunkIntegrityError("Invalid directory chunk format")
 
                 # 各階層の対象ディレクトリは、塊を取る前に必ず用意する
                 target.mkdir(parents=True, exist_ok=True)
+                directory_metadata.append((target, dir_obj.get("metadata")))
                 parent_policy = dir_obj.get("compression")
                 if parent_policy:
                     set_xattr(target, parent_policy)
+                seen_names: set[str] = set()
                 for entry in dir_obj["entries"]:
+                    if not isinstance(entry, dict):
+                        raise ChunkIntegrityError("Invalid directory entry")
                     name = normalize_name(entry["name"])
+                    if name in seen_names:
+                        raise ChunkIntegrityError(f"Duplicate directory entry: {name!r}")
+                    seen_names.add(name)
                     child = target / name
+                    if child.is_symlink():
+                        raise UnsafePathError(f"Refusing to follow symlink: {child}")
                     etype = entry["type"]
                     entry_store = entry.get("store") or self.default_store
 
                     if etype == "file":
-                        files.append(
-                            (
-                                entry["plain_id"],
-                                entry["wire_id"],
-                                entry_store,
-                                child,
-                                entry.get("size"),
-                                entry.get("compression", "none"),
-                            )
-                        )
+                        files.append({
+                            "chunks": self._entry_chunks(entry),
+                            "compression": entry.get("compression", "none"),
+                            "metadata": entry.get("metadata"),
+                            "size": entry.get("size"),
+                            "target": child,
+                        })
                     elif etype == "dir":
                         # 空のディレクトリも含めて、ここで実体を作る
                         child.mkdir(parents=True, exist_ok=True)
                         set_xattr(child, entry.get("compression", "none"))
+                        directory_metadata.append((child, entry.get("metadata")))
                         next_level.append((entry["plain_id"], entry["wire_id"], entry_store, child))
                     elif etype == "delegated_mount":
                         child.mkdir(parents=True, exist_ok=True)
+                        directory_metadata.append((child, entry.get("metadata")))
                     else:
                         raise ChunkIntegrityError(f"Unknown directory entry type: {etype!r}")
             level = next_level
 
-        # 2) ファイル塊を store ごと・上限ごとに一括取得して書き出す。
-        file_blobs = self._fetch_grouped(
-            [(sid, wid, size) for _pid, wid, sid, _t, size, _policy in files]
-        )
-        for plain_id, wire_id, _store_id, target, size, policy in files:
-            f_blob = file_blobs.get(wire_id)
-            if f_blob is None:
-                raise ChunkIntegrityError(f"Missing file chunk during download: {wire_id}")
-            f_data = self.crypto.unpack_chunk(plain_id, wire_id, f_blob)
-            if size is not None and len(f_data) != size:
+        # 2) ファイル塊を store ごと・上限ごとに取得し、各 chunk の offset へ書く。
+        wanted: List[Tuple[str, str, Optional[int]]] = []
+        refs_by_wire: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+        for file_entry in files:
+            target = file_entry["target"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd = _open_no_follow(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+            with os.fdopen(fd, "wb") as output:
+                if file_entry["size"] is not None:
+                    output.truncate(int(file_entry["size"]))
+            for chunk in file_entry["chunks"]:
+                wire_id = chunk["wire_id"]
+                if not wire_id or not chunk["plain_id"]:
+                    raise ChunkIntegrityError(f"Invalid chunk reference for {target.name}")
+                wanted.append((chunk["store"] or self.default_store, wire_id, chunk.get("size")))
+                refs_by_wire.setdefault(wire_id, []).append((file_entry, chunk))
+
+        written: Dict[Path, int] = {file_entry["target"]: 0 for file_entry in files}
+        received_refs: set[Tuple[Path, int]] = set()
+        for got in self._iter_fetch_groups(wanted):
+            for wire_id, blob in got.items():
+                for file_entry, chunk in refs_by_wire.get(wire_id, []):
+                    target = file_entry["target"]
+                    data = self.crypto.unpack_chunk(
+                        chunk["plain_id"], wire_id, blob
+                    )
+                    if chunk.get("size") is not None and len(data) != int(chunk["size"]):
+                        raise ChunkIntegrityError(
+                            f"File chunk size mismatch for {target.name}"
+                        )
+                    offset = int(chunk.get("offset", 0))
+                    fd = _open_no_follow(target, os.O_RDWR)
+                    with os.fdopen(fd, "r+b") as output:
+                        output.seek(offset)
+                        output.write(data)
+                    written[target] += len(data)
+                    received_refs.add((target, offset))
+
+        for file_entry in files:
+            target = file_entry["target"]
+            missing = [
+                chunk for chunk in file_entry["chunks"]
+                if (target, int(chunk.get("offset", 0))) not in received_refs
+            ]
+            if missing:
+                raise ChunkIntegrityError(
+                    f"Missing file chunk during download: {target.name}"
+                )
+            expected_size = file_entry["size"]
+            if expected_size is not None and written[target] != int(expected_size):
                 raise ChunkIntegrityError(f"File size mismatch for {target.name}")
-            target.write_bytes(f_data)
-            set_xattr(target, policy)
+            set_xattr(target, file_entry["compression"])
+            self._apply_metadata(target, file_entry["metadata"])
+
+        # 子の作成で親の時刻が変わるため、ディレクトリのメタデータは最後に戻す。
+        for target, metadata in sorted(
+            directory_metadata, key=lambda item: len(item[0].parts), reverse=True
+        ):
+            self._apply_metadata(target, metadata)
 
 
     # ---- 参照のみ（rclone ライク CLI 用） ---------------------------------
@@ -525,7 +759,7 @@ class MerkleTreeBuilder:
         blob = self._client(store_id).get(wire_id)
         dir_bytes = self.crypto.unpack_chunk(plain_id, wire_id, blob)
         dir_obj = json.loads(dir_bytes.decode("utf-8"))
-        if dir_obj.get("format") != "dfs-dir-v1":
+        if dir_obj.get("format") not in ("dfs-dir-v1", "dfs-dir-v2"):
             raise ChunkIntegrityError("Invalid directory chunk format")
         return dir_obj["entries"]
 
@@ -574,6 +808,15 @@ class MerkleTreeBuilder:
                     "store": child_store,
                 }
                 if etype == "file":
+                    chunks = self._entry_chunks(entry)
+                    row["chunks"] = chunks
+                    if len(chunks) == 1:
+                        row["wire_id"] = chunks[0]["wire_id"]
+                        row["plain_id"] = chunks[0]["plain_id"]
+                    else:
+                        row["wire_id"] = ""
+                        row["plain_id"] = ""
+                    row["store"] = chunks[0]["store"] or child_store
                     row["size"] = int(entry.get("size", 0))
                 results.append(row)
                 if etype == "dir":
@@ -611,12 +854,33 @@ class MerkleTreeBuilder:
             if last:
                 if entry["type"] != "file":
                     raise IsADirectoryError(f"{rel_path!r} is a directory, not a file")
-                f_store = entry.get("store") or self.default_store
-                blob = self._client(f_store).get(entry["wire_id"])
-                data = self.crypto.unpack_chunk(entry["plain_id"], entry["wire_id"], blob)
-                if len(data) != entry.get("size", len(data)):
+                chunks = self._entry_chunks(entry)
+                blobs = self._fetch_grouped(
+                    [
+                        (
+                            chunk["store"] or self.default_store,
+                            chunk["wire_id"],
+                            chunk.get("size"),
+                        )
+                        for chunk in chunks
+                    ]
+                )
+                data = bytearray()
+                for chunk in chunks:
+                    blob = blobs.get(chunk["wire_id"])
+                    if blob is None:
+                        raise ChunkIntegrityError(
+                            f"Missing file chunk: {chunk['wire_id']}"
+                        )
+                    part = self.crypto.unpack_chunk(
+                        chunk["plain_id"], chunk["wire_id"], blob
+                    )
+                    if int(chunk.get("offset", 0)) != len(data):
+                        raise ChunkIntegrityError("File chunks are not contiguous")
+                    data.extend(part)
+                if len(data) != int(entry.get("size", len(data))):
                     raise ChunkIntegrityError(f"File size mismatch for {rel_path}")
-                return data
+                return bytes(data)
             if entry["type"] != "dir":
                 raise NotADirectoryError(f"{'/'.join(parts[: i + 1])!r} is not a directory")
             plain_id = entry["plain_id"]
@@ -665,7 +929,9 @@ class L4LogClient:
         検証できないため、名簿の主張をそのまま使う（互換のため）。設定済みなら必ず検証する。
         """
         if del_env is None:
-            # 委譲が返らない（未登録）ときは、自分の鍵で検証するしかない。
+            if self.root_pubkey:
+                raise DelegationError(f"Missing delegation for {self.sub_path!r}")
+            # TOFU 前かつ委譲が返らない（未登録）ときは、自分の鍵で検証するしかない。
             return self.pub_key_str
 
         chain = del_env.get("chain") or []

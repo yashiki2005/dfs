@@ -80,6 +80,12 @@ def safe_target(
 
 def _open_no_follow(path: Path, flags: int) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        try:
+            if stat.S_ISLNK(path.lstat().st_mode):
+                raise UnsafePathError(f"Refusing to follow symlink: {path}")
+        except FileNotFoundError:
+            pass
     try:
         return os.open(path, flags | nofollow, 0o600)
     except OSError as e:
@@ -97,9 +103,20 @@ def write_bytes_no_follow(path: Path, data: bytes) -> None:
 
 
 def copyfile_no_follow(src: Path, dst: Path) -> None:
-    """コピー先の最終要素が symlink でないことを確認してファイルをコピーする。"""
+    """コピー元・コピー先の最終要素が symlink でないことを確認してコピーする。"""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    with open(src, "rb") as src_f:
-        fd = _open_no_follow(dst, flags)
-        with os.fdopen(fd, "wb") as dst_f:
+    src_fd = _open_no_follow(src, os.O_RDONLY)
+    try:
+        src_f = os.fdopen(src_fd, "rb")
+    except Exception:
+        os.close(src_fd)
+        raise
+    with src_f:
+        dst_fd = _open_no_follow(dst, flags)
+        try:
+            dst_f = os.fdopen(dst_fd, "wb")
+        except Exception:
+            os.close(dst_fd)
+            raise
+        with dst_f:
             shutil.copyfileobj(src_f, dst_f, length=1024 * 1024)

@@ -10,19 +10,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import shutil
+import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from .crypto import (
+    NS_ARCHIVE,
     NS_L4_LOG,
     ContentAddressedCrypto,
+    SignatureVerificationError,
     canonical_json,
     normalize_path,
     sha256_hex,
+    ssh_sign,
     ssh_verify,
 )
 from .l1_delegation import verify_delegation_chain
@@ -32,10 +36,19 @@ from .l4_log import MerkleTreeBuilder
 ARCHIVE_SCHEMA = "dfs-archive-v1"
 DEFAULT_PIECE_LENGTH = 256 * 1024
 CHUNK_GROUP = 128
+ARCHIVE_DESCRIPTOR_SCHEMA = "dfs-archive-descriptor-v1"
 
 
 class ArchiveError(ValueError):
     """archive bundle の作成・検証・復元エラー。"""
+
+
+def _valid_infohash(value: str) -> bool:
+    return (
+        len(value) == 40
+        and value == value.lower()
+        and all(ch in "0123456789abcdef" for ch in value)
+    )
 
 
 def bencode(value: Any) -> bytes:
@@ -121,9 +134,112 @@ class ArchiveResult:
     bundle: Path
     torrent: Path
     descriptor: Path
+    descriptor_envelope: Dict[str, Any]
     infohash: str
     version: int
     chunk_count: int
+
+
+def magnet_for_descriptor(payload: Dict[str, Any]) -> str:
+    """署名済みdescriptorから、外部BTクライアントへ渡すmagnet linkを作る。"""
+    infohash = str(payload.get("infohash", ""))
+    if not _valid_infohash(infohash):
+        raise ArchiveError(f"Invalid archive infohash: {infohash!r}")
+    name = str(payload.get("bundle_name", "dfs-archive"))
+    magnet = f"magnet:?xt=urn:btih:{infohash}&dn={name}"
+    announce = str(payload.get("announce", "") or "")
+    if announce:
+        from urllib.parse import quote
+
+        magnet += f"&tr={quote(announce, safe='')}"
+    return magnet
+
+
+def create_archive_descriptor_envelope(
+    writer_priv_key: Path | str,
+    path: str,
+    *,
+    version: int,
+    infohash: str,
+    head_hash: str,
+    root_wire_id: str,
+    bundle_name: str,
+    created_at: Optional[int] = None,
+    announce: Optional[str] = None,
+) -> Dict[str, Any]:
+    """L2へ公開する、書き手署名付きarchive descriptorを作る。
+
+    infohashはDHT上のpeer探索にだけ使う。どの版が正しいかはhead_hash、
+    root_wire_id、L1/L4署名で決める。
+    """
+    norm_path = normalize_path(path)
+    if not _valid_infohash(infohash):
+        raise ArchiveError(f"Invalid archive infohash: {infohash!r}")
+    payload = {
+        "announce": str(announce or ""),
+        "bundle_name": str(bundle_name),
+        "created_at": int(time.time() if created_at is None else created_at),
+        "head_hash": str(head_hash),
+        "infohash": infohash,
+        "path": norm_path,
+        "root_wire_id": str(root_wire_id),
+        "schema": ARCHIVE_DESCRIPTOR_SCHEMA,
+        "version": int(version),
+    }
+    raw = canonical_json(payload)
+    try:
+        signature = ssh_sign(writer_priv_key, NS_ARCHIVE, raw)
+    except SignatureVerificationError as e:
+        raise ArchiveError(str(e)) from e
+    return {"payload": payload, "signature": signature}
+
+
+def verify_archive_descriptor(
+    envelope: Dict[str, Any],
+    expected_path: str,
+    writer_pubkey: str,
+    *,
+    head_log: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """descriptorの署名と、対象L4 headへの束縛を検証する。"""
+    if not isinstance(envelope, dict):
+        raise ArchiveError("Malformed archive descriptor")
+    payload = envelope.get("payload")
+    signature = envelope.get("signature")
+    if not isinstance(payload, dict) or not isinstance(signature, str):
+        raise ArchiveError("Malformed archive descriptor")
+    if payload.get("schema") != ARCHIVE_DESCRIPTOR_SCHEMA:
+        raise ArchiveError("Unsupported archive descriptor schema")
+    norm_path = normalize_path(expected_path)
+    if payload.get("path") != norm_path:
+        raise ArchiveError(
+            f"Archive descriptor path mismatch: expected {norm_path!r}, "
+            f"got {payload.get('path')!r}"
+        )
+    if not _valid_infohash(str(payload.get("infohash", ""))):
+        raise ArchiveError("Archive descriptor has an invalid infohash")
+    try:
+        version = int(payload["version"])
+        created_at = int(payload["created_at"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ArchiveError("Archive descriptor has invalid numeric fields") from e
+    if version < 1 or created_at < 0:
+        raise ArchiveError("Archive descriptor has invalid version or timestamp")
+    raw = canonical_json(payload)
+    if not ssh_verify(writer_pubkey, norm_path, NS_ARCHIVE, raw, signature):
+        raise ArchiveError("Invalid archive descriptor signature")
+
+    if head_log is not None:
+        head_payload = head_log.get("payload", {})
+        if str(payload["head_hash"]) != str(head_log.get("entry_hash", "")):
+            raise ArchiveError("Archive descriptor does not match the L4 entry hash")
+        if version != int(head_payload.get("version", -1)):
+            raise ArchiveError("Archive descriptor version does not match the L4 head")
+        if str(payload["root_wire_id"]) != str(
+            head_payload.get("root_wire_id", "")
+        ):
+            raise ArchiveError("Archive descriptor root_wire_id does not match the L4 head")
+    return payload
 
 
 def create_archive(
@@ -152,13 +268,16 @@ def create_archive(
     p = head["payload"]
     root_pid, root_wid = p["root_plain_id"], p["root_wire_id"]
     entries = node.read_builder.list_tree(
-        root_pid, root_wid, root_store=getattr(node, "root_store", None)
+        root_pid,
+        root_wid,
+        root_store=getattr(node, "root_store", None) or getattr(node.builder, "root_store", None),
     )
     plain_by_wire: Dict[str, str] = {root_wid: root_pid}
     for entry in entries:
-        wid = str(entry.get("wire_id", ""))
-        if wid:
-            plain_by_wire[wid] = str(entry.get("plain_id", ""))
+        for chunk in entry.get("chunks") or [entry]:
+            wid = str(chunk.get("wire_id", ""))
+            if wid:
+                plain_by_wire[wid] = str(chunk.get("plain_id", ""))
     wire_ids = sorted(wid for wid in plain_by_wire if wid)
     blobs = _fetch_chunks(node, wire_ids)
 
@@ -201,6 +320,17 @@ def create_archive(
         f"{sha256_hex(meta_bytes)[:12]}"
     )
     infohash = _write_torrent(bundle, torrent, name, announce)
+    descriptor_envelope = create_archive_descriptor_envelope(
+        node.l4.priv_key_path,
+        node.sub_path,
+        version=int(p["version"]),
+        infohash=infohash,
+        head_hash=str(head.get("entry_hash", "")),
+        root_wire_id=root_wid,
+        bundle_name=name,
+        created_at=int(time.time()),
+        announce=announce,
+    )
     descriptor = bundle.with_suffix(".archive.json")
     descriptor.write_text(
         json.dumps(
@@ -208,6 +338,7 @@ def create_archive(
                 "schema": "dfs-archive-descriptor-v1",
                 "bundle": str(bundle),
                 "created_at": int(time.time()),
+                "descriptor_envelope": descriptor_envelope,
                 "head_hash": head.get("entry_hash", ""),
                 "infohash": infohash,
                 "path": node.sub_path,
@@ -225,6 +356,7 @@ def create_archive(
         bundle=bundle,
         torrent=torrent,
         descriptor=descriptor,
+        descriptor_envelope=descriptor_envelope,
         infohash=infohash,
         version=int(p["version"]),
         chunk_count=len(wire_ids),
@@ -330,7 +462,11 @@ def verify_bundle(bundle: Path | str) -> Dict[str, Any]:
         if not isinstance(row, dict):
             raise ArchiveError("Invalid archive chunk row")
         wid = str(row.get("wire_id", ""))
-        if not wid or wid in seen:
+        if (
+            len(wid) != 64
+            or any(ch not in "0123456789abcdef" for ch in wid)
+            or wid in seen
+        ):
             raise ArchiveError(f"Invalid or duplicate archive chunk: {wid!r}")
         seen.add(wid)
         chunk_path = root / "chunks" / wid
@@ -392,6 +528,111 @@ class _BundleOST:
 
     def put_if_absent(self, wire_id: str, blob: bytes) -> bool:
         raise ArchiveError("Archive bundle is read-only")
+
+
+def _resolve_torrent_client(explicit: Optional[str] = None) -> str:
+    if explicit:
+        found = shutil.which(explicit)
+        if not found:
+            raise ArchiveError(f"Torrent client not found: {explicit}")
+        return found
+    for candidate in ("aria2c", "transmission-cli"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    raise ArchiveError(
+        "No supported BitTorrent CLI was found. Install aria2c or transmission-cli, "
+        "or pass --torrent-client."
+    )
+
+
+def download_torrent(
+    magnet: str,
+    download_dir: Path | str,
+    *,
+    torrent_client: Optional[str] = None,
+    timeout: int = 7200,
+) -> Path:
+    """外部BT CLIのtracker/DHTを使ってbundleを取得する。
+
+    DFS自身はDHTやピア交換を実装しない。取得先の決定と実データ転送だけを
+    aria2c / transmission-cliへ委ね、後段でDFS署名を再検証する。
+    """
+    out = Path(download_dir).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    executable = _resolve_torrent_client(torrent_client)
+    name = Path(executable).name.lower()
+    if name.startswith("aria2c"):
+        cmd = [
+            executable,
+            "--dir", str(out),
+            "--seed-time=0",
+            "--summary-interval=0",
+            "--enable-dht=true",
+            magnet,
+        ]
+    elif "transmission-cli" in name:
+        cmd = [executable, "--download-dir", str(out), magnet]
+    else:
+        raise ArchiveError(
+            f"Unsupported torrent client {executable!r}; use aria2c or transmission-cli"
+        )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise ArchiveError(
+            f"Torrent download timed out after {timeout}s: {magnet}"
+        ) from e
+    except OSError as e:
+        raise ArchiveError(f"Cannot start torrent client {executable!r}: {e}") from e
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ArchiveError(
+            f"Torrent download failed with exit code {result.returncode}: {detail}"
+        )
+    return out
+
+
+def locate_downloaded_bundle(
+    download_dir: Path | str,
+    descriptor: Dict[str, Any],
+) -> Path:
+    """ダウンロード先から、署名済みdescriptorに対応するbundleを探す。"""
+    root = Path(download_dir).expanduser()
+    payload = descriptor.get("payload", {})
+    expected_path = str(payload.get("path", ""))
+    expected_version = int(payload.get("version", -1))
+    expected_head = str(payload.get("head_hash", ""))
+    candidates: List[Path] = []
+    for meta_path in sorted(root.rglob("meta.json")):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(meta, dict) or meta.get("schema") != ARCHIVE_SCHEMA:
+            continue
+        head = meta.get("head_log", {})
+        if (
+            str(meta.get("path", "")) == expected_path
+            and int(meta.get("version", -1)) == expected_version
+            and str(head.get("entry_hash", "")) == expected_head
+        ):
+            candidates.append(meta_path.parent)
+    if not candidates:
+        raise ArchiveError(
+            "Downloaded torrent does not contain the selected DFS archive bundle"
+        )
+    if len(candidates) > 1:
+        raise ArchiveError(
+            f"Downloaded torrent contains multiple matching bundles: {candidates}"
+        )
+    return candidates[0]
 
 
 def extract_bundle(bundle: Path | str, dest: Path | str, tree_secret: str) -> Path:

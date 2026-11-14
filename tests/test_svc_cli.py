@@ -11,7 +11,6 @@ import json
 import io
 import os
 import socket
-import subprocess
 import sys
 import tempfile
 import time
@@ -357,6 +356,25 @@ class StartStopTests(unittest.TestCase):
         self.service = ServiceStore().get("dup")
         rc = svc_main(["start", "--name", "dup", "--port", str(start_port)])
         self.assertEqual(rc, 2, "同じ名前を --force 無しで上書きした")
+
+    def test_force_stops_existing_service_before_replacing_record(self) -> None:
+        start_port, _ = find_consecutive_free_ports(28000, 2, "127.0.0.1")
+        self.assertEqual(
+            svc_main(["start", "--name", "replace", "--port", str(start_port)]),
+            0,
+        )
+        old = ServiceStore().get("replace")
+        self.assertEqual(
+            svc_main([
+                "start", "--name", "replace", "--port", str(start_port), "--force",
+            ]),
+            0,
+        )
+        new = ServiceStore().get("replace")
+        self.service = new
+        self.assertNotEqual(old.pid, new.pid)
+        self.assertFalse(old.is_running(), "--force 後も旧プロセスが動いている")
+        self.assertTrue(new.is_running())
 
     def test_two_services_get_different_ports(self) -> None:
         start_port, _ = find_consecutive_free_ports(22000, 4, "127.0.0.1")

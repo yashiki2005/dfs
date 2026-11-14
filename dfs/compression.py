@@ -8,16 +8,18 @@
 
 from __future__ import annotations
 
-import os
 import ctypes
+import functools
+import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 XATTR_NAME = "user.dfs.compression"
-VALID_POLICIES = {"none", "zstd"}
+VALID_POLICIES = {"auto", "none", "zstd"}
 
 
+@functools.lru_cache(maxsize=1)
 def _macos_libc():
     libc = ctypes.CDLL(None, use_errno=True)
     libc.getxattr.argtypes = [
@@ -32,6 +34,10 @@ def _macos_libc():
     libc.setxattr.restype = ctypes.c_int
     libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
     libc.removexattr.restype = ctypes.c_int
+    libc.listxattr.argtypes = [
+        ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+    ]
+    libc.listxattr.restype = ctypes.c_ssize_t
     return libc
 
 
@@ -127,6 +133,48 @@ def set_raw_xattr(path: Path | str, name: str, value: bytes) -> bool:
 
 def remove_raw_xattr(path: Path | str, name: str) -> bool:
     return _remove_xattr(path, name)
+
+
+def list_raw_xattrs(path: Path | str) -> Dict[str, bytes]:
+    """保存対象にできる xattr を列挙する。
+
+    ``security.*`` など特権 xattr は、署名済みマニフェスト経由で任意に設定
+    できないよう除外する。圧縮設定を含む ``user.*`` と macOS の
+    ``com.apple.*`` だけを対象にする。
+    """
+    names: list[str] = []
+    if hasattr(os, "listxattr"):
+        try:
+            names = [str(name) for name in os.listxattr(str(path))]
+        except OSError:
+            names = []
+    elif sys.platform == "darwin":
+        libc = _macos_libc()
+        cpath = str(path).encode()
+        size = libc.listxattr(cpath, None, 0, 0)
+        if size > 0:
+            buf = ctypes.create_string_buffer(size)
+            if libc.listxattr(cpath, buf, size, 0) >= 0:
+                for item in buf.raw[:size].split(b"\0"):
+                    if not item:
+                        continue
+                    try:
+                        names.append(item.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        continue
+
+    result: Dict[str, bytes] = {}
+    for name in names:
+        if not (name.startswith("user.") or name.startswith("com.apple.")):
+            continue
+        if "\x00" in name or len(name.encode("utf-8")) > 255:
+            continue
+        value = _get_xattr_bytes(path, name)
+        if value is not None and len(value) <= 64 * 1024:
+            result[name] = value
+        if len(result) >= 64:
+            break
+    return result
 
 
 def effective_policy(

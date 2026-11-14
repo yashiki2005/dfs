@@ -10,13 +10,14 @@ requires-python = ">=3.10"
 dependencies = [
     "cryptography>=41",
     "dnspython>=2.6",
+    "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]
 compression = ["zstandard>=0.22"]
 libp2p = ["libp2p>=0.8"]
 fuse = ["fusepy>=3"]
-test = ["pytest>=8"]
+test = ["pytest>=8", "zstandard>=0.22"]
 
 [project.scripts]
 dfscli = "dfs.cli_main:main"

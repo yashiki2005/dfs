@@ -106,6 +106,8 @@ class DirectoryRegistryService:
         self.delegations: Dict[str, Dict[str, Any]] = {}
         self.logs: Dict[str, List[Dict[str, Any]]] = {}
         self.locators: Dict[str, Dict[str, Any]] = {}
+        self.archives: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        self.candidacy: Optional[Dict[str, Any]] = None
         self.online: bool = True
         # 単一書き手境界の CAS は「head 読み取り -> 検証 -> append」を原子的に行う。
         # HTTP サーバは ThreadingHTTPServer なので、サービス側でも排他する。
@@ -123,6 +125,28 @@ class DirectoryRegistryService:
     def lock(self) -> threading.RLock:
         """HTTP ハンドラが state 保存まで同じ排他区間に入れるためのロック。"""
         return self._lock
+
+    def set_candidacy(self, envelope: Dict[str, Any], now: int) -> Dict[str, Any]:
+        """署名付き立候補エンベロープ (dfs-candidacy-v1) を検証して保存する。"""
+        from .discovery import verify_candidacy_envelope
+
+        with self._lock:
+            self._ensure_online()
+            min_epoch: Optional[int] = None
+            if self.candidacy is not None:
+                try:
+                    min_epoch = int(self.candidacy.get("payload", {}).get("epoch", 1))
+                except (TypeError, ValueError):
+                    min_epoch = None
+            verified = verify_candidacy_envelope(
+                envelope,
+                self.root_anchor_pubkey,
+                expected_root_anchor=self.root_anchor_path,
+                now=now,
+                min_epoch=min_epoch,
+            )
+            self.candidacy = envelope
+            return dict(verified.raw)
 
     def register_delegation(self, envelope: Dict[str, Any], now: int) -> Dict[str, Any]:
         """L1 委譲レコードを検証・登録する（多段委譲・エポック更新による即時失効に対応）。"""
@@ -268,6 +292,65 @@ class DirectoryRegistryService:
             chain.reverse()
             return chain
 
+    def register_archive(self, envelope: Dict[str, Any], now: int) -> Dict[str, Any]:
+        """書き手署名付きarchive descriptorを、対応するL4 headへ束縛して登録する。"""
+        from .archive import verify_archive_descriptor
+
+        with self._lock:
+            self._ensure_online()
+            payload = envelope.get("payload", {})
+            try:
+                norm_path = normalize_path(payload["path"])
+                version = int(payload["version"])
+            except (KeyError, TypeError, ValueError) as e:
+                raise RegistryError(f"Invalid archive descriptor: {e}") from e
+
+            del_env = self.delegations.get(norm_path)
+            if not del_env:
+                raise DelegationError(f"No active delegation registered for {norm_path!r}")
+            del_payload = del_env["payload"]
+            if not (del_payload["issued_at"] <= now < del_payload["expires_at"]):
+                raise DelegationError(f"Active delegation for {norm_path!r} has expired")
+
+            selected = next(
+                (
+                    entry
+                    for entry in self.logs.get(norm_path, [])
+                    if int(entry.get("payload", {}).get("version", -1)) == version
+                ),
+                None,
+            )
+            if selected is None:
+                raise RegistryError(
+                    f"No L4 version {version} for archive path {norm_path!r}"
+                )
+            verified = verify_archive_descriptor(
+                envelope,
+                norm_path,
+                del_payload["writer"],
+                head_log=selected,
+            )
+            current = self.archives.get(norm_path, {}).get(version)
+            if current is not None and canonical_json(current) != canonical_json(envelope):
+                raise ConflictError(
+                    f"Archive descriptor already exists for {norm_path!r} v{version}"
+                )
+            self.archives.setdefault(norm_path, {})[version] = envelope
+            return verified
+
+    def list_archives(
+        self, path: str, version: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """指定パスの署名済みarchive descriptorを版順で返す。"""
+        with self._lock:
+            self._ensure_online()
+            norm_path = normalize_path(path)
+            entries = self.archives.get(norm_path, {})
+            if version is not None:
+                selected = entries.get(int(version))
+                return [selected] if selected is not None else []
+            return [entries[key] for key in sorted(entries)]
+
     def replication_bundle(self, path: str) -> Optional[Dict[str, Any]]:
         """複製名簿へ送る、署名済みの委譲チェーン・ログ・ロケータの束。"""
         with self._lock:
@@ -280,6 +363,7 @@ class DirectoryRegistryService:
                 "chain": self.delegation_chain(norm_path),
                 "logs": list(self.logs.get(norm_path, [])),
                 "locator": self.locators.get(norm_path),
+                "archives": self.list_archives(norm_path),
             }
 
     def ingest_replica(self, bundle: Dict[str, Any], now: int) -> bool:
@@ -366,6 +450,38 @@ class DirectoryRegistryService:
             elif locator is not None:
                 raise RegistryError("Replication bundle has a locator but no logs")
 
+            raw_archives = bundle.get("archives") or []
+            if not isinstance(raw_archives, list):
+                raise RegistryError("Replication archives must be a list")
+            from .archive import verify_archive_descriptor
+
+            archives: Dict[int, Dict[str, Any]] = {}
+            for envelope in raw_archives:
+                if not isinstance(envelope, dict):
+                    raise RegistryError("Malformed archive descriptor in replication bundle")
+                p = envelope.get("payload", {})
+                try:
+                    version = int(p["version"])
+                except (KeyError, TypeError, ValueError) as e:
+                    raise RegistryError("Archive descriptor has no valid version") from e
+                selected = next(
+                    (
+                        entry
+                        for entry in logs
+                        if int(entry.get("payload", {}).get("version", -1)) == version
+                    ),
+                    None,
+                )
+                if selected is None:
+                    raise RegistryError("Archive descriptor has no matching replicated L4 log")
+                verify_archive_descriptor(
+                    envelope,
+                    norm_path,
+                    leaf["writer"],
+                    head_log=selected,
+                )
+                archives[version] = envelope
+
             existing = self.logs.get(norm_path, [])
             if len(existing) > len(logs):
                 # 複製名簿の方が進んでいる。古いバンドルで巻き戻さない。
@@ -378,6 +494,18 @@ class DirectoryRegistryService:
             if logs:
                 self.logs[norm_path] = logs
                 self.locators[norm_path] = locator
+            if archives:
+                current = self.archives.setdefault(norm_path, {})
+                for version, envelope in archives.items():
+                    existing_envelope = current.get(version)
+                    if (
+                        existing_envelope is not None
+                        and canonical_json(existing_envelope) != canonical_json(envelope)
+                    ):
+                        raise ConflictError(
+                            f"Archive descriptor fork detected for {norm_path!r} v{version}"
+                        )
+                    current[version] = envelope
             return True
 
     def _store_replica_chain(self, chain: List[Dict[str, Any]]) -> None:
