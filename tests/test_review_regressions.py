@@ -686,6 +686,43 @@ class TestReviewRegressions(unittest.TestCase):
                     with self.assertRaises(cli_main.UsageError):
                         cli_main._resolve_remote(reloaded, "yashiki.top")
 
+    def test_join_dfs_domain_uses_dnssec_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            home.mkdir()
+            _, pub = _keypair(root, "w")
+            cfg_file = home / "remotes.json"
+            discovered = SimpleNamespace(
+                domain="yashiki.top",
+                primary_url="https://l2.yashiki.top",
+                alternate_urls=[],
+                root_pubkey=pub,
+                root_fingerprint="fp-yashiki",
+                epoch=1,
+                root_anchor="/yashiki.top",
+                dnssec_validated=True,
+            )
+            with patch.dict(
+                os.environ,
+                {"HOME": str(home), "DFS_HOME": str(home), "DFS_CONFIG": str(cfg_file)},
+            ):
+                with patch("dfs.dnssec.has_txt_record", return_value=True), patch.object(
+                    cli_main, "discover_domain", return_value=discovered
+                ) as mock_discover, patch(
+                    "dfs.relay.discover_ice_candidates", return_value=[]
+                ):
+                    rc = cli_main.main(["join", "dfs://yashiki.top"])
+                self.assertEqual(rc, 0)
+                mock_discover.assert_called_once()
+                reloaded = RemoteStore(cfg_file)
+                remote = reloaded.get("yashiki.top")
+                self.assertIsNotNone(remote)
+                self.assertEqual(remote.registry, "https://l2.yashiki.top")
+                self.assertEqual(remote.path, "/yashiki.top")
+                self.assertEqual(remote.root_pubkey, pub)
+                self.assertTrue(remote.read_only)
+
 
 if __name__ == "__main__":
     unittest.main()

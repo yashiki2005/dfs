@@ -2551,12 +2551,8 @@ def cmd_join(args: argparse.Namespace) -> int:
     target = str(args.target or "").strip()
     if not target:
         raise UsageError("参加先のドメイン・URL または招待 URI を指定してください")
-    if target.startswith("dfs-invite://") or target.startswith("dfs://"):
-        clean_target = (
-            target[len("dfs-invite://"):]
-            if target.startswith("dfs-invite://")
-            else target[len("dfs://"):]
-        ).lstrip("/")
+    if target.startswith("dfs-invite://"):
+        clean_target = target[len("dfs-invite://"):].lstrip("/")
         inv_args = argparse.Namespace(
             action="join",
             target=clean_target,
@@ -2570,11 +2566,42 @@ def cmd_join(args: argparse.Namespace) -> int:
         )
         return cmd_invite(inv_args)
 
+    if target.startswith("dfs://"):
+        stripped = target[len("dfs://"):].lstrip("/")
+        if stripped.startswith("dfs-ro-v1:") or stripped.startswith("dfs-rw-v1:"):
+            inv_args = argparse.Namespace(
+                action="join",
+                target=stripped,
+                name=args.name,
+                workdir=getattr(args, "workdir", None),
+                sync=getattr(args, "sync", False),
+                dest=getattr(args, "dest", None),
+                watch=False,
+                poll=30,
+                candidacy=True,
+            )
+            return cmd_invite(inv_args)
+        target = stripped.split("/", 1)[0].rstrip(":")
+
     from urllib.parse import urlsplit
+    from .dnssec import DEFAULT_RECORD_PREFIX, has_txt_record
     from .relay import discover_ice_candidates
 
+    discovered = None
     if "://" not in target:
-        base_url = f"http://{target}" if (":" in target and not target.startswith("[")) else f"https://{target}"
+        if "." in target and ":" not in target and not target.startswith("["):
+            rec_name = f"{DEFAULT_RECORD_PREFIX}.{target}"
+            if has_txt_record(rec_name):
+                try:
+                    discovered = discover_domain(target, record_name=rec_name)
+                except DiscoveryError as e:
+                    raise UsageError(
+                        f"{rec_name} に TXT レコードが存在するため DNSSEC 検証が必須ですが失敗しました: {e}"
+                    ) from e
+        if discovered is not None:
+            base_url = discovered.primary_url
+        else:
+            base_url = f"http://{target}" if (":" in target and not target.startswith("[")) else f"https://{target}"
     else:
         base_url = target
     base_url = base_url.rstrip("/")
@@ -2610,21 +2637,25 @@ def cmd_join(args: argparse.Namespace) -> int:
         cfg_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"[dfscli] dfssvc ({svc_name}) の参加先を {base_url} に設定しました: {cfg_file}")
 
-    # 3) --path / --secret があれば RemoteStore にもリモートを登録
-    if args.path or args.secret:
+    # 3) --path / --secret または DNSSEC 自動発見があれば RemoteStore にリモートを登録
+    if args.path or args.secret or discovered is not None:
         store = RemoteStore()
-        remote_name = (args.name or host_label).strip()
-        primary_ost = direct_eps[0] if direct_eps else base_url
+        remote_name = (args.name or (discovered.domain if discovered is not None else host_label)).strip()
+        primary_ost = direct_eps[0] if direct_eps else ""
         alt_osts = direct_eps[1:] if len(direct_eps) > 1 else []
         remote = Remote(
             name=remote_name,
             registry=base_url,
+            registry_alternates=list(discovered.alternate_urls) if discovered is not None else [],
             key=str(args.key or ""),
             ost=primary_ost,
             ost_alternates=alt_osts,
-            path=str(args.path or f"/{host_label}"),
+            path=str(args.path or (discovered.root_anchor if discovered is not None else f"/{host_label}")),
             secret=str(args.secret or ""),
+            role_epoch=int(discovered.epoch) if discovered is not None else 1,
             node_name=remote_name,
+            root_pubkey=discovered.root_pubkey if discovered is not None else "",
+            root_fingerprint=ssh_key_fingerprint(discovered.root_pubkey) if discovered is not None else "",
             read_only=not bool(args.key),
         )
         store.set(remote)
