@@ -436,35 +436,112 @@ def cmd_import(args: argparse.Namespace) -> int:
 cmd_import_tar = cmd_import
 
 
-def _configure_fuse_library(explicit: Optional[str] = None) -> None:
-    """macOS では fuse-t を必須にし、fusepy の macFUSE フォールバックを防ぐ。"""
-    if explicit:
-        os.environ["FUSE_LIBRARY_PATH"] = str(Path(explicit).expanduser())
-        return
-    if _cm.sys.platform != "darwin":
-        return
-    env_path = os.environ.get("FUSE_LIBRARY_PATH", "")
-    if env_path and "fuse-t" in Path(env_path).name.lower():
-        return
+def _find_macfuse_library() -> Optional[Path]:
+    """macOS で利用可能な macFUSE のライブラリパスを返す。"""
+    candidates = (
+        Path("/usr/local/lib/libfuse.2.dylib"),
+        Path("/usr/local/lib/libfuse.dylib"),
+        Path("/Library/Frameworks/macFUSE.framework/macFUSE"),
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def _find_fuse_t_library() -> Optional[Path]:
+    """macOS で利用可能な fuse-t のライブラリパスを返す。"""
     candidates = (
         Path("/usr/local/lib/libfuse-t.dylib"),
         *sorted(Path("/Library/Application Support/fuse-t/lib").glob("libfuse-t-*.dylib")),
     )
     for path in candidates:
         if path.is_file():
-            os.environ["FUSE_LIBRARY_PATH"] = str(path)
-            return
+            return path
+    return None
+
+
+def _configure_fuse_library(explicit: Optional[str] = None) -> None:
+    """FUSE ライブラリパスを環境変数 FUSE_LIBRARY_PATH に設定する。"""
+    if explicit:
+        os.environ["FUSE_LIBRARY_PATH"] = str(Path(explicit).expanduser())
+        return
+    if _cm.sys.platform != "darwin":
+        return
+    env_path = os.environ.get("FUSE_LIBRARY_PATH", "")
+    if env_path and Path(env_path).is_file():
+        return
+    macfuse_path = _find_macfuse_library()
+    if macfuse_path:
+        os.environ["FUSE_LIBRARY_PATH"] = str(macfuse_path)
+        return
+    fuse_t_path = _find_fuse_t_library()
+    if fuse_t_path:
+        os.environ["FUSE_LIBRARY_PATH"] = str(fuse_t_path)
+        return
     raise _cm.UsageError(
-        "マウント機能には fuse-t が必要です。"
-        "macOS では "
-        "`brew install macos-fuse-t/homebrew-cask/fuse-t` "
-        "でインストールしてください"
+        "マウント機能には macFUSE または fuse-t が必要です。"
+        "macOS では macFUSE または fuse-t をインストールしてください"
     )
 
 
-def cmd_mount(args: argparse.Namespace) -> int:
-    """リモートのサブツリーを fuse-t / fusepy でローカルにマウントする。
+def _mount_candidates_darwin(
+    backend_preference: str = "auto",
+    explicit_library: Optional[str] = None,
+) -> list[tuple[str, Path, Optional[str]]]:
+    """macOS で試行する (label, lib_path, backend_option) の一覧を返す。
 
+    既定 (auto):
+    1. macFUSE (backend=fskit)
+    2. fuse-t
+    3. macFUSE (通常マウント)
+    """
+    if explicit_library:
+        explicit_path = Path(explicit_library).expanduser()
+        if not explicit_path.is_file():
+            raise _cm.UsageError(f"--fuse-library が見つかりません: {explicit_path}")
+        backend_opt = "fskit" if backend_preference == "fskit" else None
+        return [("explicit", explicit_path, backend_opt)]
+
+    macfuse_path = _find_macfuse_library()
+    fuse_t_path = _find_fuse_t_library()
+
+    candidates: list[tuple[str, Path, Optional[str]]] = []
+    if backend_preference == "fskit":
+        if macfuse_path:
+            candidates.append(("macFUSE (fskit)", macfuse_path, "fskit"))
+        else:
+            raise _cm.UsageError("macFUSE が見つからないため fskit バックエンドを使用できません")
+    elif backend_preference == "fuse-t":
+        if fuse_t_path:
+            candidates.append(("fuse-t", fuse_t_path, None))
+        else:
+            raise _cm.UsageError("fuse-t がインストールされていません")
+    elif backend_preference == "macfuse":
+        if macfuse_path:
+            candidates.append(("macFUSE", macfuse_path, None))
+        else:
+            raise _cm.UsageError("macFUSE がインストールされていません")
+    else:  # auto
+        if macfuse_path:
+            candidates.append(("macFUSE (fskit)", macfuse_path, "fskit"))
+        if fuse_t_path:
+            candidates.append(("fuse-t", fuse_t_path, None))
+        if macfuse_path:
+            candidates.append(("macFUSE", macfuse_path, None))
+
+    if not candidates:
+        raise _cm.UsageError(
+            "マウント機能には macFUSE または fuse-t が必要です。"
+            "macOS では macFUSE または fuse-t をインストールしてください"
+        )
+    return candidates
+
+
+def cmd_mount(args: argparse.Namespace) -> int:
+    """リモートのサブツリーを FUSE でローカルにマウントする。
+
+    macOS では macFUSE (backend=fskit) -> fuse-t -> macFUSE (通常) の順で試行する。
     作業ツリーを FUSE に公開し、flush / fsync / unmount 時に DFS へ push する。
     """
     store = _cm.RemoteStore()
@@ -491,18 +568,16 @@ def cmd_mount(args: argparse.Namespace) -> int:
         from dfs.fuse_mount import LocalTreeFuse
     except ImportError as e:  # pragma: no cover - 依存環境
         raise _cm.UsageError(
-            "mount には fusepy と fuse-t / FUSE が必要です "
+            "mount には fusepy と macFUSE / fuse-t / FUSE が必要です "
             "(pip install 'dfs[fuse]')"
         ) from e
 
-    _configure_fuse_library(args.fuse_library)
-    try:
-        from fuse import FUSE
-    except (ImportError, OSError) as e:
-        raise _cm.UsageError(
-            "fuse-t / libfuse を読み込めません。"
-            "macOS では FUSE-T をインストールし、必要なら --fuse-library を指定してください"
-        ) from e
+    backend_pref = getattr(args, "backend", "auto") or "auto"
+    if _cm.sys.platform == "darwin":
+        candidates = _mount_candidates_darwin(backend_pref, getattr(args, "fuse_library", None))
+    else:
+        _configure_fuse_library(getattr(args, "fuse_library", None))
+        candidates = [("FUSE", Path(os.environ.get("FUSE_LIBRARY_PATH", "/usr/lib/libfuse.so")), None)]
 
     effective_read_only = bool(args.read_only or remote.read_only)
     operations = LocalTreeFuse(
@@ -511,24 +586,61 @@ def cmd_mount(args: argparse.Namespace) -> int:
         read_only=effective_read_only,
         sync_delay=0.5,
     )
-    options = {
+
+    base_options = {
         "fsname": f"dfs:{name}:{node.sub_path}",
         "volname": f"dfs-{name}",
         "foreground": True,
         "nothreads": True,
     }
     if args.allow_other:
-        options["allow_other"] = True
+        base_options["allow_other"] = True
     if effective_read_only:
-        options["ro"] = True
+        base_options["ro"] = True
     if args.debug:
-        options["debug"] = True
+        base_options["debug"] = True
+
+    import importlib
+    last_error: Optional[Exception] = None
+    mounted_successfully = False
+
     try:
-        FUSE(operations, str(mountpoint), **options)
-    except KeyboardInterrupt:
-        print("\n[dfscli] mount を終了します", file=_cm.sys.stderr)
+        for idx, (label, lib_path, backend_opt) in enumerate(candidates):
+            options = dict(base_options)
+            if backend_opt:
+                options["backend"] = backend_opt
+            os.environ["FUSE_LIBRARY_PATH"] = str(lib_path)
+            try:
+                import fuse
+                importlib.reload(fuse)
+                from fuse import FUSE
+            except (ImportError, OSError) as e:
+                last_error = e
+                continue
+
+            try:
+                mounted_successfully = True
+                FUSE(operations, str(mountpoint), **options)
+                break
+            except KeyboardInterrupt:
+                print("\n[dfscli] mount を終了します", file=_cm.sys.stderr)
+                break
+            except Exception as e:
+                mounted_successfully = False
+                last_error = e
+                if idx + 1 < len(candidates):
+                    print(
+                        f"[dfscli] {label} でのマウントに失敗しました ({e})。次の候補を試します...",
+                        file=_cm.sys.stderr,
+                    )
+                continue
     finally:
         operations.destroy("/")
+
+    if not mounted_successfully and last_error is not None:
+        raise _cm.UsageError(
+            f"FUSE マウントに失敗しました: {last_error}"
+        )
     return 0
 
 

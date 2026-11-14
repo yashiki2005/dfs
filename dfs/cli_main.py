@@ -1501,6 +1501,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--fuse-library",
         help="fusepy が使う FUSE ライブラリ（macOS の fuse-t など）",
     )
+    p.add_argument(
+        "--backend",
+        choices=["auto", "fskit", "fuse-t", "macfuse"],
+        default="auto",
+        help="FUSE マウントのバックエンド（既定: auto = macfuse-fskit -> fuse-t -> macfuse）",
+    )
     p.set_defaults(func=cmd_mount)
 
     p = sub.add_parser("lsl", help="リモートの直下を大きさ付きで一覧する")
@@ -1951,36 +1957,46 @@ def _version() -> str:
 
 def _friendly_error(exc: BaseException) -> int:
     """例外を利用者向けの 1 行にして返す（終了コード付き）。"""
+    from .i18n import _
+
     if isinstance(exc, ConflictError):
+        title = _("単一書き手の競合")
+        hint = _("他の端末が先に書きました。'dfscli pull' の後でやり直してください。")
         print(
-            f"[dfscli] 単一書き手の競合: {exc}\n"
-            "        他の端末が先に書きました。'dfscli pull' の後でやり直してください。",
+            f"[dfscli] {title}: {exc}\n"
+            f"        {hint}",
             file=sys.stderr,
         )
         return 7
     if isinstance(exc, RollbackDetectedError):
-        print(f"[dfscli] 巻き戻しを検出しました（B6）: {exc}", file=sys.stderr)
+        title = _("巻き戻しを検出しました（B6）")
+        print(f"[dfscli] {title}: {exc}", file=sys.stderr)
         return 8
     if isinstance(exc, SilentDropDetectedError):
-        print(f"[dfscli] 黙った破棄を検出しました（B7）: {exc}", file=sys.stderr)
+        title = _("黙った破棄を検出しました（B7）")
+        print(f"[dfscli] {title}: {exc}", file=sys.stderr)
         return 9
     if isinstance(exc, ServiceUnavailableError):
-        print(f"[dfscli] L2/L3 に到達できません: {exc}", file=sys.stderr)
+        title = _("L2/L3 に到達できません")
+        print(f"[dfscli] {title}: {exc}", file=sys.stderr)
         return 6
     if isinstance(exc, (UsageError, RemoteError)):
         print(f"[dfscli] {exc}", file=sys.stderr)
         return 2
-    print(f"[dfscli] 予期しないエラー: {type(exc).__name__}: {exc}", file=sys.stderr)
+    title = _("予期しないエラー")
+    print(f"[dfscli] {title}: {type(exc).__name__}: {exc}", file=sys.stderr)
     return 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = build_parser()
+    from .i18n import _, translate_parser
+
+    parser = translate_parser(build_parser(), _)
     args = parser.parse_args(argv)
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:
-        print("\n[dfscli] 中断しました", file=sys.stderr)
+        print(f"\n[dfscli] {_('中断しました')}", file=sys.stderr)
         return 130
     except SystemExit:
         raise

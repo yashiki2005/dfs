@@ -83,14 +83,43 @@ class LocalTreeFuseTests(unittest.TestCase):
 
 
 class FuseRequirementTests(unittest.TestCase):
-    def test_macos_without_fuse_t_reports_clear_error(self) -> None:
+    def test_macos_without_fuse_reports_clear_error(self) -> None:
         with (
             patch.object(cli_main.sys, "platform", "darwin"),
             patch("pathlib.Path.is_file", return_value=False),
             patch.dict(os.environ, {"FUSE_LIBRARY_PATH": ""}, clear=False),
         ):
-            with self.assertRaisesRegex(UsageError, "マウント機能には fuse-t が必要です"):
+            with self.assertRaisesRegex(UsageError, "マウント機能には macFUSE または fuse-t が必要です"):
                 cli_main._configure_fuse_library()
+
+    def test_mount_candidates_order_darwin(self) -> None:
+        from dfs.commands.transfer import _mount_candidates_darwin
+
+        with (
+            patch("dfs.commands.transfer._find_macfuse_library", return_value=Path("/lib/macfuse.dylib")),
+            patch("dfs.commands.transfer._find_fuse_t_library", return_value=Path("/lib/fuse-t.dylib")),
+        ):
+            candidates = _mount_candidates_darwin("auto")
+            self.assertEqual(len(candidates), 3)
+            self.assertEqual(candidates[0], ("macFUSE (fskit)", Path("/lib/macfuse.dylib"), "fskit"))
+            self.assertEqual(candidates[1], ("fuse-t", Path("/lib/fuse-t.dylib"), None))
+            self.assertEqual(candidates[2], ("macFUSE", Path("/lib/macfuse.dylib"), None))
+
+    def test_mount_candidates_explicit_backend(self) -> None:
+        from dfs.commands.transfer import _mount_candidates_darwin
+
+        with (
+            patch("dfs.commands.transfer._find_macfuse_library", return_value=Path("/lib/macfuse.dylib")),
+            patch("dfs.commands.transfer._find_fuse_t_library", return_value=Path("/lib/fuse-t.dylib")),
+        ):
+            cand_fskit = _mount_candidates_darwin("fskit")
+            self.assertEqual(cand_fskit, [("macFUSE (fskit)", Path("/lib/macfuse.dylib"), "fskit")])
+
+            cand_fuset = _mount_candidates_darwin("fuse-t")
+            self.assertEqual(cand_fuset, [("fuse-t", Path("/lib/fuse-t.dylib"), None)])
+
+            cand_macfuse = _mount_candidates_darwin("macfuse")
+            self.assertEqual(cand_macfuse, [("macFUSE", Path("/lib/macfuse.dylib"), None)])
 
 
 if __name__ == "__main__":

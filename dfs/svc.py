@@ -1287,14 +1287,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    from .i18n import _, translate_parser
+
+    parser = translate_parser(build_parser(), _)
+    args = parser.parse_args(argv)
     try:
         return int(args.func(args) or 0)
     except ServiceError as e:
         print(f"[dfssvc] {e}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("\n[dfssvc] 中断しました", file=sys.stderr)
+        print(f"\n[dfssvc] {_('中断しました')}", file=sys.stderr)
         return 130
 
 
