@@ -6,6 +6,7 @@ import argparse
 import secrets
 import shutil
 import subprocess
+import sys
 from typing import Any, Dict
 
 
@@ -76,7 +77,13 @@ def cmd_web(args: argparse.Namespace) -> int:
 
     bind = args.bind
     if bind is None:
-        bind = "127.0.0.1" if (base_path or args.public_url) else "0.0.0.0"
+        bind = "127.0.0.1"
+    if bind in ("0.0.0.0", "::"):
+        print(
+            "[dfscli web] 警告: TLS なしでネットワーク全体に公開します（--bind 0.0.0.0）。"
+            "信頼できる LAN 外ではリバースプロキシ等で保護してください。",
+            file=sys.stderr,
+        )
     port = int(args.port) if args.port is not None else find_free_port(bind, 8080)
 
     cfg = WebConfig(
@@ -86,6 +93,7 @@ def cmd_web(args: argparse.Namespace) -> int:
         ttl_seconds=max(0, int(args.ttl or 0)),
         base_path=base_path,
         secure_cookie=bool(args.secure_cookie),
+        trusted_proxies=tuple(getattr(args, "trusted_proxy", None) or ()),
     )
     httpd = start_web_server(backend, cfg, bind=bind, port=port)
     bound_port = httpd.server_address[1]
@@ -100,6 +108,11 @@ def cmd_web(args: argparse.Namespace) -> int:
     )
     print(f"[dfscli web] Listen   : {bind}:{bound_port}")
     print(f"[dfscli web] Open URL : {access_url}")
+    if bind in ("127.0.0.1", "::1", "localhost") and not args.public_url:
+        print(
+            "[dfscli web] ヒント   : ローカル (127.0.0.1) のみ待機中です。"
+            "LAN 内のスマホ等から直接接続する場合は --bind 0.0.0.0 を指定してください。"
+        )
     if args.public_url:
         pub_base = args.public_url.rstrip("/")
         qr_target = f"{pub_base}/?token={token}"

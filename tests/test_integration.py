@@ -788,10 +788,12 @@ class TestStage5Integration(unittest.TestCase):
                 reg.register_delegation(d_notes, now=now)
 
                 mac_node = DFSNode(
-                    "Mac", sub_path, base / "mac_mount", alice_priv, alice_pub, secret, reg, "127.0.0.1", ost.port
+                    "Mac", sub_path, base / "mac_mount", alice_priv, alice_pub, secret, reg, "127.0.0.1", ost.port,
+                    root_pubkey=root_pub,
                 )
                 pi5_node = DFSNode(
-                    "Pi5", sub_path, base / "pi5_mount", alice_priv, alice_pub, secret, reg, "127.0.0.1", ost.port
+                    "Pi5", sub_path, base / "pi5_mount", alice_priv, alice_pub, secret, reg, "127.0.0.1", ost.port,
+                    root_pubkey=root_pub,
                 )
 
                 # 2. 片方 (Mac) で書く -> 他方 (Pi5) へ届く -> 両方で clayfs のスナップショットが取れる

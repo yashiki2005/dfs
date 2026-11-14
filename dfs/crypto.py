@@ -46,10 +46,29 @@ class CompressionError(CryptoError):
     """圧縮コーデックの利用・圧縮データの展開失敗"""
 
 
+_WINDOWS_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+})
+
+
 def normalize_name(name: str) -> str:
     """ファイル名・パス要素を UTF-8 NFC に正規化し、不正な要素を拒否する。"""
-    if not name or "/" in name or "\x00" in name or name in (".", ".."):
+    if (
+        not name
+        or "/" in name
+        or "\\" in name
+        or ":" in name
+        or "\x00" in name
+        or name in (".", "..")
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)
+        or name.endswith((".", " "))
+    ):
         raise ValueError(f"Invalid path entry name: {name!r}")
+    stem = name.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        raise ValueError(f"Invalid Windows reserved path entry name: {name!r}")
     return unicodedata.normalize("NFC", name)
 
 
@@ -302,6 +321,8 @@ def ssh_verify(
     """
     clean_pub = pubkey_str.strip()
     if not clean_pub or "\n" in clean_pub:
+        return False
+    if not identity or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in identity):
         return False
 
     in_process = _ssh_verify_ed25519(clean_pub, namespace, payload, signature)

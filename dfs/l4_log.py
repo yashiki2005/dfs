@@ -92,6 +92,14 @@ class HeadPin:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
+            try:
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
         finally:
             try:
                 tmp.unlink()
@@ -584,7 +592,8 @@ class MerkleTreeBuilder:
         mode = metadata.get("mode")
         if isinstance(mode, int) and 0 <= mode <= 0o7777:
             try:
-                os.chmod(target, mode)
+                # リモート由来の setuid/setgid/sticky ビットは復元しない。
+                os.chmod(target, mode & 0o777)
             except OSError:
                 pass
 
@@ -658,13 +667,20 @@ class MerkleTreeBuilder:
                 if parent_policy:
                     set_xattr(target, parent_policy)
                 seen_names: set[str] = set()
+                seen_casefold: set[str] = set()
                 for entry in dir_obj["entries"]:
                     if not isinstance(entry, dict):
                         raise ChunkIntegrityError("Invalid directory entry")
                     name = normalize_name(entry["name"])
                     if name in seen_names:
                         raise ChunkIntegrityError(f"Duplicate directory entry: {name!r}")
+                    cf = name.casefold()
+                    if cf in seen_casefold:
+                        raise ChunkIntegrityError(
+                            f"Case-colliding directory entry: {name!r}"
+                        )
                     seen_names.add(name)
+                    seen_casefold.add(cf)
                     child = target / name
                     if child.is_symlink():
                         raise UnsafePathError(f"Refusing to follow symlink: {child}")
@@ -901,6 +917,7 @@ class L4LogClient:
         pub_key_str: str,
         pin_file: Optional[Path] = None,
         root_pubkey: Optional[str] = None,
+        allow_tofu: bool = False,
     ):
         self.sub_path = normalize_path(sub_path)
         self.priv_key_path = Path(priv_key_path)
@@ -911,8 +928,8 @@ class L4LogClient:
         self.last_locator: Optional[Dict[str, Any]] = None
         self.last_delegation: Optional[Dict[str, Any]] = None
         # root アンカーの公開鍵。ここが信頼の根（名簿からは取らない）。
-        # 未設定なら、名簿が返した chain の先頭の parent を root として扱う検証はしない。
         self.root_pubkey: Optional[str] = (root_pubkey or "").strip() or None
+        self.allow_tofu: bool = bool(allow_tofu)
 
     def _save_pin(self) -> None:
         if self.pin_file:
@@ -931,7 +948,11 @@ class L4LogClient:
         if del_env is None:
             if self.root_pubkey:
                 raise DelegationError(f"Missing delegation for {self.sub_path!r}")
-            # TOFU 前かつ委譲が返らない（未登録）ときは、自分の鍵で検証するしかない。
+            if not self.allow_tofu:
+                raise DelegationError(
+                    f"root_pubkey is not configured for {self.sub_path!r} (allow_tofu=False)"
+                )
+            # TOFU 明示時のみ、未登録の間は自分の鍵で検証する。
             return self.pub_key_str
 
         chain = del_env.get("chain") or []
@@ -950,7 +971,11 @@ class L4LogClient:
             )
             return str(leaf["writer"])
 
-        # TOFU 前: 検証できないので名簿の主張を使う（初回のみ通る経路）。
+        if not self.allow_tofu:
+            raise DelegationError(
+                f"root_pubkey is not configured for {self.sub_path!r}; refusing unverified registry writer"
+            )
+        # TOFU 明示時のみ: 検証できないので名簿の主張を使う（初回のみ通る経路）。
         return str(del_env.get("payload", {}).get("writer") or self.pub_key_str)
 
     def sync_head(

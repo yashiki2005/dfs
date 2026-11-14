@@ -14,8 +14,10 @@ import socket
 import ssl
 import struct
 import sys
+import tempfile
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -161,12 +163,57 @@ class ChunkStoreServer:
     上書きできる。WAN では 1 往復が数百 ms になるため、LAN 時代の 2 秒固定から引き上げた。
     """
 
-    def __init__(self, certfile: Path | str, keyfile: Path | str, host: str = "127.0.0.1", port: int = 0):
-        self.store: Dict[str, bytes] = {}
+    def __init__(
+        self,
+        certfile: Path | str,
+        keyfile: Path | str,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        *,
+        chunks_dir: Optional[Path | str] = None,
+        max_store_bytes: Optional[int] = None,
+        max_ram_bytes: Optional[int] = None,
+    ):
+        self.store: Dict[str, bytes] = OrderedDict()
+        self._dirty_wire_ids: set[str] = set()
         self._store_lock = threading.RLock()
+        self._put_cond = threading.Condition(self._store_lock)
+        self._reserved_bytes: int = 0
+        self._inflight_puts: set[str] = set()
+        self.chunks_dir: Optional[Path] = (
+            Path(chunks_dir).expanduser() if chunks_dir else None
+        )
+        if self.chunks_dir is not None:
+            self.chunks_dir.mkdir(parents=True, exist_ok=True)
+        env_max_store = os.environ.get("DFS_OST_MAX_BYTES", "").strip()
+        self.max_store_bytes: Optional[int] = (
+            max_store_bytes
+            if max_store_bytes is not None
+            else (int(env_max_store) if env_max_store else None)
+        )
+        self.max_ram_bytes: int = (
+            max_ram_bytes
+            if max_ram_bytes is not None
+            else int(os.environ.get("DFS_OST_MAX_RAM_BYTES", str(256 * 1024 * 1024)))
+        )
+        self._ram_bytes: int = 0
+        self._disk_bytes: int = 0
+        if self.chunks_dir is not None:
+            self._disk_bytes = sum(
+                p.stat().st_size for p in self.chunks_dir.glob("*.blk") if p.is_file()
+            )
+        max_conns = max(1, int(os.environ.get("DFS_OST_MAX_CONNS", "64")))
+        self._conn_sem = threading.BoundedSemaphore(max_conns)
         self.online: bool = True
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.load_cert_chain(certfile=str(certfile), keyfile=str(keyfile))
+        self.cert_sha256: str = ""
+        try:
+            pem_text = Path(certfile).read_text(encoding="utf-8")
+            der = ssl.PEM_cert_to_DER_cert(pem_text)
+            self.cert_sha256 = sha256_hex(der)
+        except (OSError, ValueError):
+            self.cert_sha256 = ""
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -185,11 +232,25 @@ class ChunkStoreServer:
         while self.running:
             try:
                 conn, _ = self.sock.accept()
+                if not self._conn_sem.acquire(blocking=False):
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    continue
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 conn.settimeout(ost_socket_timeout())
-                threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+                threading.Thread(
+                    target=self._handle_client_guarded, args=(conn,), daemon=True
+                ).start()
             except Exception:
                 break
+
+    def _handle_client_guarded(self, conn: socket.socket) -> None:
+        try:
+            self._handle_client(conn)
+        finally:
+            self._conn_sem.release()
 
     @staticmethod
     def _recv_exact(conn: ssl.SSLSocket, n: int) -> bytes:
@@ -200,6 +261,120 @@ class ChunkStoreServer:
                 raise ConnectionError("EOF")
             buf.extend(chunk)
         return bytes(buf)
+
+    def _cache_ram(self, wid: str, blob: bytes) -> None:
+        if wid in self.store:
+            if isinstance(self.store, OrderedDict):
+                self.store.move_to_end(wid)
+            return
+        if self.chunks_dir is not None and len(blob) > self.max_ram_bytes:
+            return
+        self.store[wid] = blob
+        self._ram_bytes += len(blob)
+        if self.chunks_dir is not None:
+            while self._ram_bytes > self.max_ram_bytes and self.store:
+                if isinstance(self.store, OrderedDict):
+                    _old_wid, old_blob = self.store.popitem(last=False)
+                else:
+                    old_wid = next(iter(self.store))
+                    old_blob = self.store.pop(old_wid)
+                self._ram_bytes -= len(old_blob)
+
+    def _chunk_size(self, wid: str) -> int:
+        with self._store_lock:
+            blob = self.store.get(wid)
+            if blob is not None:
+                return len(blob)
+        if self.chunks_dir is not None:
+            try:
+                return (self.chunks_dir / f"{wid}.blk").stat().st_size
+            except FileNotFoundError:
+                return 0
+        return 0
+
+    def _has_chunk(self, wid: str) -> bool:
+        with self._store_lock:
+            if wid in self.store:
+                return True
+        if self.chunks_dir is not None:
+            return (self.chunks_dir / f"{wid}.blk").is_file()
+        return False
+
+    def _get_chunk(self, wid: str) -> Optional[bytes]:
+        with self._store_lock:
+            blob = self.store.get(wid)
+            if blob is not None:
+                if isinstance(self.store, OrderedDict):
+                    self.store.move_to_end(wid)
+                return blob
+        if self.chunks_dir is not None:
+            p = self.chunks_dir / f"{wid}.blk"
+            try:
+                blob = p.read_bytes()
+            except FileNotFoundError:
+                return None
+            with self._store_lock:
+                self._cache_ram(wid, blob)
+            return blob
+        return None
+
+    def _put_chunk(self, wid: str, blob: bytes) -> bool:
+        if self.chunks_dir is None:
+            with self._store_lock:
+                if wid in self.store:
+                    return True
+                if self.max_store_bytes is not None:
+                    current_total = sum(len(v) for v in self.store.values())
+                    if current_total + len(blob) > self.max_store_bytes:
+                        return False
+                self.store[wid] = blob
+                self._dirty_wire_ids.add(wid)
+                return True
+
+        dest = self.chunks_dir / f"{wid}.blk"
+        with self._store_lock:
+            while wid in self._inflight_puts:
+                self._put_cond.wait()
+            if wid in self.store:
+                return True
+            if dest.is_file():
+                self._cache_ram(wid, blob)
+                return True
+            if self.max_store_bytes is not None:
+                if self._disk_bytes + self._reserved_bytes + len(blob) > self.max_store_bytes:
+                    return False
+            self._reserved_bytes += len(blob)
+            self._inflight_puts.add(wid)
+
+        wrote_new = False
+        try:
+            if not dest.exists():
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f".{wid}.", suffix=".tmp", dir=str(self.chunks_dir)
+                )
+                tmp = Path(tmp_name)
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(blob)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, dest)
+                    wrote_new = True
+                finally:
+                    try:
+                        tmp.unlink()
+                    except FileNotFoundError:
+                        pass
+            with self._store_lock:
+                if wrote_new:
+                    self._disk_bytes += len(blob)
+                self._cache_ram(wid, blob)
+            return True
+        finally:
+            with self._store_lock:
+                self._reserved_bytes -= len(blob)
+                self._inflight_puts.discard(wid)
+                self._put_cond.notify_all()
 
     def _handle_client(self, raw_conn: socket.socket) -> None:
         ssl_conn: Optional[ssl.SSLSocket] = None
@@ -223,8 +398,7 @@ class ChunkStoreServer:
                 val = struct.unpack(">I", hdr[65:69])[0]
 
                 if op == "H":
-                    with self._store_lock:
-                        exists = wire_id in self.store
+                    exists = self._has_chunk(wire_id)
                     ssl_conn.sendall(b"1" if exists else b"0")
                 elif op == "P":
                     if val > MAX_BLOB_BYTES:
@@ -233,13 +407,12 @@ class ChunkStoreServer:
                     data = self._recv_exact(ssl_conn, val)
                     if sha256_hex(data) != wire_id:
                         ssl_conn.sendall(b"E")
+                    elif not self._put_chunk(wire_id, data):
+                        ssl_conn.sendall(b"E")
                     else:
-                        with self._store_lock:
-                            self.store[wire_id] = data
                         ssl_conn.sendall(b"O")
                 elif op == "G":
-                    with self._store_lock:
-                        blob = self.store.get(wire_id)
+                    blob = self._get_chunk(wire_id)
                     if blob is None:
                         ssl_conn.sendall(struct.pack(">I", 0))
                     else:
@@ -253,9 +426,8 @@ class ChunkStoreServer:
                     raw_ids = self._recv_exact(ssl_conn, val * 64)
                     decoded_ids = _decode_wire_ids(raw_ids, val)
                     bitmap = bytearray(b"O")
-                    with self._store_lock:
-                        for wid in decoded_ids:
-                            bitmap.extend(b"1" if wid in self.store else b"0")
+                    for wid in decoded_ids:
+                        bitmap.extend(b"1" if self._has_chunk(wid) else b"0")
                     ssl_conn.sendall(bytes(bitmap))
 
                 elif op == "M":  # Multi-PUT
@@ -277,11 +449,11 @@ class ChunkStoreServer:
                         else:
                             staged[wid] = blob
                     if ok:
-                        with self._store_lock:
-                            self.store.update(staged)
-                        ssl_conn.sendall(b"O")
-                    else:
-                        ssl_conn.sendall(b"E")
+                        for wid, blob in staged.items():
+                            if not self._put_chunk(wid, blob):
+                                ok = False
+                                break
+                    ssl_conn.sendall(b"O" if ok else b"E")
 
                 elif op == "F":  # Batch GET
                     if val > MAX_BATCH_ITEMS:
@@ -289,12 +461,15 @@ class ChunkStoreServer:
                         break
                     raw_ids = self._recv_exact(ssl_conn, val * 64)
                     decoded_ids = _decode_wire_ids(raw_ids, val)
-                    out = bytearray(b"O")
-                    with self._store_lock:
-                        for wid in decoded_ids:
-                            blob = self.store.get(wid, b"")
-                            out.extend(struct.pack(">I", len(blob)) + blob)
-                    ssl_conn.sendall(bytes(out))
+                    sizes = [self._chunk_size(wid) for wid in decoded_ids]
+                    total_bytes = 1 + sum(4 + sz for sz in sizes)
+                    if total_bytes > MAX_OST_HTTP_BODY_BYTES:
+                        ssl_conn.sendall(b"E")
+                        break
+                    ssl_conn.sendall(b"O")
+                    for wid in decoded_ids:
+                        blob = self._get_chunk(wid) or b""
+                        ssl_conn.sendall(struct.pack(">I", len(blob)) + blob)
                 else:
                     break
         except OSError:
@@ -330,9 +505,8 @@ class ChunkStoreServer:
             raise OSTProtocolError(f"batch_has exceeds MAX_BATCH_ITEMS ({count})")
         decoded_ids = _decode_wire_ids(raw_ids, count)
         bitmap = bytearray(b"O")
-        with self._store_lock:
-            for wid in decoded_ids:
-                bitmap.extend(b"1" if wid in self.store else b"0")
+        for wid in decoded_ids:
+            bitmap.extend(b"1" if self._has_chunk(wid) else b"0")
         return bytes(bitmap)
 
     def batch_get_raw(self, raw_ids: bytes) -> bytes:
@@ -346,15 +520,15 @@ class ChunkStoreServer:
             raise OSTProtocolError(f"batch_get exceeds MAX_BATCH_ITEMS ({count})")
         decoded_ids = _decode_wire_ids(raw_ids, count)
         unique_ids = list(dict.fromkeys(decoded_ids))
-        with self._store_lock:
-            blobs = [self.store.get(wid, b"") for wid in unique_ids]
-        total_bytes = 1 + sum(4 + len(blob) for blob in blobs)
+        sizes = [self._chunk_size(wid) for wid in unique_ids]
+        total_bytes = 1 + sum(4 + sz for sz in sizes)
         if total_bytes > MAX_OST_HTTP_BODY_BYTES:
             raise OSTProtocolError(
                 f"batch_get response exceeds MAX_OST_HTTP_BODY_BYTES ({total_bytes} > {MAX_OST_HTTP_BODY_BYTES})"
             )
         out = bytearray(b"O")
-        for blob in blobs:
+        for wid in unique_ids:
+            blob = self._get_chunk(wid) or b""
             out.extend(struct.pack(">I", len(blob)) + blob)
         return bytes(out)
 
@@ -384,8 +558,9 @@ class ChunkStoreServer:
             staged[wid] = blob
         if offset != len(raw_payload):
             raise OSTProtocolError("trailing bytes in batch_put payload")
-        with self._store_lock:
-            self.store.update(staged)
+        for wid, blob in staged.items():
+            if not self._put_chunk(wid, blob):
+                raise OSTProtocolError("L3 OST storage quota exceeded")
 
     def close(self) -> None:
         self.running = False
@@ -403,9 +578,18 @@ class OSTClient:
     接続タイムアウトは ``DFS_OST_CONNECT_TIMEOUT``（既定 10 秒）で上書きできる。
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        *,
+        expected_cert_sha256: Optional[str] = None,
+    ):
         self.host = host
         self.port = port
+        self.expected_cert_sha256 = (
+            (expected_cert_sha256 or "").strip().lower() or None
+        )
         self.bytes_sent: int = 0
         self.blob_bytes_sent: int = 0  # 暗号文本体の送信量（HAS などの固定費を除く）
         self.bytes_received: int = 0
@@ -481,6 +665,17 @@ class OSTClient:
             raise ServiceUnavailableError(
                 f"TLS handshake with L3 OST at {self.host}:{self.port} failed: {e}"
             ) from e
+        if self.expected_cert_sha256:
+            peer_der = ssl_conn.getpeercert(binary_form=True) or b""
+            actual_sha = sha256_hex(peer_der).lower()
+            if actual_sha != self.expected_cert_sha256:
+                try:
+                    ssl_conn.close()
+                except Exception:
+                    pass
+                raise ServiceUnavailableError(
+                    f"L3 OST TLS certificate pin mismatch at {self.host}:{self.port}"
+                )
         self.tls_handshakes += 1
         return ssl_conn
 
@@ -693,16 +888,25 @@ class HttpOSTClient:
     ``session()`` 中は HTTP keep-alive で接続を再利用する。
     """
 
-    def __init__(self, base_url: str):
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        expected_cert_sha256: Optional[str] = None,
+    ):
         host, port, canonical = parse_ost_endpoint(base_url)
         parts = urlsplit(canonical)
         if parts.scheme not in ("http", "https"):
             raise ValueError(f"HttpOSTClient requires http:// or https:// URL: {base_url!r}")
+        pin = (expected_cert_sha256 or "").strip().lower() or None
+        if pin and parts.scheme != "https":
+            raise ValueError("expected_cert_sha256 requires https:// endpoint")
         self.base_url: str = canonical
         self.scheme: str = parts.scheme
         self.host: str = host
         self.port: int = port
         self.base_path: str = parts.path.rstrip("/")
+        self.expected_cert_sha256: Optional[str] = pin
 
         self.bytes_sent: int = 0
         self.blob_bytes_sent: int = 0
@@ -775,6 +979,11 @@ class HttpOSTClient:
     def _open_new_conn(self, timeout: Optional[float] = None) -> http.client.HTTPConnection:
         eff_timeout = timeout if timeout is not None else ost_connect_timeout()
         proxy_url = self._resolve_proxy()
+        ssl_ctx: Optional[ssl.SSLContext] = None
+        if self.scheme == "https" and self.expected_cert_sha256:
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
         try:
             if proxy_url:
                 p = urlsplit(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
@@ -783,16 +992,32 @@ class HttpOSTClient:
                 p_port = p.port or (443 if p.scheme == "https" else 80)
                 if self.scheme == "https":
                     conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-                        p.hostname, p_port, timeout=eff_timeout
+                        p.hostname, p_port, timeout=eff_timeout, context=ssl_ctx
                     )
                     conn.set_tunnel(self.host, self.port)
                 else:
                     conn = http.client.HTTPConnection(p.hostname, p_port, timeout=eff_timeout)
             elif self.scheme == "https":
-                conn = http.client.HTTPSConnection(self.host, self.port, timeout=eff_timeout)
+                conn = http.client.HTTPSConnection(
+                    self.host, self.port, timeout=eff_timeout, context=ssl_ctx
+                )
             else:
                 conn = http.client.HTTPConnection(self.host, self.port, timeout=eff_timeout)
             conn.connect()
+            if self.scheme == "https" and self.expected_cert_sha256:
+                sock = conn.sock
+                peer_der = sock.getpeercert(binary_form=True) if sock is not None else None
+                actual_sha = sha256_hex(peer_der or b"").lower()
+                if actual_sha != self.expected_cert_sha256:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise ServiceUnavailableError(
+                        f"L3 HTTP OST TLS certificate pin mismatch at {self.base_url}"
+                    )
+        except ServiceUnavailableError:
+            raise
         except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException) as e:
             raise ServiceUnavailableError(
                 f"Cannot reach L3 OST over HTTP at {self.base_url}: {e}"
@@ -1002,12 +1227,14 @@ class HttpOSTClient:
         return self.batch_get([wire_id])[wire_id]
 
 
-def make_ost_client(endpoint: str) -> Union[OSTClient, HttpOSTClient]:
+def make_ost_client(
+    endpoint: str, *, expected_cert_sha256: Optional[str] = None
+) -> Union[OSTClient, HttpOSTClient]:
     """エンドポイント文字列から ``OSTClient`` または ``HttpOSTClient`` を生成する。"""
     host, port, canonical = parse_ost_endpoint(endpoint)
     if canonical.startswith("http://") or canonical.startswith("https://"):
-        return HttpOSTClient(canonical)
-    return OSTClient(host=host, port=port)
+        return HttpOSTClient(canonical, expected_cert_sha256=expected_cert_sha256)
+    return OSTClient(host=host, port=port, expected_cert_sha256=expected_cert_sha256)
 
 
 class FailoverOSTClient:

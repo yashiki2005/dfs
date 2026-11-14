@@ -100,6 +100,7 @@ class TestEvilSuite(unittest.TestCase):
             registry=reg,
             ost_host="127.0.0.1",
             ost_port=ost.port,
+            root_pubkey=self.root_pub,
         )
         return ost, reg, node
 
@@ -170,6 +171,7 @@ class TestEvilSuite(unittest.TestCase):
                 reg,
                 "127.0.0.1",
                 ost.port,
+                root_pubkey=self.root_pub,
             )
             with self.assertRaises(ChunkIntegrityError):
                 node_b.pull()

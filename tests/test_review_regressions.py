@@ -48,6 +48,21 @@ def _keypair(base: Path, name: str) -> tuple[Path, str]:
     return priv, Path(f"{priv}.pub").read_text(encoding="utf-8").strip()
 
 
+def _self_signed_cert(base: Path, cn: str = "localhost") -> tuple[Path, Path]:
+    cert = base / "cert.pem"
+    key = base / "key.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(key), "-out", str(cert),
+            "-days", "1", "-nodes", "-subj", f"/CN={cn}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key
+
+
 class _FakeOST:
     def __init__(self) -> None:
         self.store: dict[str, bytes] = {}
@@ -1179,6 +1194,547 @@ class TestReviewRegressions(unittest.TestCase):
             )
         self.assertTrue(st["l2_ok"])
         self.assertEqual(seen_timeouts, [1.5])
+
+    def test_l3_batch_get_enforces_total_byte_cap(self) -> None:
+        import ssl
+        import socket
+        import struct
+        from dfs.crypto import sha256_hex
+        from dfs.l3_ost_adapter import ChunkStoreServer, MAX_OST_HTTP_BODY_BYTES
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = root / "cert.pem", root / "key.pem"
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert),
+                    "-days", "1", "-nodes", "-subj", "/CN=localhost",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            srv = ChunkStoreServer(cert, key)
+            try:
+                blob = b"A" * 65536
+                wid = sha256_hex(blob)
+                srv.store[wid] = blob
+                # Total frame size exceeds MAX_OST_HTTP_BODY_BYTES when requested enough times
+                count = (MAX_OST_HTTP_BODY_BYTES // (4 + len(blob))) + 10
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with socket.create_connection(("127.0.0.1", srv.port), timeout=5) as raw:
+                    with ctx.wrap_socket(raw, server_hostname="localhost") as s:
+                        s.sendall(
+                            b"F"
+                            + (b"0" * 64)
+                            + struct.pack(">I", count)
+                            + (wid.encode("ascii") * count)
+                        )
+                        resp = s.recv(16)
+                self.assertEqual(resp[:1], b"E")
+            finally:
+                srv.close()
+
+    def test_windows_path_traversal_ads_and_setuid_mode_mitigations(self) -> None:
+        from dfs.crypto import normalize_name
+        from dfs.l4_log import MerkleTreeBuilder
+
+        for bad in ("..\\evil", "a:stream", "CON", "nul.txt", "trail ", "trail.", "bad\x07name"):
+            with self.assertRaises(ValueError, msg=f"Should reject {bad!r}"):
+                normalize_name(bad)
+
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "script.sh"
+            f.write_text("#!/bin/sh\n", encoding="utf-8")
+            os.chmod(f, 0o644)
+            MerkleTreeBuilder._apply_metadata(f, {"mode": 0o4755})
+            self.assertEqual(f.stat().st_mode & 0o7777, 0o755)
+
+    def test_save_ost_chunks_writes_only_dirty_wire_ids(self) -> None:
+        from dfs.crypto import sha256_hex
+        from dfs.l3_ost_adapter import ChunkStoreServer
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = root / "cert.pem", root / "key.pem"
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert),
+                    "-days", "1", "-nodes", "-subj", "/CN=localhost",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            srv = ChunkStoreServer(cert, key)
+            try:
+                pstate = cli_mod.PersistentRegistryState(
+                    root / "state", "/example.com", "ssh-ed25519 AAAA", chunks_dir=root / "chunks"
+                )
+                b1 = b"chunk-one"
+                w1 = sha256_hex(b1)
+                with srv._store_lock:
+                    srv.store[w1] = b1
+                    srv._dirty_wire_ids.add(w1)
+                pstate.save_ost_chunks(srv)
+                self.assertTrue((root / "chunks" / f"{w1}.blk").is_file())
+                self.assertEqual(srv._dirty_wire_ids, set())
+            finally:
+                srv.close()
+
+    def test_ost_client_verifies_cert_sha256_pin(self) -> None:
+        from dfs.l3_ost_adapter import ChunkStoreServer, OSTClient, ServiceUnavailableError
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert1, key1 = root / "cert1.pem", root / "key1.pem"
+            cert2, key2 = root / "cert2.pem", root / "key2.pem"
+            for cert, key, cn in ((cert1, key1, "ost1"), (cert2, key2, "ost2")):
+                subprocess.run(
+                    [
+                        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                        "-keyout", str(key), "-out", str(cert),
+                        "-days", "1", "-nodes", "-subj", f"/CN={cn}",
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            srv = ChunkStoreServer(cert1, key1)
+            srv_wrong = ChunkStoreServer(cert2, key2)
+            try:
+                self.assertEqual(len(srv.cert_sha256), 64)
+                ok_client = OSTClient("127.0.0.1", srv.port, expected_cert_sha256=srv.cert_sha256)
+                self.assertGreaterEqual(ok_client.probe(), 0.0)
+
+                bad_client = OSTClient(
+                    "127.0.0.1", srv.port, expected_cert_sha256=srv_wrong.cert_sha256
+                )
+                with self.assertRaises(ServiceUnavailableError):
+                    bad_client.probe()
+            finally:
+                srv.close()
+                srv_wrong.close()
+
+    def test_l4_rejects_unpinned_tofu_writer_unless_explicit(self) -> None:
+        from dfs.crypto import canonical_json, sha256_hex
+        from dfs.l1_delegation import DelegationError
+        from dfs.l4_log import L4LogClient
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            priv, pub = _keypair(root, "writer")
+            _, fake_pub = _keypair(root, "attacker")
+
+            class FakeReg:
+                def resolve(self, path):
+                    payload = {"path": path, "version": 1, "timestamp": 1000, "writer": fake_pub}
+                    return (
+                        {"payload": {"writer": fake_pub, "path": path}},
+                        None,
+                        {"payload": payload, "entry_hash": sha256_hex(canonical_json(payload)), "signature": "bad"},
+                    )
+
+            strict = L4LogClient("/example.com/test", priv, pub, root_pubkey=None)
+            with self.assertRaises(DelegationError):
+                strict.sync_head(FakeReg())  # type: ignore[arg-type]
+
+            tofu = L4LogClient("/example.com/test", priv, pub, root_pubkey=None, allow_tofu=True)
+            self.assertEqual(
+                tofu._verified_writer({"payload": {"writer": fake_pub}}),
+                fake_pub,
+            )
+
+    def test_ost_disk_backed_lru_and_quota(self) -> None:
+        from dfs.crypto import ChunkIntegrityError, sha256_hex
+        from dfs.l3_ost_adapter import ChunkStoreServer, OSTClient
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert = root / "cert.pem"
+            key = root / "key.pem"
+            chunks_dir = root / "chunks"
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert),
+                    "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            srv = ChunkStoreServer(
+                cert,
+                key,
+                chunks_dir=chunks_dir,
+                max_store_bytes=120,
+                max_ram_bytes=60,
+            )
+            try:
+                cli = OSTClient("127.0.0.1", srv.port, expected_cert_sha256=srv.cert_sha256)
+                b1 = b"a" * 50
+                b2 = b"b" * 50
+                b3 = b"c" * 50
+                w1 = sha256_hex(b1)
+                w2 = sha256_hex(b2)
+                w3 = sha256_hex(b3)
+
+                cli.put_if_absent(w1, b1)
+                cli.put_if_absent(w2, b2)
+
+                # w1 was evicted from bounded RAM cache (max_ram_bytes=60), but served from disk.
+                with srv._store_lock:
+                    self.assertNotIn(w1, srv.store)
+                    self.assertIn(w2, srv.store)
+                self.assertEqual(cli.get(w1), b1)
+
+                # Third chunk pushes total over max_store_bytes=120.
+                with self.assertRaises(ChunkIntegrityError):
+                    cli.put_if_absent(w3, b3)
+                self.assertEqual(cli.batch_has([w3]), {w3: False})
+            finally:
+                srv.close()
+
+    def test_download_directory_rejects_case_colliding_entries(self) -> None:
+        from dfs.crypto import ChunkIntegrityError, ContentAddressedCrypto, canonical_json
+        from dfs.l4_log import MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            crypto = ContentAddressedCrypto("test-secret")
+            f1_plain, f1_wire, f1_blob = crypto.pack_chunk(b"first")
+            f2_plain, f2_wire, f2_blob = crypto.pack_chunk(b"second")
+            dir_obj = {
+                "format": "dfs-dir-v2",
+                "entries": [
+                    {"name": "Readme.md", "type": "file", "plain_id": f1_plain, "wire_id": f1_wire, "size": 5},
+                    {"name": "readme.md", "type": "file", "plain_id": f2_plain, "wire_id": f2_wire, "size": 6},
+                ],
+            }
+            d_plain, d_wire, d_blob = crypto.pack_chunk(canonical_json(dir_obj))
+            blobs = {d_wire: d_blob, f1_wire: f1_blob, f2_wire: f2_blob}
+
+            class FakeOST:
+                def batch_get(self, wids):
+                    return {wid: blobs[wid] for wid in wids if wid in blobs}
+
+            builder = MerkleTreeBuilder(crypto, FakeOST())  # type: ignore[arg-type]
+            with self.assertRaises(ChunkIntegrityError):
+                builder.download_directory(d_plain, d_wire, root / "out")
+
+    def test_ssh_verify_rejects_whitespace_and_control_identity(self) -> None:
+        from dfs.crypto import ssh_sign, ssh_verify
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            priv, pub = _keypair(root, "signer")
+            payload = b"hello"
+            sig = ssh_sign(priv, "dfs", payload)
+            self.assertTrue(ssh_verify(pub, "alice@example.com", "dfs", payload, sig))
+            for bad_id in ("", "alice bob", "alice\nbob", "alice\x00bob"):
+                self.assertFalse(ssh_verify(pub, bad_id, "dfs", payload, sig))
+
+    def test_web_login_rate_limits_repeated_failures(self) -> None:
+        import json
+        import threading
+        import urllib.error
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        from dfs.web import WebConfig, make_web_handler
+
+        class DummyBackend:
+            pass
+
+        cfg = WebConfig(remote_name="test", token="correct-token")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), make_web_handler(DummyBackend(), cfg))  # type: ignore[arg-type]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/api/login"
+            body = json.dumps({"token": "wrong-token"}).encode("utf-8")
+            for _ in range(5):
+                req = urllib.request.Request(
+                    url,
+                    data=body,
+                    method="POST",
+                    headers={"Content-Type": "application/json", "Sec-Fetch-Site": "same-origin"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req, timeout=2.0)
+                self.assertEqual(ctx.exception.code, 401)
+
+            req6 = urllib.request.Request(
+                url,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json", "Sec-Fetch-Site": "same-origin"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx6:
+                urllib.request.urlopen(req6, timeout=2.0)
+            self.assertEqual(ctx6.exception.code, 429)
+            self.assertIsNotNone(ctx6.exception.headers.get("Retry-After"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_http_ost_disk_persistence_quota_and_restart(self) -> None:
+        import struct
+        from dfs.crypto import sha256_hex
+        from dfs.l3_ost_adapter import ChunkStoreServer, OSTProtocolError
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = _self_signed_cert(root)
+            chunks_dir = root / "chunks"
+
+            # 1) ディスクに既存の .blk がある場合、RAM が空でも batch_has_raw / batch_get_raw が見つけられる
+            pre_blob = b"preexisting-disk-chunk"
+            pre_wid = sha256_hex(pre_blob)
+            chunks_dir.mkdir(parents=True, exist_ok=True)
+            (chunks_dir / f"{pre_wid}.blk").write_bytes(pre_blob)
+
+            srv1 = ChunkStoreServer(
+                cert, key, chunks_dir=chunks_dir, max_store_bytes=100, max_ram_bytes=64
+            )
+            try:
+                self.assertEqual(srv1.batch_has_raw(pre_wid.encode("ascii")), b"O1")
+                got = srv1.batch_get_raw(pre_wid.encode("ascii"))
+                self.assertEqual(got, b"O" + struct.pack(">I", len(pre_blob)) + pre_blob)
+
+                # 2) batch_put_raw で入れたチャンクは .blk 永続化され、max_store_bytes も効く
+                new_blob = b"http-put-chunk-1"
+                new_wid = sha256_hex(new_blob)
+                payload = (
+                    struct.pack(">I", 1)
+                    + new_wid.encode("ascii")
+                    + struct.pack(">I", len(new_blob))
+                    + new_blob
+                )
+                srv1.batch_put_raw(payload)
+                self.assertTrue((chunks_dir / f"{new_wid}.blk").is_file())
+
+                big_blob = b"X" * 90
+                big_wid = sha256_hex(big_blob)
+                big_payload = (
+                    struct.pack(">I", 1)
+                    + big_wid.encode("ascii")
+                    + struct.pack(">I", len(big_blob))
+                    + big_blob
+                )
+                with self.assertRaises(OSTProtocolError):
+                    srv1.batch_put_raw(big_payload)
+            finally:
+                srv1.close()
+
+            # 3) 再起動後（別インスタンス）でも HTTP 経由で入れたチャンクを取得できる
+            srv2 = ChunkStoreServer(cert, key, chunks_dir=chunks_dir)
+            try:
+                self.assertEqual(srv2.batch_has_raw(new_wid.encode("ascii")), b"O1")
+                got2 = srv2.batch_get_raw(new_wid.encode("ascii"))
+                self.assertEqual(got2, b"O" + struct.pack(">I", len(new_blob)) + new_blob)
+            finally:
+                srv2.close()
+
+    def test_batch_get_checks_size_before_reading_chunks(self) -> None:
+        from unittest import mock
+        from dfs.crypto import sha256_hex
+        from dfs.l3_ost_adapter import ChunkStoreServer, OSTProtocolError, MAX_OST_HTTP_BODY_BYTES
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = _self_signed_cert(root)
+            chunks_dir = root / "chunks"
+            chunks_dir.mkdir(parents=True, exist_ok=True)
+            srv = ChunkStoreServer(cert, key, chunks_dir=chunks_dir)
+            try:
+                # 擬似的に上限超えサイズを返す _chunk_size で、_get_chunk が呼ばれないことを検証
+                wid1 = sha256_hex(b"a")
+                wid2 = sha256_hex(b"b")
+                raw_ids = (wid1 + wid2).encode("ascii")
+                with mock.patch.object(
+                    srv, "_chunk_size", return_value=MAX_OST_HTTP_BODY_BYTES
+                ), mock.patch.object(srv, "_get_chunk") as mock_get:
+                    with self.assertRaises(OSTProtocolError):
+                        srv.batch_get_raw(raw_ids)
+                    mock_get.assert_not_called()
+            finally:
+                srv.close()
+
+    def test_ost_cert_pin_propagation_and_explicit_tofu(self) -> None:
+        import time
+        from dfs.invite import decode_invite, encode_ro_invite
+        from dfs.l1_delegation import DelegationError, create_delegation_envelope
+        from dfs.l2_registry import DirectoryRegistryService
+        from dfs.l3_ost_adapter import ChunkStoreServer, HttpOSTClient, ServiceUnavailableError
+        from dfs.l5_fs import DFSNode
+
+        with self.assertRaises(ValueError):
+            HttpOSTClient("http://127.0.0.1:19440/relay/a", expected_cert_sha256="aa" * 32)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = _self_signed_cert(root)
+            root_priv, root_pub = _keypair(root, "root")
+            alice_priv, alice_pub = _keypair(root, "alice")
+            srv = ChunkStoreServer(cert, key)
+            try:
+                reg = DirectoryRegistryService("/example.com", root_pub)
+                now = int(time.time())
+                env = create_delegation_envelope(
+                    root_priv, "/example.com", "/example.com/alice", alice_pub,
+                    1, 0, now - 60, now + 3600,
+                )
+                reg.register_delegation(env, now=now)
+
+                # DFSNode -> make_ost_client へ誤ったピンが伝播し、拒否されること
+                bad_node = DFSNode(
+                    "alice", "/example.com/alice", root / "wd_bad",
+                    alice_priv, alice_pub, "secret", reg, "127.0.0.1", srv.port,
+                    root_pubkey=root_pub, ost_cert_sha256="00" * 32,
+                )
+                (bad_node.clayfs.work_tree / "f.txt").write_text("hi", encoding="utf-8")
+                with self.assertRaises(ServiceUnavailableError):
+                    bad_node.push(1, now=now)
+
+                # 正しいピンでは成功すること
+                good_node = DFSNode(
+                    "alice", "/example.com/alice", root / "wd_good",
+                    alice_priv, alice_pub, "secret", reg, "127.0.0.1", srv.port,
+                    root_pubkey=root_pub, ost_cert_sha256=srv.cert_sha256,
+                )
+                (good_node.clayfs.work_tree / "f.txt").write_text("hi", encoding="utf-8")
+                good_node.push(1, now=now)
+
+                # root_pubkey="" では既定 (allow_tofu=False) で拒否、allow_tofu=True なら許可
+                no_tofu = DFSNode(
+                    "alice", "/example.com/alice", root / "wd_notofu",
+                    alice_priv, alice_pub, "secret", reg, "127.0.0.1", srv.port,
+                    root_pubkey="", ost_cert_sha256=srv.cert_sha256,
+                )
+                with self.assertRaises(DelegationError):
+                    no_tofu.pull()
+
+                yes_tofu = DFSNode(
+                    "alice", "/example.com/alice", root / "wd_yestofu",
+                    alice_priv, alice_pub, "secret", reg, "127.0.0.1", srv.port,
+                    root_pubkey="", ost_cert_sha256=srv.cert_sha256, allow_tofu=True,
+                )
+                yes_tofu.pull()
+                self.assertEqual((yes_tofu.clayfs.work_tree / "f.txt").read_text(encoding="utf-8"), "hi")
+
+                # 招待トークンにも ost_cert_sha256 が含まれ往復できること
+                tok = encode_ro_invite(
+                    name="ro",
+                    registries=["http://127.0.0.1:19440"],
+                    root_pubkey=root_pub,
+                    tree_secret="secret",
+                    ost=f"127.0.0.1:{srv.port}",
+                    ost_cert_sha256=srv.cert_sha256,
+                )
+                decoded = decode_invite(tok)
+                self.assertEqual(decoded["ost_cert_sha256"], srv.cert_sha256)
+            finally:
+                srv.close()
+
+    def test_web_query_token_bearer_and_trusted_proxy_rate_limit(self) -> None:
+        import threading
+        import urllib.error
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        from dfs.web import WebConfig, make_web_handler
+
+        class DummyBackend:
+            pass
+
+        # 1) クエリトークン & Bearer のレート制限（trusted_proxies なし）
+        cfg = WebConfig(remote_name="test", token="correct-token")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), make_web_handler(DummyBackend(), cfg))  # type: ignore[arg-type]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            for _ in range(5):
+                req = urllib.request.Request(
+                    f"{base}/?token=wrong",
+                    headers={"X-Forwarded-For": "203.0.113.99"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req, timeout=2.0)
+                self.assertEqual(ctx.exception.code, 401)
+
+            # XFF を偽装しても trusted_proxies が空なので 429 になる
+            req6 = urllib.request.Request(
+                f"{base}/?token=wrong",
+                headers={"X-Forwarded-For": "203.0.113.100"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx6:
+                urllib.request.urlopen(req6, timeout=2.0)
+            self.assertEqual(ctx6.exception.code, 429)
+
+            # Bearer ヘッダー認証も同じ IP バケットで 429 になる
+            req_bearer = urllib.request.Request(
+                f"{base}/api/info",
+                headers={"Authorization": "Bearer wrong"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_b:
+                urllib.request.urlopen(req_bearer, timeout=2.0)
+            self.assertEqual(ctx_b.exception.code, 429)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # 2) trusted_proxies 指定時は X-Forwarded-For のクライアント IP 単位で分離される
+        cfg2 = WebConfig(
+            remote_name="test",
+            token="correct-token",
+            trusted_proxies=("127.0.0.1",),
+        )
+        srv2 = ThreadingHTTPServer(("127.0.0.1", 0), make_web_handler(DummyBackend(), cfg2))  # type: ignore[arg-type]
+        th2 = threading.Thread(target=srv2.serve_forever, daemon=True)
+        th2.start()
+        try:
+            base2 = f"http://127.0.0.1:{srv2.server_address[1]}"
+            for _ in range(5):
+                req = urllib.request.Request(
+                    f"{base2}/api/info",
+                    headers={
+                        "Authorization": "Bearer wrong",
+                        "X-Forwarded-For": "203.0.113.10",
+                    },
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req, timeout=2.0)
+                self.assertEqual(ctx.exception.code, 401)
+            # 203.0.113.10 はロック
+            with self.assertRaises(urllib.error.HTTPError) as ctx_lock:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"{base2}/api/info",
+                        headers={
+                            "Authorization": "Bearer wrong",
+                            "X-Forwarded-For": "203.0.113.10",
+                        },
+                    ),
+                    timeout=2.0,
+                )
+            self.assertEqual(ctx_lock.exception.code, 429)
+            # 別クライアント 203.0.113.11 はまだ 401（ロックされていない）
+            with self.assertRaises(urllib.error.HTTPError) as ctx_other:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"{base2}/api/info",
+                        headers={
+                            "Authorization": "Bearer wrong",
+                            "X-Forwarded-For": "203.0.113.11",
+                        },
+                    ),
+                    timeout=2.0,
+                )
+            self.assertEqual(ctx_other.exception.code, 401)
+        finally:
+            srv2.shutdown()
+            srv2.server_close()
 
 
 if __name__ == "__main__":

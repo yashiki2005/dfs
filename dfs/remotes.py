@@ -55,6 +55,8 @@ class Remote:
     node_name: str = ""                 # 端末名（既定: リモート名）
     root_pubkey: str = ""               # root アンカーの公開鍵（信頼の根。TOFU で記録）
     root_fingerprint: str = ""          # 表示・比較用の指紋
+    ost_cert_sha256: str = ""           # L3 OST の TLS 証明書 SHA-256 ピン
+    allow_tofu: bool = False            # True のときのみ root_pubkey 未設定時の TOFU を許可
     read_only: bool = False             # True のときは秘密鍵を持たず読み取り専用にする
 
     def resolved_workdir(self) -> Path:
@@ -118,6 +120,8 @@ class Remote:
             node_name=str(data.get("node_name", "") or data["name"]),
             root_pubkey=str(data.get("root_pubkey", "") or ""),
             root_fingerprint=str(data.get("root_fingerprint", "") or ""),
+            ost_cert_sha256=str(data.get("ost_cert_sha256", "") or "").strip().lower(),
+            allow_tofu=bool(data.get("allow_tofu", False)),
             read_only=read_only,
         )
 

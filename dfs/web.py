@@ -14,6 +14,7 @@ import base64
 import hashlib
 import hmac
 import http.cookies
+import ipaddress
 import json
 import mimetypes
 import os
@@ -22,8 +23,10 @@ import secrets
 import shlex
 import shutil
 import socket
+import sys
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -64,6 +67,10 @@ class WebConfig:
     secure_cookie: bool = False
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
     started_at: float = 0.0
+    trusted_proxies: Tuple[str, ...] = ()
+    login_max_attempts: int = 5
+    login_window_sec: float = 60.0
+    login_max_tracked_ips: int = 4096
 
     @property
     def expires_at(self) -> float:
@@ -1178,6 +1185,66 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
     """スマホ向け Web CLI HTTP ハンドラを生成する。"""
     base_prefix = "/" + config.base_path.strip("/") if config.base_path.strip("/") else ""
     cookie_name = "dfs_web_session"
+    login_failures_lock = threading.Lock()
+    login_failures: "OrderedDict[str, List[float]]" = OrderedDict()
+    login_window_sec = float(config.login_window_sec)
+    login_max_attempts = max(1, int(config.login_max_attempts))
+    login_max_tracked_ips = max(16, int(config.login_max_tracked_ips))
+    trusted_nets = []
+    for raw_proxy in config.trusted_proxies:
+        text = str(raw_proxy or "").strip()
+        if not text:
+            continue
+        try:
+            trusted_nets.append(ipaddress.ip_network(text, strict=False))
+        except ValueError:
+            pass
+
+    def _is_trusted_proxy(ip_str: str) -> bool:
+        if not trusted_nets:
+            return False
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        return any(addr in net for net in trusted_nets)
+
+    def _prune_failures_locked(now: float) -> None:
+        expired = [
+            ip
+            for ip, times in login_failures.items()
+            if not any(now - t < login_window_sec for t in times)
+        ]
+        for ip in expired:
+            login_failures.pop(ip, None)
+        while len(login_failures) > login_max_tracked_ips:
+            login_failures.popitem(last=False)
+
+    def _check_rate_limit(ip: str) -> Optional[int]:
+        now = time.monotonic()
+        with login_failures_lock:
+            recent = [t for t in login_failures.get(ip, []) if now - t < login_window_sec]
+            if recent:
+                login_failures[ip] = recent
+            else:
+                login_failures.pop(ip, None)
+            if len(recent) >= login_max_attempts:
+                return max(1, int(login_window_sec - (now - recent[0])) + 1)
+        return None
+
+    def _record_auth_failure(ip: str) -> None:
+        now = time.monotonic()
+        with login_failures_lock:
+            recent = [t for t in login_failures.get(ip, []) if now - t < login_window_sec]
+            recent.append(now)
+            login_failures[ip] = recent
+            login_failures.move_to_end(ip)
+            _prune_failures_locked(now)
+        print(f"[dfs-web] failed login attempt from {ip}", file=sys.stderr)
+
+    def _clear_auth_failures(ip: str) -> None:
+        with login_failures_lock:
+            login_failures.pop(ip, None)
 
     class DFSWebHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1232,27 +1299,77 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                 parts.append("Secure")
             return "; ".join(parts)
 
-        def _is_authenticated(self) -> bool:
+        def _client_ip(self) -> str:
+            peer = (self.client_address[0] if self.client_address else "") or "unknown"
+            if _is_trusted_proxy(peer):
+                xff = self.headers.get("X-Forwarded-For") or ""
+                if xff:
+                    parts = [p.strip() for p in xff.split(",") if p.strip()]
+                    for cand in reversed(parts):
+                        try:
+                            ipaddress.ip_address(cand)
+                        except ValueError:
+                            continue
+                        if not _is_trusted_proxy(cand):
+                            return cand
+                    if parts:
+                        try:
+                            ipaddress.ip_address(parts[0])
+                            return parts[0]
+                        except ValueError:
+                            pass
+                xri = (self.headers.get("X-Real-IP") or "").strip()
+                if xri:
+                    try:
+                        ipaddress.ip_address(xri)
+                        return xri
+                    except ValueError:
+                        pass
+            return peer
+
+        def _send_rate_limited(self, retry_after: int) -> None:
+            self._send_json(
+                429,
+                {"error": "Too many failed login attempts"},
+                extra_headers=[("Retry-After", str(retry_after))],
+            )
+
+        def _authenticate_request(self) -> Tuple[bool, bool]:
+            """(authenticated, response_already_sent) を返す。"""
             if config.is_expired():
-                return False
+                return False, False
             auth = self.headers.get("Authorization") or ""
-            if auth.startswith("Bearer "):
-                presented = auth[len("Bearer ") :].strip()
-                if hmac.compare_digest(presented, config.token):
-                    return True
             hdr_tok = (self.headers.get("X-DFS-Web-Token") or "").strip()
-            if hdr_tok and hmac.compare_digest(hdr_tok, config.token):
-                return True
+            presented_tok: Optional[str] = None
+            if auth.startswith("Bearer "):
+                presented_tok = auth[len("Bearer ") :].strip()
+            elif hdr_tok:
+                presented_tok = hdr_tok
+            if presented_tok is not None:
+                client_ip = self._client_ip()
+                retry_after = _check_rate_limit(client_ip)
+                if retry_after is not None:
+                    self._send_rate_limited(retry_after)
+                    return False, True
+                if presented_tok and hmac.compare_digest(presented_tok, config.token):
+                    _clear_auth_failures(client_ip)
+                    return True, False
+                _record_auth_failure(client_ip)
+                return False, False
             raw_cookie = self.headers.get("Cookie") or ""
             if raw_cookie:
                 c = http.cookies.SimpleCookie()
                 try:
                     c.load(raw_cookie)
                 except http.cookies.CookieError:
-                    return False
+                    return False, False
                 if cookie_name in c and verify_session_cookie(config.token, c[cookie_name].value):
-                    return True
-            return False
+                    return True, False
+            return False, False
+
+        def _is_authenticated(self) -> bool:
+            ok, _sent = self._authenticate_request()
+            return ok
 
         def _check_fetch_metadata(self) -> bool:
             site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
@@ -1292,22 +1409,35 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
             qs = parse_qs(parsed.query)
 
             if route in ("/", "/index.html"):
-                q_tok = (qs.get("token") or [""])[0]
-                if q_tok and hmac.compare_digest(q_tok, config.token):
-                    sess = sign_session_cookie(config.token, config.expires_at)
-                    clean_target = parsed.path or "/"
-                    self.send_response(302)
-                    self.send_header("Location", clean_target)
-                    self.send_header("Set-Cookie", self._cookie_header(sess))
-                    self.send_header("Content-Length", "0")
-                    self._set_common_headers()
-                    self.end_headers()
+                if "token" in qs:
+                    client_ip = self._client_ip()
+                    retry_after = _check_rate_limit(client_ip)
+                    if retry_after is not None:
+                        self._send_rate_limited(retry_after)
+                        return
+                    q_tok = (qs.get("token") or [""])[0]
+                    if q_tok and hmac.compare_digest(q_tok, config.token):
+                        _clear_auth_failures(client_ip)
+                        sess = sign_session_cookie(config.token, config.expires_at)
+                        clean_target = parsed.path or "/"
+                        self.send_response(302)
+                        self.send_header("Location", clean_target)
+                        self.send_header("Set-Cookie", self._cookie_header(sess))
+                        self.send_header("Content-Length", "0")
+                        self._set_common_headers()
+                        self.end_headers()
+                        return
+                    _record_auth_failure(client_ip)
+                    self._send_json(401, {"error": "Invalid token"})
+                    return
+                authed, sent = self._authenticate_request()
+                if sent:
                     return
                 nonce = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
                 html_doc = _render_html(
                     nonce=nonce,
                     remote_name=config.remote_name,
-                    authenticated=self._is_authenticated(),
+                    authenticated=authed,
                     read_only=config.read_only,
                 ).encode("utf-8")
                 self.send_response(200)
@@ -1318,7 +1448,10 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                 self.wfile.write(html_doc)
                 return
 
-            if not self._is_authenticated():
+            authed, sent = self._authenticate_request()
+            if sent:
+                return
+            if not authed:
                 self._send_json(401, {"error": "Unauthorized"})
                 return
 
@@ -1375,6 +1508,12 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
             qs = parse_qs(parsed.query)
 
             if route == "/api/login":
+                client_ip = self._client_ip()
+                retry_after = _check_rate_limit(client_ip)
+                if retry_after is not None:
+                    self._send_rate_limited(retry_after)
+                    return
+
                 body = self._read_body(MAX_JSON_BODY_BYTES)
                 if body is None:
                     return
@@ -1385,8 +1524,10 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                     return
                 presented = str(data.get("token") or "")
                 if not hmac.compare_digest(presented, config.token):
+                    _record_auth_failure(client_ip)
                     self._send_json(401, {"error": "Invalid token"})
                     return
+                _clear_auth_failures(client_ip)
                 sess = sign_session_cookie(config.token, config.expires_at)
                 self._send_json(
                     200,
@@ -1406,7 +1547,10 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                 )
                 return
 
-            if not self._is_authenticated():
+            authed, sent = self._authenticate_request()
+            if sent:
+                return
+            if not authed:
                 self._send_json(401, {"error": "Unauthorized"})
                 return
 

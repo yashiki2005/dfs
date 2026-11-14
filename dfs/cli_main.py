@@ -255,15 +255,20 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
         registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
         ost_value = resolve_ost(remote, registry)
         ost_alternates = list(remote.ost_alternates)
-        if not remote.ost:
+        ost_cert_sha256 = (remote.ost_cert_sha256 or "").strip().lower()
+        ost_info_cache: Optional[Dict[str, Any]] = None
+        if not remote.ost or not ost_cert_sha256:
             try:
-                info = registry.ost_info()
-                for alt in info.get("alternates") or []:
-                    norm_alt = Remote.normalize_ost(str(alt))
-                    if norm_alt and norm_alt != ost_value and norm_alt not in ost_alternates:
-                        ost_alternates.append(norm_alt)
+                ost_info_cache = registry.ost_info()
             except Exception:
-                pass
+                ost_info_cache = None
+        if not remote.ost and ost_info_cache is not None:
+            for alt in ost_info_cache.get("alternates") or []:
+                norm_alt = Remote.normalize_ost(str(alt))
+                if norm_alt and norm_alt != ost_value and norm_alt not in ost_alternates:
+                    ost_alternates.append(norm_alt)
+        if not ost_cert_sha256 and ost_info_cache is not None:
+            ost_cert_sha256 = str(ost_info_cache.get("cert_sha256") or "").strip().lower()
         sub_path = resolve_path(remote, registry)
         try:
             host, port, canonical_ost = (
@@ -289,6 +294,8 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
             "ost_endpoint": canonical_ost,
             "ost_host": host,
             "ost_port": int(port),
+            "ost_cert_sha256": ost_cert_sha256,
+            "allow_tofu": bool(remote.allow_tofu),
             "priv_key": priv_key_value,
             "read_only": bool(remote.read_only),
             "registry_url": remote.registry,
@@ -366,6 +373,13 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
         cfg["root_pubkey"] = remote.root_pubkey
         changed = True
         tree_identity_changed = True
+    desired_ost_pin = (remote.ost_cert_sha256 or "").strip().lower()
+    if desired_ost_pin and str(cfg.get("ost_cert_sha256", "") or "").strip().lower() != desired_ost_pin:
+        cfg["ost_cert_sha256"] = desired_ost_pin
+        changed = True
+    if bool(cfg.get("allow_tofu", False)) != bool(remote.allow_tofu):
+        cfg["allow_tofu"] = bool(remote.allow_tofu)
+        changed = True
     if changed:
         if tree_identity_changed:
             _reset_workdir_pin(mount_root)
@@ -1089,10 +1103,13 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
     registries = list(remote.registry_urls())
     ost_primary = remote.ost
     ost_alts = list(remote.ost_alternates)
+    ost_cert_sha256 = (remote.ost_cert_sha256 or "").strip().lower()
     try:
         info = cli_mod.RemoteRegistryClient(registries).ost_info()
         if not ost_primary and info.get("endpoint"):
             ost_primary = Remote.normalize_ost(str(info["endpoint"]))
+        if not ost_cert_sha256 and info.get("cert_sha256"):
+            ost_cert_sha256 = str(info["cert_sha256"]).strip().lower()
         raw_relays = list(info.get("relay_endpoints") or [])
         if info.get("relay_endpoint"):
             raw_relays.insert(0, info["relay_endpoint"])
@@ -1183,6 +1200,7 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
                 path=remote.path,
                 ost=ost_primary,
                 ost_alternates=ost_alts,
+                ost_cert_sha256=ost_cert_sha256,
                 role_epoch=remote.role_epoch,
                 poll_seconds=int(args.poll),
                 use_candidacy=bool(args.candidacy),
@@ -1195,6 +1213,7 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
             path=remote.path,
             ost=ost_primary,
             ost_alternates=ost_alts,
+            ost_cert_sha256=ost_cert_sha256,
             role_epoch=remote.role_epoch,
             poll_seconds=int(args.poll),
             use_candidacy=bool(args.candidacy),
@@ -1265,6 +1284,10 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     )
     p.add_argument("--ost", help="L3 OST の host:port（例: 172.16.1.60:19443）")
     p.add_argument(
+        "--ost-cert-sha256",
+        help="L3 OST の TLS 証明書 SHA-256 ピン（ローテーション時や厳格ピン留め用）",
+    )
+    p.add_argument(
         "--ost-alternate", action="append", default=[],
         help="読み取り用の複製 OST の host:port（複数指定可）",
     )
@@ -1300,7 +1323,11 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     p.add_argument("--node-name", help="端末名（既定はリモート名）")
     p.add_argument(
         "--root-pubkey",
-        help="root アンカーの公開鍵ファイル（信頼の根）。省略時は名簿から取得して記録する（TOFU）",
+        help="root アンカーの公開鍵ファイル（信頼の根）",
+    )
+    p.add_argument(
+        "--allow-tofu", action="store_true",
+        help="root 公開鍵未設定時に TOFU（初回信頼）を明示的に許可する",
     )
     p.add_argument(
         "--dnssec-domain",
@@ -1747,7 +1774,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument(
         "--bind",
         default=None,
-        help="待機アドレス（既定 0.0.0.0、--base-path/--public-url 指定時は 127.0.0.1）",
+        help="待機アドレス（既定 127.0.0.1。LAN 内のスマホ等から直接接続するには --bind 0.0.0.0 を指定）",
     )
     p_web.add_argument(
         "--port",
@@ -1784,6 +1811,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--secure-cookie",
         action="store_true",
         help="セッションクッキーに常に Secure 属性を付ける",
+    )
+    p_web.add_argument(
+        "--trusted-proxy",
+        action="append",
+        default=[],
+        help="X-Forwarded-For を信頼するリバースプロキシの IP または CIDR（複数指定可）",
     )
     p_web.set_defaults(func=cmd_web)
 

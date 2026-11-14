@@ -115,7 +115,7 @@ class RcloneCase(unittest.TestCase):
         store.set(Remote(
             name="t", registry=self.server.registry_url, ost=self.server.ost_endpoint,
             path="/example.com/alice/notes", key=str(self.alice_key), secret="s3cret",
-            workdir=str(self.workdir),
+            workdir=str(self.workdir), root_pubkey=self.root_pub,
         ))
 
         self.local = self.base / "local"

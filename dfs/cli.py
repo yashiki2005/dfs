@@ -420,6 +420,7 @@ class PersistentRegistryState:
         self.service = DirectoryRegistryService(root_anchor, root_pubkey)
         # L3 OST の広告用。`serve` の起動時に埋める（ロケータが無い初回でも引けるように）。
         self.ost_endpoint: str = ""
+        self.ost_cert_sha256: str = ""
         self.ost_alternates: list[str] = []
         self.relay_endpoint: str = ""
         self.relay_endpoints: list[str] = []
@@ -474,14 +475,22 @@ class PersistentRegistryState:
         write_private_json(self.state_file, data)
 
     def load_ost_chunks(self, ost: ChunkStoreServer) -> None:
+        if getattr(ost, "chunks_dir", None) is not None:
+            return
         for f in self.chunks_dir.glob("*.blk"):
             ost.store[f.stem] = f.read_bytes()
 
     def save_ost_chunks(self, ost: ChunkStoreServer) -> None:
         store_lock = getattr(ost, "_store_lock", None)
+        dirty = getattr(ost, "_dirty_wire_ids", None)
         if store_lock is not None:
             with store_lock:
-                items = list(ost.store.items())
+                if dirty is not None:
+                    wids = list(dirty)
+                    items = [(wid, ost.store[wid]) for wid in wids if wid in ost.store]
+                    dirty.clear()
+                else:
+                    items = list(ost.store.items())
         else:
             items = list(ost.store.items())
         for wid, blob in items:
@@ -1034,6 +1043,7 @@ def make_registry_http_handler(
                         # サーバ自身が把握している endpoint を返す。
                         response_body = {
                             "endpoint": pstate.ost_endpoint,
+                            "cert_sha256": pstate.ost_cert_sha256,
                             "alternates": list(pstate.ost_alternates),
                             "relay_endpoint": pstate.relay_endpoint,
                             "relay_endpoints": list(pstate.relay_endpoints),
@@ -1106,6 +1116,8 @@ def load_node_from_mount(
         libp2p_psk=cfg.get("libp2p_psk") or "",
         role_epoch=int(cfg.get("role_epoch", 1)),
         compression=str(cfg.get("compression", "auto") or "auto"),
+        ost_cert_sha256=cfg.get("ost_cert_sha256") or None,
+        allow_tofu=bool(cfg.get("allow_tofu", False)),
     )
     return node, cfg, reg_client
 
@@ -1139,7 +1151,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
             capture_output=True,
         )
 
-    ost = ChunkStoreServer(cert, key, host=args.bind, port=args.ost_port)
+    ost = ChunkStoreServer(
+        cert, key, host=args.bind, port=args.ost_port, chunks_dir=chunks_dir
+    )
     pstate = PersistentRegistryState(
         state_dir, args.root_anchor, root_pubkey, chunks_dir=chunks_dir
     )
@@ -1162,6 +1176,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     advertised_host = args.advertise or ("127.0.0.1" if args.bind in ("0.0.0.0", "::") else args.bind)
     endpoint_host = f"[{advertised_host}]" if ":" in advertised_host else advertised_host
     pstate.ost_endpoint = f"tls://{endpoint_host}:{ost.port}"
+    pstate.ost_cert_sha256 = getattr(ost, "cert_sha256", "") or ""
     pstate.own_registry_url = f"http://{endpoint_host}:{args.registry_port}"
 
     relay_token = getattr(args, "relay_token", None) or os.environ.get("DFS_RELAY_TOKEN", "")

@@ -99,11 +99,14 @@ class DFSNode:
         role_epoch: int = 1,
         compression: str = "auto",
         ost_endpoint: Optional[str] = None,
+        ost_cert_sha256: Optional[str] = None,
+        allow_tofu: bool = False,
     ):
         self.name = name
         self.sub_path = sub_path
         self.clayfs = ClayFSAdapter(mount_root)
         self.crypto = ContentAddressedCrypto(tree_secret)
+        self.ost_cert_sha256: Optional[str] = (ost_cert_sha256 or "").strip().lower() or None
         if ost_endpoint:
             primary_canonical = self._normalize_ost_endpoint(ost_endpoint)
         else:
@@ -114,11 +117,12 @@ class DFSNode:
         seen = set()
         self.ost_endpoints: List[str] = []
         ost_clients: List[Any] = []
-        for canonical in raw_endpoints:
+        for idx, canonical in enumerate(raw_endpoints):
             if canonical in seen:
                 continue
             seen.add(canonical)
-            ost_clients.append(make_ost_client(canonical))
+            pin = self.ost_cert_sha256 if (idx == 0 and not canonical.startswith("http://")) else None
+            ost_clients.append(make_ost_client(canonical, expected_cert_sha256=pin))
             self.ost_endpoints.append(canonical)
         relay_write_fallbacks = [
             c
@@ -170,6 +174,7 @@ class DFSNode:
         self.l4 = L4LogClient(
             sub_path, priv_key_path, pub_key_str,
             pin_file=pin_file, root_pubkey=root_pubkey,
+            allow_tofu=bool(allow_tofu),
         )
 
     def switch_credentials(self, new_priv_key: Path | str, new_pub_key_str: str) -> None:
@@ -218,7 +223,17 @@ class DFSNode:
             if canonical in seen:
                 continue
             seen.add(canonical)
-            clients.append(make_ost_client(canonical))
+            pin = (
+                self.ost_cert_sha256
+                if (
+                    self.ost_cert_sha256
+                    and self.ost_endpoints
+                    and canonical == self.ost_endpoints[0]
+                    and not canonical.startswith("http://")
+                )
+                else None
+            )
+            clients.append(make_ost_client(canonical, expected_cert_sha256=pin))
         if self.libp2p_client is not None:
             clients.append(self.libp2p_client)
         self.read_ost = SwarmOSTClient(

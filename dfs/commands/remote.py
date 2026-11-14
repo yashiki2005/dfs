@@ -508,6 +508,16 @@ def cmd_config(args: argparse.Namespace) -> int:
                 root_fingerprint = _cm.ssh_key_fingerprint(root_pubkey)
                 root_source = "名簿から取得（TOFU）"
 
+        ost_cert_sha256 = (getattr(args, "ost_cert_sha256", None) or "").strip().lower()
+        if not ost_cert_sha256:
+            try:
+                ost_info = _cm.cli_mod.RemoteRegistryClient(
+                    [registry, *registry_alternates]
+                ).ost_info()
+                ost_cert_sha256 = str(ost_info.get("cert_sha256") or "").strip().lower()
+            except Exception:
+                ost_cert_sha256 = ""
+
         # --secret が無ければ端末から読む（エコーなし）。
         secret = args.secret
         secret_from_prompt = False
@@ -541,6 +551,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             node_name=args.node_name or args.name,
             root_pubkey=root_pubkey,
             root_fingerprint=root_fingerprint,
+            ost_cert_sha256=ost_cert_sha256,
+            allow_tofu=bool(getattr(args, "allow_tofu", False)),
         )
         store.set(remote)
         print(f"[dfscli] リモート {remote.name!r} を保存しました: {store.path}")
@@ -569,11 +581,13 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"  tree_secret : *** （{how}）")
         else:
             print("  tree_secret : （未指定。書く前に設定してください）")
+        if ost_cert_sha256:
+            print(f"  OST 証明書ピン: {ost_cert_sha256}")
         if root_pubkey:
             print(f"  root アンカー: {root_fingerprint} （{root_source}）")
             print("                 これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）")
         else:
-            print("  root アンカー: （取得できませんでした。--root-pubkey で指定してください）")
+            print("  root アンカー: （取得できませんでした。--root-pubkey で指定するか --allow-tofu を明示してください）")
         return 0
 
     if args.action == "delete":
@@ -585,8 +599,9 @@ def cmd_config(args: argparse.Namespace) -> int:
     if args.action == "show":
         r = store.get(args.name)
         for key in ("name", "registry", "registry_alternates", "ost", "ost_alternates",
-                    "libp2p_peers", "libp2p_psk", "path", "key", "workdir", "epoch",
-                    "role_epoch", "compression", "node_name", "root_fingerprint"):
+                    "ost_cert_sha256", "libp2p_peers", "libp2p_psk", "path", "key", "workdir",
+                    "epoch", "role_epoch", "compression", "node_name", "root_fingerprint",
+                    "allow_tofu"):
             value = getattr(r, key)
             if key in ("secret", "libp2p_psk"):
                 value = "***"
@@ -755,6 +770,14 @@ def cmd_invite(args: argparse.Namespace) -> int:
 
         remote_name = (args.name or info["name"]).strip()
         workdir = str(Path(args.workdir).expanduser()) if args.workdir else ""
+        invite_ost_pin = str(info.get("ost_cert_sha256") or "").strip().lower()
+        if not invite_ost_pin:
+            try:
+                invite_ost_pin = str(
+                    _cm.cli_mod.RemoteRegistryClient(registries).ost_info().get("cert_sha256") or ""
+                ).strip().lower()
+            except Exception:
+                invite_ost_pin = ""
         remote = _cm.Remote(
             name=remote_name,
             registry=registries[0],
@@ -769,6 +792,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
             node_name=remote_name,
             root_pubkey=info["root_pubkey"],
             root_fingerprint=_cm.ssh_key_fingerprint(info["root_pubkey"]),
+            ost_cert_sha256=invite_ost_pin,
             read_only=True,
         )
         store.set(remote)
@@ -819,6 +843,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
                 node_name=write_name,
                 root_pubkey=info["root_pubkey"],
                 root_fingerprint=_cm.ssh_key_fingerprint(info["root_pubkey"]),
+                ost_cert_sha256=invite_ost_pin,
                 read_only=False,
             )
             store.set(out_remote)
@@ -1031,6 +1056,14 @@ def cmd_join(args: argparse.Namespace) -> int:
                 remote_path = f"{anchor_clean}/{subtree_label}"
         else:
             remote_path = base_anchor
+        join_ost_pin = existing_remote.ost_cert_sha256 if existing_remote is not None else ""
+        if not join_ost_pin:
+            try:
+                join_ost_pin = str(
+                    _cm.cli_mod.RemoteRegistryClient([base_url]).ost_info().get("cert_sha256") or ""
+                ).strip().lower()
+            except Exception:
+                join_ost_pin = ""
         remote = _cm.Remote(
             name=remote_name,
             registry=base_url,
@@ -1044,6 +1077,7 @@ def cmd_join(args: argparse.Namespace) -> int:
             node_name=remote_name,
             root_pubkey=discovered.root_pubkey if discovered is not None else "",
             root_fingerprint=_cm.ssh_key_fingerprint(discovered.root_pubkey) if discovered is not None else "",
+            ost_cert_sha256=join_ost_pin,
             read_only=not bool(key_value),
         )
         store.set(remote)

@@ -157,6 +157,7 @@ class RootAnchorCase(unittest.TestCase):
         client = L4LogClient(
             self.path, self.client_key, self.client_pub,
             pin_file=self.base / "pin_tofu.json",  # root_pubkey を渡さない
+            allow_tofu=True,
         )
         result = client.sync_head(self._evil_registry())
         self.assertEqual(result["payload"]["version"], 1)
