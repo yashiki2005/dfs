@@ -193,6 +193,31 @@ def public_key_of(priv_key: Path) -> str:
     return res.stdout.strip()
 
 
+def _ensure_remote_secret(remote: Remote) -> Remote:
+    """``remote.secret`` が空なら端末から 2 度入力して ``RemoteStore`` に保存する。"""
+    if remote.secret:
+        return remote
+    # tree_secret はサーバに置かない共有秘密なので、L2 からは引けない。
+    # 対話端末ならその場で 2 度入力して remotes.json に保存する。
+    secret = prompt_secret(
+        f"tree_secret ({remote.name}): ",
+        f"tree_secret ({remote.name}, 確認): ",
+    )
+    if secret:
+        remote.secret = secret
+        store = RemoteStore()
+        if store.get(remote.name) is not None:
+            store.set(remote)
+            print(f"[dfscli] 共有秘密鍵 (tree_secret) を保存しました: {store.path}", file=sys.stderr)
+    if not remote.secret:
+        raise UsageError(
+            f"Remote {remote.name!r} has no tree_secret.\n"
+            f"Set it with 'dfscli config create {remote.name} ... --secret <共有秘密>' "
+            f"(or edit {RemoteStore().path})."
+        )
+    return remote
+
+
 def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     """リモートの作業ディレクトリを用意し、ノードを組み立てる。
 
@@ -218,14 +243,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
             priv_key = Path(remote.key).expanduser()
             _ensure_keypair(priv_key)
             priv_key_value = str(priv_key)
-        if not remote.secret:
-            # tree_secret はサーバに置かない共有秘密なので、L2 からは引けない。
-            # 空のまま暗号化すると、誰でも復号できる木を作ってしまう。
-            raise UsageError(
-                f"Remote {remote.name!r} has no tree_secret.\n"
-                f"Set it with 'dfscli config create {remote.name} ... --secret <共有秘密>' "
-                f"(or edit {RemoteStore().path})."
-            )
+        remote = _ensure_remote_secret(remote)
         registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
         ost_value = resolve_ost(remote, registry)
         ost_alternates = list(remote.ost_alternates)
@@ -316,6 +334,8 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     if remote.path and cfg.get("sub_path") != remote.path:
         cfg["sub_path"] = remote.path
         changed = True
+    if not remote.secret and not str(cfg.get("tree_secret", "") or ""):
+        remote = _ensure_remote_secret(remote)
     if remote.secret and cfg.get("tree_secret") != remote.secret:
         cfg["tree_secret"] = remote.secret
         changed = True
@@ -855,39 +875,262 @@ def _probe_registry_tcp(url: str, timeout: float = 0.4) -> bool:
         return False
 
 
+def _remote_domain_candidate(remote: Remote) -> str:
+    """リモート定義から DNSSEC 検証対象のドメイン名候補を取り出す。"""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    def _is_domain(val: str) -> bool:
+        s = (val or "").strip().rstrip(".")
+        if not s or "." not in s or s == "localhost":
+            return False
+        try:
+            ipaddress.ip_address(s.strip("[]"))
+            return False
+        except ValueError:
+            return True
+
+    if _is_domain(remote.name):
+        return remote.name.strip().rstrip(".")
+    host = urlsplit(remote.registry).hostname or ""
+    if _is_domain(host):
+        return host.strip().rstrip(".")
+    return ""
+
+
+def _probe_remote_status(remote: Remote) -> Dict[str, Any]:
+    """L2 (root/domain dfs) への問い合わせと ``_dfs.<domain>`` DNSSEC 検証を行う。"""
+    from .dnssec import DEFAULT_RECORD_PREFIX, has_txt_record
+
+    online = _probe_registry_tcp(remote.registry)
+    status: Dict[str, Any] = {
+        "online": online,
+        "l2_ok": None,
+        "l2_error": "",
+        "role": None,
+        "root_anchor": "",
+        "paths_count": None,
+        "pubkey_match": None,
+        "dnssec": None,
+        "dnssec_record": "",
+        "dnssec_error": "",
+    }
+    if online:
+        try:
+            urls = [u for u in [remote.registry, *remote.registry_alternates] if u]
+            info = cli_mod.RemoteRegistryClient(urls).list_paths()
+            anchor = str(info.get("root_anchor") or "")
+            server_pub = str(info.get("root_pubkey") or "").strip()
+            paths = info.get("paths")
+            status["l2_ok"] = True
+            status["root_anchor"] = anchor
+            domain_cand = _remote_domain_candidate(remote)
+            if anchor == "/" or remote.name in DEFAULT_ROOT_DFS_DOMAINS or domain_cand in DEFAULT_ROOT_DFS_DOMAINS:
+                status["role"] = "root"
+            elif anchor:
+                status["role"] = "domain"
+            status["paths_count"] = len(paths) if isinstance(paths, dict) else 0
+            if remote.root_pubkey and server_pub:
+                status["pubkey_match"] = (remote.root_pubkey == server_pub)
+        except Exception as e:  # noqa: BLE001
+            status["l2_ok"] = False
+            status["l2_error"] = str(e)
+
+    domain = _remote_domain_candidate(remote)
+    if domain:
+        record_name = f"{DEFAULT_RECORD_PREFIX}.{domain}"
+        try:
+            if has_txt_record(record_name):
+                status["dnssec_record"] = record_name
+                try:
+                    disc = discover_domain(domain, record_name=record_name)
+                    if remote.root_pubkey and disc.root_pubkey and remote.root_pubkey != disc.root_pubkey:
+                        status["dnssec"] = "mismatch"
+                        status["dnssec_error"] = "root_pubkey mismatch with DNSSEC"
+                    else:
+                        status["dnssec"] = "verified"
+                except DiscoveryError as e:
+                    status["dnssec"] = "failed"
+                    status["dnssec_error"] = str(e)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return status
+
+
+DEFAULT_ROOT_DFS_DOMAINS = ("yashiki.top",)
+
+
+def _probe_root_dfs_domain(domain: str) -> Dict[str, Any]:
+    """既定の root dfs ドメインを決め打ちで DNSSEC 検証し、L2 へ問い合わせる。"""
+    from .dnssec import DEFAULT_RECORD_PREFIX, has_txt_record
+
+    record_name = f"{DEFAULT_RECORD_PREFIX}.{domain}"
+    status: Dict[str, Any] = {
+        "name": domain,
+        "registered": False,
+        "registry": "",
+        "path": f"/{domain}",
+        "online": False,
+        "l2_ok": None,
+        "l2_error": "",
+        "role": "root",
+        "root_anchor": "",
+        "paths_count": None,
+        "dnssec": None,
+        "dnssec_record": record_name,
+        "dnssec_error": "",
+    }
+    try:
+        if not has_txt_record(record_name):
+            status["dnssec"] = "none"
+            status["dnssec_error"] = f"{record_name} TXT not found"
+            return status
+        disc = discover_domain(domain, record_name=record_name)
+        status["dnssec"] = "verified"
+        status["registry"] = disc.primary_url
+        status["path"] = disc.root_anchor or f"/{domain}"
+        urls = [u for u in [disc.primary_url, *disc.alternate_urls] if u]
+        online = _probe_registry_tcp(disc.primary_url) if disc.primary_url else False
+        status["online"] = online
+        if online and urls:
+            try:
+                info = cli_mod.RemoteRegistryClient(urls).list_paths()
+                paths = info.get("paths")
+                status["l2_ok"] = True
+                status["root_anchor"] = str(info.get("root_anchor") or status["path"])
+                status["paths_count"] = len(paths) if isinstance(paths, dict) else 0
+            except Exception as e:  # noqa: BLE001
+                status["l2_ok"] = False
+                status["l2_error"] = str(e)
+    except DiscoveryError as e:
+        status["dnssec"] = "failed"
+        status["dnssec_error"] = str(e)
+    except Exception as e:  # noqa: BLE001
+        status["dnssec"] = "failed"
+        status["dnssec_error"] = str(e)
+    return status
+
+
+def _format_remote_status_details(st: Dict[str, Any]) -> str:
+    """``_probe_remote_status`` / ``_probe_root_dfs_domain`` の詳細文字列を組み立てる。"""
+    details: List[str] = []
+    if st.get("l2_ok") is True:
+        role_label = "root dfs" if st.get("role") == "root" else "domain dfs"
+        anchor = st.get("root_anchor") or "/"
+        paths_count = st.get("paths_count")
+        l2_part = f"{role_label} (anchor={anchor}"
+        if paths_count is not None:
+            l2_part += f", paths={paths_count}"
+        if st.get("pubkey_match") is False:
+            l2_part += ", pubkey=MISMATCH"
+        l2_part += ")"
+        details.append(l2_part)
+    elif st.get("l2_ok") is False and st.get("l2_error"):
+        details.append(f"L2 error ({st['l2_error']})")
+    dnssec_state = st.get("dnssec")
+    if dnssec_state == "verified":
+        details.append(f"DNSSEC: verified ({st.get('dnssec_record')})")
+    elif dnssec_state in ("failed", "mismatch"):
+        details.append(f"DNSSEC: FAILED ({st.get('dnssec_record')}: {st.get('dnssec_error')})")
+    elif dnssec_state == "none":
+        details.append(f"DNSSEC: none ({st.get('dnssec_record')})")
+    return ", ".join(details)
+
+
 def cmd_listremotes(args: argparse.Namespace) -> int:
     from concurrent.futures import ThreadPoolExecutor
     from .svc import ServiceStore
 
     store = RemoteStore()
     names = store.names()
+    no_check = bool(getattr(args, "no_check", False))
+    is_prune = bool(getattr(args, "prune", False))
+
+    known_domains = {n for n in names} | {
+        _remote_domain_candidate(store.remotes[n]) for n in names
+    }
+    builtin_roots_to_probe = (
+        []
+        if (no_check or is_prune)
+        else [d for d in DEFAULT_ROOT_DFS_DOMAINS if d not in known_domains]
+    )
+
     if not names:
+        root_statuses: List[Dict[str, Any]] = []
+        if builtin_roots_to_probe:
+            with ThreadPoolExecutor(max_workers=len(builtin_roots_to_probe)) as pool:
+                root_statuses = list(pool.map(_probe_root_dfs_domain, builtin_roots_to_probe))
+        if getattr(args, "json", False):
+            print(json.dumps(root_statuses, ensure_ascii=False, indent=2))
+            return 0
         print("(登録済みリモートはありません。'dfssvc start' または 'dfscli join <url>' を実行してください)")
+        if root_statuses:
+            print("\n既定の root dfs:")
+            for rst in root_statuses:
+                state_tag = "online" if rst["online"] else "unreachable"
+                reg_disp = rst["registry"] or "-"
+                print(f"dfs://{rst['name']}/ -> {reg_disp} {rst['path']} [{state_tag}, unregistered]")
+                detail_str = _format_remote_status_details(rst)
+                if detail_str:
+                    print(f"  status: {detail_str}")
+                print(f"  参加するには: dfscli join dfs://{rst['name']}")
         return 0
 
     svc_store = ServiceStore()
     running_svcs = {n for n, s in svc_store.services.items() if s.is_running()}
-    urls = {n: store.remotes[n].registry for n in names}
 
-    if getattr(args, "no_check", False):
-        reachable = {n: None for n in names}
+    if no_check:
+        statuses = {
+            n: {
+                "online": None,
+                "l2_ok": None,
+                "l2_error": "",
+                "role": None,
+                "root_anchor": "",
+                "paths_count": None,
+                "pubkey_match": None,
+                "dnssec": None,
+                "dnssec_record": "",
+                "dnssec_error": "",
+            }
+            for n in names
+        }
+        root_statuses = []
     else:
-        with ThreadPoolExecutor(max_workers=min(8, len(names))) as pool:
-            futs = {n: pool.submit(_probe_registry_tcp, urls[n]) for n in names}
-            reachable = {n: futs[n].result() for n in names}
+        total_jobs = len(names) + len(builtin_roots_to_probe)
+        with ThreadPoolExecutor(max_workers=min(8, max(1, total_jobs))) as pool:
+            futs = {n: pool.submit(_probe_remote_status, store.remotes[n]) for n in names}
+            root_futs = [pool.submit(_probe_root_dfs_domain, d) for d in builtin_roots_to_probe]
+            statuses = {n: futs[n].result() for n in names}
+            root_statuses = [f.result() for f in root_futs]
+    reachable = {n: statuses[n]["online"] for n in names}
 
     if getattr(args, "json", False):
         out = []
         for n in names:
             r = store.remotes[n]
+            st = statuses[n]
             out.append({
                 "name": n,
+                "registered": True,
                 "registry": r.registry,
                 "path": r.path or "/",
                 "read_only": bool(r.read_only),
-                "online": reachable[n],
+                "online": st["online"],
                 "dfssvc": n in running_svcs,
+                "role": st["role"],
+                "l2_ok": st["l2_ok"],
+                "l2_error": st["l2_error"] or None,
+                "root_anchor": st["root_anchor"] or None,
+                "paths_count": st["paths_count"],
+                "pubkey_match": st["pubkey_match"],
+                "dnssec": st["dnssec"],
+                "dnssec_record": st["dnssec_record"] or None,
+                "dnssec_error": st["dnssec_error"] or None,
             })
+        for rst in root_statuses:
+            out.append(rst)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
 
@@ -940,6 +1183,20 @@ def cmd_listremotes(args: argparse.Namespace) -> int:
             tags.append("dfssvc")
         tag_str = ", ".join(tags)
         print(f"dfs://{name}/ -> {r.registry} {r.path or '/'} [{tag_str}]")
+        detail_str = _format_remote_status_details(statuses[name])
+        if detail_str:
+            print(f"  status: {detail_str}")
+
+    if root_statuses:
+        print("\n既定の root dfs:")
+        for rst in root_statuses:
+            state_tag = "online" if rst["online"] else "unreachable"
+            reg_disp = rst["registry"] or "-"
+            print(f"dfs://{rst['name']}/ -> {reg_disp} {rst['path']} [{state_tag}, unregistered]")
+            detail_str = _format_remote_status_details(rst)
+            if detail_str:
+                print(f"  status: {detail_str}")
+            print(f"  参加するには: dfscli join dfs://{rst['name']}")
 
     hint_name = first_online or names[0]
     print(
@@ -2257,8 +2514,7 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
         raise UsageError(
             f"Remote {remote.name!r} に root_pubkey がありません。TOFU を避けるため必須です"
         )
-    if not remote.secret:
-        raise UsageError(f"Remote {remote.name!r} に tree_secret がありません")
+    remote = _ensure_remote_secret(remote)
     write_path = getattr(args, "write_path", None)
     registries = list(remote.registry_urls())
     ost_primary = remote.ost
@@ -2608,6 +2864,19 @@ def cmd_join(args: argparse.Namespace) -> int:
     parsed = urlsplit(base_url)
     host_label = parsed.hostname or "remote"
 
+    # 0) L2 名簿への疎通確認
+    urls = [base_url, *(list(discovered.alternate_urls) if discovered is not None else [])]
+    try:
+        l2_info = cli_mod.RemoteRegistryClient(urls).list_paths()
+    except Exception as e:  # noqa: BLE001
+        raise UsageError(f"L2 名簿 ({base_url}) への疎通確認に失敗しました: {e}") from e
+    if discovered is not None:
+        server_pub = str(l2_info.get("root_pubkey") or "").strip()
+        if server_pub and discovered.root_pubkey and server_pub != discovered.root_pubkey:
+            raise UsageError(
+                f"L2 名簿 ({base_url}) の root_pubkey が DNSSEC 記録と一致しません"
+            )
+
     # 1) /_ice/candidates から直接ピア候補を取得
     cands = discover_ice_candidates(base_url, timeout=2.0)
     direct_eps = [
@@ -2662,6 +2931,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         print(f"[dfscli] リモート {remote.name!r} を登録しました: {store.path}")
 
     print(f"[dfscli] join 対象: {base_url}")
+    anchor_info = str(l2_info.get("root_anchor") or "").strip() or "/"
+    print(f"[dfscli] L2 疎通確認 OK: {base_url} (anchor={anchor_info})")
     if direct_eps:
         print(f"[dfscli] 発見した直接 OST 候補 ({len(direct_eps)} 件): {', '.join(direct_eps)}")
     if svc_dir.is_dir():

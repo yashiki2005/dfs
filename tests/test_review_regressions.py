@@ -703,13 +703,40 @@ class TestReviewRegressions(unittest.TestCase):
                 root_anchor="/yashiki.top",
                 dnssec_validated=True,
             )
+            class FailReg:
+                def __init__(self, urls):
+                    pass
+
+                def list_paths(self):
+                    raise RuntimeError("HTTP 502: Bad Gateway")
+
+            class OkReg:
+                def __init__(self, urls):
+                    pass
+
+                def list_paths(self):
+                    return {"root_anchor": "/yashiki.top", "root_pubkey": pub, "paths": {}}
+
             with patch.dict(
                 os.environ,
                 {"HOME": str(home), "DFS_HOME": str(home), "DFS_CONFIG": str(cfg_file)},
             ):
                 with patch("dfs.dnssec.has_txt_record", return_value=True), patch.object(
                     cli_main, "discover_domain", return_value=discovered
-                ) as mock_discover, patch(
+                ), patch.object(
+                    cli_mod, "RemoteRegistryClient", FailReg
+                ), patch(
+                    "dfs.relay.discover_ice_candidates", return_value=[]
+                ):
+                    rc_fail = cli_main.main(["join", "dfs://yashiki.top"])
+                self.assertNotEqual(rc_fail, 0)
+                self.assertNotIn("yashiki.top", RemoteStore(cfg_file).remotes)
+
+                with patch("dfs.dnssec.has_txt_record", return_value=True), patch.object(
+                    cli_main, "discover_domain", return_value=discovered
+                ) as mock_discover, patch.object(
+                    cli_mod, "RemoteRegistryClient", OkReg
+                ), patch(
                     "dfs.relay.discover_ice_candidates", return_value=[]
                 ):
                     rc = cli_main.main(["join", "dfs://yashiki.top"])
@@ -722,6 +749,175 @@ class TestReviewRegressions(unittest.TestCase):
                 self.assertEqual(remote.path, "/yashiki.top")
                 self.assertEqual(remote.root_pubkey, pub)
                 self.assertTrue(remote.read_only)
+
+    def test_ensure_remote_secret_prompts_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            home.mkdir()
+            cfg_file = home / "remotes.json"
+            store = RemoteStore(cfg_file)
+            remote = Remote(
+                name="yashiki.top",
+                registry="https://l2.yashiki.top",
+                key="",
+                path="/yashiki.top",
+                secret="",
+                read_only=True,
+            )
+            store.set(remote)
+            with patch.dict(os.environ, {"DFS_HOME": str(home), "DFS_CONFIG": str(cfg_file)}):
+                with patch.object(cli_main, "prompt_secret", return_value="") as mock_empty:
+                    with self.assertRaises(cli_main.UsageError):
+                        cli_main._ensure_remote_secret(RemoteStore(cfg_file).get("yashiki.top"))
+                mock_empty.assert_called_once()
+
+                with patch.object(
+                    cli_main, "prompt_secret", return_value="my-shared-secret"
+                ) as mock_prompt:
+                    updated = cli_main._ensure_remote_secret(
+                        RemoteStore(cfg_file).get("yashiki.top")
+                    )
+                mock_prompt.assert_called_once()
+                self.assertEqual(updated.secret, "my-shared-secret")
+                self.assertEqual(RemoteStore(cfg_file).get("yashiki.top").secret, "my-shared-secret")
+
+    def test_listremotes_queries_l2_and_dnssec_status(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            home.mkdir()
+            _, pub = _keypair(root, "w")
+            cfg_file = home / "remotes.json"
+            store = RemoteStore(cfg_file)
+            store.set(
+                Remote(
+                    name="root",
+                    registry="https://root.example.net",
+                    key="",
+                    path="/root",
+                    root_pubkey=pub,
+                    read_only=True,
+                )
+            )
+            store.set(
+                Remote(
+                    name="yashiki.top",
+                    registry="https://l2.yashiki.top",
+                    key="",
+                    path="/yashiki.top",
+                    root_pubkey=pub,
+                    read_only=True,
+                )
+            )
+
+            class FakeReg:
+                def __init__(self, urls):
+                    self.url = urls[0] if isinstance(urls, list) else urls
+
+                def list_paths(self):
+                    if "root.example.net" in self.url:
+                        return {"root_anchor": "/", "root_pubkey": pub, "paths": {"/a": {}}}
+                    return {
+                        "root_anchor": "/yashiki.top",
+                        "root_pubkey": pub,
+                        "paths": {"/yashiki.top/d1": {}, "/yashiki.top/d2": {}},
+                    }
+
+            discovered = SimpleNamespace(
+                domain="yashiki.top",
+                primary_url="https://l2.yashiki.top",
+                alternate_urls=[],
+                root_pubkey=pub,
+                epoch=1,
+                root_anchor="/yashiki.top",
+                dnssec_validated=True,
+            )
+
+            with patch.dict(os.environ, {"DFS_HOME": str(home), "DFS_CONFIG": str(cfg_file)}), patch.object(
+                cli_main, "_probe_registry_tcp", return_value=True
+            ), patch.object(
+                cli_mod, "RemoteRegistryClient", FakeReg
+            ), patch(
+                "dfs.dnssec.has_txt_record",
+                side_effect=lambda rec: rec == "_dfs.yashiki.top",
+            ), patch.object(
+                cli_main, "discover_domain", return_value=discovered
+            ):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = cli_main.main(["listremotes"])
+                self.assertEqual(rc, 0)
+                out = buf.getvalue()
+                self.assertIn("root dfs (anchor=/, paths=1)", out)
+                self.assertIn("root dfs (anchor=/yashiki.top, paths=2), DNSSEC: verified (_dfs.yashiki.top)", out)
+
+                buf_json = io.StringIO()
+                with redirect_stdout(buf_json):
+                    rc2 = cli_main.main(["listremotes", "--json"])
+                self.assertEqual(rc2, 0)
+                rows = {r["name"]: r for r in json.loads(buf_json.getvalue())}
+                self.assertEqual(rows["root"]["role"], "root")
+                self.assertEqual(rows["root"]["paths_count"], 1)
+                self.assertIsNone(rows["root"]["dnssec"])
+                self.assertEqual(rows["yashiki.top"]["role"], "root")
+                self.assertEqual(rows["yashiki.top"]["paths_count"], 2)
+                self.assertEqual(rows["yashiki.top"]["dnssec"], "verified")
+                self.assertEqual(rows["yashiki.top"]["dnssec_record"], "_dfs.yashiki.top")
+
+    def test_listremotes_empty_probes_builtin_root_yashiki_top(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            home.mkdir()
+            _, pub = _keypair(root, "w")
+            cfg_file = home / "remotes.json"
+
+            class FakeReg:
+                def __init__(self, urls):
+                    self.urls = urls
+
+                def list_paths(self):
+                    return {"root_anchor": "/yashiki.top", "root_pubkey": pub, "paths": {"/yashiki.top/a": {}}}
+
+            discovered = SimpleNamespace(
+                domain="yashiki.top",
+                primary_url="https://l2.yashiki.top",
+                alternate_urls=[],
+                root_pubkey=pub,
+                epoch=1,
+                root_anchor="/yashiki.top",
+                dnssec_validated=True,
+            )
+
+            with patch.dict(os.environ, {"DFS_HOME": str(home), "DFS_CONFIG": str(cfg_file)}), patch.object(
+                cli_main, "_probe_registry_tcp", return_value=True
+            ), patch.object(
+                cli_mod, "RemoteRegistryClient", FakeReg
+            ), patch(
+                "dfs.dnssec.has_txt_record",
+                side_effect=lambda rec: rec == "_dfs.yashiki.top",
+            ), patch.object(
+                cli_main, "discover_domain", return_value=discovered
+            ):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = cli_main.main(["listremotes"])
+                self.assertEqual(rc, 0)
+                out = buf.getvalue()
+                self.assertIn("既定の root dfs:", out)
+                self.assertIn("dfs://yashiki.top/ -> https://l2.yashiki.top /yashiki.top [online, unregistered]", out)
+                self.assertIn("root dfs (anchor=/yashiki.top, paths=1), DNSSEC: verified (_dfs.yashiki.top)", out)
+
+    def test_serve_accepts_relay_hub_flag(self) -> None:
+        args = cli_mod.build_parser().parse_args(["serve", "--root-pubkey", "dummy.pub", "--relay-hub"])
+        self.assertTrue(args.enable_relay)
 
 
 if __name__ == "__main__":

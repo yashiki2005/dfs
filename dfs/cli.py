@@ -1422,6 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_serve.add_argument(
         "--enable-relay",
+        "--relay-hub",
         action="store_true",
         help="root リレーハブ (/relay/<node>/..., /_relay/*) を有効にする",
     )
