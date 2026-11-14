@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import signal
 import socket
@@ -64,22 +65,34 @@ DEFAULT_ROOT_ANCHOR = "/example.com"
 LEAF_TTL_DAYS = 365
 INTERMEDIATE_TTL_DAYS = LEAF_TTL_DAYS + 1
 BASE_DIR_NAME = "dfssvc"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 class ServiceError(Exception):
     """使い方の誤り・状態の不整合"""
 
 
+def validate_service_name(name: str) -> str:
+    """サービス名が安全な識別子であることを検証する（パストラバーサル防止）。"""
+    value = str(name or "").strip()
+    if not value or value in (".", "..") or not NAME_RE.match(value):
+        raise ServiceError(
+            f"不正なサービス名です: {name!r}（先頭は英数字、以降は英数字と _ . - のみ使用可）"
+        )
+    return value
+
+
 # --------------------------------------------------------------------------
 # 空きポート
 # --------------------------------------------------------------------------
-def is_port_free(port: int, host: str = "127.0.0.1") -> bool:
+def is_port_free(port: int, host: str = "127.0.0.1", *, allow_reuse: bool = False) -> bool:
     """そのポートを今から使えるか。
 
     2 段で確かめる。macOS では ``SO_REUSEADDR`` を立てた bind が、他のプロセスが
     ``0.0.0.0:port`` で待ち受けていても通ってしまう（``127.0.0.1:port`` とは別物として
     扱われるため）。まず接続を試して「誰かが答えている」なら使用中とし、次に
-    ``SO_REUSEADDR`` 無しの bind で確かめる。
+    ``SO_REUSEADDR`` 無しの bind で確かめる。``allow_reuse=True`` の場合は既存ポートの
+    再起動向けに ``TIME_WAIT`` 残骸を許容する。
 
     L3 は TLS のサーバなので、接続するとハンドシェイク前で切れる。connect が
     成功した時点で「そのポートには誰かがいる」と判断してよい。
@@ -98,12 +111,14 @@ def is_port_free(port: int, host: str = "127.0.0.1") -> bool:
         finally:
             s.close()
 
-    # 2) SO_REUSEADDR を付けずに bind してみる（TIME_WAIT の残骸にも当たる）
+    # 2) bind で確かめる（通常は TIME_WAIT 残骸も避けるため SO_REUSEADDR 無し）
     for family, socktype, proto, _canon, addr in socket.getaddrinfo(
         host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
     ):
         s = socket.socket(family, socktype, proto)
         try:
+            if allow_reuse:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(addr)
         except OSError:
             return False
@@ -298,12 +313,13 @@ class ServiceStore:
         except json.JSONDecodeError as e:
             raise ServiceError(f"{self.path} が壊れています: {e}") from e
         for name, item in (raw.get("services") or {}).items():
+            clean_name = validate_service_name(name)
             data = dict(item)
-            data.setdefault("name", name)
+            data.setdefault("name", clean_name)
             data.pop("registry_url", None)  # 派生値は保存しない
             data.pop("ost_endpoint", None)
             data.pop("running", None)
-            self.services[name] = Service(**data)
+            self.services[clean_name] = Service(**data)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -500,7 +516,12 @@ def wait_for_l2(registry_url: str, timeout: float = 30.0) -> bool:
 # コマンド
 # --------------------------------------------------------------------------
 def _base_dir(name: str) -> Path:
-    return dfs_home() / BASE_DIR_NAME / name
+    clean = validate_service_name(name)
+    root = (dfs_home() / BASE_DIR_NAME).resolve()
+    target = (root / clean).resolve()
+    if not target.is_relative_to(root) or target == root:
+        raise ServiceError(f"不正なサービスディレクトリです: {name!r}")
+    return dfs_home() / BASE_DIR_NAME / clean
 
 
 def _read_serve_pid(state_dir: Path, timeout: float = 5.0) -> int:
@@ -540,7 +561,7 @@ def _resolve_service_name(args: argparse.Namespace) -> str:
     pos_name = getattr(args, "target_name", None)
     if opt_name and pos_name and opt_name != pos_name:
         raise ServiceError(f"--name {opt_name!r} と位置引数 {pos_name!r} が一致しません")
-    return opt_name or pos_name or getattr(args, "name", None) or DEFAULT_NAME
+    return validate_service_name(opt_name or pos_name or getattr(args, "name", None) or DEFAULT_NAME)
 
 
 def _add_service_name_args(parser: argparse.ArgumentParser) -> None:
@@ -572,19 +593,36 @@ def cmd_start(args: argparse.Namespace) -> int:
         if not _stop_process(existing):
             raise ServiceError(f"既存のサービス {name!r} を停止できませんでした")
 
-    host = args.host
-    start_port = args.port if args.port is not None else DEFAULT_START_PORT
+    host_arg = getattr(args, "host", None)
+    host = host_arg if host_arg is not None else (existing.bind if existing and existing.bind else "127.0.0.1")
+    start_port = (
+        args.port
+        if args.port is not None
+        else (existing.registry_port if existing and existing.registry_port else DEFAULT_START_PORT)
+    )
     # 記録済みのサービスが使っているポートは避ける
-    while True:
-        used = {
-            s.registry_port for s in store.services.values() if s.name != name
-        } | {s.ost_port for s in store.services.values() if s.name != name}
-        while start_port in used:
-            start_port += 1
-        registry_port, ost_port = find_consecutive_free_ports(start_port, 2, host)
-        if registry_port not in used and ost_port not in used:
-            break
-        start_port = ost_port + 1
+    used = {
+        s.registry_port for s in store.services.values() if s.name != name
+    } | {s.ost_port for s in store.services.values() if s.name != name}
+    if (
+        args.port is None
+        and existing is not None
+        and existing.registry_port
+        and existing.ost_port
+        and existing.registry_port not in used
+        and existing.ost_port not in used
+        and is_port_free(existing.registry_port, host, allow_reuse=True)
+        and is_port_free(existing.ost_port, host, allow_reuse=True)
+    ):
+        registry_port, ost_port = existing.registry_port, existing.ost_port
+    else:
+        while True:
+            while start_port in used:
+                start_port += 1
+            registry_port, ost_port = find_consecutive_free_ports(start_port, 2, host)
+            if registry_port not in used and ost_port not in used:
+                break
+            start_port = ost_port + 1
 
     base = _base_dir(name)
     cfg_file = base / "dfssvc.json"
@@ -615,10 +653,14 @@ def cmd_start(args: argparse.Namespace) -> int:
         relay_node = name if name != DEFAULT_NAME else socket.gethostname().split(".")[0]
 
     effective_host = host
-    if is_hub and effective_host == "127.0.0.1":
+    if is_hub and host_arg is None and not (existing and existing.bind) and effective_host == "127.0.0.1":
         effective_host = "0.0.0.0"
 
-    effective_advertise = args.advertise or str(saved_cfg.get("advertise") or "")
+    effective_advertise = (
+        args.advertise
+        or str(saved_cfg.get("advertise") or "")
+        or (existing.advertise if existing and existing.advertise else "")
+    )
     if not effective_advertise and isinstance(hub_arg, str) and hub_arg not in ("", "auto"):
         from urllib.parse import urlsplit
 
@@ -628,16 +670,37 @@ def cmd_start(args: argparse.Namespace) -> int:
     if not effective_advertise:
         effective_advertise = "127.0.0.1" if effective_host in ("0.0.0.0", "::") else effective_host
 
-    state_dir = Path(args.state_dir).expanduser() if args.state_dir else base / "server"
+    effective_root_anchor = (
+        args.root_anchor
+        if getattr(args, "root_anchor", None) is not None
+        else (existing.root_anchor if existing and existing.root_anchor else DEFAULT_ROOT_ANCHOR)
+    )
+    state_dir = (
+        Path(args.state_dir).expanduser()
+        if args.state_dir
+        else (Path(existing.state_dir).expanduser() if existing and existing.state_dir else base / "server")
+    )
     raw_ost_dir = getattr(args, "ost_dir", None) or (existing.ost_dir if existing else "")
     ost_dir = (
         Path(raw_ost_dir).expanduser().resolve()
         if raw_ost_dir
         else state_dir / "ost_chunks"
     )
-    root_key = Path(args.root_key).expanduser() if args.root_key else base / "keys" / "root"
-    writer_key = Path(args.writer_key).expanduser() if args.writer_key else base / "keys" / "writer"
-    log_path = base / "serve.log"
+    root_key = (
+        Path(args.root_key).expanduser()
+        if args.root_key
+        else (Path(existing.root_key).expanduser() if existing and existing.root_key else base / "keys" / "root")
+    )
+    writer_key = (
+        Path(args.writer_key).expanduser()
+        if args.writer_key
+        else (Path(existing.writer_key).expanduser() if existing and existing.writer_key else base / "keys" / "writer")
+    )
+    log_path = (
+        Path(existing.log_path).expanduser()
+        if existing and existing.log_path
+        else base / "serve.log"
+    )
 
     ensure_private_dir(base)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -673,8 +736,12 @@ def cmd_start(args: argparse.Namespace) -> int:
     advertised = effective_advertise
     advertised_host = f"[{advertised}]" if ":" in advertised else advertised
     registry_url = f"http://{advertised_host}:{registry_port}"
-    service_role = args.role or "primary"
-    service_role_epoch = args.role_epoch if args.role_epoch is not None else 1
+    service_role = args.role or (existing.role if existing and existing.role else "primary")
+    service_role_epoch = (
+        args.role_epoch
+        if args.role_epoch is not None
+        else (existing.role_epoch if existing and existing.role_epoch else 1)
+    )
     state_file = state_dir / "registry_state.json"
     if state_file.is_file():
         try:
@@ -691,7 +758,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "--bind", effective_host,
         "--registry-port", str(registry_port),
         "--ost-port", str(ost_port),
-        "--root-anchor", args.root_anchor,
+        "--root-anchor", effective_root_anchor,
         "--root-pubkey", str(root_pub),
         "--state-dir", str(state_dir),
         "--ost-dir", str(ost_dir),
@@ -722,33 +789,35 @@ def cmd_start(args: argparse.Namespace) -> int:
     print(f"[dfssvc] root 鍵   : {root_key}")
     print(f"[dfssvc] ログ      : {log_path}")
 
-    if args.foreground:
-        print("[dfssvc] 前面で起動します（Ctrl-C で停止）")
-        env = dict(os.environ)
-        repo = _repo_root()
-        env["PYTHONPATH"] = str(repo) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-        if relay_token:
-            env["DFS_RELAY_TOKEN"] = relay_token
+    # 前回強制終了時などに残留した stop.request / serve.pid を掃除してから起動する
+    for stale_name in ("stop.request", "serve.pid"):
         try:
-            return subprocess.call(cmd, env=env)
-        except KeyboardInterrupt:
-            return 0
+            (state_dir / stale_name).unlink(missing_ok=True)
+        except OSError:
+            pass
 
     env = dict(os.environ)
     repo = _repo_root()
     env["PYTHONPATH"] = str(repo) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     if relay_token:
         env["DFS_RELAY_TOKEN"] = relay_token
-    with open(log_path, "ab") as log:
-        proc = subprocess.Popen(
-            cmd, env=env, stdout=log, stderr=log,
-            stdin=subprocess.DEVNULL, start_new_session=True,
-        )
+
+    if args.foreground:
+        print("[dfssvc] 前面で起動します（Ctrl-C で停止）")
+        proc = subprocess.Popen(cmd, env=env)
+    else:
+        with open(log_path, "ab") as log:
+            proc = subprocess.Popen(
+                cmd, env=env, stdout=log, stderr=log,
+                stdin=subprocess.DEVNULL, start_new_session=True,
+            )
 
     if not wait_for_l2(registry_url, timeout=args.wait):
         if proc.poll() is not None:
-            tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
-            raise ServiceError(f"サーバが起動しませんでした（終了コード {proc.returncode}）:\n{tail}")
+            if not args.foreground and log_path.is_file():
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                raise ServiceError(f"サーバが起動しませんでした（終了コード {proc.returncode}）:\n{tail}")
+            raise ServiceError(f"サーバが起動しませんでした（終了コード {proc.returncode}）")
         _terminate(proc)
         raise ServiceError(f"L2 ({registry_url}) が {args.wait:.0f} 秒以内に応答しませんでした")
 
@@ -764,12 +833,12 @@ def cmd_start(args: argparse.Namespace) -> int:
     sub_path = ""
     try:
         if not args.no_delegate:
-            raw_path = (args.path or "").strip()
-            sub_path = raw_path.rstrip("/") if raw_path else f"{args.root_anchor}/{name}"
+            raw_path = (args.path or "").strip() or (existing.sub_path if existing else "")
+            sub_path = raw_path.rstrip("/") if raw_path else f"{effective_root_anchor}/{name}"
             if not sub_path.startswith("/"):
                 sub_path = "/" + sub_path
             # 根の直下でなければ、親のパスも委譲が要る（L1 は多段）
-            _ensure_parent_delegations(root_key, root_pub, args.root_anchor, sub_path, registry_url)
+            _ensure_parent_delegations(root_key, root_pub, effective_root_anchor, sub_path, registry_url)
             register_delegation(root_key, writer_pub, sub_path, registry_url)
             print(f"[dfssvc] 委譲を登録: {sub_path}（書き手 {writer_key.name}）")
     except BaseException:
@@ -786,9 +855,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         sub_path=sub_path,
         registry_port=registry_port,
         ost_port=ost_port,
-        bind=host,
+        bind=effective_host,
         advertise=advertised,
-        root_anchor=args.root_anchor,
+        root_anchor=effective_root_anchor,
         pid=server_pid,
         started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         config_path=str(store.path),
@@ -817,6 +886,12 @@ def cmd_start(args: argparse.Namespace) -> int:
         if service.sub_path:
             print(f"  # このサーバのサブツリー: {service.sub_path}")
         print(f"  # 書き手の鍵: {key_hint}" if service.writer_key else "")
+    if args.foreground:
+        try:
+            return int(proc.wait() or 0)
+        except KeyboardInterrupt:
+            _terminate(proc)
+            return 0
     return 0
 
 
@@ -1149,13 +1224,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, help=f"この番号から連続した空きを探す（既定 {DEFAULT_START_PORT}）")
     p.add_argument("--ost-dir", help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）")
     p.add_argument("--foreground", action="store_true", help="前面で動かす（Ctrl-C で停止）")
-    p.add_argument("--force", action="store_true", help="同じ名前の記録を上書きする")
+    p.add_argument("--force", action="store_true", help="起動中なら停止し、既存設定を引き継いで再起動する")
     # 高度な設定・後方互換用（--help を簡潔に保つため既定では非表示）
-    p.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
+    p.add_argument("--host", default=None, help=argparse.SUPPRESS)
     p.add_argument("--advertise", help=argparse.SUPPRESS)
     p.add_argument("--state-dir", help=argparse.SUPPRESS)
     p.add_argument("--root-key", help=argparse.SUPPRESS)
-    p.add_argument("--root-anchor", default=DEFAULT_ROOT_ANCHOR, help=argparse.SUPPRESS)
+    p.add_argument("--root-anchor", default=None, help=argparse.SUPPRESS)
     p.add_argument("--writer-key", help=argparse.SUPPRESS)
     p.add_argument("--path", help=argparse.SUPPRESS)
     p.add_argument("--no-delegate", action="store_true", help=argparse.SUPPRESS)

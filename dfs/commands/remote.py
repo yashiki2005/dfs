@@ -1001,8 +1001,10 @@ def cmd_join(args: argparse.Namespace) -> int:
     ]
 
     # 2) ローカルの dfssvc 設定があれば join 先を保存
+    from dfs import svc as svc_mod
+
     svc_name = getattr(args, "svc", None) or "local"
-    svc_dir = Path.home() / "dfssvc" / svc_name
+    svc_dir = svc_mod._base_dir(svc_name)
     cfg_file = svc_dir / "dfssvc.json"
     if svc_dir.is_dir():
         cfg: Dict[str, Any] = {}
@@ -1184,8 +1186,10 @@ def cmd_join(args: argparse.Namespace) -> int:
 
 def cmd_quit(args: argparse.Namespace) -> int:
     """参加中のドメインから安全に離脱し、ローカル単独モードへ戻す。"""
+    from dfs import svc as svc_mod
+
     svc_name = getattr(args, "svc", None) or "local"
-    svc_dir = Path.home() / "dfssvc" / svc_name
+    svc_dir = svc_mod._base_dir(svc_name)
     cfg_file = svc_dir / "dfssvc.json"
     prev_join = ""
     cleared_svc = False

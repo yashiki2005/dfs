@@ -1923,31 +1923,21 @@ def _resolve_remote(store: RemoteStore, name: str) -> Remote:
 
 
 def _ensure_remote_from_service(store: RemoteStore, service_name: str) -> Optional[Remote]:
-    """dfssvc の起動済みサービスからリモート定義を自動生成して登録する。"""
+    """dfssvc の記録が見つかった場合、tree_secret 不在のため不正な自動登録は行わず登録手順を案内する。"""
     from .svc import ServiceStore
 
     svc_store = ServiceStore()
     svc = svc_store.services.get(service_name)
     if svc is None:
         return None
-    root_pub_text = ""
-    if svc.root_pub and Path(svc.root_pub).is_file():
-        root_pub_text = Path(svc.root_pub).read_text(encoding="utf-8").strip()
-    remote = Remote(
-        name=svc.name,
-        registry=svc.registry_url,
-        key=svc.writer_key,
-        ost=svc.ost_endpoint,
-        path=svc.sub_path or f"{svc.root_anchor.rstrip('/')}/{svc.name}",
-        secret=secrets.token_urlsafe(18),
-        role_epoch=int(svc.role_epoch or 1),
-        root_pubkey=root_pub_text,
-        root_fingerprint=ssh_key_fingerprint(root_pub_text) if root_pub_text else "",
-        read_only=not bool(svc.writer_key),
+    key_opt = f"--key {svc.writer_key} " if svc.writer_key else ""
+    raise UsageError(
+        f"リモート {service_name!r} は {store.path} に未登録です。\n"
+        f"dfssvc は tree_secret を保持しないため、ランダムな secret で自動登録できません。\n"
+        f"'dfssvc env {svc.name}' を確認し、次のコマンドで登録してください:\n"
+        f"  dfscli config create {svc.name} --registry {svc.registry_url} "
+        f"{key_opt}--secret <tree_secret>"
     )
-    store.set(remote)
-    print(f"[dfscli web] dfssvc '{svc.name}' からリモート設定を自動登録しました")
-    return remote
 
 
 def _version() -> str:

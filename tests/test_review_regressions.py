@@ -1804,7 +1804,7 @@ class TestReviewRegressions(unittest.TestCase):
                     "--path", "/example.com/alice",
                     "--key", str(alice_priv),
                     "--secret", "shared-sec",
-                    "--svc", "__test_none__",
+                    "--svc", "test-none",
                 ])
                 self.assertEqual(rc, 0)
                 remote = RemoteStore(cfg_file).get("joined")
@@ -1928,7 +1928,7 @@ class TestReviewRegressions(unittest.TestCase):
                         "--key", str(alice_priv),
                         "--secret", "sec",
                         "--root-pubkey", str(wrong_pub_file),
-                        "--svc", "__test_none__",
+                        "--svc", "test-none",
                     ])
                 self.assertNotEqual(rc_bad, 0)
                 self.assertIn("一致しません", err_buf.getvalue())
@@ -1941,7 +1941,7 @@ class TestReviewRegressions(unittest.TestCase):
                         "--path", "/example.com/alice",
                         "--key", str(alice_priv),
                         "--secret", "sec",
-                        "--svc", "__test_none__",
+                        "--svc", "test-none",
                     ])
                 self.assertEqual(rc, 0)
                 out = buf.getvalue()
@@ -1959,6 +1959,201 @@ class TestReviewRegressions(unittest.TestCase):
                     os.environ["HOME"] = old_home
                 httpd.shutdown()
                 httpd.server_close()
+
+    def test_dfssvc_rejects_invalid_service_names_and_clears_stale_stop_request(self) -> None:
+        from dfs.svc import ServiceError, ServiceStore, _base_dir, validate_service_name
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "dfs_home"
+            home.mkdir(parents=True, exist_ok=True)
+            with patch.dict("os.environ", {"DFS_HOME": str(home)}):
+                for bad in ("../escape", "..", ".", "a/b", "a\\b", ".hidden"):
+                    with self.assertRaises(ServiceError):
+                        validate_service_name(bad)
+                    with self.assertRaises(ServiceError):
+                        _base_dir(bad)
+                self.assertFalse((Path(td) / "escape").exists())
+
+                # 読み込み済み services.json の不正名も拒否
+                store = ServiceStore()
+                store.path.parent.mkdir(parents=True, exist_ok=True)
+                store.path.write_text(
+                    json.dumps({"schema": "dfs-services-v1", "services": {"../evil": {"name": "../evil"}}}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ServiceError):
+                    ServiceStore()
+
+    def test_dfssvc_restart_preserves_custom_settings_and_clears_stop_request(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            dfs_home_dir = root / "dfs_home"
+            dfs_home_dir.mkdir(parents=True, exist_ok=True)
+            custom_state = root / "custom-state"
+            custom_ost = root / "custom-ost"
+            custom_keys = root / "custom-keys"
+            custom_keys.mkdir(parents=True, exist_ok=True)
+            r_key = custom_keys / "root"
+            w_key = custom_keys / "writer"
+
+            env = dict(os.environ)
+            env["DFS_HOME"] = str(dfs_home_dir)
+            env["DFS_CONFIG"] = str(root / "remotes.json")
+            env["DFS_ICE_DISCOVER"] = "0"
+            try:
+                rc1 = None
+                with patch.dict("os.environ", env, clear=True):
+                    rc1 = svc_mod.main([
+                        "start", "custom",
+                        "--port", "31200",
+                        "--state-dir", str(custom_state),
+                        "--ost-dir", str(custom_ost),
+                        "--root-key", str(r_key),
+                        "--writer-key", str(w_key),
+                        "--root-anchor", "/review.test",
+                        "--path", "/review.test/team/notes",
+                    ])
+                    self.assertEqual(rc1, 0)
+                    s1 = svc_mod.ServiceStore().get("custom")
+                    self.assertEqual(s1.root_anchor, "/review.test")
+                    self.assertEqual(s1.sub_path, "/review.test/team/notes")
+                    self.assertEqual(Path(s1.state_dir).resolve(), custom_state.resolve())
+                    self.assertEqual(Path(s1.ost_dir).resolve(), custom_ost.resolve())
+                    self.assertEqual(Path(s1.root_key).resolve(), r_key.resolve())
+                    self.assertEqual(Path(s1.writer_key).resolve(), w_key.resolve())
+
+                    self.assertEqual(svc_mod.main(["stop", "custom"]), 0)
+                    # 残留 stop.request を意図的に置いてから引数なしで再起動
+                    (custom_state / "stop.request").write_text("stale\n", encoding="utf-8")
+                    self.assertEqual(svc_mod.main(["start", "custom"]), 0)
+                    s2 = svc_mod.ServiceStore().get("custom")
+                    self.assertEqual(s2.registry_port, s1.registry_port)
+                    self.assertEqual(s2.ost_port, s1.ost_port)
+                    self.assertEqual(s2.root_anchor, "/review.test")
+                    self.assertEqual(s2.sub_path, "/review.test/team/notes")
+                    self.assertEqual(Path(s2.state_dir).resolve(), custom_state.resolve())
+                    self.assertEqual(Path(s2.ost_dir).resolve(), custom_ost.resolve())
+                    self.assertEqual(Path(s2.root_key).resolve(), r_key.resolve())
+                    self.assertEqual(Path(s2.writer_key).resolve(), w_key.resolve())
+                    self.assertFalse((custom_state / "stop.request").exists())
+            finally:
+                with patch.dict("os.environ", env, clear=True):
+                    try:
+                        svc_mod.main(["stop", "custom"])
+                    except Exception:
+                        pass
+
+    def test_dfssvc_foreground_registers_delegation_and_service(self) -> None:
+        import time
+        from dfs.cli import RemoteRegistryClient
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            dfs_home_dir = root / "dfs_home"
+            dfs_home_dir.mkdir(parents=True, exist_ok=True)
+            env = dict(os.environ)
+            env["DFS_HOME"] = str(dfs_home_dir)
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "dfs.svc", "start", "fgsvc", "--foreground", "--port", "31300"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                deadline = time.time() + 15.0
+                svc_rec = None
+                while time.time() < deadline:
+                    if (dfs_home_dir / ".config" / "dfs" / "services.json").is_file():
+                        st = svc_mod.ServiceStore(dfs_home_dir / ".config" / "dfs" / "services.json")
+                        svc_rec = st.services.get("fgsvc")
+                        if svc_rec is not None and svc_rec.is_running():
+                            break
+                    time.sleep(0.2)
+                self.assertIsNotNone(svc_rec)
+                paths_info = RemoteRegistryClient([svc_rec.registry_url]).list_paths()
+                registered_paths = [row["path"] for row in paths_info.get("paths", [])]
+                self.assertIn("/example.com/fgsvc", registered_paths)
+            finally:
+                with patch.dict("os.environ", {"DFS_HOME": str(dfs_home_dir)}):
+                    try:
+                        svc_mod.main(["stop", "fgsvc"])
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+
+    def test_join_and_quit_use_dfs_home_for_dfssvc(self) -> None:
+        from http.server import ThreadingHTTPServer
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            os_home = root / "os_home"
+            dfs_home_dir = root / "dfs_home"
+            os_home.mkdir()
+            dfs_home_dir.mkdir()
+            svc_dir = dfs_home_dir / "dfssvc" / "local"
+            svc_dir.mkdir(parents=True)
+            cfg_file = svc_dir / "dfssvc.json"
+            cfg_file.write_text('{"hub": false, "join": ""}\n', encoding="utf-8")
+
+            _, root_pub = _keypair(root, "root")
+            pstate = cli_mod.PersistentRegistryState(root / "state", "/example.com", root_pub)
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), cli_mod.make_registry_http_handler(pstate, ost=_FakeOST()))  # type: ignore[arg-type]
+            th = threading.Thread(target=httpd.serve_forever, daemon=True)
+            th.start()
+            try:
+                reg_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+                env = {
+                    "HOME": str(os_home),
+                    "DFS_HOME": str(dfs_home_dir),
+                    "DFS_CONFIG": str(root / "remotes.json"),
+                }
+                with patch.dict("os.environ", env):
+                    self.assertEqual(cli_main.main(["join", reg_url]), 0)
+                    saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+                    self.assertEqual(saved["join"], reg_url)
+                    self.assertFalse((os_home / "dfssvc").exists())
+
+                    self.assertEqual(cli_main.main(["quit"]), 0)
+                    cleared = json.loads(cfg_file.read_text(encoding="utf-8"))
+                    self.assertEqual(cleared["join"], "")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_resolve_remote_refuses_random_secret_from_dfssvc(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            dfs_home_dir = root / "dfs_home"
+            dfs_home_dir.mkdir()
+            cfg_file = root / "remotes.json"
+            with patch.dict("os.environ", {"DFS_HOME": str(dfs_home_dir), "DFS_CONFIG": str(cfg_file)}):
+                st = svc_mod.ServiceStore()
+                st.services["auto"] = svc_mod.Service(
+                    name="auto",
+                    state_dir=str(root / "state"),
+                    root_key=str(root / "root"),
+                    root_pub=str(root / "root.pub"),
+                    registry_port=19440,
+                    ost_port=19441,
+                    bind="127.0.0.1",
+                    advertise="127.0.0.1",
+                    root_anchor="/example.com",
+                    pid=999999,
+                    started_at="2026-01-01T00:00:00Z",
+                    writer_key=str(root / "writer"),
+                    sub_path="/example.com/auto",
+                )
+                st.save()
+                r_store = RemoteStore(cfg_file)
+                with self.assertRaises(cli_main.UsageError) as ctx:
+                    cli_main._resolve_remote(r_store, "auto")
+                self.assertIn("dfscli config create auto", str(ctx.exception))
+                self.assertNotIn("auto", r_store.remotes)
 
 
 if __name__ == "__main__":

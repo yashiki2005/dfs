@@ -294,12 +294,11 @@ class TestWebCLI(unittest.TestCase):
                 )
                 svc_store.save()
                 r_store = RemoteStore()
-                rem = cli_main._ensure_remote_from_service(r_store, "local")
-                self.assertIsNotNone(rem)
-                self.assertEqual(rem.name, "local")
-                self.assertEqual(rem.registry, "http://127.0.0.1:19440")
-                self.assertEqual(rem.path, "/example.com/local")
-                self.assertTrue(rem.secret)
+                with self.assertRaises(cli_main.UsageError) as ctx:
+                    cli_main._ensure_remote_from_service(r_store, "local")
+                self.assertIn("dfscli config create local", str(ctx.exception))
+                self.assertIn("dfssvc env local", str(ctx.exception))
+                self.assertNotIn("local", r_store.remotes)
 
 
 if __name__ == "__main__":
