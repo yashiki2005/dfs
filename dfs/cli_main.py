@@ -98,7 +98,7 @@ from .fs.core import remove_tree
 from .path_safety import UnsafePathError, copyfile_no_follow, safe_target
 from .paths import config_dir, restrict_to_owner
 from .private_io import ensure_private_dir, write_private_json
-from .remotes import NAME_RE, Remote, RemoteError, RemoteStore, split_remote_spec
+from .remotes import NAME_RE, Remote, RemoteError, RemoteStore, matching_ost_cert_pin, split_remote_spec
 
 CACHE_VERSION_FILENAME = "cache_version"
 CHECKSUM_MODES = ("size", "crc32", "sha1", "plain_id")
@@ -268,7 +268,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
                 if norm_alt and norm_alt != ost_value and norm_alt not in ost_alternates:
                     ost_alternates.append(norm_alt)
         if not ost_cert_sha256 and ost_info_cache is not None:
-            ost_cert_sha256 = str(ost_info_cache.get("cert_sha256") or "").strip().lower()
+            ost_cert_sha256 = matching_ost_cert_pin(ost_value, ost_info_cache)
         sub_path = resolve_path(remote, registry)
         try:
             host, port, canonical_ost = (
@@ -311,6 +311,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     # 主名簿・代替名簿・複製 OST をリモート定義に合わせる。
     changed = False
     tree_identity_changed = False
+    ost_changed = False
     desired_ost = remote.ost
     if desired_ost:
         desired_host, desired_port = DFSNode._parse_ost_endpoint(desired_ost)
@@ -324,6 +325,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
             cfg["ost_host"] = desired_host
             cfg["ost_port"] = int(desired_port)
             changed = True
+            ost_changed = True
     if (
         cfg.get("registry_url") != remote.registry
         or list(cfg.get("registry_alternates") or []) != list(remote.registry_alternates)
@@ -374,8 +376,14 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
         changed = True
         tree_identity_changed = True
     desired_ost_pin = (remote.ost_cert_sha256 or "").strip().lower()
-    if desired_ost_pin and str(cfg.get("ost_cert_sha256", "") or "").strip().lower() != desired_ost_pin:
-        cfg["ost_cert_sha256"] = desired_ost_pin
+    current_ost_pin = str(cfg.get("ost_cert_sha256", "") or "").strip().lower()
+    if desired_ost_pin:
+        if current_ost_pin != desired_ost_pin:
+            cfg["ost_cert_sha256"] = desired_ost_pin
+            changed = True
+    elif ost_changed and current_ost_pin:
+        # OST endpoint が変更され、新しいリモート定義にピンが無い場合（HTTPS や別 OST 等）は古いピンを消す
+        cfg["ost_cert_sha256"] = ""
         changed = True
     if bool(cfg.get("allow_tofu", False)) != bool(remote.allow_tofu):
         cfg["allow_tofu"] = bool(remote.allow_tofu)
@@ -1108,8 +1116,8 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
         info = cli_mod.RemoteRegistryClient(registries).ost_info()
         if not ost_primary and info.get("endpoint"):
             ost_primary = Remote.normalize_ost(str(info["endpoint"]))
-        if not ost_cert_sha256 and info.get("cert_sha256"):
-            ost_cert_sha256 = str(info["cert_sha256"]).strip().lower()
+        if not ost_cert_sha256 and ost_primary:
+            ost_cert_sha256 = matching_ost_cert_pin(ost_primary, info)
         raw_relays = list(info.get("relay_endpoints") or [])
         if info.get("relay_endpoint"):
             raw_relays.insert(0, info["relay_endpoint"])
@@ -1327,7 +1335,7 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     )
     p.add_argument(
         "--allow-tofu", action="store_true",
-        help="root 公開鍵未設定時に TOFU（初回信頼）を明示的に許可する",
+        help="root 公開鍵を取得できない／未設定のリモートでも writer 検証を省略して TOFU を許可する",
     )
     p.add_argument(
         "--dnssec-domain",
@@ -1643,6 +1651,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_join.add_argument("--secret", help="ツリー共有シークレット")
     p_join.add_argument("--svc", default="local", help="設定を更新するローカル dfssvc 名（既定: local）")
     p_join.add_argument("--workdir", help="作業ディレクトリ（招待 URI 利用時）")
+    p_join.add_argument("--root-pubkey", help="root アンカーの公開鍵ファイル（信頼の根）")
+    p_join.add_argument(
+        "--allow-tofu", action="store_true",
+        help="root 公開鍵を取得できない／未設定のリモートでも writer 検証を省略して TOFU を許可する",
+    )
     p_join.add_argument("--sync", action="store_true", help="join 後に即時 pull する（招待 URI 利用時）")
     p_join.set_defaults(func=cmd_join)
 

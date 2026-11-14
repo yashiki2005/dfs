@@ -359,6 +359,14 @@ class ChunkStoreServer:
                         f.flush()
                         os.fsync(f.fileno())
                     os.replace(tmp, dest)
+                    try:
+                        dir_fd = os.open(str(self.chunks_dir), os.O_RDONLY)
+                        try:
+                            os.fsync(dir_fd)
+                        finally:
+                            os.close(dir_fd)
+                    except OSError:
+                        pass
                     wrote_new = True
                 finally:
                     try:

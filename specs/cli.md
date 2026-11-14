@@ -257,19 +257,26 @@ dfscli listremotes                             # config list と同じ
 `dialog` / `whiptail` も同種である。ただし macOS には既定で入っていないため、外部コマンドに
 頼らず `getpass` で済ませている。
 
-### 1.2 root アンカー（信頼の根）
+### 1.2 root アンカー（信頼の根）と証明書ピン
 
 委譲チェーンを root から検証するには、root アンカーの公開鍵が要る。これは**リモート定義に
 持つ**（`root_pubkey` と、表示用の `root_fingerprint`）。
 
-- `--root-pubkey FILE` を渡せば、その中身を使う（本番はこちら）。
-- 省略すると、名簿の `/v1/paths` から取って記録する（**TOFU**）。指紋を画面に出す。
+- `--root-pubkey FILE`（`create` / `join`）を渡せば、その中身で事前固定する（本番はこちら。DNSSEC や名簿の鍵と不一致ならエラー）。
+- 省略すると、初回登録時に名簿（`/v1/paths`）から取得して記録する（**初回 TOFU ピン留め**）。取得元と `SHA256:...` 指紋を表示する。
 - 以降は記録した公開鍵だけを信頼し、名簿が違う値を返したら拒否する。
+- `--allow-tofu`（`create` / `join`）を明示した場合は、root 公開鍵を取得できない／未設定のリモートでも writer 検証を省略して TOFU を許可する（既定では `root_pubkey` 未設定時の署名検証は拒否）。
 
 ```text
-  root アンカー: SHA256:n2ypRtbEq5vZOTK+i0WmBioSgHFEPFPCr21KWO7c4Jc （名簿から取得（TOFU））
+  root アンカー: SHA256:n2ypRtbEq5vZOTK+i0WmBioSgHFEPFPCr21KWO7c4Jc （名簿から取得（初回 TOFU ピン留め））
                  これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）
 ```
+
+L3 OST の TLS 証明書ピン（`ost_cert_sha256`）も同様に扱う:
+
+- `--ost-cert-sha256` で明示指定でき、ローテーション時は新しいピンを指定して反映する。
+- 未指定時は、選択した OST エンドポイントが名簿 `/v1/ost` の `endpoint` と正規化後に一致し、かつ `tls://`（`host:port`）接続である場合のみ自動ピン留めする（`https://` リバースプロキシや別 OST には自動適用しない）。
+- `Remote.ost` を別エンドポイントへ切り替えた際、新しい定義にピンが無い場合は作業ディレクトリの古い証明書ピンを自動でクリアする。
 
 理由と限界は `specs/delegation.md` §3.5 に書いた。要は「信頼の根を相手から取ると根に
 ならない」ので、初回だけ TOFU で取り、以降は手元の記録を使う。本番は明示する。

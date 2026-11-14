@@ -1424,6 +1424,7 @@ class TestReviewRegressions(unittest.TestCase):
                 builder.download_directory(d_plain, d_wire, root / "out")
 
     def test_ssh_verify_rejects_whitespace_and_control_identity(self) -> None:
+        from unittest import mock
         from dfs.crypto import ssh_sign, ssh_verify
 
         with tempfile.TemporaryDirectory() as td:
@@ -1432,7 +1433,10 @@ class TestReviewRegressions(unittest.TestCase):
             payload = b"hello"
             sig = ssh_sign(priv, "dfs", payload)
             self.assertTrue(ssh_verify(pub, "alice@example.com", "dfs", payload, sig))
-            for bad_id in ("", "alice bob", "alice\nbob", "alice\x00bob"):
+            self.assertTrue(ssh_verify(pub, "/example.com/my team", "dfs", payload, sig))
+            with mock.patch("dfs.crypto._ssh_verify_ed25519", return_value=None):
+                self.assertTrue(ssh_verify(pub, "/example.com/my team", "dfs", payload, sig))
+            for bad_id in ("", "alice\nbob", "alice\rbob", "alice\x00bob"):
                 self.assertFalse(ssh_verify(pub, bad_id, "dfs", payload, sig))
 
     def test_web_login_rate_limits_repeated_failures(self) -> None:
@@ -1735,6 +1739,226 @@ class TestReviewRegressions(unittest.TestCase):
         finally:
             srv2.shutdown()
             srv2.server_close()
+
+    def test_ost_pin_only_auto_applied_when_endpoint_matches_tls(self) -> None:
+        from dfs.remotes import matching_ost_cert_pin
+
+        ost_info = {"endpoint": "127.0.0.1:19443", "cert_sha256": "ab" * 32}
+        self.assertEqual(matching_ost_cert_pin("127.0.0.1:19443", ost_info), "ab" * 32)
+        self.assertEqual(matching_ost_cert_pin("tls://127.0.0.1:19443", ost_info), "ab" * 32)
+        self.assertEqual(matching_ost_cert_pin("127.0.0.1:19444", ost_info), "")
+        self.assertEqual(matching_ost_cert_pin("https://proxy.example.com/ost", ost_info), "")
+        self.assertEqual(matching_ost_cert_pin("http://127.0.0.1:19440/relay/n1", ost_info), "")
+
+    def test_join_url_populates_root_pubkey_and_pulls(self) -> None:
+        import time
+        from http.server import ThreadingHTTPServer
+        from dfs.l5_fs import DFSNode
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = _self_signed_cert(root)
+            root_priv, root_pub = _keypair(root, "root")
+            alice_priv, alice_pub = _keypair(root, "alice")
+            ost = ChunkStoreServer(cert, key, chunks_dir=root / "ost_chunks")
+            pstate = cli_mod.PersistentRegistryState(
+                root / "state", "/example.com", root_pub, chunks_dir=root / "ost_chunks"
+            )
+            pstate.ost_endpoint = f"127.0.0.1:{ost.port}"
+            pstate.ost_cert_sha256 = ost.cert_sha256
+
+            now = int(time.time())
+            del_env = create_delegation_envelope(
+                root_priv, "/example.com", "/example.com/alice", alice_pub,
+                1, 0, now - 60, now + 3600,
+            )
+            pstate.service.register_delegation(del_env, now=now)
+
+            writer = DFSNode(
+                "writer", "/example.com/alice", root / "writer_wd",
+                alice_priv, alice_pub, "shared-sec", pstate.service,
+                "127.0.0.1", ost.port, root_pubkey=root_pub, ost_cert_sha256=ost.cert_sha256,
+            )
+            (writer.clayfs.work_tree / "hello.txt").write_text("from-writer", encoding="utf-8")
+            writer.push(1, now=now)
+
+            httpd = ThreadingHTTPServer(
+                ("127.0.0.1", 0), cli_mod.make_registry_http_handler(pstate, ost=ost)
+            )
+            th = threading.Thread(target=httpd.serve_forever, daemon=True)
+            th.start()
+            cfg_file = root / "remotes.json"
+            home_dir = root / "home"
+            home_dir.mkdir(parents=True, exist_ok=True)
+            old_env = os.environ.get("DFS_CONFIG")
+            old_home = os.environ.get("HOME")
+            old_xdg = os.environ.get("XDG_CACHE_HOME")
+            os.environ["DFS_CONFIG"] = str(cfg_file)
+            os.environ["HOME"] = str(home_dir)
+            os.environ["XDG_CACHE_HOME"] = str(home_dir / ".cache")
+            try:
+                reg_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+                rc = cli_main.main([
+                    "join", reg_url,
+                    "--name", "joined",
+                    "--path", "/example.com/alice",
+                    "--key", str(alice_priv),
+                    "--secret", "shared-sec",
+                    "--svc", "__test_none__",
+                ])
+                self.assertEqual(rc, 0)
+                remote = RemoteStore(cfg_file).get("joined")
+                self.assertTrue(bool(remote.root_pubkey))
+                node = cli_main.open_remote(remote, create=True)
+                node.pull()
+                self.assertEqual(
+                    (node.clayfs.work_tree / "hello.txt").read_text(encoding="utf-8"),
+                    "from-writer",
+                )
+            finally:
+                if old_env is None:
+                    os.environ.pop("DFS_CONFIG", None)
+                else:
+                    os.environ["DFS_CONFIG"] = old_env
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                if old_xdg is None:
+                    os.environ.pop("XDG_CACHE_HOME", None)
+                else:
+                    os.environ["XDG_CACHE_HOME"] = old_xdg
+                httpd.shutdown()
+                httpd.server_close()
+                ost.close()
+
+    def test_open_remote_clears_stale_ost_pin_on_endpoint_change(self) -> None:
+        import time
+        from http.server import ThreadingHTTPServer
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = _self_signed_cert(root)
+            root_priv, root_pub = _keypair(root, "root")
+            alice_priv, alice_pub = _keypair(root, "alice")
+            ost = ChunkStoreServer(cert, key)
+            pstate = cli_mod.PersistentRegistryState(root / "state", "/example.com", root_pub)
+            now = int(time.time())
+            pstate.service.register_delegation(
+                create_delegation_envelope(
+                    root_priv, "/example.com", "/example.com/alice", alice_pub,
+                    1, 0, now - 60, now + 3600,
+                ),
+                now=now,
+            )
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), cli_mod.make_registry_http_handler(pstate, ost=ost))
+            th = threading.Thread(target=httpd.serve_forever, daemon=True)
+            th.start()
+            try:
+                wd = root / "wd"
+                reg_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+                r1 = Remote(
+                    name="r",
+                    registry=reg_url,
+                    key=str(alice_priv),
+                    ost=f"127.0.0.1:{ost.port}",
+                    path="/example.com/alice",
+                    secret="sec",
+                    workdir=str(wd),
+                    root_pubkey=root_pub,
+                    ost_cert_sha256=ost.cert_sha256,
+                )
+                n1 = cli_main.open_remote(r1, create=True)
+                self.assertEqual(n1.ost.expected_cert_sha256, ost.cert_sha256)
+
+                # エンドポイントを別 OST / HTTPS へ変更し、新しいピンが空になった場合、古いピンが消えること
+                r2 = Remote(
+                    name="r",
+                    registry=reg_url,
+                    key=str(alice_priv),
+                    ost="https://proxy.example.com/ost",
+                    path="/example.com/alice",
+                    secret="sec",
+                    workdir=str(wd),
+                    root_pubkey=root_pub,
+                    ost_cert_sha256="",
+                )
+                n2 = cli_main.open_remote(r2, create=False)
+                self.assertIsNone(n2.ost.expected_cert_sha256)
+                cfg = json.loads((wd / ".clayfs" / cli_mod.CONFIG_FILENAME).read_text(encoding="utf-8"))
+                self.assertEqual(cfg.get("ost_cert_sha256"), "")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                ost.close()
+
+    def test_join_validates_root_pubkey_and_prints_fingerprint(self) -> None:
+        import contextlib
+        import io
+        import time
+        from http.server import ThreadingHTTPServer
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root_priv, root_pub = _keypair(root, "root")
+            _, wrong_pub = _keypair(root, "wrong_root")
+            wrong_pub_file = root / "wrong_root.pub"
+            wrong_pub_file.write_text(wrong_pub + "\n", encoding="utf-8")
+            alice_priv, _ = _keypair(root, "alice")
+            pstate = cli_mod.PersistentRegistryState(root / "state", "/example.com", root_pub)
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), cli_mod.make_registry_http_handler(pstate, ost=_FakeOST()))  # type: ignore[arg-type]
+            th = threading.Thread(target=httpd.serve_forever, daemon=True)
+            th.start()
+
+            cfg_file = root / "remotes.json"
+            home_dir = root / "home"
+            home_dir.mkdir(parents=True, exist_ok=True)
+            old_env = os.environ.get("DFS_CONFIG")
+            old_home = os.environ.get("HOME")
+            os.environ["DFS_CONFIG"] = str(cfg_file)
+            os.environ["HOME"] = str(home_dir)
+            try:
+                reg_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+                err_buf = io.StringIO()
+                with contextlib.redirect_stderr(err_buf):
+                    rc_bad = cli_main.main([
+                        "join", reg_url,
+                        "--name", "bad",
+                        "--path", "/example.com/alice",
+                        "--key", str(alice_priv),
+                        "--secret", "sec",
+                        "--root-pubkey", str(wrong_pub_file),
+                        "--svc", "__test_none__",
+                    ])
+                self.assertNotEqual(rc_bad, 0)
+                self.assertIn("一致しません", err_buf.getvalue())
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli_main.main([
+                        "join", reg_url,
+                        "--name", "good",
+                        "--path", "/example.com/alice",
+                        "--key", str(alice_priv),
+                        "--secret", "sec",
+                        "--svc", "__test_none__",
+                    ])
+                self.assertEqual(rc, 0)
+                out = buf.getvalue()
+                self.assertIn("SHA256:", out)
+                self.assertIn("初回 TOFU", out)
+                self.assertIn("--root-pubkey", out)
+            finally:
+                if old_env is None:
+                    os.environ.pop("DFS_CONFIG", None)
+                else:
+                    os.environ["DFS_CONFIG"] = old_env
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                httpd.shutdown()
+                httpd.server_close()
 
 
 if __name__ == "__main__":

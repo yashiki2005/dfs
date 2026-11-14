@@ -322,19 +322,20 @@ def ssh_verify(
     clean_pub = pubkey_str.strip()
     if not clean_pub or "\n" in clean_pub:
         return False
-    if not identity or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in identity):
+    if not identity or any(ch in "\r\n\x00" or ord(ch) < 32 or ord(ch) == 127 for ch in identity):
         return False
 
     in_process = _ssh_verify_ed25519(clean_pub, namespace, payload, signature)
     if in_process is not None:
         return in_process
 
+    safe_identity = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     with tempfile.TemporaryDirectory(prefix="dfs_verify_") as tmpdir:
         tmp_path = Path(tmpdir)
         allowed_signers = tmp_path / "allowed_signers"
         sig_file = tmp_path / "payload.sig"
 
-        allowed_signers.write_text(f"{identity} {clean_pub}\n", encoding="utf-8")
+        allowed_signers.write_text(f"{safe_identity} {clean_pub}\n", encoding="utf-8")
         sig_file.write_text(signature, encoding="utf-8")
 
         res = subprocess.run(
@@ -345,7 +346,7 @@ def ssh_verify(
                 "-f",
                 str(allowed_signers),
                 "-I",
-                identity,
+                safe_identity,
                 "-n",
                 namespace,
                 "-s",

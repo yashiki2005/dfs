@@ -15,7 +15,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .crypto import normalize_path
 from .paths import cache_dir, config_dir, restrict_to_owner
@@ -134,6 +134,21 @@ class Remote:
         if value.startswith("tls://"):
             value = value[len("tls://"):]
         return value.rstrip("/")
+
+
+def matching_ost_cert_pin(selected_endpoint: str, ost_info: Optional[Dict[str, Any]]) -> str:
+    """選択した OST が /v1/ost の tls:// endpoint と一致するときだけ証明書ピンを返す。"""
+    if not selected_endpoint or not isinstance(ost_info, dict):
+        return ""
+    selected_norm = Remote.normalize_ost(selected_endpoint)
+    if selected_norm.startswith("http://") or selected_norm.startswith("https://"):
+        return ""
+    advertised = str(ost_info.get("endpoint") or "").strip()
+    if not advertised:
+        return ""
+    if Remote.normalize_ost(advertised) != selected_norm:
+        return ""
+    return str(ost_info.get("cert_sha256") or "").strip().lower()
 
 
 def config_path() -> Path:

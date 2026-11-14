@@ -506,7 +506,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             root_pubkey = (info.get("root_pubkey") or "").strip()
             if root_pubkey:
                 root_fingerprint = _cm.ssh_key_fingerprint(root_pubkey)
-                root_source = "名簿から取得（TOFU）"
+                root_source = "名簿から取得（初回 TOFU ピン留め）"
 
         ost_cert_sha256 = (getattr(args, "ost_cert_sha256", None) or "").strip().lower()
         if not ost_cert_sha256:
@@ -514,7 +514,8 @@ def cmd_config(args: argparse.Namespace) -> int:
                 ost_info = _cm.cli_mod.RemoteRegistryClient(
                     [registry, *registry_alternates]
                 ).ost_info()
-                ost_cert_sha256 = str(ost_info.get("cert_sha256") or "").strip().lower()
+                selected_ost = args.ost or str(ost_info.get("endpoint") or "").strip()
+                ost_cert_sha256 = _cm.matching_ost_cert_pin(selected_ost, ost_info)
             except Exception:
                 ost_cert_sha256 = ""
 
@@ -771,11 +772,10 @@ def cmd_invite(args: argparse.Namespace) -> int:
         remote_name = (args.name or info["name"]).strip()
         workdir = str(Path(args.workdir).expanduser()) if args.workdir else ""
         invite_ost_pin = str(info.get("ost_cert_sha256") or "").strip().lower()
-        if not invite_ost_pin:
+        if not invite_ost_pin and info.get("ost"):
             try:
-                invite_ost_pin = str(
-                    _cm.cli_mod.RemoteRegistryClient(registries).ost_info().get("cert_sha256") or ""
-                ).strip().lower()
+                ost_info = _cm.cli_mod.RemoteRegistryClient(registries).ost_info()
+                invite_ost_pin = _cm.matching_ost_cert_pin(info["ost"], ost_info)
             except Exception:
                 invite_ost_pin = ""
         remote = _cm.Remote(
@@ -1059,11 +1059,43 @@ def cmd_join(args: argparse.Namespace) -> int:
         join_ost_pin = existing_remote.ost_cert_sha256 if existing_remote is not None else ""
         if not join_ost_pin:
             try:
-                join_ost_pin = str(
-                    _cm.cli_mod.RemoteRegistryClient([base_url]).ost_info().get("cert_sha256") or ""
-                ).strip().lower()
+                ost_info = _cm.cli_mod.RemoteRegistryClient([base_url]).ost_info()
+                selected_ost = primary_ost or str(ost_info.get("endpoint") or "").strip()
+                join_ost_pin = _cm.matching_ost_cert_pin(selected_ost, ost_info)
             except Exception:
                 join_ost_pin = ""
+
+        explicit_root_arg = getattr(args, "root_pubkey", None)
+        explicit_root = _cm._read_root_pubkey_arg(explicit_root_arg) if explicit_root_arg else ""
+        join_root_pub = ""
+        join_root_source = "未取得"
+        if discovered is not None:
+            join_root_pub = discovered.root_pubkey
+            join_root_source = "DNSSEC"
+            if explicit_root and " ".join(explicit_root.split()) != " ".join(join_root_pub.split()):
+                raise _cm.UsageError(
+                    "--root-pubkey が DNSSEC の root 公開鍵と一致しません"
+                )
+        elif explicit_root:
+            server_root = str(l2_info.get("root_pubkey") or "").strip()
+            if server_root and " ".join(explicit_root.split()) != " ".join(server_root.split()):
+                raise _cm.UsageError(
+                    "--root-pubkey が L2 名簿の root 公開鍵と一致しません"
+                )
+            join_root_pub = explicit_root
+            join_root_source = f"指定（{explicit_root_arg}）"
+        elif existing_remote is not None and existing_remote.root_pubkey:
+            join_root_pub = existing_remote.root_pubkey
+            join_root_source = "既存リモート設定を引き継ぎ"
+        else:
+            join_root_pub = str(l2_info.get("root_pubkey") or "").strip()
+            if join_root_pub:
+                join_root_source = "名簿から取得（初回 TOFU ピン留め）"
+        join_root_fp = _cm.ssh_key_fingerprint(join_root_pub) if join_root_pub else ""
+        join_allow_tofu = bool(getattr(args, "allow_tofu", False)) or (
+            bool(existing_remote.allow_tofu) if existing_remote is not None else False
+        )
+
         remote = _cm.Remote(
             name=remote_name,
             registry=base_url,
@@ -1075,9 +1107,10 @@ def cmd_join(args: argparse.Namespace) -> int:
             secret=secret_value,
             role_epoch=int(discovered.epoch) if discovered is not None else 1,
             node_name=remote_name,
-            root_pubkey=discovered.root_pubkey if discovered is not None else "",
-            root_fingerprint=_cm.ssh_key_fingerprint(discovered.root_pubkey) if discovered is not None else "",
+            root_pubkey=join_root_pub,
+            root_fingerprint=join_root_fp,
             ost_cert_sha256=join_ost_pin,
+            allow_tofu=join_allow_tofu,
             read_only=not bool(key_value),
         )
         store.set(remote)
@@ -1091,6 +1124,13 @@ def cmd_join(args: argparse.Namespace) -> int:
         ):
             _cm._reset_workdir_pin(remote.resolved_workdir().expanduser())
         print(f"[dfscli] リモート {remote.name!r} を登録しました: {store.path}")
+        if join_root_pub:
+            print(f"  root アンカー: {join_root_fp} （{join_root_source}）")
+            if join_root_source.startswith("名簿から取得"):
+                print("                 名簿由来の初回 TOFU として記録しました（--root-pubkey で事前固定できます）")
+            print("                 これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）")
+        else:
+            print("  root アンカー: （取得できませんでした。--root-pubkey で指定するか --allow-tofu を明示してください）")
         if key_value:
             try:
                 writer_pub = _cm.public_key_of(Path(key_value).expanduser())
