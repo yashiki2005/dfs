@@ -534,19 +534,41 @@ def _normalize_hub_url(raw: str) -> str:
     return f"https://{value}"
 
 
+def _resolve_service_name(args: argparse.Namespace) -> str:
+    """位置引数と ``--name`` のどちらからでもサービス名を解決する。"""
+    opt_name = getattr(args, "name_opt", None)
+    pos_name = getattr(args, "target_name", None)
+    if opt_name and pos_name and opt_name != pos_name:
+        raise ServiceError(f"--name {opt_name!r} と位置引数 {pos_name!r} が一致しません")
+    return opt_name or pos_name or getattr(args, "name", None) or DEFAULT_NAME
+
+
+def _add_service_name_args(parser: argparse.ArgumentParser) -> None:
+    """サブコマンドに共通の位置引数 ``<name>`` と ``--name <name>`` を登録する。"""
+    parser.add_argument(
+        "target_name", nargs="?",
+        help=f"サービスの名前（--name と同じ。既定 {DEFAULT_NAME}）",
+    )
+    parser.add_argument(
+        "--name", dest="name_opt", default=None,
+        help=f"サービスの名前（既定 {DEFAULT_NAME}）",
+    )
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     store = ServiceStore()
-    name = args.name
+    name = _resolve_service_name(args)
     existing = store.services.get(name)
 
-    if name in store.services and not args.force:
-        raise ServiceError(
-            f"サービス {name!r} は既に記録にあります。"
-            f"止めるなら 'dfssvc stop {name}'、作り直すなら --force を付けてください"
-        )
-    if existing is not None and args.force and (
+    is_alive = existing is not None and (
         existing.is_running() or _recorded_server_is_alive(existing)
-    ):
+    )
+    if is_alive and not args.force:
+        raise ServiceError(
+            f"サービス {name!r} は既に起動しています。"
+            f"止めるなら 'dfssvc stop {name}'、再起動するなら --force を付けてください"
+        )
+    if is_alive and args.force:
         if not _stop_process(existing):
             raise ServiceError(f"既存のサービス {name!r} を停止できませんでした")
 
@@ -677,6 +699,12 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if is_hub:
         cmd.append("--relay-hub")
+        if (
+            service_role == "primary"
+            and root_key.is_file()
+            and not getattr(args, "no_auto_delegate", False)
+        ):
+            cmd.extend(["--auto-delegate-key", str(root_key)])
     if join_url:
         cmd.extend(["--relay", join_url])
     if relay_node:
@@ -809,7 +837,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     store = ServiceStore()
-    s = store.get(args.name)
+    s = store.get(_resolve_service_name(args))
     alive = s.is_running()
     if args.json:
         print(json.dumps(s.to_dict(), ensure_ascii=False, indent=2))
@@ -854,17 +882,18 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_stop(args: argparse.Namespace) -> int:
     store = ServiceStore()
-    s = store.get(args.name)
+    name = _resolve_service_name(args)
+    s = store.get(name)
     stopped = _stop_process(s)
     if args.forget:
-        store.services.pop(args.name, None)
+        store.services.pop(name, None)
         store.save()
-        print(f"[dfssvc] 記録からも消しました: {args.name}")
+        print(f"[dfssvc] 記録からも消しました: {name}")
     else:
         # 状態は残す（再開できるように PID だけ 0 にする）
         s.pid = 0
         store.save()
-    print(f"[dfssvc] {'停止しました' if stopped else 'もともと動いていません'}: {args.name}")
+    print(f"[dfssvc] {'停止しました' if stopped else 'もともと動いていません'}: {name}")
     return 0
 
 
@@ -987,7 +1016,7 @@ def _stop_process(s: Service) -> bool:
 def cmd_env(args: argparse.Namespace) -> int:
     """dfscli につなぐための設定行を出す。"""
     store = ServiceStore()
-    s = store.get(args.name)
+    s = store.get(_resolve_service_name(args))
     writer = s.writer_key or "<書き手の Ed25519 秘密鍵>"
     print(f"# {s.name} に接続する（L3 は L2 が広告するので --ost は不要）")
     print(
@@ -1019,7 +1048,7 @@ def _domain_from_root_anchor(root_anchor: str) -> str:
 def cmd_dnssec(args: argparse.Namespace) -> int:
     """DNSSEC の ``_dfs.<domain>`` TXT に置く JSON を出力する。"""
     store = ServiceStore()
-    service = store.get(args.name)
+    service = store.get(_resolve_service_name(args))
     domain = (args.domain or _domain_from_root_anchor(service.root_anchor)).strip().rstrip(".").lower()
 
     root_pub_path = Path(service.root_pub).expanduser()
@@ -1081,7 +1110,7 @@ def cmd_dnssec(args: argparse.Namespace) -> int:
 
 def cmd_logs(args: argparse.Namespace) -> int:
     store = ServiceStore()
-    s = store.get(args.name)
+    s = store.get(_resolve_service_name(args))
     path = Path(s.log_path)
     if not path.is_file():
         raise ServiceError(f"ログがありません: {path}")
@@ -1106,7 +1135,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("start", help="サーバを立てる（引数なしでローカル単一起動）")
-    p.add_argument("--name", default=DEFAULT_NAME, help=f"サービスの名前（既定 {DEFAULT_NAME}）")
+    _add_service_name_args(p)
     p.add_argument(
         "--hub",
         nargs="?",
@@ -1130,6 +1159,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--writer-key", help=argparse.SUPPRESS)
     p.add_argument("--path", help=argparse.SUPPRESS)
     p.add_argument("--no-delegate", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--no-auto-delegate", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--wait", type=float, default=30.0, help=argparse.SUPPRESS)
     p.add_argument("--replica", action="append", default=[], help=argparse.SUPPRESS)
     p.add_argument("--role", choices=["primary", "secondary"], help=argparse.SUPPRESS)
@@ -1142,21 +1172,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("status", help="状態と接続情報を出す")
-    p.add_argument("name", nargs="?", default=DEFAULT_NAME)
+    _add_service_name_args(p)
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("stop", help="止める")
-    p.add_argument("name", nargs="?", default=DEFAULT_NAME)
+    _add_service_name_args(p)
     p.add_argument("--forget", action="store_true", help="記録からも消す")
     p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("env", help="dfscli の設定行を出す")
-    p.add_argument("name", nargs="?", default=DEFAULT_NAME)
+    _add_service_name_args(p)
     p.add_argument("--workdir", help="--workdir も付ける")
     p.set_defaults(func=cmd_env)
 
     p = sub.add_parser("dnssec", help="_dfs.<domain> TXT に置く JSON を出す")
-    p.add_argument("name", nargs="?", default=DEFAULT_NAME)
+    _add_service_name_args(p)
     p.add_argument("--domain", help="TXT のドメイン（既定は root_anchor から推定）")
     p.add_argument(
         "--primary-url",
@@ -1174,7 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_dnssec)
 
     p = sub.add_parser("logs", help="ログの末尾を出す")
-    p.add_argument("name", nargs="?", default=DEFAULT_NAME)
+    _add_service_name_args(p)
     p.add_argument("-n", "--lines", type=int, default=30)
     p.set_defaults(func=cmd_logs)
 

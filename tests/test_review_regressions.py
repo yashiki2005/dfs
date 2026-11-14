@@ -919,6 +919,215 @@ class TestReviewRegressions(unittest.TestCase):
         args = cli_mod.build_parser().parse_args(["serve", "--root-pubkey", "dummy.pub", "--relay-hub"])
         self.assertTrue(args.enable_relay)
 
+    def test_join_auto_restarts_running_dfssvc(self) -> None:
+        from dfs import svc as svc_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            svc_dir = home / "dfssvc" / "local"
+            svc_dir.mkdir(parents=True)
+            priv, pub = _keypair(root, "w")
+            cfg_file = home / "remotes.json"
+
+            class OkReg:
+                def __init__(self, urls):
+                    pass
+
+                def list_paths(self):
+                    return {"root_anchor": "/yashiki.top", "root_pubkey": pub, "paths": {}}
+
+            discovered = SimpleNamespace(
+                domain="yashiki.top",
+                primary_url="https://l2.yashiki.top",
+                alternate_urls=[],
+                root_pubkey=pub,
+                epoch=1,
+                root_anchor="/yashiki.top",
+                dnssec_validated=True,
+            )
+
+            with patch.dict(
+                os.environ,
+                {"HOME": str(home), "DFS_HOME": str(home), "DFS_CONFIG": str(cfg_file)},
+            ):
+                svc_store = svc_mod.ServiceStore()
+                svc_store.services["local"] = svc_mod.Service(
+                    name="local",
+                    state_dir=str(root / "st"),
+                    root_key=str(priv),
+                    root_pub=str(root / "w.pub"),
+                    registry_port=19440,
+                    ost_port=19443,
+                    bind="127.0.0.1",
+                    advertise="127.0.0.1",
+                    root_anchor="/example.com",
+                    pid=999999,
+                    started_at="2026-01-01T00:00:00Z",
+                )
+                svc_store.save()
+
+                with patch("dfs.dnssec.has_txt_record", return_value=True), patch.object(
+                    cli_main, "discover_domain", return_value=discovered
+                ), patch.object(
+                    cli_mod, "RemoteRegistryClient", OkReg
+                ), patch(
+                    "dfs.relay.discover_ice_candidates", return_value=[]
+                ), patch.object(
+                    svc_mod.Service, "is_running", return_value=True
+                ), patch.object(
+                    svc_mod, "main", return_value=0
+                ) as mock_svc_main:
+                    rc = cli_main.main(["join", "--name", "local", "dfs://yashiki.top"])
+                self.assertEqual(rc, 0)
+                mock_svc_main.assert_called_once_with(["start", "--name", "local", "--force"])
+
+    def test_join_preserves_dfssvc_writer_key_as_rw(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            keys_dir = home / "dfssvc" / "local" / "keys"
+            keys_dir.mkdir(parents=True)
+            writer_priv = keys_dir / "writer"
+            writer_priv.write_text("dummy-priv", encoding="utf-8")
+            _, pub = _keypair(root, "w")
+            cfg_file = home / "remotes.json"
+
+            class OkReg:
+                def __init__(self, urls):
+                    pass
+
+                def list_paths(self):
+                    return {"root_anchor": "/yashiki.top", "root_pubkey": pub, "paths": {}}
+
+            discovered = SimpleNamespace(
+                domain="yashiki.top",
+                primary_url="https://l2.yashiki.top",
+                alternate_urls=[],
+                root_pubkey=pub,
+                epoch=1,
+                root_anchor="/yashiki.top",
+                dnssec_validated=True,
+            )
+
+            with patch.dict(
+                os.environ,
+                {"HOME": str(home), "DFS_HOME": str(home), "DFS_CONFIG": str(cfg_file)},
+            ):
+                with patch("dfs.dnssec.has_txt_record", return_value=True), patch.object(
+                    cli_main, "discover_domain", return_value=discovered
+                ), patch.object(
+                    cli_mod, "RemoteRegistryClient", OkReg
+                ), patch(
+                    "dfs.relay.discover_ice_candidates", return_value=[]
+                ), patch.object(
+                    cli_main, "_detect_external_ip", return_value="203.0.113.10"
+                ), patch(
+                    "socket.gethostname", return_value="mac-test"
+                ):
+                    rc = cli_main.main(["join", "--name", "local", "dfs://yashiki.top"])
+                self.assertEqual(rc, 0)
+                expected_id = cli_main.default_subtree_name("203.0.113.10", "mac-test")
+                self.assertEqual(
+                    expected_id,
+                    cli_main.default_subtree_name("203.0.113.10", "mac-test"),
+                )
+                self.assertNotEqual(
+                    expected_id,
+                    cli_main.default_subtree_name("203.0.113.11", "mac-test"),
+                )
+                remote = RemoteStore(cfg_file).get("local")
+                self.assertEqual(remote.key, str(writer_priv))
+                self.assertEqual(remote.path, f"/yashiki.top/{expected_id}")
+                self.assertFalse(remote.read_only)
+
+    def test_open_remote_resets_pin_when_subtree_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workdir = root / "wd"
+            meta = workdir / ".clayfs"
+            meta.mkdir(parents=True)
+            (workdir / "tree").mkdir()
+            priv, pub = _keypair(root, "w")
+            pin_file = meta / "local_head.json"
+            pin_file.write_text('{"version": 2, "entry_hash": "abc", "delegation_epoch": 1}', encoding="utf-8")
+            cfg_file = meta / cli_mod.CONFIG_FILENAME
+            cfg_file.write_text(
+                json.dumps(
+                    {
+                        "node_name": "local",
+                        "registry_url": "http://127.0.0.1:19440",
+                        "ost_endpoint": "127.0.0.1:19441",
+                        "ost_host": "127.0.0.1",
+                        "ost_port": 19441,
+                        "sub_path": "/example.com/local",
+                        "priv_key": str(priv),
+                        "root_pubkey": pub,
+                        "tree_secret": "s",
+                        "read_only": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            remote = Remote(
+                name="local",
+                registry="https://l2.yashiki.top",
+                key=str(priv),
+                ost="127.0.0.1:19441",
+                path="/yashiki.top/new_node",
+                secret="s",
+                workdir=str(workdir),
+                root_pubkey=pub,
+                read_only=False,
+            )
+            node = cli_main.open_remote(remote)
+            self.assertFalse(pin_file.exists())
+            self.assertEqual(node.l4.pin.version, 0)
+
+    def test_auto_delegate_registers_new_leaf_and_blocks_hijack(self) -> None:
+        from http.server import ThreadingHTTPServer
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root_priv, root_pub = _keypair(root, "root")
+            _, pub_a = _keypair(root, "writer_a")
+            _, pub_b = _keypair(root, "writer_b")
+            state_dir = root / "state"
+            state_dir.mkdir()
+            ost_dir = root / "ost"
+            ost_dir.mkdir()
+            pstate = cli_mod.PersistentRegistryState(
+                state_dir, "/yashiki.top", root_pub, chunks_dir=ost_dir
+            )
+            pstate.auto_delegate_key = root_priv
+            handler = cli_mod.make_registry_http_handler(pstate, None)  # type: ignore[arg-type]
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                client = cli_mod.RemoteRegistryClient(f"http://127.0.0.1:{httpd.server_port}")
+                res_a = client.auto_delegate("/yashiki.top/nodeA", pub_a)
+                self.assertTrue(res_a["ok"])
+
+                # 同一書き手なら冪等に成功
+                res_a2 = client.auto_delegate("/yashiki.top/nodeA", pub_a)
+                self.assertTrue(res_a2.get("already_registered"))
+
+                # 別の書き手による既存パスの乗っ取りは拒否
+                with self.assertRaises(cli_mod.ConflictError):
+                    client.auto_delegate("/yashiki.top/nodeA", pub_b)
+
+                # 多段パスは拒否
+                with self.assertRaises(cli_mod.RegistryError):
+                    client.auto_delegate("/yashiki.top/nodeA/sub", pub_b)
+
+                # 未使用の直下パスなら別の書き手も参加可能
+                res_b = client.auto_delegate("/yashiki.top/nodeB", pub_b)
+                self.assertTrue(res_b["ok"])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

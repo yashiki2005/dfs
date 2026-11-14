@@ -295,6 +295,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     # リモート定義は接続先の正本。既存の作業 config が古い場合も、
     # 主名簿・代替名簿・複製 OST をリモート定義に合わせる。
     changed = False
+    tree_identity_changed = False
     desired_ost = remote.ost
     if desired_ost:
         desired_host, desired_port = DFSNode._parse_ost_endpoint(desired_ost)
@@ -334,6 +335,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     if remote.path and cfg.get("sub_path") != remote.path:
         cfg["sub_path"] = remote.path
         changed = True
+        tree_identity_changed = True
     if not remote.secret and not str(cfg.get("tree_secret", "") or ""):
         remote = _ensure_remote_secret(remote)
     if remote.secret and cfg.get("tree_secret") != remote.secret:
@@ -355,10 +357,23 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     if remote.root_pubkey and cfg.get("root_pubkey") != remote.root_pubkey:
         cfg["root_pubkey"] = remote.root_pubkey
         changed = True
+        tree_identity_changed = True
     if changed:
+        if tree_identity_changed:
+            _reset_workdir_pin(mount_root)
         write_private_json(cfg_path, cfg)
         node, cfg, _reg = cli_mod.load_node_from_mount(mount_root)
     return node
+
+
+def _reset_workdir_pin(mount_root: Path) -> None:
+    """接続先ツリーや root 鍵が切り替わったときに古い L4 ピンとキャッシュ版数を消す。"""
+    meta = mount_root / ".clayfs"
+    for fname in ("local_head.json", CACHE_VERSION_FILENAME):
+        try:
+            (meta / fname).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _cache_marker(node: DFSNode) -> Path:
@@ -2802,6 +2817,38 @@ def cmd_invite(args: argparse.Namespace) -> int:
     raise UsageError(f"Unknown invite action: {args.action}")
 
 
+def _detect_external_ip(timeout: float = 0.8) -> str:
+    """外部 IP（取得できなければローカルの送出元 IP）を返す。"""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=timeout) as resp:
+            ip_txt = resp.read().decode("utf-8", errors="ignore").strip()
+            if ip_txt:
+                return ip_txt
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return str(s.getsockname()[0])
+    except OSError:
+        return "127.0.0.1"
+
+
+def default_subtree_name(
+    external_ip: Optional[str] = None,
+    hostname: Optional[str] = None,
+) -> str:
+    """外部 IP とホスト名から決定的な URL-safe Base64 部分木名を生成する。"""
+    import base64
+
+    ext_ip = (external_ip if external_ip is not None else _detect_external_ip()).strip()
+    host = (hostname if hostname is not None else socket.gethostname()).strip()
+    digest = hashlib.sha256(f"{ext_ip}\n{host}".encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest[:12]).decode("ascii").rstrip("=")
+
+
 def cmd_join(args: argparse.Namespace) -> int:
     """別のドメイン / root ハブ / 招待 URI に後から参加する。"""
     target = str(args.target or "").strip()
@@ -2866,8 +2913,9 @@ def cmd_join(args: argparse.Namespace) -> int:
 
     # 0) L2 名簿への疎通確認
     urls = [base_url, *(list(discovered.alternate_urls) if discovered is not None else [])]
+    reg_client = cli_mod.RemoteRegistryClient(urls)
     try:
-        l2_info = cli_mod.RemoteRegistryClient(urls).list_paths()
+        l2_info = reg_client.list_paths()
     except Exception as e:  # noqa: BLE001
         raise UsageError(f"L2 名簿 ({base_url}) への疎通確認に失敗しました: {e}") from e
     if discovered is not None:
@@ -2910,25 +2958,87 @@ def cmd_join(args: argparse.Namespace) -> int:
     if args.path or args.secret or discovered is not None:
         store = RemoteStore()
         remote_name = (args.name or (discovered.domain if discovered is not None else host_label)).strip()
+        existing_remote = store.remotes.get(remote_name)
+        key_value = str(args.key or "")
+        if not key_value and existing_remote is not None and existing_remote.key:
+            key_value = existing_remote.key
+        if not key_value:
+            from . import svc as svc_mod
+
+            svc_rec = svc_mod.ServiceStore().services.get(remote_name)
+            if svc_rec is not None and svc_rec.writer_key and Path(svc_rec.writer_key).expanduser().is_file():
+                key_value = svc_rec.writer_key
+            elif remote_name == svc_name:
+                cand_writer = svc_dir / "keys" / "writer"
+                if cand_writer.is_file():
+                    key_value = str(cand_writer)
+        secret_value = str(args.secret or "")
+        if not secret_value and existing_remote is not None and existing_remote.secret:
+            secret_value = existing_remote.secret
         primary_ost = direct_eps[0] if direct_eps else ""
         alt_osts = direct_eps[1:] if len(direct_eps) > 1 else []
+        base_anchor = discovered.root_anchor if discovered is not None else f"/{host_label}"
+        if args.path:
+            remote_path = str(args.path)
+        elif key_value:
+            anchor_clean = base_anchor.rstrip("/")
+            subtree_label = default_subtree_name()
+            if anchor_clean.endswith(f"/{subtree_label}"):
+                remote_path = anchor_clean or f"/{subtree_label}"
+            else:
+                remote_path = f"{anchor_clean}/{subtree_label}"
+        else:
+            remote_path = base_anchor
         remote = Remote(
             name=remote_name,
             registry=base_url,
             registry_alternates=list(discovered.alternate_urls) if discovered is not None else [],
-            key=str(args.key or ""),
+            key=key_value,
             ost=primary_ost,
             ost_alternates=alt_osts,
-            path=str(args.path or (discovered.root_anchor if discovered is not None else f"/{host_label}")),
-            secret=str(args.secret or ""),
+            path=remote_path,
+            secret=secret_value,
             role_epoch=int(discovered.epoch) if discovered is not None else 1,
             node_name=remote_name,
             root_pubkey=discovered.root_pubkey if discovered is not None else "",
             root_fingerprint=ssh_key_fingerprint(discovered.root_pubkey) if discovered is not None else "",
-            read_only=not bool(args.key),
+            read_only=not bool(key_value),
         )
         store.set(remote)
+        if existing_remote is not None and (
+            existing_remote.path != remote.path
+            or (
+                remote.root_pubkey
+                and existing_remote.root_pubkey
+                and existing_remote.root_pubkey != remote.root_pubkey
+            )
+        ):
+            _reset_workdir_pin(remote.resolved_workdir().expanduser())
         print(f"[dfscli] リモート {remote.name!r} を登録しました: {store.path}")
+        if key_value:
+            try:
+                writer_pub = public_key_of(Path(key_value).expanduser())
+            except UsageError:
+                writer_pub = ""
+            if writer_pub:
+                rows = l2_info.get("paths")
+                already = isinstance(rows, list) and any(
+                    isinstance(r, dict)
+                    and r.get("path") == remote.path
+                    and str(r.get("writer") or "").strip() == writer_pub
+                    for r in rows
+                )
+                auto_fn = getattr(reg_client, "auto_delegate", None)
+                if not already and callable(auto_fn):
+                    try:
+                        auto_fn(remote.path, writer_pub)
+                        print(f"[dfscli] L2 自動委譲を登録しました: {remote.path}")
+                    except Exception as e:  # noqa: BLE001
+                        print(
+                            f"[dfscli] warning: L2 自動委譲に失敗しました ({e})。"
+                            "必要に応じて手動で dfscli delegate を実行してください",
+                            file=sys.stderr,
+                        )
 
     print(f"[dfscli] join 対象: {base_url}")
     anchor_info = str(l2_info.get("root_anchor") or "").strip() or "/"
@@ -2936,7 +3046,23 @@ def cmd_join(args: argparse.Namespace) -> int:
     if direct_eps:
         print(f"[dfscli] 発見した直接 OST 候補 ({len(direct_eps)} 件): {', '.join(direct_eps)}")
     if svc_dir.is_dir():
-        print(f"[dfscli] 反映するには 'dfssvc start --name {svc_name} --force' を実行してください")
+        from . import svc as svc_mod
+
+        svc_store = svc_mod.ServiceStore()
+        running_svc = svc_store.services.get(svc_name)
+        if running_svc is not None and (
+            running_svc.is_running() or svc_mod._recorded_server_is_alive(running_svc)
+        ):
+            print(f"[dfscli] 稼働中の dfssvc ({svc_name}) を再起動して参加先を反映します...")
+            rc_svc = svc_mod.main(["start", "--name", svc_name, "--force"])
+            if rc_svc != 0:
+                print(
+                    f"[dfscli] warning: dfssvc の自動再起動に失敗しました (code={rc_svc})。"
+                    f"手動で 'dfssvc start --name {svc_name} --force' を実行してください",
+                    file=sys.stderr,
+                )
+        else:
+            print(f"[dfscli] 反映するには 'dfssvc start --name {svc_name} --force' を実行してください")
     return 0
 
 

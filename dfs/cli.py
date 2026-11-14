@@ -245,6 +245,10 @@ class RemoteRegistryClient:
         res = self._post("/v1/delegate", {"envelope": envelope, "now": int(now)})
         return res["verified"]
 
+    def auto_delegate(self, path: str, writer_pubkey: str) -> Dict[str, Any]:
+        """初回参加時に root アンカー直下の未使用サブツリーを自動委譲してもらう。"""
+        return self._post("/v1/auto-delegate", {"path": path, "writer_pubkey": writer_pubkey})
+
     def announce_and_append(
         self,
         path: str,
@@ -423,6 +427,7 @@ class PersistentRegistryState:
         self.own_registry_url: str = ""
         # 主名簿が受け取った署名済みバンドルを送る複製名簿。
         self.replica_registries: list[str] = []
+        self.auto_delegate_key: Optional[Path] = None
         self._load()
 
     def _load(self) -> None:
@@ -863,6 +868,61 @@ def make_registry_http_handler(
                         pstate.save()
                         replica_bundle = pstate.service.replication_bundle(verified["path"])
                         response_body = {"ok": True, "verified": verified}
+                    elif self.path == "/v1/auto-delegate":
+                        if pstate.role != "primary":
+                            raise RegistryError(
+                                f"Registry is {pstate.role}; auto-delegation requires primary"
+                            )
+                        if pstate.auto_delegate_key is None or not pstate.auto_delegate_key.is_file():
+                            raise RegistryError("Auto-delegation is not enabled on this registry")
+                        sub_path = str(req.get("path") or "").strip().rstrip("/")
+                        writer_pub = str(req.get("writer_pubkey") or "").strip()
+                        if not writer_pub.startswith("ssh-"):
+                            raise RegistryError("writer_pubkey must be an OpenSSH public key")
+                        anchor = pstate.root_anchor.rstrip("/")
+                        expected_prefix = f"{anchor}/" if anchor else "/"
+                        if not sub_path.startswith(expected_prefix):
+                            raise RegistryError(
+                                f"Auto-delegation path {sub_path!r} must be directly under {anchor!r}"
+                            )
+                        leaf = sub_path[len(expected_prefix):]
+                        if not leaf or "/" in leaf or leaf in (".", ".."):
+                            raise RegistryError(
+                                f"Auto-delegation only allows a single segment under {anchor!r}"
+                            )
+                        existing_env = pstate.service.delegations.get(sub_path)
+                        if existing_env is not None:
+                            existing_writer = str(existing_env.get("payload", {}).get("writer") or "").strip()
+                            if existing_writer == writer_pub:
+                                response_body = {
+                                    "ok": True,
+                                    "already_registered": True,
+                                    "verified": existing_env.get("payload", {}),
+                                }
+                            else:
+                                raise ConflictError(
+                                    f"Path {sub_path!r} is already delegated to another writer"
+                                )
+                        else:
+                            for ep in pstate.service.delegations:
+                                if ep.startswith(sub_path + "/") or sub_path.startswith(ep + "/"):
+                                    raise ConflictError(
+                                        f"Path {sub_path!r} overlaps existing delegation {ep!r}"
+                                    )
+                            env = create_delegation_envelope(
+                                parent_priv_key=pstate.auto_delegate_key,
+                                parent=pstate.root_anchor,
+                                path=sub_path,
+                                writer_pubkey=writer_pub,
+                                epoch=1,
+                                base_version=0,
+                                issued_at=now - 60,
+                                expires_at=now + 365 * 86400,
+                            )
+                            verified = pstate.service.register_delegation(env, now=now)
+                            pstate.save()
+                            replica_bundle = pstate.service.replication_bundle(verified["path"])
+                            response_body = {"ok": True, "verified": verified}
                     elif self.path == "/v1/announce":
                         if pstate.role != "primary":
                             raise RegistryError(
@@ -1080,6 +1140,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
         pstate.role = str(args.role)
     if getattr(args, "role_epoch", None) is not None:
         pstate.role_epoch = int(args.role_epoch)
+    raw_auto_key = getattr(args, "auto_delegate_key", None)
+    if raw_auto_key:
+        pstate.auto_delegate_key = Path(raw_auto_key).expanduser().resolve()
     pstate.save()
     pstate.load_ost_chunks(ost)
     pstate.replica_registries = [
@@ -1445,6 +1508,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help="リレーの同時待ち受けワーカー数 (既定: 4)",
+    )
+    p_serve.add_argument(
+        "--auto-delegate-key",
+        help="初回参加時に直下サブツリーを自動委譲する root 秘密鍵パス",
     )
     p_serve.set_defaults(func=cmd_serve)
 

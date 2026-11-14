@@ -386,6 +386,16 @@ class StartStopTests(unittest.TestCase):
         self.assertNotEqual(s1.ost_port, s2.ost_port)
         self.assertTrue(s2.is_running())
 
+    def test_start_stopped_service_with_positional_name_without_force(self) -> None:
+        start_port, _ = find_consecutive_free_ports(23000, 2, "127.0.0.1")
+        self.assertEqual(svc_main(["start", "--name", "resume", "--port", str(start_port)]), 0)
+        self.assertEqual(svc_main(["stop", "resume"]), 0)
+        self.assertFalse(ServiceStore().get("resume").is_running())
+        self.assertEqual(svc_main(["start", "resume", "--port", str(start_port)]), 0)
+        resumed = ServiceStore().get("resume")
+        self.service = resumed
+        self.assertTrue(resumed.is_running())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
