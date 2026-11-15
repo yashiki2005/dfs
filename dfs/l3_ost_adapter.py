@@ -1917,6 +1917,11 @@ class SwarmOSTClient(FailoverOSTClient):
         self._slow_hosts: set[str] = set()
         self._peer_bps: Dict[str, float] = {}
         self._peer_bps_lock = threading.Lock()
+        self._libp2p_disabled: bool = False
+        self._libp2p_consecutive_failures: int = 0
+        self._libp2p_fail_threshold: int = max(
+            1, int(os.environ.get("DFS_LIBP2P_FAIL_THRESHOLD", "3") or "3")
+        )
         self.overload_cooldown: float = float(
             os.environ.get("DFS_OVERLOAD_COOLDOWN", "15.0") or "15.0"
         )
@@ -1945,6 +1950,46 @@ class SwarmOSTClient(FailoverOSTClient):
     @staticmethod
     def _is_relay_client(client: Any) -> bool:
         return "/relay/" in str(getattr(client, "base_url", ""))
+
+    @classmethod
+    def _is_libp2p_client(cls, client: Any) -> bool:
+        return cls._client_uri(client).startswith("libp2p://")
+
+    def disable_libp2p(self, reason: str) -> None:
+        """UDP/QUIC 受信失敗が続く環境で libp2p クライアントを無効化し、TLS/HTTP/Relay へフォールバックする。"""
+        with self._peer_bps_lock:
+            already = self._libp2p_disabled
+            self._libp2p_disabled = True
+        removed = [c for c in self.clients if self._is_libp2p_client(c)]
+        if removed:
+            self.clients = [c for c in self.clients if not self._is_libp2p_client(c)]
+            if self._active in removed:
+                self._active = self.clients[0] if self.clients else None
+            for c in removed:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+        if not already:
+            print(
+                f"[dfs p2p] disabling libp2p ({reason}); falling back to TLS/HTTP/Relay",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _record_libp2p_outcome(self, client: Any, *, ok: bool, reason: str = "udp_receive_failures") -> None:
+        if not self._is_libp2p_client(client):
+            return
+        should_disable = False
+        with self._peer_bps_lock:
+            if ok:
+                self._libp2p_consecutive_failures = 0
+            else:
+                self._libp2p_consecutive_failures += 1
+                if self._libp2p_consecutive_failures >= self._libp2p_fail_threshold:
+                    should_disable = True
+        if should_disable:
+            self.disable_libp2p(reason)
 
     def _partition_tiers(self) -> Tuple[List[Any], List[Any]]:
         direct = [c for c in self.clients if not self._is_relay_client(c)]
@@ -2052,6 +2097,7 @@ class SwarmOSTClient(FailoverOSTClient):
                     dt = max(0.001, time.perf_counter() - t0)
                     got_bytes = sum(len(v) for v in fetched.values())
                     self._record_peer_throughput(client, got_bytes, dt)
+                    self._record_libp2p_outcome(client, ok=True)
                     result.update(fetched)
                     self._active = client
                     if getattr(client, "last_overloaded", False):
@@ -2060,6 +2106,7 @@ class SwarmOSTClient(FailoverOSTClient):
                     if not remaining:
                         return result
                 except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                    self._record_libp2p_outcome(client, ok=False)
                     last_error = e
                     if bool(getattr(client, "last_overloaded", False)) or isinstance(
                         e, ServiceUnavailableError
@@ -2201,6 +2248,7 @@ class SwarmOSTClient(FailoverOSTClient):
                                     dt = max(0.001, time.perf_counter() - t0)
                                     got_bytes = sum(len(v) for v in fetched.values())
                                     self._record_peer_throughput(client, got_bytes, dt)
+                                    self._record_libp2p_outcome(client, ok=True)
                                     with lock:
                                         result.update(fetched)
                                         self._active = client
@@ -2214,6 +2262,7 @@ class SwarmOSTClient(FailoverOSTClient):
                                     elif dt > 0.6 and quantum > 1:
                                         quantum = max(1, quantum // 2)
                                 except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                                    self._record_libp2p_outcome(client, ok=False)
                                     with lock:
                                         last_error = e
                                         failed_clients.add(idx)
@@ -2238,9 +2287,11 @@ class SwarmOSTClient(FailoverOSTClient):
                     continue
                 try:
                     fetched = direct_tier[idx].batch_get(can_serve)
+                    self._record_libp2p_outcome(direct_tier[idx], ok=True)
                     result.update(fetched)
                     remaining = [wid for wid in remaining if wid not in result]
                 except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                    self._record_libp2p_outcome(direct_tier[idx], ok=False)
                     last_error = e
 
         if remaining:
@@ -2360,7 +2411,7 @@ class SwarmOSTClient(FailoverOSTClient):
         timeout: float = 2.0,
     ) -> List[str]:
         """Kademlia DHT を優先して libp2p ピアを発見し、失敗時は既存ハブ (/_p2p/peers, /_ice/candidates) へフォールバックする。"""
-        if self.safe_mode or host_manager is None:
+        if self.safe_mode or self._libp2p_disabled or host_manager is None:
             return []
         try:
             from .libp2p_chunk import Libp2pPeerClient, is_libp2p_available
@@ -2508,7 +2559,17 @@ class SwarmOSTClient(FailoverOSTClient):
                         pass
 
         if added:
+            with self._peer_bps_lock:
+                self._libp2p_consecutive_failures = 0
             self.adapt_order(force=True)
+        elif pending:
+            should_disable = False
+            with self._peer_bps_lock:
+                self._libp2p_consecutive_failures += 1
+                if self._libp2p_consecutive_failures >= self._libp2p_fail_threshold:
+                    should_disable = True
+            if should_disable:
+                self.disable_libp2p("p2p_peers_unreachable")
         return added
 
 

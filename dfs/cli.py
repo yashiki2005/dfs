@@ -1353,14 +1353,15 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     p2p_manager_ref: List[Any] = [None]
     p2p_status_lock = threading.Lock()
-    p2p_runtime_status: Dict[str, Any] = {"last_sync": None}
+    p2p_runtime_status: Dict[str, Any] = {"last_sync": None, "fallback": None}
 
     def _get_p2p_status() -> Dict[str, Any]:
         mgr = p2p_manager_ref[0]
         with p2p_status_lock:
             last_sync = dict(p2p_runtime_status["last_sync"]) if p2p_runtime_status["last_sync"] else None
+            fallback = dict(p2p_runtime_status["fallback"]) if p2p_runtime_status["fallback"] else None
         if mgr is None:
-            return {"enabled": False, "last_sync": last_sync}
+            return {"enabled": False, "last_sync": last_sync, "fallback": fallback}
         try:
             conns = mgr.connection_summary()
         except Exception:
@@ -1370,6 +1371,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
             "peer_id": getattr(mgr, "peer_id", ""),
             "connections": conns,
             "last_sync": last_sync,
+            "fallback": fallback,
         }
 
     handler = make_registry_http_handler(
@@ -1516,8 +1518,15 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
         def _p2p_sync_loop() -> None:
             interval = max(1.0, float(os.environ.get("DFS_P2P_SYNC_INTERVAL", "5.0")))
+            fail_threshold = max(1, int(os.environ.get("DFS_LIBP2P_FAIL_THRESHOLD", "3") or "3"))
+            fallback_cooldown = max(
+                0.0, float(os.environ.get("DFS_LIBP2P_FALLBACK_COOLDOWN", "300.0") or "300.0")
+            )
             last_registered_addrs: Optional[Tuple[str, ...]] = tuple(p2p_manager.effective_addrs())
             probe_cache: Dict[str, Tuple[int, str, float]] = {}
+            consecutive_udp_failures = 0
+            fallback_active = False
+            fallback_until = 0.0
             p2p_sync_stop.wait(0.5)
             while not p2p_sync_stop.is_set():
                 try:
@@ -1578,6 +1587,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
                             addrs = [str(a).strip() for a in (entry.get("addrs") or []) if str(a).strip()]
                             matched_peers.append((pid, addrs))
                         if matched_peers and not p2p_sync_stop.is_set():
+                            now_mono = time.monotonic()
+                            if fallback_active and (fallback_cooldown == 0.0 or now_mono < fallback_until):
+                                p2p_sync_stop.wait(interval)
+                                continue
+
                             def _refresh_peers() -> List[Tuple[str, List[str]]]:
                                 _, latest = _fetch_merged_peers()
                                 out: List[Tuple[str, List[str]]] = []
@@ -1595,6 +1609,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                         out.append((epid, eaddrs))
                                 return out
 
+                            sync_failed = False
                             try:
                                 sync_t0 = time.monotonic()
                                 stats = sync_from_peers(
@@ -1606,7 +1621,19 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                     probe_cache=probe_cache,
                                 )
                                 sync_elapsed = max(0.0, time.monotonic() - sync_t0)
-                                if stats.get("fetched", 0) > 0:
+                                probe_ok = int(stats.get("probe_ok", 1 if stats.get("fetched", 0) > 0 else 0))
+                                missing_cnt = int(stats.get("missing", 0))
+                                fetched_cnt = int(stats.get("fetched", 0))
+                                if probe_ok == 0 or (missing_cnt > 0 and fetched_cnt == 0):
+                                    sync_failed = True
+                                else:
+                                    consecutive_udp_failures = 0
+                                    if fallback_active:
+                                        fallback_active = False
+                                        with p2p_status_lock:
+                                            p2p_runtime_status["fallback"] = None
+                                        print("[dfs p2p] UDP/QUIC sync recovered; resuming libp2p", flush=True)
+                                if fetched_cnt > 0:
                                     with pstate.lock:
                                         pstate.save_ost_chunks(ost)
                                     per_peer = stats.get("per_peer") or {}
@@ -1614,7 +1641,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                     bps = round(synced_bytes / sync_elapsed, 1) if sync_elapsed > 0 else 0.0
                                     with p2p_status_lock:
                                         p2p_runtime_status["last_sync"] = {
-                                            "fetched": int(stats["fetched"]),
+                                            "fetched": fetched_cnt,
                                             "remote_total": int(stats.get("remote_total", 0)),
                                             "bytes": synced_bytes,
                                             "duration_s": round(sync_elapsed, 3),
@@ -1638,7 +1665,27 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                         flush=True,
                                     )
                             except Exception:
-                                pass
+                                sync_failed = True
+                            if sync_failed:
+                                consecutive_udp_failures += 1
+                                if consecutive_udp_failures >= fail_threshold:
+                                    fallback_active = True
+                                    fallback_until = (
+                                        time.monotonic() + fallback_cooldown if fallback_cooldown > 0 else 0.0
+                                    )
+                                    with p2p_status_lock:
+                                        p2p_runtime_status["fallback"] = {
+                                            "active": True,
+                                            "reason": "udp_receive_failures",
+                                            "failures": consecutive_udp_failures,
+                                            "cooldown_s": fallback_cooldown,
+                                        }
+                                    cd_msg = f" for {int(fallback_cooldown)}s" if fallback_cooldown > 0 else ""
+                                    print(
+                                        f"[dfs p2p] UDP/QUIC sync failed {consecutive_udp_failures} consecutive times; "
+                                        f"falling back to non-libp2p (TLS/HTTP/Relay){cd_msg}",
+                                        flush=True,
+                                    )
                 except Exception:
                     pass
                 p2p_sync_stop.wait(interval)

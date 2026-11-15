@@ -2473,6 +2473,69 @@ class TestReviewRegressions(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
 
+    def test_swarm_ost_disables_libp2p_after_consecutive_udp_failures(self) -> None:
+        import hashlib
+        from dfs.l3_ost_adapter import ServiceUnavailableError, SwarmOSTClient
+
+        blobs = {}
+        wids = []
+        for i in range(4):
+            b = f"fallback-payload-{i}".encode()
+            w = hashlib.sha256(b).hexdigest()
+            blobs[w] = b
+            wids.append(w)
+
+        class FailingP2PClient:
+            endpoint_uri = "libp2p://12D3KooWFailingPeer"
+            closed = False
+
+            def has(self, w: str) -> bool:
+                return w in blobs
+
+            def batch_has(self, wids):
+                return {w: (w in blobs) for w in wids}
+
+            def batch_get(self, wids):
+                raise ServiceUnavailableError("udp receive timeout")
+
+            def close(self) -> None:
+                self.closed = True
+
+            def session(self):
+                from contextlib import nullcontext
+                return nullcontext(self)
+
+        class HealthyHTTPClient:
+            endpoint_uri = "https://l2.example.com/ost"
+
+            def has(self, w: str) -> bool:
+                return w in blobs
+
+            def batch_has(self, wids):
+                return {w: (w in blobs) for w in wids}
+
+            def batch_get(self, wids):
+                return {w: blobs[w] for w in wids if w in blobs}
+
+            def close(self) -> None:
+                pass
+
+            def session(self):
+                from contextlib import nullcontext
+                return nullcontext(self)
+
+        p2p_c = FailingP2PClient()
+        http_c = HealthyHTTPClient()
+        swarm = SwarmOSTClient([p2p_c, http_c])  # type: ignore[list-item]
+        swarm._libp2p_fail_threshold = 2
+        swarm.overload_cooldown = 0.0
+        for _ in range(2):
+            got = swarm.batch_get(wids)
+            self.assertEqual(got, blobs)
+        self.assertTrue(swarm._libp2p_disabled)
+        self.assertTrue(p2p_c.closed)
+        self.assertEqual(swarm.clients, [http_c])
+
 
 if __name__ == "__main__":
     unittest.main()

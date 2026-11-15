@@ -1698,6 +1698,7 @@ def sync_from_peers(
     step = max(1, min(mem_max_step, int(batch_size)))
     fetched = 0
     fetched_bytes = 0
+    fetch_errors = 0
     per_peer: Dict[str, int] = {}
     write_sem = threading.Semaphore(mem_max_wq)
     write_futs: List[Any] = []
@@ -1782,6 +1783,7 @@ def sync_from_peers(
             write_sem.release()
 
     def _worker(pid: str) -> None:
+        nonlocal fetch_errors
         with lock:
             entry = active_peers_map.get(pid)
         if entry is None:
@@ -1824,6 +1826,7 @@ def sync_from_peers(
                 if adaptive_batch:
                     cur_step = _adapt_batch_size(cur_step, time.monotonic() - t_req, failed=True)
                 with lock:
+                    fetch_errors += 1
                     for wid in batch:
                         cnt = inflight.get(wid, 0)
                         if cnt <= 1:
@@ -1920,6 +1923,8 @@ def sync_from_peers(
         "fetched": fetched,
         "bytes": fetched_bytes,
         "per_peer": per_peer,
+        "probe_ok": len(active_peers_map),
+        "errors": fetch_errors,
     }
 
 
