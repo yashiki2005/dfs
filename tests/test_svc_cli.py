@@ -257,6 +257,33 @@ class StartStopTests(unittest.TestCase):
         self.assertFalse(service.is_running(), "stop したのに動いている")
         self.service = None
 
+    def test_explicit_l2_and_l3_ports_are_used(self) -> None:
+        l2_port, _ = find_consecutive_free_ports(29400, 2, "127.0.0.1")
+        l3_port, _ = find_consecutive_free_ports(29500, 2, "127.0.0.1")
+        self.assertEqual(
+            svc_main([
+                "start", "--name", "explicit-ports",
+                "--registry-port", str(l2_port),
+                "--ost-port", str(l3_port),
+            ]),
+            0,
+        )
+        service = ServiceStore().get("explicit-ports")
+        self.service = service
+        self.assertEqual(service.registry_port, l2_port)
+        self.assertEqual(service.ost_port, l3_port)
+
+    def test_start_help_documents_l2_and_l3_ports(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as ctx:
+            svc_main(["start", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        help_text = output.getvalue()
+        self.assertIn("--registry-port", help_text)
+        self.assertIn("L2 Registry", help_text)
+        self.assertIn("--ost-port", help_text)
+        self.assertIn("L3 OST", help_text)
+
     def test_start_registers_delegation(self) -> None:
         """start は書き手の鍵と委譲まで用意する（dfscli がそのまま使える）。"""
         start_port, _ = find_consecutive_free_ports(23000, 2, "127.0.0.1")

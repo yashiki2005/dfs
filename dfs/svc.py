@@ -603,6 +603,18 @@ def cmd_start(args: argparse.Namespace) -> int:
     name = _resolve_service_name(args)
     existing = store.services.get(name)
 
+    if args.port is not None and (
+        args.registry_port is not None or args.ost_port is not None
+    ):
+        raise ServiceError("--port と --registry-port/--ost-port は同時に指定できません")
+    if (args.registry_port is None) != (args.ost_port is None):
+        raise ServiceError("--registry-port と --ost-port は両方指定してください")
+    if (
+        args.registry_port is not None
+        and args.registry_port == args.ost_port
+    ):
+        raise ServiceError("--registry-port と --ost-port には別のポートを指定してください")
+
     is_alive = existing is not None and (
         existing.is_running() or _recorded_server_is_alive(existing)
     )
@@ -626,7 +638,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     used = {
         s.registry_port for s in store.services.values() if s.name != name
     } | {s.ost_port for s in store.services.values() if s.name != name}
-    if (
+    if args.registry_port is not None and args.ost_port is not None:
+        registry_port, ost_port = args.registry_port, args.ost_port
+        if registry_port in used or ost_port in used:
+            raise ServiceError("指定したポートは別の登録済みサービスが使用しています")
+        for label, port in (("L2", registry_port), ("L3", ost_port)):
+            if not 1 <= port <= 65535:
+                raise ServiceError(f"{label} ポートが範囲外です: {port}")
+            if not is_port_free(port, host, allow_reuse=True):
+                raise ServiceError(f"{label} ポートは使用中です: {port}")
+    elif (
         args.port is None
         and existing is not None
         and existing.registry_port
@@ -1362,7 +1383,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="自動同期・シードする相手の Base64 共有 ID（複数指定可）",
     )
-    p.add_argument("--port", type=int, help=f"この番号から連続した空きを探す（既定 {DEFAULT_START_PORT}）")
+    p.add_argument(
+        "--port",
+        type=int,
+        help=(
+            f"L2 Registryの開始番号。L3 OSTにはN+1を使う"
+            f"（既定 {DEFAULT_START_PORT}）"
+        ),
+    )
+    p.add_argument(
+        "--registry-port",
+        type=int,
+        help="L2 Registry（L4ログもここで公開）の待受ポート",
+    )
+    p.add_argument(
+        "--ost-port",
+        type=int,
+        help="L3 OST（暗号化チャンク）の待受ポート。--registry-portとセットで指定",
+    )
     p.add_argument("--ost-dir", help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）")
     p.add_argument("--foreground", action="store_true", help="前面で動かす（Ctrl-C で停止）")
     p.add_argument("--force", action="store_true", help="起動中なら停止し、既存設定を引き継いで再起動する")
