@@ -15,7 +15,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfs.crypto import ChunkIntegrityError
 from dfs.l2_registry import ServiceUnavailableError
-from dfs.libp2p_chunk import Libp2pChunkClient
+from dfs.l3_ost_adapter import SwarmOSTClient
+from dfs.libp2p_chunk import (
+    Libp2pChunkClient,
+    Libp2pHostManager,
+    Libp2pPeerClient,
+    is_libp2p_available,
+)
 
 
 class TestLibp2pChunkSource(unittest.TestCase):
@@ -78,6 +84,449 @@ class TestLibp2pChunkSource(unittest.TestCase):
     def test_source_is_read_only(self) -> None:
         with self.assertRaises(ServiceUnavailableError):
             self.client.batch_put_if_absent({"x": b"y"})
+
+
+class TestLibp2pHostManagerAndDHT(unittest.TestCase):
+    def setUp(self) -> None:
+        if not is_libp2p_available():
+            self.skipTest("libp2p is not installed")
+
+    def test_resident_host_allowlist_and_connection_reuse(self) -> None:
+        blob1 = b"p2p-chunk-one-" * 64
+        blob2 = b"p2p-chunk-two-" * 64
+        w1 = hashlib.sha256(blob1).hexdigest()
+        w2 = hashlib.sha256(blob2).hexdigest()
+        store = {w1: blob1, w2: blob2}
+
+        # 許可リスト空で起動 → 未登録 PeerID は拒否される
+        server_mgr = Libp2pHostManager(
+            store=store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            allowed_peer_ids=[],
+            enable_dht=True,
+            dht_mode="server",
+            enable_relay=True,
+            relay_hop=True,
+            enable_dcutr=True,
+        ).start()
+        self.addCleanup(server_mgr.close)
+
+        client_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=True,
+            dht_mode="server",
+            enable_relay=True,
+            relay_hop=False,
+            enable_dcutr=True,
+            bootstrap_peers=[server_mgr.addrs[0]],
+        ).start()
+        self.addCleanup(client_mgr.close)
+
+        peer_client = Libp2pPeerClient(client_mgr, server_mgr.peer_id, server_mgr.addrs)
+        with self.assertRaises(Exception):
+            peer_client.batch_has([w1])
+
+        # PeerID をドメイン許可リストに追加すると接続・取得が通る
+        server_mgr.allow_peer_id(client_mgr.peer_id)
+        self.assertEqual(peer_client.batch_has([w1, w2]), {w1: True, w2: True})
+        self.assertEqual(peer_client.batch_get([w1]), {w1: blob1})
+        # 2 回目も常駐ホスト・接続を再利用して取得できる
+        self.assertEqual(peer_client.batch_get([w2]), {w2: blob2})
+
+    def test_dht_discovery_and_swarm_integration(self) -> None:
+        blob = b"dht-discovered-payload-" * 32
+        wid = hashlib.sha256(blob).hexdigest()
+        store = {wid: blob}
+
+        server_mgr = Libp2pHostManager(
+            store=store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=True,
+            dht_mode="server",
+        ).start()
+        self.addCleanup(server_mgr.close)
+
+        client_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=True,
+            dht_mode="server",
+            bootstrap_peers=[server_mgr.addrs[0]],
+        ).start()
+        self.addCleanup(client_mgr.close)
+
+        domain_key = "example.com:test-dht"
+        self.assertTrue(server_mgr.provide_domain(domain_key, timeout=5.0))
+        provs = client_mgr.find_domain_providers(domain_key, timeout=5.0)
+        self.assertTrue(any(p["peer_id"] == server_mgr.peer_id for p in provs))
+
+        from dfs.l3_ost_adapter import make_ost_client
+
+        swarm = SwarmOSTClient([make_ost_client("http://127.0.0.1:1")])
+        added = swarm.discover_from_p2p(
+            client_mgr,
+            domain_key=domain_key,
+            timeout=3.0,
+        )
+        self.assertEqual(added, [f"libp2p://{server_mgr.peer_id}"])
+        self.assertEqual(swarm.batch_get([wid]), {wid: blob})
+
+    def test_bootstrap_from_peers_and_circuit_addrs(self) -> None:
+        server_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=True,
+            dht_mode="server",
+            enable_relay=True,
+            relay_hop=True,
+        ).start()
+        self.addCleanup(server_mgr.close)
+
+        client_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=True,
+            dht_mode="client",
+            enable_relay=True,
+            relay_hop=False,
+        ).start()
+        self.addCleanup(client_mgr.close)
+
+        connected = client_mgr.bootstrap_from_peers(
+            [
+                {
+                    "peer_id": server_mgr.peer_id,
+                    "role": "hub",
+                    "addrs": server_mgr.addrs,
+                }
+            ],
+            timeout=3.0,
+        )
+        self.assertEqual(connected, 1)
+
+        effective = client_mgr.effective_addrs()
+        self.assertTrue(
+            any(a.endswith(f"/p2p-circuit/p2p/{client_mgr.peer_id}") for a in effective)
+        )
+        # 非ループバックのリレーアドレスがある場合はそちらを優先し、多重 /p2p-circuit は作らない
+        mixed = client_mgr.build_circuit_addrs(
+            [
+                server_mgr.addrs[0],
+                f"/ip4/203.0.113.10/udp/4001/quic-v1/p2p/{server_mgr.peer_id}",
+                f"/ip4/203.0.113.10/udp/4001/quic-v1/p2p/{server_mgr.peer_id}/p2p-circuit/p2p/QmDummy",
+            ]
+        )
+        self.assertEqual(
+            mixed,
+            [
+                f"/ip4/203.0.113.10/udp/4001/quic-v1/p2p/{server_mgr.peer_id}/p2p-circuit/p2p/{client_mgr.peer_id}"
+            ],
+        )
+
+        domain_key = "example.com:bootstrapped"
+        self.assertTrue(client_mgr.provide_domain(domain_key, timeout=5.0))
+        provs = server_mgr.find_domain_providers(domain_key, timeout=5.0)
+        self.assertTrue(any(p["peer_id"] == client_mgr.peer_id for p in provs))
+
+    def test_circuit_relay_v2_chunk_fetch_through_hop(self) -> None:
+        blob = b"relayed-firewall-traversal-chunk-" * 64
+        wid = hashlib.sha256(blob).hexdigest()
+
+        relay_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/tcp/0"],
+            enable_dht=False,
+            enable_relay=True,
+            relay_hop=True,
+            enable_dcutr=True,
+        ).start()
+        self.addCleanup(relay_mgr.close)
+
+        target_mgr = Libp2pHostManager(
+            store={wid: blob},
+            listen=["/ip4/127.0.0.1/tcp/0"],
+            enable_dht=False,
+            enable_relay=True,
+            relay_hop=False,
+            enable_dcutr=True,
+        ).start()
+        self.addCleanup(target_mgr.close)
+
+        dialer_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/tcp/0"],
+            enable_dht=False,
+            enable_relay=True,
+            relay_hop=False,
+            enable_dcutr=True,
+        ).start()
+        self.addCleanup(dialer_mgr.close)
+
+        # target が relay に接続して Reservation を張る
+        connected = target_mgr.bootstrap_from_peers(
+            [{"peer_id": relay_mgr.peer_id, "role": "hub", "addrs": relay_mgr.addrs}],
+            timeout=3.0,
+        )
+        self.assertEqual(connected, 1)
+
+        circuit_addrs = target_mgr.build_circuit_addrs(relay_mgr.addrs)
+        self.assertEqual(len(circuit_addrs), 1)
+
+        # dialer には直接アドレスを渡さず /p2p-circuit のみを渡してチャンク取得する
+        peer_client = Libp2pPeerClient(
+            dialer_mgr,
+            target_mgr.peer_id,
+            addrs=circuit_addrs,
+        )
+        self.assertEqual(peer_client.batch_has([wid]), {wid: True})
+        self.assertEqual(peer_client.batch_get([wid]), {wid: blob})
+
+    def test_provide_domain_background_returns_immediately(self) -> None:
+        import time
+
+        server_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=True,
+            dht_mode="server",
+        ).start()
+        self.addCleanup(server_mgr.close)
+
+        client_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=True,
+            dht_mode="client",
+            bootstrap_peers=[server_mgr.addrs[0]],
+        ).start()
+        self.addCleanup(client_mgr.close)
+
+        domain_key = "example.com:bg-provide"
+        t0 = time.monotonic()
+        ok = client_mgr.provide_domain(domain_key, timeout=5.0, background=True)
+        elapsed = time.monotonic() - t0
+        self.assertTrue(ok)
+        self.assertLess(elapsed, 0.5)
+
+        found = False
+        for _ in range(20):
+            provs = server_mgr.find_domain_providers(domain_key, timeout=1.0)
+            if any(p["peer_id"] == client_mgr.peer_id for p in provs):
+                found = True
+                break
+            time.sleep(0.1)
+        self.assertTrue(found)
+
+    def test_list_chunks_and_sync_from_peer(self) -> None:
+        from dfs.libp2p_chunk import Libp2pHostManager, Libp2pPeerClient, sync_from_peer
+
+        blobs = [f"chunk-{i}".encode("utf-8") for i in range(5)]
+        src_store = {hashlib.sha256(b).hexdigest(): b for b in blobs}
+        dst_store: dict[str, bytes] = {}
+
+        src_mgr = Libp2pHostManager(
+            store=src_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        self.addCleanup(src_mgr.close)
+
+        dst_mgr = Libp2pHostManager(
+            store=dst_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        self.addCleanup(dst_mgr.close)
+
+        client = Libp2pPeerClient(dst_mgr, src_mgr.peer_id, src_mgr.addrs, owns_manager=False)
+        total, page1 = client.list_chunks(offset=0, limit=2)
+        self.assertEqual(total, 5)
+        self.assertEqual(len(page1), 2)
+
+        stats1 = sync_from_peer(dst_mgr, dst_store, src_mgr.peer_id, src_mgr.addrs, batch_size=2)
+        self.assertEqual(stats1["remote_total"], 5)
+        self.assertEqual(stats1["fetched"], 5)
+        self.assertEqual(dst_store, src_store)
+
+        # 2回目は既存チャンクをスキップすること
+        stats2 = sync_from_peer(dst_mgr, dst_store, src_mgr.peer_id, src_mgr.addrs, batch_size=2)
+        self.assertEqual(stats2["missing"], 0)
+        self.assertEqual(stats2["fetched"], 0)
+
+    def test_relay_hub_sync_id_and_svc_subscribe_flags(self) -> None:
+        from dfs.relay import RelayHub
+        from dfs.svc import build_parser
+
+        hub = RelayHub()
+        hub.allow_peer_id(
+            "12D3KooWTestPeer",
+            node_id="mac",
+            role="primary",
+            addrs=["/ip4/127.0.0.1/tcp/1234/p2p/12D3KooWTestPeer"],
+            sync_id="HxsWZRX7hQIUmdBA",
+            sub_path="/yashiki.top/HxsWZRX7hQIUmdBA",
+        )
+        info = hub.get_allowed_peers()
+        self.assertEqual(info["peers"][0]["sync_id"], "HxsWZRX7hQIUmdBA")
+        self.assertEqual(info["peers"][0]["sub_path"], "/yashiki.top/HxsWZRX7hQIUmdBA")
+
+        ns = build_parser().parse_args([
+            "start", "--join", "https://l2.yashiki.top",
+            "--subscribe", "ID1", "--subscribe", "ID2",
+        ])
+        self.assertEqual(ns.subscribe, ["ID1", "ID2"])
+
+    def test_ipv6_listen_and_relay_parallel_race(self) -> None:
+        import time
+        from unittest.mock import patch
+        from dfs.libp2p_chunk import (
+            Libp2pHostManager,
+            _is_private_multiaddr,
+            _supports_ipv6_bind,
+        )
+
+        self.assertFalse(_is_private_multiaddr("/ip4/133.125.58.250/tcp/35355/p2p/abc"))
+        self.assertFalse(_is_private_multiaddr("/ip6/2404:7a80:f61:2800::1/tcp/35355/p2p/abc"))
+        self.assertTrue(_is_private_multiaddr("/ip4/172.17.0.1/tcp/35355/p2p/abc"))
+        self.assertTrue(_is_private_multiaddr("/ip4/192.168.0.3/tcp/35355/p2p/abc"))
+
+        mgr = Libp2pHostManager(enable_dht=False)
+        if _supports_ipv6_bind():
+            self.assertTrue(any(a.startswith("/ip6/::/") for a in mgr.listen))
+
+        mgr.addrs = [
+            "/ip4/0.0.0.0/tcp/4001/p2p/12D3KooWTest",
+            "/ip6/::/tcp/4002/p2p/12D3KooWTest",
+        ]
+        with patch("dfs.libp2p_chunk._local_non_loopback_ipv4s", return_value=["192.168.0.10"]), \
+             patch("dfs.libp2p_chunk._local_non_loopback_ipv6s", return_value=["2404:7a80:f61:2800::1"]):
+            eff = mgr.effective_addrs()
+        self.assertIn("/ip4/192.168.0.10/tcp/4001/p2p/12D3KooWTest", eff)
+        self.assertIn("/ip6/2404:7a80:f61:2800::1/tcp/4002/p2p/12D3KooWTest", eff)
+
+        # リレー並列レース: 到達不能アドレスが混ざっていても即座に生きるリレーへ繋がること
+        src_mgr = Libp2pHostManager(
+            store={"aa" * 32: b"hello"},
+            listen=["/ip4/127.0.0.1/tcp/0"],
+            enable_dht=False,
+        ).start()
+        self.addCleanup(src_mgr.close)
+        dst_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/tcp/0"],
+            enable_dht=False,
+        ).start()
+        self.addCleanup(dst_mgr.close)
+
+        relay_mgr = Libp2pHostManager(
+            listen=["/ip4/127.0.0.1/tcp/0"],
+            enable_dht=False,
+            enable_relay=True,
+            relay_hop=True,
+        ).start()
+        self.addCleanup(relay_mgr.close)
+
+        src_mgr.bootstrap_from_peers([{"peer_id": relay_mgr.peer_id, "role": "hub", "addrs": relay_mgr.addrs}], timeout=2.0)
+        dead_relay_pid = "12D3KooWDeadRelayPeer11111111111111111111111111111111"
+        bad_relay = f"/ip4/192.0.2.1/tcp/39999/p2p/{dead_relay_pid}/p2p-circuit/p2p/{src_mgr.peer_id}"
+        good_relay = f"{relay_mgr.addrs[0]}/p2p-circuit/p2p/{src_mgr.peer_id}"
+        t0 = time.monotonic()
+        pid = dst_mgr._run_sync(
+            dst_mgr._ensure_connected_async,
+            src_mgr.peer_id,
+            [],
+            [bad_relay, good_relay],
+            4.0,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(str(pid), src_mgr.peer_id)
+        self.assertLess(elapsed, 3.5)
+
+    def test_sync_from_peers_distributes_across_multiple_seeds(self) -> None:
+        from dfs.libp2p_chunk import Libp2pHostManager, sync_from_peers
+
+        blobs = [f"multi-seed-chunk-{i}".encode("utf-8") for i in range(12)]
+        expected = {hashlib.sha256(b).hexdigest(): b for b in blobs}
+        seed1_store = dict(expected)
+        seed2_store = dict(expected)
+        dst_store: dict[str, bytes] = {}
+
+        s1_mgr = Libp2pHostManager(
+            store=seed1_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        s2_mgr = Libp2pHostManager(
+            store=seed2_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        dst_mgr = Libp2pHostManager(
+            store=dst_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        self.addCleanup(s1_mgr.close)
+        self.addCleanup(s2_mgr.close)
+        self.addCleanup(dst_mgr.close)
+
+        stats = sync_from_peers(
+            dst_mgr,
+            dst_store,
+            [(s1_mgr.peer_id, s1_mgr.addrs), (s2_mgr.peer_id, s2_mgr.addrs)],
+            batch_size=2,
+        )
+        self.assertEqual(stats["remote_total"], 12)
+        self.assertEqual(stats["fetched"], 12)
+        self.assertEqual(dst_store, expected)
+        per_peer = stats["per_peer"]
+        self.assertEqual(sum(per_peer.values()), 12)
+        self.assertEqual(len(per_peer), 2)
+
+    def test_sync_from_peers_endgame_races_slow_peer(self) -> None:
+        import time
+        from unittest.mock import patch
+        from dfs.libp2p_chunk import Libp2pHostManager, Libp2pPeerClient, sync_from_peers
+
+        blobs = [f"endgame-chunk-{i}".encode("utf-8") for i in range(6)]
+        expected = {hashlib.sha256(b).hexdigest(): b for b in blobs}
+        s1_store = dict(expected)
+        s2_store = dict(expected)
+        dst_store: dict[str, bytes] = {}
+
+        s1_mgr = Libp2pHostManager(
+            store=s1_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        s2_mgr = Libp2pHostManager(
+            store=s2_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        dst_mgr = Libp2pHostManager(
+            store=dst_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        self.addCleanup(s1_mgr.close)
+        self.addCleanup(s2_mgr.close)
+        self.addCleanup(dst_mgr.close)
+
+        orig_batch_get = Libp2pPeerClient.batch_get
+
+        def slow_on_s2(client_self, wire_ids):
+            if client_self.peer_id == s2_mgr.peer_id:
+                time.sleep(0.35)
+            return orig_batch_get(client_self, wire_ids)
+
+        with patch.object(Libp2pPeerClient, "batch_get", slow_on_s2):
+            t0 = time.monotonic()
+            stats = sync_from_peers(
+                dst_mgr,
+                dst_store,
+                [(s1_mgr.peer_id, s1_mgr.addrs), (s2_mgr.peer_id, s2_mgr.addrs)],
+                batch_size=2,
+            )
+            elapsed = time.monotonic() - t0
+
+        self.assertEqual(stats["fetched"], 6)
+        self.assertEqual(dst_store, expected)
+        self.assertEqual(sum(stats["per_peer"].values()), 6)
+        self.assertGreater(stats["per_peer"].get(s1_mgr.peer_id, 0), 0)
+        self.assertLess(elapsed, 2.0)
 
 
 if __name__ == "__main__":

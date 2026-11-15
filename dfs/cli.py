@@ -15,6 +15,7 @@ Mac と raspi5 のターミナルから直接実行できる dfs CLI エント�
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import socket
@@ -577,18 +578,54 @@ def make_registry_http_handler(
             if body:
                 self.wfile.write(body)
 
+        def _is_trusted_proxy_peer(self, peer_ip: str) -> bool:
+            if not peer_ip:
+                return False
+            try:
+                addr = ipaddress.ip_address(peer_ip.split("%", 1)[0])
+            except ValueError:
+                return False
+            if addr.is_loopback:
+                return True
+            raw = os.environ.get("DFS_TRUSTED_PROXIES", "").strip()
+            if not raw:
+                return False
+            for item in raw.split(","):
+                spec = item.strip()
+                if not spec:
+                    continue
+                try:
+                    if "/" in spec:
+                        if addr in ipaddress.ip_network(spec, strict=False):
+                            return True
+                    elif addr == ipaddress.ip_address(spec):
+                        return True
+                except ValueError:
+                    continue
+            return False
+
         def _client_observed_ip(self) -> str:
-            xff = self.headers.get("X-Forwarded-For") or ""
-            if xff:
-                first = xff.split(",")[0].strip()
-                if first:
-                    return first
-            xri = (self.headers.get("X-Real-IP") or "").strip()
-            if xri:
-                return xri
+            peer_ip = ""
             if self.client_address and self.client_address[0]:
-                return str(self.client_address[0])
-            return ""
+                peer_ip = str(self.client_address[0])
+            if self._is_trusted_proxy_peer(peer_ip):
+                xff = self.headers.get("X-Forwarded-For") or ""
+                if xff:
+                    first = xff.split(",")[0].strip()
+                    if first:
+                        try:
+                            ipaddress.ip_address(first.split("%", 1)[0])
+                            return first
+                        except ValueError:
+                            pass
+                xri = (self.headers.get("X-Real-IP") or "").strip()
+                if xri:
+                    try:
+                        ipaddress.ip_address(xri.split("%", 1)[0])
+                        return xri
+                    except ValueError:
+                        pass
+            return peer_ip
 
         def _handle_ice(self) -> bool:
             from urllib.parse import parse_qs, urlsplit
@@ -600,6 +637,11 @@ def make_registry_http_handler(
             if parsed.path == "/_ice/candidates":
                 if relay_hub is None:
                     self._send_json(404, {"error_type": "RegistryError", "message": "Relay hub is not enabled"})
+                    return True
+                try:
+                    relay_hub.verify_token(self.headers.get("X-DFS-Relay-Token"))
+                except RelayAuthError as e:
+                    self._send_json(403, {"error_type": "RegistryError", "message": str(e)})
                     return True
                 qs = parse_qs(parsed.query)
                 node_id = (qs.get("node") or [""])[0] or None
@@ -628,11 +670,49 @@ def make_registry_http_handler(
                         direct_endpoints=req.get("direct_endpoints") or [],
                         observed_ip=self._client_observed_ip(),
                         role=str(req.get("role") or "seeder"),
+                        peer_id=str(req.get("peer_id") or ""),
+                        p2p_addrs=req.get("p2p_addrs") or [],
                     )
                 except (ValueError, TypeError) as e:
                     self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
                     return True
                 self._send_json(200, payload)
+                return True
+            if parsed.path in ("/_p2p/peers", "/_p2p/peers/revoke"):
+                if relay_hub is None:
+                    self._send_json(404, {"error_type": "RegistryError", "message": "Relay hub is not enabled"})
+                    return True
+                try:
+                    relay_hub.verify_token(self.headers.get("X-DFS-Relay-Token"))
+                except RelayAuthError as e:
+                    self._send_json(403, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+                if self.command == "GET":
+                    self._send_json(200, relay_hub.get_allowed_peers())
+                    return True
+                req = self._read_json_body()
+                if req is None:
+                    return True
+                if parsed.path == "/_p2p/peers/revoke":
+                    pid = str(req.get("peer_id") or "").strip()
+                    removed = relay_hub.revoke_peer_id(pid)
+                    out = relay_hub.get_allowed_peers()
+                    out["revoked"] = bool(removed)
+                    self._send_json(200, out)
+                    return True
+                try:
+                    relay_hub.allow_peer_id(
+                        peer_id=str(req.get("peer_id") or ""),
+                        node_id=str(req.get("node_id") or ""),
+                        role=str(req.get("role") or "seeder"),
+                        addrs=req.get("p2p_addrs") or req.get("addrs") or [],
+                        sync_id=str(req.get("sync_id") or ""),
+                        sub_path=str(req.get("sub_path") or ""),
+                    )
+                except (ValueError, TypeError) as e:
+                    self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+                self._send_json(200, relay_hub.get_allowed_peers())
                 return True
             return False
 
@@ -1254,6 +1334,156 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     threading.Thread(target=_watch_stop, daemon=True).start()
 
+    p2p_manager = None
+    if os.environ.get("DFS_LIBP2P", "1").strip() != "0":
+        try:
+            from .libp2p_chunk import Libp2pHostManager, is_libp2p_available
+
+            if is_libp2p_available():
+                p2p_manager = Libp2pHostManager(
+                    store=ost,
+                    enable_dht=True,
+                    dht_mode="client" if relay_urls else "server",
+                    enable_relay=True,
+                    relay_hop=bool(relay_hub is not None and not relay_urls),
+                    enable_dcutr=True,
+                )
+                p2p_manager.start(timeout=5.0)
+                if relay_hub is not None:
+                    relay_hub.on_allowlist_change = p2p_manager.set_allowed_peer_ids
+                    relay_hub.allow_peer_id(
+                        p2p_manager.peer_id,
+                        node_id=relay_node or "hub",
+                        role="hub",
+                        addrs=p2p_manager.effective_addrs(),
+                    )
+                sync_id_arg = str(getattr(args, "sync_id", "") or "").strip()
+                sub_path_arg = str(getattr(args, "sub_path", "") or "").strip()
+                if relay_urls:
+                    from .relay import register_p2p_peer
+
+                    info = register_p2p_peer(
+                        relay_urls[0],
+                        p2p_manager.peer_id,
+                        node_id=relay_node or pstate.role,
+                        p2p_addrs=p2p_manager.effective_addrs(),
+                        role=pstate.role,
+                        sync_id=sync_id_arg,
+                        sub_path=sub_path_arg,
+                        token=relay_token,
+                        timeout=1.5,
+                    )
+                    peer_ids = info.get("peer_ids")
+                    if isinstance(peer_ids, list) and peer_ids:
+                        p2p_manager.set_allowed_peer_ids(peer_ids)
+                if root_pubkey:
+                    p2p_manager.provide_domain(root_pubkey, timeout=5.0, background=True)
+        except Exception:
+            if p2p_manager is not None:
+                try:
+                    p2p_manager.close()
+                except Exception:
+                    pass
+                p2p_manager = None
+
+    subscribe_ids = {
+        s.strip()
+        for raw in (getattr(args, "subscribe", None) or [])
+        for s in str(raw).split(",")
+        if s.strip()
+    }
+    p2p_sync_stop = threading.Event()
+    if p2p_manager is not None and relay_urls:
+        from .libp2p_chunk import sync_from_peers
+        from .relay import fetch_p2p_peers, register_p2p_peer
+
+        def _p2p_sync_loop() -> None:
+            interval = max(1.0, float(os.environ.get("DFS_P2P_SYNC_INTERVAL", "5.0")))
+            last_registered_addrs: Optional[Tuple[str, ...]] = tuple(p2p_manager.effective_addrs())
+            p2p_sync_stop.wait(0.5)
+            while not p2p_sync_stop.is_set():
+                try:
+                    info = fetch_p2p_peers(relay_urls[0], token=relay_token, timeout=2.0)
+                    peer_ids = info.get("peer_ids")
+                    if isinstance(peer_ids, list) and peer_ids:
+                        p2p_manager.set_allowed_peer_ids(peer_ids)
+                    peers = [p for p in (info.get("peers") or []) if isinstance(p, dict)]
+                    hub_relays = [
+                        str(a).strip()
+                        for p in peers
+                        if str(p.get("role") or "").strip().lower() in ("hub", "root")
+                        for a in (p.get("addrs") or [])
+                        if str(a).strip() and "/p2p-circuit" not in str(a)
+                    ]
+                    if peers:
+                        p2p_manager.bootstrap_from_peers(peers, timeout=5.0)
+                        cur_addrs = p2p_manager.effective_addrs(relay_addrs=hub_relays)
+                        if tuple(cur_addrs) != last_registered_addrs:
+                            try:
+                                reg_info = register_p2p_peer(
+                                    relay_urls[0],
+                                    p2p_manager.peer_id,
+                                    node_id=relay_node or pstate.role,
+                                    p2p_addrs=cur_addrs,
+                                    role=pstate.role,
+                                    sync_id=sync_id_arg,
+                                    sub_path=sub_path_arg,
+                                    token=relay_token,
+                                    timeout=2.0,
+                                )
+                                last_registered_addrs = tuple(cur_addrs)
+                                disc = getattr(getattr(p2p_manager, "_relay_discovery", None), "_discovered_relays", {}) or {}
+                                res_map = {str(k): bool(getattr(v, "has_reservation", False)) for k, v in disc.items()}
+                                print(f"[dfs p2p] registered {len(cur_addrs)} addrs, relay_reservations={res_map}", flush=True)
+                                reg_peer_ids = reg_info.get("peer_ids")
+                                if isinstance(reg_peer_ids, list) and reg_peer_ids:
+                                    p2p_manager.set_allowed_peer_ids(reg_peer_ids)
+                            except Exception:
+                                pass
+                    if subscribe_ids:
+                        matched_peers: List[Tuple[str, List[str]]] = []
+                        for entry in peers:
+                            if p2p_sync_stop.is_set():
+                                break
+                            pid = str(entry.get("peer_id") or "").strip()
+                            if not pid or pid == p2p_manager.peer_id:
+                                continue
+                            candidates = {
+                                str(entry.get("sync_id") or "").strip(),
+                                str(entry.get("node_id") or "").strip(),
+                                str(entry.get("sub_path") or "").strip().rstrip("/").split("/")[-1],
+                            }
+                            if not (candidates & subscribe_ids):
+                                continue
+                            addrs = [str(a).strip() for a in (entry.get("addrs") or []) if str(a).strip()]
+                            matched_peers.append((pid, addrs))
+                        if matched_peers and not p2p_sync_stop.is_set():
+                            try:
+                                stats = sync_from_peers(
+                                    p2p_manager,
+                                    ost,
+                                    matched_peers,
+                                    relay_addrs=hub_relays,
+                                )
+                                if stats.get("fetched", 0) > 0:
+                                    with pstate.lock:
+                                        pstate.save_ost_chunks(ost)
+                                    per_peer = stats.get("per_peer") or {}
+                                    peer_summary = ", ".join(
+                                        f"{k[:12]}={v}" for k, v in per_peer.items()
+                                    )
+                                    print(
+                                        f"[dfs p2p-sync] fetched={stats['fetched']}/{stats['remote_total']} "
+                                        f"({stats['bytes']} B) [{peer_summary}]",
+                                        flush=True,
+                                    )
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                p2p_sync_stop.wait(interval)
+
+        threading.Thread(target=_p2p_sync_loop, daemon=True).start()
     print(f"[dfs serve] Root Anchor : {args.root_anchor}")
     print(f"[dfs serve] Role        : {pstate.role} (epoch={pstate.role_epoch})")
     print(f"[dfs serve] State Dir   : {state_dir}")
@@ -1264,11 +1494,18 @@ def cmd_serve(args: argparse.Namespace) -> None:
         print(f"[dfs serve] Relay Hub   : enabled (token={'set' if relay_token else 'none'})")
     if relay_agents:
         print(f"[dfs serve] Relay Agent : {', '.join(pstate.relay_endpoints)}")
+    if p2p_manager is not None:
+        print(f"[dfs serve] libp2p P2P  : {p2p_manager.peer_id} ({len(p2p_manager.addrs)} addrs)")
+    if subscribe_ids:
+        print(f"[dfs serve] P2P Sub     : {', '.join(sorted(subscribe_ids))}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[dfs serve] Shutting down...")
     finally:
+        p2p_sync_stop.set()
+        if p2p_manager is not None:
+            p2p_manager.close()
         for agent in relay_agents:
             agent.close()
         with pstate.lock:
@@ -1524,6 +1761,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument(
         "--relay-node",
         help="リレー上で名乗るノード ID (例: mac1 -> /relay/mac1/...)",
+    )
+    p_serve.add_argument(
+        "--sync-id",
+        default="",
+        help="このサーバの Base64 共有 ID",
+    )
+    p_serve.add_argument(
+        "--sub-path",
+        default="",
+        help="このサーバの書き手サブツリーパス",
+    )
+    p_serve.add_argument(
+        "--subscribe",
+        action="append",
+        default=[],
+        help="自動同期・シードする相手の Base64 共有 ID（複数指定可）",
     )
     p_serve.add_argument(
         "--relay-workers",
