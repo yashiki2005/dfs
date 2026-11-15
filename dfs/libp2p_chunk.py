@@ -1410,6 +1410,17 @@ def sync_from_peer(
     }
 
 
+def _adapt_batch_size(current: int, elapsed_s: float, *, failed: bool = False, max_step: int = 16) -> int:
+    """直近のバッチ取得所要時間・成否に応じて次回バッチサイズを動的調整する。"""
+    if failed:
+        return max(1, current // 2)
+    if elapsed_s < 0.4 and current < max_step:
+        return min(max_step, current * 2)
+    if elapsed_s > 2.5 and current > 1:
+        return max(1, current // 2)
+    return current
+
+
 def sync_from_peers(
     manager: Libp2pHostManager,
     store: Any,
@@ -1421,6 +1432,7 @@ def sync_from_peers(
     streams_per_peer: Optional[int] = None,
     peer_provider: Optional[Callable[[], Sequence[Tuple[str, Sequence[str]]]]] = None,
     refresh_interval: float = 5.0,
+    adaptive_batch: bool = True,
 ) -> Dict[str, Any]:
     """Pull missing encrypted chunks in parallel across multiple *peers* via libp2p."""
     if streams_per_peer is None:
@@ -1541,6 +1553,7 @@ def sync_from_peers(
             return
         client, wid_set = entry
         consec_err = 0
+        cur_step = step
         tried_endgame: Set[str] = set()
         while True:
             batch: List[str] = []
@@ -1551,7 +1564,7 @@ def sync_from_peers(
                         remaining.pop(wid, None)
                         inflight[wid] = inflight.get(wid, 0) + 1
                         batch.append(wid)
-                        if len(batch) >= step:
+                        if len(batch) >= cur_step:
                             break
                 if not batch and not remaining and inflight:
                     for wid, dup_cnt in list(inflight.items()):
@@ -1565,13 +1578,16 @@ def sync_from_peers(
                             tried_endgame.add(wid)
                             batch.append(wid)
                             is_endgame = True
-                            if len(batch) >= step:
+                            if len(batch) >= cur_step:
                                 break
             if not batch:
                 return
+            t_req = time.monotonic()
             try:
                 blobs = client.batch_get(batch)
             except Exception:
+                if adaptive_batch:
+                    cur_step = _adapt_batch_size(cur_step, time.monotonic() - t_req, failed=True)
                 with lock:
                     for wid in batch:
                         cnt = inflight.get(wid, 0)
@@ -1586,6 +1602,8 @@ def sync_from_peers(
                     return
                 continue
 
+            if adaptive_batch:
+                cur_step = _adapt_batch_size(cur_step, time.monotonic() - t_req, failed=False)
             consec_err = 0
             newly_put: List[Tuple[str, int]] = []
             for wid, blob in blobs.items():

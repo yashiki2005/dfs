@@ -660,6 +660,17 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
         self.assertEqual(stats["fetched"], 6)
         self.assertEqual(set(s1_first_batch), {wids[0], wids[1]})
 
+    def test_adapt_batch_size_adjusts_for_rtt_and_failures(self) -> None:
+        from dfs.libp2p_chunk import _adapt_batch_size
+
+        self.assertEqual(_adapt_batch_size(4, 0.1), 8)
+        self.assertEqual(_adapt_batch_size(8, 0.1), 16)
+        self.assertEqual(_adapt_batch_size(16, 0.1), 16)
+        self.assertEqual(_adapt_batch_size(8, 1.0), 8)
+        self.assertEqual(_adapt_batch_size(8, 3.0), 4)
+        self.assertEqual(_adapt_batch_size(4, 0.1, failed=True), 2)
+        self.assertEqual(_adapt_batch_size(1, 3.0, failed=True), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
