@@ -558,6 +558,63 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
         self.assertEqual(stats["fetched"], 10)
         self.assertEqual(dst_store, expected)
 
+    def test_sync_from_peers_dynamic_peer_discovery_mid_sync(self) -> None:
+        from unittest.mock import patch
+        from dfs.libp2p_chunk import Libp2pHostManager, Libp2pPeerClient, sync_from_peers
+
+        blobs = [f"dyn-peer-{i}".encode("utf-8") for i in range(8)]
+        expected = {hashlib.sha256(b).hexdigest(): b for b in blobs}
+        s1_store = dict(expected)
+        s2_store = dict(expected)
+        dst_store: dict[str, bytes] = {}
+
+        s1_mgr = Libp2pHostManager(
+            store=s1_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        s2_mgr = Libp2pHostManager(
+            store=s2_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        dst_mgr = Libp2pHostManager(
+            store=dst_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        self.addCleanup(s1_mgr.close)
+        self.addCleanup(s2_mgr.close)
+        self.addCleanup(dst_mgr.close)
+
+        calls = {"n": 0}
+        orig_batch_get = Libp2pPeerClient.batch_get
+
+        def slow_s1(client_self, wire_ids):
+            if client_self.peer_id == s1_mgr.peer_id:
+                time.sleep(0.15)
+            return orig_batch_get(client_self, wire_ids)
+
+        def provider():
+            calls["n"] += 1
+            return [(s2_mgr.peer_id, s2_mgr.addrs)]
+
+        import time
+        with patch.object(Libp2pPeerClient, "batch_get", slow_s1):
+            stats = sync_from_peers(
+                dst_mgr,
+                dst_store,
+                [(s1_mgr.peer_id, s1_mgr.addrs)],
+                batch_size=1,
+                streams_per_peer=1,
+                peer_provider=provider,
+                refresh_interval=0.2,
+            )
+
+        self.assertEqual(stats["fetched"], 8)
+        self.assertEqual(dst_store, expected)
+        self.assertIn(s2_mgr.peer_id, stats["per_peer"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

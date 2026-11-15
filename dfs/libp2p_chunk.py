@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .crypto import ChunkIntegrityError
 from .l2_registry import ServiceUnavailableError
@@ -1418,6 +1418,8 @@ def sync_from_peers(
     batch_size: int = 4,
     timeout: float = 30.0,
     streams_per_peer: Optional[int] = None,
+    peer_provider: Optional[Callable[[], Sequence[Tuple[str, Sequence[str]]]]] = None,
+    refresh_interval: float = 5.0,
 ) -> Dict[str, Any]:
     """Pull missing encrypted chunks in parallel across multiple *peers* via libp2p."""
     if streams_per_peer is None:
@@ -1443,7 +1445,7 @@ def sync_from_peers(
     if not merged:
         return {"remote_total": 0, "missing": 0, "fetched": 0, "bytes": 0, "per_peer": {}}
 
-    if len(merged) == 1 and streams_per_peer <= 1:
+    if len(merged) == 1 and streams_per_peer <= 1 and peer_provider is None:
         pid, addrs = next(iter(merged.items()))
         stats = sync_from_peer(
             manager,
@@ -1484,18 +1486,18 @@ def sync_from_peers(
             return None
         return pid, client, set(wids), wids
 
-    active_peers: List[Tuple[str, Libp2pPeerClient, Set[str]]] = []
+    active_peers_map: Dict[str, Tuple[Libp2pPeerClient, Set[str]]] = {}
     all_wids_ordered: Dict[str, None] = {}
     with ThreadPoolExecutor(max_workers=min(8, len(merged))) as probe_pool:
         for res in probe_pool.map(_probe_peer, merged.items()):
             if res is None:
                 continue
             pid, client, wid_set, wid_list = res
-            active_peers.append((pid, client, wid_set))
+            active_peers_map[pid] = (client, wid_set)
             for wid in wid_list:
                 all_wids_ordered.setdefault(wid, None)
 
-    if not active_peers or not all_wids_ordered:
+    if not active_peers_map or not all_wids_ordered:
         return {
             "remote_total": len(all_wids_ordered),
             "missing": 0,
@@ -1523,9 +1525,13 @@ def sync_from_peers(
     fetched_bytes = 0
     per_peer: Dict[str, int] = {}
 
-    def _worker(peer_entry: Tuple[str, Libp2pPeerClient, Set[str]]) -> None:
+    def _worker(pid: str) -> None:
         nonlocal fetched, fetched_bytes
-        pid, client, wid_set = peer_entry
+        with lock:
+            entry = active_peers_map.get(pid)
+        if entry is None:
+            return
+        client, wid_set = entry
         consec_err = 0
         tried_endgame: Set[str] = set()
         while True:
@@ -1599,11 +1605,43 @@ def sync_from_peers(
                         if not is_endgame:
                             remaining.setdefault(wid, None)
 
-    worker_entries = [
-        peer_entry for peer_entry in active_peers for _ in range(streams_per_peer)
-    ]
-    with ThreadPoolExecutor(max_workers=min(16, len(worker_entries))) as pool:
-        list(pool.map(_worker, worker_entries))
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futs = [
+            pool.submit(_worker, pid)
+            for pid in list(active_peers_map)
+            for _ in range(streams_per_peer)
+        ]
+        if peer_provider is not None:
+            interval = max(0.2, float(refresh_interval))
+            while any(not f.done() for f in futs):
+                time.sleep(min(interval, 0.5))
+                with lock:
+                    done_all = not remaining and not inflight
+                if done_all:
+                    break
+                try:
+                    new_specs = peer_provider() or ()
+                except Exception:
+                    new_specs = ()
+                for raw_pid, raw_addrs in new_specs:
+                    npid = str(raw_pid or "").strip()
+                    if not npid or npid == manager.peer_id:
+                        continue
+                    with lock:
+                        already_active = npid in active_peers_map
+                    if already_active:
+                        continue
+                    res = _probe_peer((npid, [str(a).strip() for a in (raw_addrs or ()) if str(a).strip()]))
+                    if res is None:
+                        continue
+                    _, nclient, nwid_set, _ = res
+                    with lock:
+                        if npid not in active_peers_map:
+                            active_peers_map[npid] = (nclient, nwid_set)
+                            for _ in range(streams_per_peer):
+                                futs.append(pool.submit(_worker, npid))
+        for f in futs:
+            f.result()
 
     return {
         "remote_total": len(all_wids_ordered),

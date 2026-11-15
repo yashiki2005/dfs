@@ -1458,12 +1458,32 @@ def cmd_serve(args: argparse.Namespace) -> None:
                             addrs = [str(a).strip() for a in (entry.get("addrs") or []) if str(a).strip()]
                             matched_peers.append((pid, addrs))
                         if matched_peers and not p2p_sync_stop.is_set():
+                            def _refresh_peers() -> List[Tuple[str, List[str]]]:
+                                latest = fetch_p2p_peers(
+                                    relay_urls[0], token=relay_token, timeout=2.0
+                                )
+                                out: List[Tuple[str, List[str]]] = []
+                                for e in latest:
+                                    epid = str(e.get("peer_id") or "").strip()
+                                    if not epid or epid == p2p_manager.peer_id:
+                                        continue
+                                    ecands = {
+                                        str(e.get("sync_id") or "").strip(),
+                                        str(e.get("node_id") or "").strip(),
+                                        str(e.get("sub_path") or "").strip().rstrip("/").split("/")[-1],
+                                    }
+                                    if ecands & subscribe_ids:
+                                        eaddrs = [str(a).strip() for a in (e.get("addrs") or []) if str(a).strip()]
+                                        out.append((epid, eaddrs))
+                                return out
+
                             try:
                                 stats = sync_from_peers(
                                     p2p_manager,
                                     ost,
                                     matched_peers,
                                     relay_addrs=hub_relays,
+                                    peer_provider=_refresh_peers,
                                 )
                                 if stats.get("fetched", 0) > 0:
                                     with pstate.lock:
