@@ -6,6 +6,7 @@ import argparse
 import base64
 import hashlib
 import json
+import shlex
 import socket
 import subprocess
 import sys
@@ -345,7 +346,23 @@ def cmd_listremotes(args: argparse.Namespace) -> int:
         if name in running_svcs:
             tags.append("dfssvc")
         tag_str = ", ".join(tags)
-        print(f"dfs://{name}/ -> {r.registry} {r.path or '/'} [{tag_str}]")
+        sync_id = ""
+        if name in svc_store.services:
+            try:
+                from dfs.svc import _base_dir as _svc_base_dir
+                cfg_p = _svc_base_dir(name) / "dfssvc.json"
+                if cfg_p.is_file():
+                    sync_id = str(json.loads(cfg_p.read_text(encoding="utf-8")).get("sync_id") or "").strip()
+            except Exception:
+                sync_id = ""
+        if not sync_id and r.path:
+            parts = [p for p in r.path.strip("/").split("/") if p]
+            if len(parts) >= 2:
+                leaf = parts[-1]
+                if len(leaf) == 16 and re.fullmatch(r"[A-Za-z0-9_-]{16}", leaf):
+                    sync_id = leaf
+        id_suffix = f" (共有ID: {sync_id})" if sync_id else ""
+        print(f"dfs://{name}/ -> {r.registry} {r.path or '/'} [{tag_str}]{id_suffix}")
         detail_str = _format_remote_status_details(statuses[name])
         if detail_str:
             print(f"  status: {detail_str}")
@@ -725,7 +742,7 @@ def cmd_share(args: argparse.Namespace) -> int:
         print(token)
         return 0
     bootstrap_url = getattr(args, "bootstrap_url", None) or _cm._default_bootstrap_url(remote)
-    print(f"curl -sSL {bootstrap_url} | bash -s -- {token}")
+    print(f"curl -sSL {shlex.quote(bootstrap_url)} | bash -s -- {shlex.quote(token)}")
     return 0
 
 
@@ -738,7 +755,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
         remote = store.get(args.target)
         token = _cm._create_invite_token(args, remote)
         if args.bootstrap_url:
-            print(f"curl -sSL {args.bootstrap_url} | bash -s -- {token}")
+            print(f"curl -sSL {shlex.quote(args.bootstrap_url)} | bash -s -- {shlex.quote(token)}")
         else:
             print(token)
         return 0
@@ -936,6 +953,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         )
         return cmd_invite(inv_args)
 
+    clone_id = ""
     if target.startswith("dfs://"):
         stripped = target[len("dfs://"):].lstrip("/")
         if stripped.startswith("dfs-ro-v1:") or stripped.startswith("dfs-rw-v1:"):
@@ -951,7 +969,12 @@ def cmd_join(args: argparse.Namespace) -> int:
                 candidacy=True,
             )
             return cmd_invite(inv_args)
-        target = stripped.split("/", 1)[0].rstrip(":")
+        if "/" in stripped:
+            host_part, rest_part = stripped.split("/", 1)
+            target = host_part.rstrip(":")
+            clone_id = rest_part.strip("/").split("/")[-1]
+        else:
+            target = stripped.rstrip(":")
 
     from urllib.parse import urlsplit
     from dfs.dnssec import DEFAULT_RECORD_PREFIX, has_txt_record
@@ -1006,6 +1029,8 @@ def cmd_join(args: argparse.Namespace) -> int:
     svc_name = getattr(args, "svc", None) or "local"
     svc_dir = svc_mod._base_dir(svc_name)
     cfg_file = svc_dir / "dfssvc.json"
+    if clone_id:
+        svc_dir.mkdir(parents=True, exist_ok=True)
     if svc_dir.is_dir():
         cfg: Dict[str, Any] = {}
         if cfg_file.is_file():
@@ -1020,8 +1045,22 @@ def cmd_join(args: argparse.Namespace) -> int:
             import socket as _sock
 
             cfg["relay_node"] = svc_name if svc_name != "local" else _sock.gethostname().split(".")[0]
+        if clone_id:
+            subs = [str(s).strip() for s in (cfg.get("subscribe") or []) if str(s).strip()]
+            if clone_id not in subs:
+                subs.append(clone_id)
+            cfg["subscribe"] = subs
         cfg_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"[dfscli] dfssvc ({svc_name}) の参加先を {base_url} に設定しました: {cfg_file}")
+        if clone_id:
+            start_ns = svc_mod.build_parser().parse_args([
+                "start",
+                "--name", svc_name,
+                "--join", base_url,
+                "--subscribe", clone_id,
+                "--force",
+            ])
+            svc_mod.cmd_start(start_ns)
 
     # 3) --path / --secret または DNSSEC 自動発見があれば _cm.RemoteStore にリモートを登録
     if args.path or args.secret or discovered is not None:

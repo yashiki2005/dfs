@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -142,6 +143,71 @@ class ArchiveResult:
     chunk_count: int
     tarball: Optional[Path] = None
     par2_files: Tuple[Path, ...] = ()
+    readme: Optional[Path] = None
+
+
+def _build_archive_readme(
+    *,
+    bundle_name: str,
+    sub_path: str,
+    version: int,
+    chunk_count: int,
+    tarball_name: str,
+    archive_format: str,
+    par2_names: Sequence[str],
+    descriptor_name: str,
+    torrent_name: str,
+    readme_name: str,
+) -> str:
+    """アーカイブの利用・検証・復元手順をまとめた README テキストを生成する。"""
+    par2_section = (
+        f"  - {par2_names[0]} (+ {len(par2_names) - 1} volume(s)): PAR2 修復データ\n"
+        if par2_names
+        else "  - (PAR2 修復データなし / not generated)\n"
+    )
+    par2_verify_cmd = (
+        f"  par2 verify {par2_names[0]}\n"
+        f"  # 破損時は修復:\n"
+        f"  par2 repair {par2_names[0]}\n"
+        if par2_names
+        else "  # (PAR2 なし)\n"
+    )
+    unpack_cmd = (
+        f"  tar --zstd -xf {tarball_name}\n"
+        f"  # または (if tar lacks --zstd):\n"
+        f"  zstd -d {tarball_name} -o {bundle_name}.tar && tar -xf {bundle_name}.tar"
+        if archive_format != "tar.gz"
+        else f"  tar -xzf {tarball_name}"
+    )
+    return (
+        f"DFS Archive Bundle: {bundle_name}\n"
+        f"{'=' * (20 + len(bundle_name))}\n\n"
+        f"Subtree : {sub_path}\n"
+        f"Version : v{version}\n"
+        f"Chunks  : {chunk_count}\n"
+        f"Format  : {archive_format}\n\n"
+        f"1. 同梱ファイル / Included Files\n"
+        f"--------------------------------\n"
+        f"  - {tarball_name} : アーカイブ本体 (meta.json + chunks/*)\n"
+        f"{par2_section}"
+        f"  - {readme_name} : この説明書\n"
+        f"  - {descriptor_name} : 署名付きアーカイブ記述子 (catalog/publish 用)\n"
+        f"  - {torrent_name} : BitTorrent メタデータ\n\n"
+        f"2. 破損チェック・修復 / Verify & Repair (PAR2)\n"
+        f"----------------------------------------------\n"
+        f"{par2_verify_cmd}\n"
+        f"3. DFS リモートへ復元 / Restore into DFS Remote\n"
+        f"-----------------------------------------------\n"
+        f"アーカイブ内のチャンクは元の tree_secret で暗号化されています。\n"
+        f"復元には元のツリーの tree_secret（または同じ秘密鍵を設定したリモート）が必要です。\n\n"
+        f"  dfscli import {tarball_name} <remote>:/ --source-secret <tree_secret>\n\n"
+        f"4. ローカルで展開・検証 / Local Verify & Extract\n"
+        f"------------------------------------------------\n"
+        f"tarball を展開して中身の整合性検証やファイル抽出を行う場合:\n\n"
+        f"{unpack_cmd}\n"
+        f"  dfscli archive verify {bundle_name} --secret <tree_secret>\n"
+        f"  dfscli archive extract {bundle_name} ./restored --secret <tree_secret>\n"
+    )
 
 
 def find_par2_binary() -> Optional[str]:
@@ -430,6 +496,226 @@ def _write_files_torrent(
     return hashlib.sha1(bencode(info)).hexdigest()
 
 
+ZSTD_SKIPPABLE_TOC_MAGIC = 0x184D2A50
+ZSTD_SKIPPABLE_FOOTER_MAGIC = 0x184D2A5F
+
+
+def _require_zstd() -> Any:
+    try:
+        import zstandard as zstd
+    except ImportError as e:  # pragma: no cover
+        raise ArchiveError(
+            "zstandard is required for zstd:chunked archives (pip install zstandard)"
+        ) from e
+    return zstd
+
+
+def write_zstd_chunked_tar(bundle: Path, out_path: Path) -> Dict[str, Any]:
+    """``bundle`` ディレクトリを zstd:chunked 形式（独立 Zstd フレーム + TOC Skippable Frame）の tar.zst へ書き出す。"""
+    zstd = _require_zstd()
+    bundle = Path(bundle)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    c_meta = zstd.ZstdCompressor(level=3)
+    c_chunk = zstd.ZstdCompressor(level=1)
+    toc_entries: List[Dict[str, Any]] = []
+    uncompressed_offset = 0
+
+    items: List[Path] = [bundle]
+    for p in sorted(bundle.rglob("*"), key=lambda x: str(x.relative_to(bundle))):
+        items.append(p)
+
+    with out_path.open("wb") as fout:
+        for item in items:
+            rel = item.relative_to(bundle.parent).as_posix()
+            st = item.stat()
+            ti = tarfile.TarInfo(rel)
+            ti.mtime = int(st.st_mtime)
+            if item.is_dir():
+                ti.type = tarfile.DIRTYPE
+                ti.mode = 0o755
+                ti.size = 0
+                raw_entry = ti.tobuf(tarfile.USTAR_FORMAT)
+                compressed = c_meta.compress(raw_entry)
+                frame_off = fout.tell()
+                fout.write(compressed)
+                toc_entries.append({
+                    "name": rel,
+                    "type": "dir",
+                    "size": 0,
+                    "offset": frame_off,
+                    "compressed_size": len(compressed),
+                    "uncompressed_offset": uncompressed_offset,
+                    "payload_offset_in_frame": len(raw_entry),
+                })
+                uncompressed_offset += len(raw_entry)
+            elif item.is_file():
+                file_size = st.st_size
+                ti.type = tarfile.REGTYPE
+                ti.mode = 0o644
+                ti.size = file_size
+                hdr = ti.tobuf(tarfile.USTAR_FORMAT)
+                pad_len = (-file_size) % 512
+                raw_entry_len = len(hdr) + file_size + pad_len
+
+                comp = c_meta if item.name == "meta.json" else c_chunk
+                frame_off = fout.tell()
+                compressor_obj = comp.compressobj(size=raw_entry_len)
+                compressed_len = 0
+
+                # 1. ヘッダーを圧縮して出力
+                out_chunk = compressor_obj.compress(hdr)
+                if out_chunk:
+                    fout.write(out_chunk)
+                    compressed_len += len(out_chunk)
+
+                # 2. ファイル本体をバッファ単位でストリーミング圧縮
+                with item.open("rb") as fin:
+                    while True:
+                        buf = fin.read(64 * 1024)
+                        if not buf:
+                            break
+                        out_chunk = compressor_obj.compress(buf)
+                        if out_chunk:
+                            fout.write(out_chunk)
+                            compressed_len += len(out_chunk)
+
+                # 3. パディング (512 バイト境界アラインメント)
+                if pad_len > 0:
+                    out_chunk = compressor_obj.compress(b"\x00" * pad_len)
+                    if out_chunk:
+                        fout.write(out_chunk)
+                        compressed_len += len(out_chunk)
+
+                # 4. Zstd フレームの終端フラッシュ
+                out_chunk = compressor_obj.flush(zstd.COMPRESSOBJ_FLUSH_FINISH)
+                if out_chunk:
+                    fout.write(out_chunk)
+                    compressed_len += len(out_chunk)
+
+                toc_entries.append({
+                    "name": rel,
+                    "type": "file",
+                    "size": file_size,
+                    "offset": frame_off,
+                    "compressed_size": compressed_len,
+                    "uncompressed_offset": uncompressed_offset,
+                    "payload_offset_in_frame": len(hdr),
+                })
+                uncompressed_offset += raw_entry_len
+
+        # Standard tar EOF 1024 zero bytes in its own frame
+        fout.write(c_meta.compress(b"\x00" * 1024))
+
+        toc_payload = {
+            "version": 1,
+            "format": "zstd:chunked",
+            "entries": toc_entries,
+        }
+        toc_bytes = json.dumps(
+            toc_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        toc_offset = fout.tell()
+        fout.write(struct.pack("<II", ZSTD_SKIPPABLE_TOC_MAGIC, len(toc_bytes)))
+        fout.write(toc_bytes)
+        fout.write(struct.pack("<IIQ", ZSTD_SKIPPABLE_FOOTER_MAGIC, 8, toc_offset))
+
+    return toc_payload
+
+
+def read_zstd_chunked_toc(archive_path: Path | str) -> Dict[str, Any]:
+    """``zstd:chunked`` アーカイブ末尾の Skippable Frame から TOC を O(1) で読み取る。"""
+    path = Path(archive_path)
+    size = path.stat().st_size
+    if size < 24:
+        raise ArchiveError(f"Not a zstd:chunked archive (too small): {path}")
+    with path.open("rb") as fh:
+        fh.seek(size - 16)
+        footer = fh.read(16)
+        magic, flen, toc_offset = struct.unpack("<IIQ", footer)
+        if magic != ZSTD_SKIPPABLE_FOOTER_MAGIC or flen != 8 or toc_offset >= size - 16:
+            raise ArchiveError(f"Missing zstd:chunked TOC footer: {path}")
+        fh.seek(toc_offset)
+        hdr = fh.read(8)
+        if len(hdr) != 8:
+            raise ArchiveError(f"Truncated zstd:chunked TOC header: {path}")
+        toc_magic, toc_len = struct.unpack("<II", hdr)
+        if toc_magic != ZSTD_SKIPPABLE_TOC_MAGIC or toc_offset + 8 + toc_len != size - 16:
+            raise ArchiveError(f"Invalid zstd:chunked TOC frame: {path}")
+        raw_toc = fh.read(toc_len)
+    try:
+        toc = json.loads(raw_toc.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ArchiveError(f"Invalid zstd:chunked TOC JSON: {e}") from e
+    if not isinstance(toc, dict) or toc.get("format") != "zstd:chunked":
+        raise ArchiveError(f"Invalid zstd:chunked TOC payload: {path}")
+    return toc
+
+
+def extract_zstd_chunked_member(archive_path: Path | str, member_name: str) -> bytes:
+    """TOC を使って ``zstd:chunked`` アーカイブから単一メンバーだけをシーク復号して取り出す。"""
+    zstd = _require_zstd()
+    path = Path(archive_path)
+    toc = read_zstd_chunked_toc(path)
+    norm_target = member_name.strip().lstrip("./")
+    if not norm_target:
+        raise ArchiveError("member_name must not be empty")
+
+    entries = [e for e in (toc.get("entries") or []) if isinstance(e, dict)]
+    matched_entry: Optional[Dict[str, Any]] = None
+
+    # 1. 完全一致 (例: bundle_name/meta.json または bundle_name 相対)
+    for entry in entries:
+        ename = str(entry.get("name") or "").strip().lstrip("./")
+        if ename == norm_target:
+            matched_entry = entry
+            break
+
+    # 2. トップレベルディレクトリ（バンドル名）を剥がしたパスとの完全一致
+    #    例: ename が "dfs-archive/meta.json" で norm_target が "meta.json"
+    #        ename が "dfs-archive/chunks/abc" で norm_target が "chunks/abc"
+    if matched_entry is None:
+        exact_subpath_matches = []
+        for entry in entries:
+            ename = str(entry.get("name") or "").strip().lstrip("./")
+            parts = ename.split("/", 1)
+            if len(parts) == 2 and parts[1] == norm_target:
+                exact_subpath_matches.append(entry)
+        if len(exact_subpath_matches) == 1:
+            matched_entry = exact_subpath_matches[0]
+        elif len(exact_subpath_matches) > 1:
+            raise ArchiveError(f"Ambiguous member name in archive: {member_name}")
+
+    # 3. フォールバック: パス末尾との完全一致 (ただし一意であること)
+    if matched_entry is None:
+        suffix_matches = []
+        for entry in entries:
+            ename = str(entry.get("name") or "").strip().lstrip("./")
+            if ename.endswith(f"/{norm_target}"):
+                suffix_matches.append(entry)
+        if len(suffix_matches) == 1:
+            matched_entry = suffix_matches[0]
+        elif len(suffix_matches) > 1:
+            raise ArchiveError(f"Ambiguous member name in archive (multiple matches): {member_name}")
+
+    if matched_entry is None:
+        raise ArchiveError(f"Member not found in zstd:chunked archive: {member_name}")
+
+    if matched_entry.get("type") != "file":
+        raise ArchiveError(f"Member is not a file: {member_name}")
+
+    off = int(matched_entry["offset"])
+    clen = int(matched_entry["compressed_size"])
+    poff = int(matched_entry["payload_offset_in_frame"])
+    psize = int(matched_entry["size"])
+    with path.open("rb") as fh:
+        fh.seek(off)
+        compressed = fh.read(clen)
+    raw_frame = zstd.ZstdDecompressor().decompress(compressed)
+    return raw_frame[poff : poff + psize]
+
+
 def create_archive(
     node: Any,
     out_dir: Path | str,
@@ -438,18 +724,31 @@ def create_archive(
     version: Optional[int] = None,
     keep_dir: bool = True,
     recovery_percent: int = 0,
+    archive_format: str = "zstd:chunked",
 ) -> ArchiveResult:
-    """指定版（省略時は先頭版）を、署名済みメタデータ + 全チャンク + torrent + tar.gz として保存する。"""
+    """指定版（省略時は先頭版）を、署名済みメタデータ + 全チャンク + torrent + zstd:chunked (.tar.zst) として保存する。"""
     raw_out = Path(out_dir).expanduser()
+    fmt = str(archive_format or "zstd:chunked").strip().lower()
     if raw_out.name.endswith(".tar.gz"):
+        fmt = "tar.gz"
         tarball = raw_out
         bundle = raw_out.with_name(raw_out.name[:-7] or "dfs-archive")
     elif raw_out.name.endswith(".tgz"):
+        fmt = "tar.gz"
         tarball = raw_out
         bundle = raw_out.with_name(raw_out.name[:-4] or "dfs-archive")
+    elif raw_out.name.endswith(".tar.zst"):
+        fmt = "zstd:chunked"
+        tarball = raw_out
+        bundle = raw_out.with_name(raw_out.name[:-8] or "dfs-archive")
+    elif raw_out.name.endswith(".tzst"):
+        fmt = "zstd:chunked"
+        tarball = raw_out
+        bundle = raw_out.with_name(raw_out.name[:-5] or "dfs-archive")
     else:
         bundle = raw_out
-        tarball = bundle.parent / f"{bundle.name}.tar.gz"
+        ext = ".tar.gz" if fmt == "tar.gz" else ".tar.zst"
+        tarball = bundle.parent / f"{bundle.name}{ext}"
     if bundle.exists() and any(bundle.iterdir()):
         raise ArchiveError(f"Archive output is not empty: {bundle}")
     try:
@@ -518,16 +817,35 @@ def create_archive(
         f"dfs-{_safe_name(node.sub_path)}-v{int(p['version'])}-"
         f"{sha256_hex(meta_bytes)[:12]}"
     )
-    with tarfile.open(tarball, "w:gz") as tf:
-        tf.add(bundle, arcname=bundle.name)
+    if fmt == "tar.gz":
+        with tarfile.open(tarball, "w:gz") as tf:
+            tf.add(bundle, arcname=bundle.name)
+    else:
+        write_zstd_chunked_tar(bundle, tarball)
     par2_files: Tuple[Path, ...] = ()
     if recovery_percent > 0:
         par2_files = create_par2_recovery(tarball, redundancy=recovery_percent)
+    descriptor = bundle.with_suffix(".archive.json")
+    readme_file = bundle.with_name(f"{bundle.name}.README.txt")
+    readme_text = _build_archive_readme(
+        bundle_name=bundle.name,
+        sub_path=node.sub_path,
+        version=int(p["version"]),
+        chunk_count=len(wire_ids),
+        tarball_name=tarball.name,
+        archive_format=fmt,
+        par2_names=[pf.name for pf in par2_files],
+        descriptor_name=descriptor.name,
+        torrent_name=torrent.name,
+        readme_name=readme_file.name,
+    )
+    readme_file.write_text(readme_text, encoding="utf-8")
     if keep_dir:
+        (bundle / "README.txt").write_text(readme_text, encoding="utf-8")
         infohash = _write_torrent(bundle, torrent, name, announce)
     else:
         shutil.rmtree(bundle)
-        torrent_targets = [tarball, *par2_files]
+        torrent_targets = [tarball, *par2_files, readme_file]
         infohash = _write_files_torrent(torrent_targets, torrent, bundle.name, announce)
     descriptor_envelope = create_archive_descriptor_envelope(
         node.l4.priv_key_path,
@@ -540,7 +858,6 @@ def create_archive(
         created_at=int(time.time()),
         announce=announce,
     )
-    descriptor = bundle.with_suffix(".archive.json")
     descriptor.write_text(
         json.dumps(
             {
@@ -551,6 +868,7 @@ def create_archive(
                 "head_hash": head.get("entry_hash", ""),
                 "infohash": infohash,
                 "path": node.sub_path,
+                "readme": str(readme_file),
                 "root_wire_id": root_wid,
                 "tarball": str(tarball),
                 "torrent": str(torrent),
@@ -572,6 +890,7 @@ def create_archive(
         chunk_count=len(wire_ids),
         tarball=tarball,
         par2_files=par2_files,
+        readme=readme_file,
     )
 
 

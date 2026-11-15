@@ -120,10 +120,10 @@ class RcloneCase(unittest.TestCase):
 
         self.local = self.base / "local"
         (self.local / "docs" / "sub").mkdir(parents=True)
-        (self.local / "a.txt").write_text("hello world\n", encoding="utf-8")
+        (self.local / "a.txt").write_bytes(b"hello world\n")
         (self.local / "b.bin").write_bytes(b"B" * 4096)
-        (self.local / "docs" / "readme.md").write_text("readme\n", encoding="utf-8")
-        (self.local / "docs" / "sub" / "deep.txt").write_text("deep\n", encoding="utf-8")
+        (self.local / "docs" / "readme.md").write_bytes(b"readme\n")
+        (self.local / "docs" / "sub" / "deep.txt").write_bytes(b"deep\n")
 
     def tearDown(self) -> None:
         if self.old_config_env is None:
@@ -566,7 +566,7 @@ class RcloneCase(unittest.TestCase):
         node3 = cli_mod.load_node_from_mount(store.get("t").resolved_workdir())[0]
         self.assertEqual(node3.l4.pin.version, v1 + 1, "crc32 checksum が更新しない")
 
-        src.write_text("CCCC\n", encoding="utf-8")
+        src.write_bytes(b"CCCC\n")
         self.assertEqual(
             self.run_cli("copyto", str(src), "t:same-size.txt", "--checksum", "sha1"),
             0,
@@ -578,7 +578,7 @@ class RcloneCase(unittest.TestCase):
     def test_import_tar_supports_all_compression_formats(self) -> None:
         source = self.base / "tar_source" / "bundle"
         (source / "docs").mkdir(parents=True)
-        (source / "docs" / "readme.txt").write_text("from tar\n", encoding="utf-8")
+        (source / "docs" / "readme.txt").write_bytes(b"from tar\n")
         (source / "empty").mkdir()
 
         for suffix, mode in (
@@ -633,7 +633,7 @@ class RcloneCase(unittest.TestCase):
     def test_import_command_and_import_tar_alias(self) -> None:
         source = self.base / "alias_src"
         source.mkdir()
-        (source / "hello.txt").write_text("hello import\n", encoding="utf-8")
+        (source / "hello.txt").write_bytes(b"hello import\n")
         archive = self.base / "alias.tar.gz"
         with tarfile.open(archive, "w:gz") as tf:
             tf.add(source, arcname="root")
@@ -660,11 +660,28 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(
             self.run_cli("archive", "create", "t:", "--out", str(bundle_dir)), 0
         )
-        # 既定ではディレクトリを残さず、tar.gz と .torrent を出力する
+        # 既定ではディレクトリを残さず、zstd:chunked (.tar.zst) と .torrent を出力する
         self.assertFalse(bundle_dir.exists())
-        bundle_tar = self.base / "exported_bundle.tar.gz"
+        bundle_tar = self.base / "exported_bundle.tar.zst"
         self.assertTrue(bundle_tar.is_file())
         self.assertTrue((self.base / "exported_bundle.torrent").is_file())
+
+        from dfs.archive import extract_zstd_chunked_member, read_zstd_chunked_toc
+
+        toc = read_zstd_chunked_toc(bundle_tar)
+        self.assertEqual(toc["format"], "zstd:chunked")
+        meta_bytes = extract_zstd_chunked_member(bundle_tar, "meta.json")
+        self.assertIn(b"dfs-archive-v1", meta_bytes)
+
+        # --format tar.gz 指定時は従来形式も出力・import できる
+        gz_out = self.base / "legacy_bundle"
+        self.assertEqual(
+            self.run_cli(
+                "archive", "create", "t:", "--out", str(gz_out), "--format", "tar.gz"
+            ),
+            0,
+        )
+        self.assertTrue((self.base / "legacy_bundle.tar.gz").is_file())
 
         self.assertEqual(
             self.run_cli(
@@ -718,19 +735,25 @@ class RcloneCase(unittest.TestCase):
             ),
             0,
         )
-        bundle_tar = self.base / "par2_bundle.tar.gz"
-        par2_index = self.base / "par2_bundle.tar.gz.par2"
+        bundle_tar = self.base / "par2_bundle.tar.zst"
+        par2_index = self.base / "par2_bundle.tar.zst.par2"
+        readme_file = self.base / "par2_bundle.README.txt"
         self.assertTrue(bundle_tar.is_file())
         self.assertTrue(par2_index.is_file())
-        # vol*.par2 は par2_bundle.tar.gz.par2 に統合されている
+        self.assertTrue(readme_file.is_file())
+        readme_text = readme_file.read_text(encoding="utf-8")
+        self.assertIn("dfscli import", readme_text)
+        self.assertIn("par2 verify", readme_text)
+        # vol*.par2 は par2_bundle.tar.zst.par2 に統合されている
         self.assertEqual(
-            list(self.base.glob("par2_bundle.tar.gz*.par2")), [par2_index]
+            list(self.base.glob("par2_bundle.tar.zst*.par2")), [par2_index]
         )
         torrent_bytes = (self.base / "par2_bundle.torrent").read_bytes()
-        self.assertIn(b"par2_bundle.tar.gz", torrent_bytes)
-        self.assertIn(b"par2_bundle.tar.gz.par2", torrent_bytes)
+        self.assertIn(b"par2_bundle.tar.zst", torrent_bytes)
+        self.assertIn(b"par2_bundle.tar.zst.par2", torrent_bytes)
+        self.assertIn(b"par2_bundle.README.txt", torrent_bytes)
 
-        # tar.gz の末尾付近を少し破損させても par2 で自動修復して import できる
+        # tar.zst の末尾付近を少し破損させても par2 で自動修復して import できる
         raw = bytearray(bundle_tar.read_bytes())
         raw[-8:] = b"\x00" * 8
         bundle_tar.write_bytes(bytes(raw))
@@ -766,11 +789,13 @@ class RcloneCase(unittest.TestCase):
             with mock.patch("sys.stderr", stderr_buf):
                 rc = self.run_cli("archive", "create", "t:", "--out", str(bundle_out))
         self.assertEqual(rc, 0)
-        self.assertTrue((self.base / "nopar2_bundle.tar.gz").is_file())
+        self.assertTrue((self.base / "nopar2_bundle.tar.zst").is_file())
+        self.assertTrue((self.base / "nopar2_bundle.README.txt").is_file())
         self.assertTrue((self.base / "nopar2_bundle.torrent").is_file())
-        self.assertFalse((self.base / "nopar2_bundle.tar.gz.par2").exists())
+        self.assertFalse((self.base / "nopar2_bundle.tar.zst.par2").exists())
         nopar2_torrent = (self.base / "nopar2_bundle.torrent").read_bytes()
-        self.assertIn(b"nopar2_bundle.tar.gz", nopar2_torrent)
+        self.assertIn(b"nopar2_bundle.tar.zst", nopar2_torrent)
+        self.assertIn(b"nopar2_bundle.README.txt", nopar2_torrent)
         self.assertNotIn(b".par2", nopar2_torrent)
         self.assertIn("par2", stderr_buf.getvalue())
         self.assertIn("リカバリレコード", stderr_buf.getvalue())
@@ -1058,6 +1083,52 @@ class RcloneCase(unittest.TestCase):
         """知らないリモートは終了コード 2 で返る（例外を投げない）。"""
         rc = self.run_cli("ls", "nope:")
         self.assertEqual(rc, 2)
+
+    def test_zstd_chunked_streaming_and_member_disambiguation(self) -> None:
+        """zstd:chunked アーカイブのストリーミング作成とメンバー抽出の曖昧性解消を検証する。"""
+        from dfs.archive import (
+            ArchiveError,
+            extract_zstd_chunked_member,
+            read_zstd_chunked_toc,
+            write_zstd_chunked_tar,
+        )
+
+        test_bundle = self.base / "disambig_bundle"
+        test_bundle.mkdir()
+        (test_bundle / "meta.json").write_text('{"root":"top-level"}', encoding="utf-8")
+        sub_dir = test_bundle / "subdir"
+        sub_dir.mkdir()
+        (sub_dir / "meta.json").write_text('{"root":"nested"}', encoding="utf-8")
+        (sub_dir / "large.bin").write_bytes(b"DATA" * 50_000)  # 200KB
+
+        tar_zst = self.base / "disambig_bundle.tar.zst"
+        toc = write_zstd_chunked_tar(test_bundle, tar_zst)
+        self.assertEqual(toc["format"], "zstd:chunked")
+
+        # 1. 完全一致
+        top_meta = extract_zstd_chunked_member(tar_zst, "disambig_bundle/meta.json")
+        self.assertEqual(top_meta, b'{"root":"top-level"}')
+        nested_meta = extract_zstd_chunked_member(tar_zst, "disambig_bundle/subdir/meta.json")
+        self.assertEqual(nested_meta, b'{"root":"nested"}')
+
+        # 2. トップレベル剥離一致 (例: "meta.json" -> 直下の meta.json, "subdir/meta.json" -> ネスト)
+        self.assertEqual(
+            extract_zstd_chunked_member(tar_zst, "meta.json"),
+            b'{"root":"top-level"}',
+        )
+        self.assertEqual(
+            extract_zstd_chunked_member(tar_zst, "subdir/meta.json"),
+            b'{"root":"nested"}',
+        )
+
+        # 3. 200KB のストリーミング圧縮メンバー抽出
+        large_bytes = extract_zstd_chunked_member(tar_zst, "subdir/large.bin")
+        self.assertEqual(large_bytes, b"DATA" * 50_000)
+
+        # 4. 存在しないメンバーは ArchiveError
+        with self.assertRaises(ArchiveError):
+            extract_zstd_chunked_member(tar_zst, "nonexistent.txt")
+
 
 
 if __name__ == "__main__":

@@ -206,10 +206,11 @@ class TestL3ContentDedup(unittest.TestCase):
                     builder.download_directory(root_pid, root_wid, out)
 
                 self.assertEqual((out / "large.bin").read_bytes(), payload)
-                self.assertEqual(
-                    stat.S_IMODE((out / "large.bin").stat().st_mode), 0o640
-                )
-                self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o750)
+                if sys.platform != "win32":
+                    self.assertEqual(
+                        stat.S_IMODE((out / "large.bin").stat().st_mode), 0o640
+                    )
+                    self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o750)
                 self.assertLessEqual(
                     abs((out / "large.bin").stat().st_mtime_ns - mtime_ns), 1000
                 )
@@ -533,6 +534,230 @@ class TestPullBatch(unittest.TestCase):
                     os.environ.pop("DFS_BATCH_CHUNKS", None)
                 else:
                     os.environ["DFS_BATCH_CHUNKS"] = old
+
+    def test_dynamic_batch_bytes_uses_available_memory(self) -> None:
+        """空きメモリに応じて動的バッチ上限が決まり、DFS_BATCH_BYTES 指定時は上書きされる。"""
+        import os
+        from unittest import mock
+        from dfs import l4_log
+
+        old = os.environ.pop("DFS_BATCH_BYTES", None)
+        try:
+            with mock.patch.object(l4_log, "_get_available_memory_bytes", return_value=400 * 1024 * 1024):
+                self.assertEqual(l4_log._dynamic_batch_bytes(), 50 * 1024 * 1024)
+            with mock.patch.object(l4_log, "_get_available_memory_bytes", return_value=16 * 1024 * 1024):
+                self.assertEqual(l4_log._dynamic_batch_bytes(), l4_log.MIN_DYNAMIC_BATCH_BYTES)
+            with mock.patch.object(l4_log, "_get_available_memory_bytes", return_value=16 * 1024**3):
+                self.assertEqual(l4_log._dynamic_batch_bytes(), l4_log.MAX_DYNAMIC_BATCH_BYTES)
+            with mock.patch.object(l4_log, "_get_available_memory_bytes", return_value=None):
+                self.assertEqual(l4_log._dynamic_batch_bytes(12_345), 12_345)
+            os.environ["DFS_BATCH_BYTES"] = str(12 * 1024 * 1024)
+            with mock.patch.object(l4_log, "_get_available_memory_bytes", return_value=16 * 1024**3):
+                self.assertEqual(l4_log._dynamic_batch_bytes(), 12 * 1024 * 1024)
+        finally:
+            if old is None:
+                os.environ.pop("DFS_BATCH_BYTES", None)
+            else:
+                os.environ["DFS_BATCH_BYTES"] = old
+
+    def test_read_remote_file_respects_available_memory_guard(self) -> None:
+        """read_remote_file は空きメモリの 75% を超える場合に OOM 前に MemoryError を送出する。"""
+        from unittest import mock
+        from dfs import l4_log
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+
+        with tempfile.TemporaryDirectory(prefix="dfs_rmem_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                (tree / "big.bin").write_bytes(b"X" * 4096)
+                crypto = ContentAddressedCrypto("mem-guard")
+                writer = OSTClient("127.0.0.1", ost.port)
+                pid, wid = l4_log.MerkleTreeBuilder(crypto, writer).upload_directory(tree)
+                reader = l4_log.MerkleTreeBuilder(crypto, OSTClient("127.0.0.1", ost.port))
+                with mock.patch.object(l4_log, "_get_available_memory_bytes", return_value=1024):
+                    with self.assertRaises(MemoryError):
+                        reader.read_remote_file(pid, wid, "big.bin")
+            finally:
+                ost.close()
+
+    def test_sqlite_index_migrates_legacy_json_and_flushes_download(self) -> None:
+        """旧 JSON 索引を SQLite へ自動移行し、分割フラッシュ付きダウンロードが完結する。"""
+        import json
+        import os
+        from dfs.crypto import ContentAddressedCrypto, sha256_hex
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import MerkleTreeBuilder, SQLiteChunkIndex
+
+        with tempfile.TemporaryDirectory(prefix="dfs_sqlite_idx_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            old_chunks = os.environ.get("DFS_BATCH_CHUNKS")
+            os.environ["DFS_BATCH_CHUNKS"] = "2"
+            try:
+                secret = "sqlite-idx-secret"
+                idx_file = base / "ost_index.json"
+                idx_file.write_text(
+                    json.dumps({
+                        "schema": "dfs-ost-index-v1",
+                        "address_key": sha256_hex(ContentAddressedCrypto(secret).address_secret),
+                        "entries": {"deadbeef": ["w1", "ost0", "none"]},
+                    }),
+                    encoding="utf-8",
+                )
+                tree = base / "tree"
+                tree.mkdir()
+                for i in range(5):
+                    (tree / f"f{i}.txt").write_text(f"payload-{i}\n" * 10, encoding="utf-8")
+
+                builder = MerkleTreeBuilder(
+                    ContentAddressedCrypto(secret),
+                    OSTClient("127.0.0.1", ost.port),
+                    index_file=idx_file,
+                )
+                self.assertIsInstance(builder.index, SQLiteChunkIndex)
+                self.assertEqual(builder.index.get("deadbeef"), ("w1", "ost0", "none"))
+                pid, wid = builder.upload_directory(tree)
+                builder.index.close()
+
+                # 再オープンしても SQLite から読める
+                reopened = MerkleTreeBuilder(
+                    ContentAddressedCrypto(secret),
+                    OSTClient("127.0.0.1", ost.port),
+                    index_file=idx_file,
+                )
+                self.assertGreaterEqual(len(reopened.index), 6)
+                dest = base / "out"
+                reopened.download_directory(pid, wid, dest)
+                reopened.index.close()
+                for i in range(5):
+                    self.assertEqual(
+                        (dest / f"f{i}.txt").read_text(encoding="utf-8"),
+                        f"payload-{i}\n" * 10,
+                    )
+            finally:
+                ost.close()
+                if old_chunks is None:
+                    os.environ.pop("DFS_BATCH_CHUNKS", None)
+                else:
+                    os.environ["DFS_BATCH_CHUNKS"] = old_chunks
+
+    def test_ost_gc_ttl_and_size_cap_eviction(self) -> None:
+        """ChunkStoreServer.gc() と evict_on_full により期限切れ・古いチャンクが回収される。"""
+        import os
+        import time
+        from dfs.crypto import sha256_hex
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+
+        with tempfile.TemporaryDirectory(prefix="dfs_gc_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            chunks_dir = base / "ost_chunks"
+            srv = ChunkStoreServer(
+                cert,
+                key,
+                chunks_dir=chunks_dir,
+                max_store_bytes=120,
+                chunk_ttl_seconds=60.0,
+                evict_on_full=True,
+            )
+            try:
+                cli = OSTClient("127.0.0.1", srv.port, expected_cert_sha256=srv.cert_sha256)
+                b1, b2, b3 = b"1" * 50, b"2" * 50, b"3" * 50
+                w1, w2, w3 = sha256_hex(b1), sha256_hex(b2), sha256_hex(b3)
+                cli.put_if_absent(w1, b1)
+                cli.put_if_absent(w2, b2)
+
+                # w1 の mtime を古くすると、w3 追加時の evict_on_full で w1 が追い出される
+                old_t = time.time() - 10.0
+                os.utime(chunks_dir / f"{w1}.blk", (old_t, old_t))
+                cli.put_if_absent(w3, b3)
+                self.assertEqual(cli.batch_has([w1, w2, w3]), {w1: False, w2: True, w3: True})
+
+                # TTL を 5 秒にして gc() を呼ぶと、w1 より新しい w2/w3 のうち期限切れだけが消える
+                os.utime(chunks_dir / f"{w2}.blk", (old_t, old_t))
+                res = srv.gc(ttl_seconds=5.0)
+                self.assertEqual(res["evicted"], 1)
+                self.assertEqual(cli.batch_has([w2, w3]), {w2: False, w3: True})
+            finally:
+                srv.close()
+
+    def test_download_directory_resumes_valid_local_chunks(self) -> None:
+        """既存ファイルの有効チャンクを plain_id で照合してスキップし、不足分のみ取得する。"""
+        from dfs.crypto import ContentAddressedCrypto
+        from dfs.l3_store import ChunkStoreServer, OSTClient
+        from dfs.l4_log import FILE_CHUNK_BYTES, MerkleTreeBuilder
+
+        with tempfile.TemporaryDirectory(prefix="dfs_resume_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                tree = base / "tree"
+                tree.mkdir()
+                chunk0 = b"A" * FILE_CHUNK_BYTES
+                chunk1 = b"B" * 1024
+                (tree / "big.bin").write_bytes(chunk0 + chunk1)
+                crypto = ContentAddressedCrypto("resume-secret")
+                writer = OSTClient("127.0.0.1", ost.port)
+                pid, wid = MerkleTreeBuilder(crypto, writer).upload_directory(tree)
+
+                dest = base / "dest"
+                dest.mkdir()
+                # chunk0 だけ正しくローカルに存在し、chunk1 は欠けている状態を模擬
+                (dest / "big.bin").write_bytes(chunk0)
+
+                reader = OSTClient("127.0.0.1", ost.port)
+                reader.reset_metrics()
+                MerkleTreeBuilder(crypto, reader).download_directory(pid, wid, dest)
+                self.assertEqual((dest / "big.bin").read_bytes(), chunk0 + chunk1)
+                # ディレクトリ塊(1) + 不足チャンク chunk1(1) = 2 チャンクのみ取得（chunk0 はスキップ）
+                self.assertEqual(reader.get_count, 2)
+            finally:
+                ost.close()
+
+    def test_dfsnode_libp2p_peers_graceful_fallback(self) -> None:
+        """libp2p 未導入環境でも libp2p_peers 指定でクラッシュせず TLS/HTTP にフォールバックする。"""
+        import warnings
+        from unittest import mock
+        from dfs.l2_registry import DirectoryRegistryService
+        from dfs.l3_store import ChunkStoreServer
+        from dfs.l5_fs import DFSNode
+
+        with tempfile.TemporaryDirectory(prefix="dfs_lp2p_") as tmp:
+            base = Path(tmp)
+            cert, key = self._cert(base)
+            ost = ChunkStoreServer(cert, key)
+            try:
+                key_path = base / "writer"
+                pub_path = base / "writer.pub"
+                key_path.write_text("dummy", encoding="utf-8")
+                pub_path.write_text("ssh-ed25519 AAAA dummy", encoding="utf-8")
+                reg = DirectoryRegistryService("/example.com", "ssh-ed25519 AAAA root")
+                with mock.patch("dfs.libp2p_chunk._LIBP2P_AVAILABLE", False):
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        node = DFSNode(
+                            name="n1",
+                            sub_path="/example.com/a",
+                            mount_root=base / "mnt",
+                            priv_key_path=key_path,
+                            pub_key_str="ssh-ed25519 AAAA dummy",
+                            tree_secret="sec",
+                            registry=reg,
+                            ost_host="127.0.0.1",
+                            ost_port=ost.port,
+                            libp2p_peers=["/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWTest"],
+                        )
+                self.assertIsNone(node.libp2p_client)
+                self.assertTrue(any("libp2p unavailable" in str(w.message) for w in caught))
+            finally:
+                ost.close()
 
     def test_missing_chunk_is_reported(self) -> None:
         """サーバから塊が消えていたら、黙って欠けずに ChunkIntegrityError になる。"""

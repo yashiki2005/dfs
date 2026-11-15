@@ -65,10 +65,33 @@ def cmd_lsl(args: argparse.Namespace) -> int:
     store = _cm.RemoteStore()
     name, sub = _cm.split_remote_spec(args.remote, args.remote_name)
     node = _cm.open_remote(_cm._resolve_remote(store, name), create=True)
+    head_ts: Optional[int] = None
+    try:
+        head = node.l4.sync_head(node.registry)
+        if head and isinstance(head.get("payload"), dict):
+            ts = head["payload"].get("timestamp")
+            if isinstance(ts, (int, float)):
+                head_ts = int(ts)
+    except Exception:
+        head_ts = None
+    work_tree = getattr(getattr(node, "clayfs", None), "work_tree", None)
     for e in _cm._rel_entries(node, _cm._norm_prefix(sub)):
         rel = e["rel"] + ("/" if e["type"] == "dir" else "")
         size = e.get("size", 0)
-        print(f"{size:>12}  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}  {rel}")
+        ts_val = head_ts
+        if work_tree is not None:
+            local_item = work_tree / e["path"]
+            if local_item.exists() and not local_item.is_symlink():
+                try:
+                    ts_val = int(local_item.stat().st_mtime)
+                except OSError:
+                    pass
+        ts_str = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_val))
+            if ts_val is not None
+            else "-"
+        )
+        print(f"{size:>12}  {ts_str}  {rel}")
     return 0
 
 
@@ -116,10 +139,14 @@ def cmd_cat(args: argparse.Namespace) -> int:
         raise _cm.UsageError("cat にはファイルのパスが必要です（例: remote:dir/file.txt）")
     node = _cm.open_remote(_cm._resolve_remote(store, name), create=True)
     try:
-        data = node.read_remote(sub)
+        iter_fn = getattr(node, "iter_remote", None)
+        if callable(iter_fn):
+            for chunk in iter_fn(sub):
+                _cm.sys.stdout.buffer.write(chunk)
+        else:
+            _cm.sys.stdout.buffer.write(node.read_remote(sub))
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         raise _cm.UsageError(str(e)) from e
-    _cm.sys.stdout.buffer.write(data)
     _cm.sys.stdout.buffer.flush()
     return 0
 
@@ -783,9 +810,9 @@ def _pull_once(
     try:
         src_root.resolve(strict=False).relative_to(work_root)
     except ValueError as e:
-        raise _cm.UsageError(f"_cm.Remote path escapes the work tree: {prefix!r}") from e
+        raise _cm.UsageError(f"Remote path escapes the work tree: {prefix!r}") from e
     if not src_root.exists():
-        raise _cm.UsageError(f"_cm.Remote path does not exist: {remote.name}:{prefix}")
+        raise _cm.UsageError(f"Remote path does not exist: {remote.name}:{prefix}")
 
     dest.mkdir(parents=True, exist_ok=True)
     count = 0
@@ -905,7 +932,7 @@ def cmd_about(args: argparse.Namespace) -> int:
     cfg = json.loads((node.clayfs.clayfs_meta / _cm.cli_mod.CONFIG_FILENAME).read_text(encoding="utf-8"))
     effective_path = cfg.get("sub_path") or remote.path
     effective_ost = remote.ost or f"{cfg.get('ost_host', '')}:{cfg.get('ost_port', '')}"
-    print(f"_cm.Remote      : {name}")
+    print(f"Remote      : {name}")
     print(f"Registry    : {remote.registry}")
     print(f"OST         : {effective_ost}" + ("" if remote.ost else "  (L2 のロケータから解決)"))
     print(f"Subtree     : {effective_path}" + ("" if remote.path else "  (L2 で書き手鍵から解決)"))
@@ -919,13 +946,13 @@ def cmd_about(args: argparse.Namespace) -> int:
         if head_env:
             hp = head_env["payload"]
             print(
-                f"_cm.Remote Head : v{hp['version']} (epoch={hp['delegation_epoch']}, "
+                f"Remote Head : v{hp['version']} (epoch={hp['delegation_epoch']}, "
                 f"root={hp['root_plain_id'][:12]}...)"
             )
         else:
-            print("_cm.Remote Head : (empty)")
+            print("Remote Head : (empty)")
     except Exception as e:  # noqa: BLE001 - 表示のためのコマンドなので落とさない
-        print(f"_cm.Remote Head : [unreachable: {e}]")
+        print(f"Remote Head : [unreachable: {e}]")
     return 0
 
 

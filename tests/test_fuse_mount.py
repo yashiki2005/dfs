@@ -53,10 +53,14 @@ class LocalTreeFuseTests(unittest.TestCase):
     def test_statfs_reports_backing_filesystem_capacity(self) -> None:
         ops = LocalTreeFuse(self.root, self._flush)
         attrs = ops.statfs("/")
-        expected = os.statvfs(self.root)
-        self.assertEqual(attrs["f_bsize"], expected.f_bsize)
-        self.assertEqual(attrs["f_blocks"], expected.f_blocks)
-        self.assertEqual(attrs["f_bavail"], expected.f_bavail)
+        if hasattr(os, "statvfs"):
+            expected = os.statvfs(self.root)
+            self.assertEqual(attrs["f_bsize"], expected.f_bsize)
+            self.assertEqual(attrs["f_blocks"], expected.f_blocks)
+            self.assertEqual(attrs["f_bavail"], expected.f_bavail)
+        else:
+            self.assertGreater(attrs["f_bsize"], 0)
+            self.assertGreater(attrs["f_blocks"], 0)
         self.assertGreater(attrs["f_blocks"], 0)
 
     def test_directory_operations(self) -> None:

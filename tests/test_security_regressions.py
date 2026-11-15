@@ -258,7 +258,10 @@ class TestSymlinkBoundaries(unittest.TestCase):
             outside = base / "outside.txt"
             outside.write_text("OUTSIDE-SECRET", encoding="utf-8")
             (source / "normal.txt").write_text("normal", encoding="utf-8")
-            os.symlink(outside, source / "leak.txt")
+            try:
+                os.symlink(outside, source / "leak.txt")
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink を作れない: {exc}")
 
             collected = _collect_local(source)
             self.assertEqual(set(collected), {"normal.txt"})
@@ -271,7 +274,10 @@ class TestSymlinkBoundaries(unittest.TestCase):
             outside = base / "outside.txt"
             outside.write_text("OUTSIDE-SECRET", encoding="utf-8")
             source = base / "source.txt"
-            os.symlink(outside, source)
+            try:
+                os.symlink(outside, source)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink を作れない: {exc}")
             destination = base / "destination.txt"
 
             with self.assertRaises(UnsafePathError):
@@ -286,7 +292,10 @@ class TestSymlinkBoundaries(unittest.TestCase):
             tree = base / "tree"
             tree.mkdir()
             (tree / "normal.txt").write_text("normal", encoding="utf-8")
-            os.symlink(outside, tree / "leak.txt")
+            try:
+                os.symlink(outside, tree / "leak.txt")
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink を作れない: {exc}")
 
             ost = _FakeOST()
             builder = MerkleTreeBuilder(ContentAddressedCrypto("secret"), ost)
@@ -305,7 +314,10 @@ class TestSymlinkBoundaries(unittest.TestCase):
             outside = base / "outside"
             root.mkdir()
             outside.mkdir()
-            os.symlink(outside, root / "escape")
+            try:
+                os.symlink(outside, root / "escape")
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink を作れない: {exc}")
             with self.assertRaises(UnsafePathError):
                 safe_target(root, "escape/pwned.txt", create_parents=True)
             self.assertFalse((outside / "pwned.txt").exists())
@@ -319,7 +331,10 @@ class TestSymlinkBoundaries(unittest.TestCase):
             root.mkdir()
             src.write_text("new", encoding="utf-8")
             outside.write_text("old", encoding="utf-8")
-            os.symlink(outside, root / "leak.txt")
+            try:
+                os.symlink(outside, root / "leak.txt")
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink を作れない: {exc}")
 
             with self.assertRaises(UnsafePathError):
                 copyfile_no_follow(src, root / "leak.txt")
@@ -332,7 +347,10 @@ class TestSymlinkBoundaries(unittest.TestCase):
             outside = base / "outside"
             root.mkdir()
             outside.mkdir()
-            os.symlink(outside, root / "escape")
+            try:
+                os.symlink(outside, root / "escape")
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink を作れない: {exc}")
             src = base / "src.txt"
             src.write_text("payload", encoding="utf-8")
 
@@ -451,7 +469,10 @@ class TestServerClock(unittest.TestCase):
             dst = root / "dst_link"
             src.write_bytes(b"hello")
             target.write_bytes(b"keep")
-            dst.symlink_to(target)
+            try:
+                dst.symlink_to(target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink を作れない: {exc}")
             with self.assertRaises(UnsafePathError):
                 copyfile_no_follow(src, dst)
             self.assertEqual(target.read_bytes(), b"keep")

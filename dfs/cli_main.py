@@ -267,6 +267,11 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
                 norm_alt = Remote.normalize_ost(str(alt))
                 if norm_alt and norm_alt != ost_value and norm_alt not in ost_alternates:
                     ost_alternates.append(norm_alt)
+        for reg_u in remote.registry_urls():
+            if "/relay/" in reg_u:
+                norm_rel = Remote.normalize_ost(reg_u)
+                if norm_rel and norm_rel != ost_value and norm_rel not in ost_alternates:
+                    ost_alternates.append(norm_rel)
         if not ost_cert_sha256 and ost_info_cache is not None:
             ost_cert_sha256 = matching_ost_cert_pin(ost_value, ost_info_cache)
         sub_path = resolve_path(remote, registry)
@@ -333,8 +338,14 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
         cfg["registry_url"] = remote.registry
         cfg["registry_alternates"] = list(remote.registry_alternates)
         changed = True
-    if list(cfg.get("ost_alternates") or []) != list(remote.ost_alternates):
-        cfg["ost_alternates"] = list(remote.ost_alternates)
+    desired_alts = list(remote.ost_alternates) if remote.ost_alternates else list(cfg.get("ost_alternates") or [])
+    for reg_u in remote.registry_urls():
+        if "/relay/" in reg_u:
+            norm_rel = Remote.normalize_ost(reg_u)
+            if norm_rel and norm_rel != str(cfg.get("ost_endpoint", "")) and norm_rel not in desired_alts:
+                desired_alts.append(norm_rel)
+    if list(cfg.get("ost_alternates") or []) != desired_alts:
+        cfg["ost_alternates"] = desired_alts
         changed = True
     if (
         list(cfg.get("libp2p_peers") or []) != list(remote.libp2p_peers)
@@ -353,6 +364,19 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
         cfg["sub_path"] = remote.path
         changed = True
         tree_identity_changed = True
+    elif not remote.path and (
+        cfg.get("registry_url") != remote.registry
+        or (remote.root_pubkey and cfg.get("root_pubkey") != remote.root_pubkey)
+        or getattr(node.l4.pin, "version", 0) == 0
+    ):
+        try:
+            resolved_sub = resolve_path(remote, node.registry)
+        except Exception:
+            resolved_sub = ""
+        if resolved_sub and cfg.get("sub_path") != resolved_sub:
+            cfg["sub_path"] = resolved_sub
+            changed = True
+            tree_identity_changed = True
     if not remote.secret and not str(cfg.get("tree_secret", "") or ""):
         remote = _ensure_remote_secret(remote)
     if remote.secret and cfg.get("tree_secret") != remote.secret:
@@ -393,6 +417,14 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
             _reset_workdir_pin(mount_root)
         write_private_json(cfg_path, cfg)
         node, cfg, _reg = cli_mod.load_node_from_mount(mount_root)
+    if create and not remote.read_only and getattr(node.l4.pin, "version", 0) == 0:
+        auto_fn = getattr(node.registry, "auto_delegate", None)
+        writer_pub = getattr(node.l4, "pub_key_str", "")
+        if callable(auto_fn) and writer_pub:
+            try:
+                auto_fn(node.sub_path, writer_pub)
+            except Exception:
+                pass
     return node
 
 
@@ -622,6 +654,20 @@ def _tar_member_path(name: str, strip_components: int) -> str:
     return rel
 
 
+def _is_zstd_file(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            hdr = fh.read(4)
+    except OSError:
+        return False
+    if len(hdr) < 4:
+        return False
+    if hdr == b"\x28\xb5\x2f\xfd":
+        return True
+    magic_le = int.from_bytes(hdr, "little")
+    return 0x184D2A50 <= magic_le <= 0x184D2A5F
+
+
 def _extract_tar_safely(
     archive_path: Path,
     staging: Path,
@@ -634,30 +680,50 @@ def _extract_tar_safely(
     """
     files: Dict[str, Path] = {}
     dirs = set()
+
+    def _consume(archive: tarfile.TarFile) -> None:
+        for member in archive:
+            rel = _tar_member_path(member.name, strip_components)
+            if not rel:
+                continue
+            if member.issym() or member.islnk():
+                raise UsageError(f"tar のリンクはインポートできません: {member.name!r}")
+            if not (member.isfile() or member.isdir()):
+                raise UsageError(
+                    f"tar の特殊ファイルはインポートできません: {member.name!r}"
+                )
+            if rel == ".DS_Store" or rel.startswith("._"):
+                continue
+            if member.isdir():
+                dirs.add(rel)
+                continue
+            target = safe_target(staging, rel, create_parents=True)
+            source = archive.extractfile(member)
+            if source is None:
+                raise UsageError(f"tar member を読めません: {member.name!r}")
+            with source, target.open("wb") as dest:
+                shutil.copyfileobj(source, dest, length=1024 * 1024)
+            files[rel] = target
+
     try:
-        with tarfile.open(archive_path, mode="r:*") as archive:
-            for member in archive:
-                rel = _tar_member_path(member.name, strip_components)
-                if not rel:
-                    continue
-                if member.issym() or member.islnk():
-                    raise UsageError(f"tar のリンクはインポートできません: {member.name!r}")
-                if not (member.isfile() or member.isdir()):
-                    raise UsageError(
-                        f"tar の特殊ファイルはインポートできません: {member.name!r}"
-                    )
-                if rel == ".DS_Store" or rel.startswith("._"):
-                    continue
-                if member.isdir():
-                    dirs.add(rel)
-                    continue
-                target = safe_target(staging, rel, create_parents=True)
-                source = archive.extractfile(member)
-                if source is None:
-                    raise UsageError(f"tar member を読めません: {member.name!r}")
-                with source, target.open("wb") as dest:
-                    shutil.copyfileobj(source, dest, length=1024 * 1024)
-                files[rel] = target
+        if _is_zstd_file(archive_path):
+            try:
+                import zstandard as zstd
+            except ImportError as e:
+                raise UsageError(
+                    f"tar.zst の展開には zstandard が必要です: {archive_path}"
+                ) from e
+            dctx = zstd.ZstdDecompressor()
+            try:
+                with archive_path.open("rb") as raw_fh:
+                    with dctx.stream_reader(raw_fh) as z_reader:
+                        with tarfile.open(fileobj=z_reader, mode="r|") as archive:
+                            _consume(archive)
+            except zstd.ZstdError as e:
+                raise UsageError(f"zstd tar を読み込めません: {archive_path}: {e}") from e
+        else:
+            with tarfile.open(archive_path, mode="r:*") as archive:
+                _consume(archive)
     except (tarfile.TarError, OSError, EOFError) as e:
         raise UsageError(f"tar を読み込めません: {archive_path}: {e}") from e
     return files, dirs
@@ -731,9 +797,6 @@ def plan_changes(
         if int(entry.get("size", 0)) != size:
             to_write.append((path, src, "update"))
             continue
-        data: Optional[bytes] = None
-        if checksum in ("plain_id", "crc32", "sha1"):
-            data = src.read_bytes()
         if checksum == "plain_id":
             local_ids = _local_chunk_plain_ids(src, node.crypto)
             remote_ids = [
@@ -744,13 +807,39 @@ def plan_changes(
                 to_write.append((path, src, "update"))
                 continue
         elif checksum in ("crc32", "sha1"):
-            remote_data = node.read_remote(path)
+            iter_fn = getattr(node, "iter_remote", None)
             if checksum == "crc32":
-                local_sum = zlib.crc32(data) & 0xFFFFFFFF
-                remote_sum = zlib.crc32(remote_data) & 0xFFFFFFFF
+                local_sum_i = 0
+                with src.open("rb") as fh:
+                    while True:
+                        blk = fh.read(8 * 1024 * 1024)
+                        if not blk:
+                            break
+                        local_sum_i = zlib.crc32(blk, local_sum_i)
+                local_sum: Any = local_sum_i & 0xFFFFFFFF
+                remote_sum_i = 0
+                if callable(iter_fn):
+                    for chunk in iter_fn(path):
+                        remote_sum_i = zlib.crc32(chunk, remote_sum_i)
+                else:
+                    remote_sum_i = zlib.crc32(node.read_remote(path))
+                remote_sum: Any = remote_sum_i & 0xFFFFFFFF
             else:
-                local_sum = hashlib.sha1(data).hexdigest()
-                remote_sum = hashlib.sha1(remote_data).hexdigest()
+                lh = hashlib.sha1()
+                with src.open("rb") as fh:
+                    while True:
+                        blk = fh.read(8 * 1024 * 1024)
+                        if not blk:
+                            break
+                        lh.update(blk)
+                local_sum = lh.hexdigest()
+                rh = hashlib.sha1()
+                if callable(iter_fn):
+                    for chunk in iter_fn(path):
+                        rh.update(chunk)
+                else:
+                    rh.update(node.read_remote(path))
+                remote_sum = rh.hexdigest()
             if local_sum != remote_sum:
                 to_write.append((path, src, "update"))
                 continue
@@ -1446,6 +1535,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="create の bundle 出力先、または fetch のダウンロード先",
     )
     p_arch.add_argument(
+        "--format",
+        choices=["zstd:chunked", "tar.zst", "tar.gz"],
+        default="zstd:chunked",
+        help="create のアーカイブ形式（既定: zstd:chunked）",
+    )
+    p_arch.add_argument(
         "--keep-dir",
         action="store_true",
         help="create 時に展開済み bundle ディレクトリも削除せず残す",
@@ -1988,11 +2083,57 @@ def _friendly_error(exc: BaseException) -> int:
     return 1
 
 
+def _normalize_intermixed_archive_argv(argv: List[str]) -> List[str]:
+    if not argv:
+        return argv
+    prefix: List[str] = []
+    idx = 0
+    while idx < len(argv):
+        tok = argv[idx]
+        if tok in ("--remote", "-r"):
+            if idx + 1 >= len(argv):
+                return argv
+            prefix.extend((tok, argv[idx + 1]))
+            idx += 2
+        elif tok.startswith("--remote="):
+            prefix.append(tok)
+            idx += 1
+        else:
+            break
+    rest_all = argv[idx:]
+    if len(rest_all) < 3 or rest_all[0] != "archive":
+        return argv
+    action = rest_all[1]
+    if action not in ("fetch", "extract"):
+        return argv
+    source = rest_all[2]
+    rest = rest_all[3:]
+    non_opts = []
+    opts = []
+    i = 0
+    val_options = {"--out", "--announce", "--version", "--secret", "--recovery", "--torrent-client", "--torrent-timeout"}
+    while i < len(rest):
+        arg = rest[i]
+        if arg.startswith("-"):
+            opts.append(arg)
+            if arg in val_options and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+                opts.append(rest[i + 1])
+                i += 1
+        else:
+            non_opts.append(arg)
+        i += 1
+    if non_opts:
+        return [*prefix, "archive", action, source, *non_opts, *opts]
+    return argv
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     from .i18n import _, translate_parser
 
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    norm_argv = _normalize_intermixed_archive_argv(raw_argv)
     parser = translate_parser(build_parser(), _)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(norm_argv)
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:

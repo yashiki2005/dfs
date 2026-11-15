@@ -9,6 +9,7 @@ from __future__ import annotations
 import hmac
 import http.client
 import json
+import os
 import queue
 import re
 import ssl
@@ -96,6 +97,8 @@ class _NodeSlot:
         self.observed_ip: str = ""
         self.direct_endpoints: List[str] = []
         self.role: str = "writer"
+        self.peer_id: str = ""
+        self.p2p_addrs: List[str] = []
 
 
 class RelayHub:
@@ -114,6 +117,8 @@ class RelayHub:
         self.max_pending_per_node = max(1, int(max_pending_per_node))
         self._lock = threading.RLock()
         self._nodes: Dict[str, _NodeSlot] = {}
+        self._allowed_peer_ids: Dict[str, Dict[str, Any]] = {}
+        self.on_allowlist_change: Optional[Any] = None
 
     def verify_token(self, presented: Optional[str]) -> None:
         if not self.token:
@@ -289,9 +294,20 @@ class RelayHub:
             observed_ip = slot.observed_ip
             direct_eps = list(slot.direct_endpoints)
             role = slot.role
+            peer_id = slot.peer_id
+            p2p_addrs = list(slot.p2p_addrs)
 
         candidates: List[Dict[str, Any]] = []
         seen: set[str] = set()
+        for addr in p2p_addrs:
+            if addr not in seen:
+                seen.add(addr)
+                candidates.append({
+                    "type": "libp2p",
+                    "endpoint": addr,
+                    "peer_id": peer_id,
+                    "priority": 120,
+                })
         for ep in direct_eps:
             if ep not in seen:
                 seen.add(ep)
@@ -311,8 +327,80 @@ class RelayHub:
             "role": role,
             "observed_ip": observed_ip,
             "online": online,
+            "peer_id": peer_id,
+            "p2p_addrs": p2p_addrs,
             "candidates": candidates,
         }
+
+    def allow_peer_id(
+        self,
+        peer_id: str,
+        node_id: str = "",
+        role: str = "seeder",
+        addrs: Optional[Sequence[str]] = None,
+        sync_id: str = "",
+        sub_path: str = "",
+    ) -> Dict[str, Any]:
+        """ドメイン内の許可済み libp2p PeerID リストへ登録する。"""
+        pid = str(peer_id or "").strip()
+        if not pid:
+            raise ValueError("peer_id is required")
+        cleaned_addrs = [str(a).strip() for a in (addrs or ()) if str(a).strip()]
+        cleaned_node_id = str(node_id or "").strip()
+        cleaned_sync_id = str(sync_id or "").strip()
+        with self._lock:
+            if cleaned_node_id and cleaned_node_id not in ("hub", "seeder", "primary", "secondary"):
+                stale_pids = [
+                    k for k, v in self._allowed_peer_ids.items()
+                    if k != pid and v.get("node_id") == cleaned_node_id
+                ]
+                for sp in stale_pids:
+                    self._allowed_peer_ids.pop(sp, None)
+            existing = self._allowed_peer_ids.get(pid, {})
+            entry = {
+                "peer_id": pid,
+                "node_id": str(cleaned_node_id or existing.get("node_id") or "").strip(),
+                "role": str(role or existing.get("role") or "seeder"),
+                "addrs": cleaned_addrs or list(existing.get("addrs") or []),
+                "sync_id": str(cleaned_sync_id or existing.get("sync_id") or "").strip(),
+                "sub_path": str(sub_path or existing.get("sub_path") or "").strip(),
+                "updated_at": time.time(),
+            }
+            self._allowed_peer_ids[pid] = entry
+            cb = self.on_allowlist_change
+            ids = sorted(self._allowed_peer_ids.keys())
+        if callable(cb):
+            try:
+                cb(ids)
+            except Exception:
+                pass
+        return dict(entry)
+
+    def revoke_peer_id(self, peer_id: str) -> bool:
+        """ドメイン内の許可済み libp2p PeerID リストから削除する。"""
+        pid = str(peer_id or "").strip()
+        with self._lock:
+            removed = self._allowed_peer_ids.pop(pid, None) is not None
+            cb = self.on_allowlist_change
+            ids = sorted(self._allowed_peer_ids.keys())
+        if removed and callable(cb):
+            try:
+                cb(ids)
+            except Exception:
+                pass
+        return removed
+
+    def is_peer_id_allowed(self, peer_id: str) -> bool:
+        pid = str(peer_id or "").strip()
+        with self._lock:
+            return bool(pid and pid in self._allowed_peer_ids)
+
+    def get_allowed_peers(self) -> Dict[str, Any]:
+        """ドメイン内の許可済み PeerID とマルチアドレス一覧を返す。"""
+        with self._lock:
+            peers = [dict(v) for v in self._allowed_peer_ids.values()]
+            peer_ids = sorted(self._allowed_peer_ids.keys())
+        return {"peer_ids": peer_ids, "peers": peers}
 
     def announce_peer(
         self,
@@ -320,10 +408,14 @@ class RelayHub:
         direct_endpoints: Sequence[str],
         observed_ip: str = "",
         role: str = "seeder",
+        peer_id: str = "",
+        p2p_addrs: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """読者キャッシュ（seeder）やミラーが軽量トラッカーへ読み取りエンドポイントを登録する。"""
         slot = self._get_or_create_slot(node_id)
         cleaned = [str(ep).strip() for ep in direct_endpoints if str(ep).strip()]
+        cleaned_p2p = [str(a).strip() for a in (p2p_addrs or ()) if str(a).strip()]
+        pid = str(peer_id or "").strip()
         with self._lock:
             slot.last_seen = time.monotonic()
             if observed_ip:
@@ -332,6 +424,12 @@ class RelayHub:
                 slot.direct_endpoints = cleaned
             if role in ("writer", "seeder"):
                 slot.role = role
+            if pid:
+                slot.peer_id = pid
+            if cleaned_p2p:
+                slot.p2p_addrs = cleaned_p2p
+        if pid:
+            self.allow_peer_id(pid, node_id=node_id, role=role, addrs=cleaned_p2p)
         return self.get_ice_candidates(node_id)
 
 
@@ -342,21 +440,32 @@ def announce_ice_peer(
     role: str = "seeder",
     token: str = "",
     timeout: float = 1.5,
+    peer_id: str = "",
+    p2p_addrs: Sequence[str] = (),
 ) -> bool:
     """root dfssvc の ``/_ice/announce`` へ読み取り用エンドポイントを登録する。"""
     import urllib.request
 
     root = str(base_url or "").strip().rstrip("/")
-    if not root or not direct_endpoints:
+    cleaned_eps = [str(ep).strip() for ep in direct_endpoints if str(ep).strip()]
+    cleaned_p2p = [str(a).strip() for a in p2p_addrs if str(a).strip()]
+    pid = str(peer_id or "").strip()
+    if not root or (not cleaned_eps and not pid):
         return False
-    payload = json.dumps({
+    body_obj: Dict[str, Any] = {
         "node_id": node_id,
-        "direct_endpoints": [str(ep).strip() for ep in direct_endpoints if str(ep).strip()],
+        "direct_endpoints": cleaned_eps,
         "role": role,
-    }).encode("utf-8")
+    }
+    if pid:
+        body_obj["peer_id"] = pid
+    if cleaned_p2p:
+        body_obj["p2p_addrs"] = cleaned_p2p
+    payload = json.dumps(body_obj).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    if token:
-        headers["X-DFS-Relay-Token"] = token
+    resolved_token = str(token or os.environ.get("DFS_RELAY_TOKEN", "") or "").strip()
+    if resolved_token:
+        headers["X-DFS-Relay-Token"] = resolved_token
     req = urllib.request.Request(f"{root}/_ice/announce", data=payload, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
@@ -365,10 +474,83 @@ def announce_ice_peer(
         return False
 
 
+def register_p2p_peer(
+    base_url: str,
+    peer_id: str,
+    *,
+    node_id: str = "",
+    p2p_addrs: Sequence[str] = (),
+    role: str = "seeder",
+    sync_id: str = "",
+    sub_path: str = "",
+    token: str = "",
+    timeout: float = 1.5,
+) -> Dict[str, Any]:
+    """root/domain dfssvc の ``/_p2p/peers`` へ自身の PeerID を自動登録し、許可リストを受け取る。"""
+    import urllib.request
+
+    root = str(base_url or "").strip().rstrip("/")
+    pid = str(peer_id or "").strip()
+    if not root or not pid:
+        return {}
+    payload_obj: Dict[str, Any] = {
+        "peer_id": pid,
+        "node_id": node_id,
+        "p2p_addrs": [str(a).strip() for a in p2p_addrs if str(a).strip()],
+        "role": role,
+    }
+    if sync_id:
+        payload_obj["sync_id"] = str(sync_id).strip()
+    if sub_path:
+        payload_obj["sub_path"] = str(sub_path).strip()
+    payload = json.dumps(payload_obj).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    resolved_token = str(token or os.environ.get("DFS_RELAY_TOKEN", "") or "").strip()
+    if resolved_token:
+        headers["X-DFS-Relay-Token"] = resolved_token
+    req = urllib.request.Request(f"{root}/_p2p/peers", data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+            if resp.status != 200:
+                return {}
+            data = json.loads(resp.read().decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def fetch_p2p_peers(
+    base_url: str,
+    *,
+    token: str = "",
+    timeout: float = 1.5,
+) -> Dict[str, Any]:
+    """root/domain dfssvc の ``/_p2p/peers`` から許可済み PeerID リストを取得する。"""
+    import urllib.request
+
+    root = str(base_url or "").strip().rstrip("/")
+    if not root:
+        return {}
+    headers: Dict[str, str] = {}
+    resolved_token = str(token or os.environ.get("DFS_RELAY_TOKEN", "") or "").strip()
+    if resolved_token:
+        headers["X-DFS-Relay-Token"] = resolved_token
+    req = urllib.request.Request(f"{root}/_p2p/peers", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+            if resp.status != 200:
+                return {}
+            data = json.loads(resp.read().decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def discover_ice_candidates(
     base_url: str,
     node_id: Optional[str] = None,
     timeout: float = 1.5,
+    token: str = "",
 ) -> List[Dict[str, Any]]:
     """root dfssvc の ``/_ice/candidates`` から到達候補一覧を取得する。"""
     import urllib.request
@@ -379,7 +561,11 @@ def discover_ice_candidates(
     url = f"{root}/_ice/candidates"
     if node_id:
         url = f"{url}?{urlencode({'node': node_id})}"
-    req = urllib.request.Request(url, method="GET")
+    headers: Dict[str, str] = {}
+    resolved_token = str(token or os.environ.get("DFS_RELAY_TOKEN", "") or "").strip()
+    if resolved_token:
+        headers["X-DFS-Relay-Token"] = resolved_token
+    req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
             if resp.status != 200:
@@ -459,7 +645,9 @@ class RelayAgent:
                 pass
 
     def _worker_loop(self, worker_idx: int) -> None:
-        pull_path = f"{self.base_path}/_relay/pull?{urlencode({'node': self.node_id})}"
+        wait_s = max(0.5, min(25.0, self.pull_timeout - 2.0)) if self.pull_timeout > 2.0 else 0.5
+        pull_params = {"node": self.node_id, "wait": f"{wait_s:.1f}"}
+        pull_path = f"{self.base_path}/_relay/pull?{urlencode(pull_params)}"
         base_headers: Dict[str, str] = {"Content-Length": "0", "Connection": "keep-alive"}
         if self.token:
             base_headers["X-DFS-Relay-Token"] = self.token
@@ -470,7 +658,7 @@ class RelayAgent:
         while self._running:
             try:
                 if relay_conn is None:
-                    relay_conn = self._open_relay_conn(self.pull_timeout)
+                    relay_conn = self._open_relay_conn(max(self.pull_timeout, 30.0))
                 relay_conn.request("POST", pull_path, body=b"", headers=base_headers)
                 resp = relay_conn.getresponse()
                 raw = resp.read()

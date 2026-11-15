@@ -46,13 +46,14 @@ def test_swarm_distributes_across_healthy_peers(tmp_path: Path) -> None:
             got = swarm.batch_get(wids)
 
         assert got == dict(zip(wids, blobs))
-        # 通常時は最速単一ホスト (Phase B) で完結する
+        # 全生存ピアで並列取得し、負荷を分散する
+        assert c1.round_trips >= 1 and c2.round_trips >= 1
+        assert c1.get_count > 0 and c2.get_count > 0
         assert c1.get_count + c2.get_count == 6
-        assert max(c1.get_count, c2.get_count) == 6
         # 直接ピアで完結したのでリレー層には一切触らない
         assert relay_dummy.round_trips == 0
 
-        # 低速ホストのみ残った場合は Phase A (Work Stealing 並列) にフォールバックする
+        # 2 回目以降のバッチでも両ピアへ比例配分される
         c1.get_count = 0
         c2.get_count = 0
         c1.round_trips = 0
@@ -62,12 +63,11 @@ def test_swarm_distributes_across_healthy_peers(tmp_path: Path) -> None:
         for wid, blob in zip(wids2, blobs2):
             s1.store[wid] = blob
             s2.store[wid] = blob
-        swarm._slow_hosts = {swarm._client_uri(c1), swarm._client_uri(c2)}
         with swarm.session():
             got2 = swarm.batch_get(wids2)
         assert got2 == dict(zip(wids2, blobs2))
-        # Phase A に入り両方の直接ピアがプローブ (batch_has) に参加し、全12チャンクを取得したこと
         assert c1.round_trips >= 1 and c2.round_trips >= 1
+        assert c1.get_count > 0 and c2.get_count > 0
         assert c1.get_count + c2.get_count == 12
         assert relay_dummy.round_trips == 0
     finally:
@@ -183,6 +183,41 @@ def test_rarest_first_prioritizes_scarce_chunks(tmp_path: Path) -> None:
         assert len(got) == len(all_ids)
         assert batches_seen
         assert set(rare_ids).issubset(set(batches_seen[0]))
+    finally:
+        s1.close()
+        s2.close()
+
+
+def test_swarm_proportional_weights_use_measured_bps(tmp_path: Path) -> None:
+    s1 = _start_ost(tmp_path, "pw1")
+    s2 = _start_ost(tmp_path, "pw2")
+    try:
+        blobs = [f"prop-{i}".encode("utf-8") * 50 for i in range(10)]
+        wids = [sha256_hex(b) for b in blobs]
+        for wid, blob in zip(wids, blobs):
+            s1.store[wid] = blob
+            s2.store[wid] = blob
+
+        c1 = OSTClient("127.0.0.1", s1.port)
+        c2 = OSTClient("127.0.0.1", s2.port)
+        swarm = SwarmOSTClient([c1, c2])
+        # s1 を 4 倍高帯域として記録すると、初回バッチ要求サイズも s1 に多く配分される
+        swarm._peer_bps[swarm._client_uri(c1)] = 40 * 1024 * 1024
+        swarm._peer_bps[swarm._client_uri(c2)] = 10 * 1024 * 1024
+
+        c1_batches: list[int] = []
+        orig_c1 = c1.batch_get
+
+        def spy_c1(w):
+            c1_batches.append(len(w))
+            return orig_c1(w)
+
+        c1.batch_get = spy_c1  # type: ignore[method-assign]
+        with swarm.session():
+            got = swarm.batch_get(wids)
+        assert got == dict(zip(wids, blobs))
+        assert c1_batches and c1_batches[0] >= 7
+        assert c1.get_count > c2.get_count > 0
     finally:
         s1.close()
         s2.close()

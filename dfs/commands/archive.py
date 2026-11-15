@@ -131,13 +131,14 @@ def cmd_archive(args: argparse.Namespace) -> int:
                 version=args.version,
                 keep_dir=bool(getattr(args, "keep_dir", False)),
                 recovery_percent=recovery_percent,
+                archive_format=str(getattr(args, "format", "zstd:chunked") or "zstd:chunked"),
             )
         except _cm.ArchiveError as e:
             raise _cm.UsageError(f"archive create に失敗しました: {e}") from e
         if missing_par2_notice:
             print(
                 "[dfscli] ヒント: par2 が入っていれば 5% のリカバリレコード付き"
-                "（*.tar.gz.par2）にできます（例: brew install par2 / apt install par2）",
+                "（*.tar.zst.par2）にできます（例: brew install par2 / apt install par2）",
                 file=sys.stderr,
             )
         if result.bundle.is_dir():
@@ -149,6 +150,8 @@ def cmd_archive(args: argparse.Namespace) -> int:
                 f"par2        : {result.par2_files[0]} "
                 f"({len(result.par2_files)} files, {recovery_percent}%)"
             )
+        if result.readme is not None:
+            print(f"readme      : {result.readme}")
         print(f"torrent     : {result.torrent}")
         print(f"descriptor  : {result.descriptor}")
         print(f"infohash    : {result.infohash}")

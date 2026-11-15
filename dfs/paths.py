@@ -30,6 +30,9 @@ def dfs_home() -> Path:
     override = os.environ.get(HOME_ENV)
     if override:
         return Path(override).expanduser()
+    home = os.environ.get("HOME")
+    if home:
+        return Path(home).expanduser()
     return Path.home()
 
 
@@ -43,19 +46,27 @@ def cache_dir() -> Path:
     return dfs_home() / ".cache" / "dfs"
 
 
+_CACHED_SID: str | None = None
+
+
 def _windows_user_sid() -> str:
     """今のユーザーの SID。取れなければ空文字。"""
+    global _CACHED_SID
+    if _CACHED_SID is not None:
+        return _CACHED_SID
     try:
         res = subprocess.run(
             ["whoami", "/user", "/fo", "csv", "/nh"],
             capture_output=True, text=True, timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    for token in res.stdout.replace('"', " ").replace(",", " ").split():
-        if token.startswith("S-1-5-") and token.count("-") >= 6:
-            return token
-    return ""
+        for token in res.stdout.replace('"', " ").replace(",", " ").split():
+            if token.startswith("S-1-5-") and token.count("-") >= 6:
+                _CACHED_SID = token
+                return _CACHED_SID
+    except (OSError, subprocess.SubprocessError, Exception):
+        pass
+    _CACHED_SID = ""
+    return _CACHED_SID
 
 
 def restrict_to_owner(path: Path | str) -> None:
@@ -88,5 +99,5 @@ def restrict_to_owner(path: Path | str) -> None:
              _WINDOWS_SYSTEM_SID + ":F", _WINDOWS_ADMINS_SID + ":F"],
             capture_output=True, timeout=15,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, Exception):
         pass

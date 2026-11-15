@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import hashlib
 import hmac
 import json
@@ -395,9 +396,26 @@ class ContentAddressedCrypto:
     NONCE_LEN = 12
     TAG_LEN = 16  # ChaCha20-Poly1305 のタグ長
 
+    @staticmethod
+    @functools.lru_cache(maxsize=256)
+    def _derive_key_from_str(secret: str, domain: bytes) -> bytes:
+        raw = secret.encode("utf-8")
+        salt = b"dfs-kdf-v1:" + domain
+        if hasattr(hashlib, "scrypt"):
+            return hashlib.scrypt(
+                raw,
+                salt=salt,
+                n=2**14,
+                r=8,
+                p=1,
+                dklen=32,
+                maxmem=32 * 1024 * 1024,
+            )
+        return hashlib.pbkdf2_hmac("sha256", raw, salt, 600_000, dklen=32)
+
     def __init__(self, tree_secret: bytes | str, address_secret: bytes | str | None = None):
         if isinstance(tree_secret, str):
-            tree_secret = hashlib.sha256(tree_secret.encode("utf-8")).digest()
+            tree_secret = self._derive_key_from_str(tree_secret, b"tree")
         self.tree_secret: bytes = tree_secret
         # 内容アドレス鍵は暗号化鍵と分離する。未指定なら tree_secret から決定的に導出する。
         if address_secret is None:
@@ -405,7 +423,7 @@ class ContentAddressedCrypto:
                 b"dfs-address-key-v1", tree_secret, hashlib.sha256
             ).digest()
         elif isinstance(address_secret, str):
-            self.address_secret = hashlib.sha256(address_secret.encode("utf-8")).digest()
+            self.address_secret = self._derive_key_from_str(address_secret, b"address")
         else:
             self.address_secret = address_secret
 

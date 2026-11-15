@@ -104,6 +104,7 @@ class DirectoryRegistryService:
         self.root_anchor_path = normalize_path(root_anchor_path)
         self.root_anchor_pubkey = root_anchor_pubkey.strip()
         self.delegations: Dict[str, Dict[str, Any]] = {}
+        self.delegation_history: Dict[str, Dict[int, List[Dict[str, Any]]]] = {}
         self.logs: Dict[str, List[Dict[str, Any]]] = {}
         self.locators: Dict[str, Dict[str, Any]] = {}
         self.archives: Dict[str, Dict[int, Dict[str, Any]]] = {}
@@ -183,6 +184,9 @@ class DirectoryRegistryService:
                 current_head_version=curr_head_ver,
             )
             self.delegations[verified["path"]] = envelope
+            self.delegation_history.setdefault(verified["path"], {})[
+                int(verified["epoch"])
+            ] = self.delegation_chain(verified["path"])
             return verified
 
     def announce_and_append(
@@ -357,10 +361,20 @@ class DirectoryRegistryService:
             norm_path = normalize_path(path)
             if norm_path not in self.delegations:
                 return None
+            current_chain = self.delegation_chain(norm_path)
+            epoch_chains = {
+                str(ep): ch
+                for ep, ch in self.delegation_history.get(norm_path, {}).items()
+            }
+            if current_chain:
+                cur_ep = str(current_chain[-1].get("payload", {}).get("epoch", ""))
+                if cur_ep:
+                    epoch_chains.setdefault(cur_ep, current_chain)
             return {
                 "root_anchor": self.root_anchor_path,
                 "path": norm_path,
-                "chain": self.delegation_chain(norm_path),
+                "chain": current_chain,
+                "epoch_chains": epoch_chains,
                 "logs": list(self.logs.get(norm_path, [])),
                 "locator": self.locators.get(norm_path),
                 "archives": self.list_archives(norm_path),
@@ -398,12 +412,19 @@ class DirectoryRegistryService:
                 requested_path=norm_path,
             )
 
+            epoch_chains_raw = bundle.get("epoch_chains") or {}
+            verified_epochs: Dict[int, Dict[str, Any]] = {int(leaf["epoch"]): leaf}
+            verified_epoch_chains: Dict[int, List[Dict[str, Any]]] = {
+                int(leaf["epoch"]): list(chain)
+            }
+
             raw_logs = bundle.get("logs") or []
             if not isinstance(raw_logs, list):
                 raise RegistryError("Replication logs must be a list")
             logs: List[Dict[str, Any]] = []
             prev_version = 0
             prev_hash = EMPTY_SHA256
+            prev_epoch = 0
             for env in raw_logs:
                 if not isinstance(env, dict) or "payload" not in env or "signature" not in env:
                     raise RegistryError("Malformed L4 log in replication bundle")
@@ -419,24 +440,48 @@ class DirectoryRegistryService:
                 raw = canonical_json(p)
                 if sha256_hex(raw) != env.get("entry_hash"):
                     raise ChunkIntegrityError("Replication log entry_hash mismatch")
-                if p.get("delegation_epoch") != leaf["epoch"]:
+                log_epoch = p.get("delegation_epoch")
+                if not isinstance(log_epoch, int):
                     raise DelegationError("Replication log delegation_epoch mismatch")
+                if log_epoch < prev_epoch:
+                    raise DelegationError("Replication log delegation_epoch regressed")
+                if log_epoch not in verified_epochs:
+                    ep_chain = None
+                    if isinstance(epoch_chains_raw, dict):
+                        ep_chain = epoch_chains_raw.get(str(log_epoch)) or epoch_chains_raw.get(log_epoch)
+                    if not ep_chain:
+                        raise DelegationError("Replication log delegation_epoch mismatch")
+                    log_ts = p.get("timestamp")
+                    ep_now = int(log_ts) if isinstance(log_ts, (int, float)) else now
+                    ep_leaf = verify_delegation_chain(
+                        root_anchor_path=self.root_anchor_path,
+                        root_anchor_pubkey=self.root_anchor_pubkey,
+                        chain=ep_chain,
+                        now=ep_now,
+                        requested_path=norm_path,
+                    )
+                    if int(ep_leaf["epoch"]) != log_epoch:
+                        raise DelegationError("Replication epoch_chains epoch mismatch")
+                    verified_epochs[log_epoch] = ep_leaf
+                    verified_epoch_chains[log_epoch] = list(ep_chain)
+                ep_leaf = verified_epochs[log_epoch]
                 if p.get("version") != prev_version + 1:
                     raise ConflictError(
                         f"Replication log version gap: expected {prev_version + 1}, "
                         f"got {p.get('version')}"
                     )
-                if p.get("version") <= leaf["base_version"]:
+                if p.get("version") <= ep_leaf["base_version"]:
                     raise DelegationError("Replication log version is at or below base_version")
                 if p.get("parent_version") != prev_version or p.get("parent_hash") != prev_hash:
                     raise ConflictError("Replication log parent mismatch")
                 if not ssh_verify(
-                    leaf["writer"], norm_path, NS_L4_LOG, raw, env["signature"]
+                    ep_leaf["writer"], norm_path, NS_L4_LOG, raw, env["signature"]
                 ):
                     raise DelegationError("Invalid replication log signature")
                 logs.append(env)
                 prev_version = p["version"]
                 prev_hash = env["entry_hash"]
+                prev_epoch = log_epoch
 
             locator = bundle.get("locator")
             if logs:
@@ -474,10 +519,12 @@ class DirectoryRegistryService:
                 )
                 if selected is None:
                     raise RegistryError("Archive descriptor has no matching replicated L4 log")
+                archive_epoch = int(selected.get("payload", {}).get("delegation_epoch", leaf["epoch"]))
+                archive_leaf = verified_epochs.get(archive_epoch, leaf)
                 verify_archive_descriptor(
                     envelope,
                     norm_path,
-                    leaf["writer"],
+                    archive_leaf["writer"],
                     head_log=selected,
                 )
                 archives[version] = envelope
@@ -491,6 +538,7 @@ class DirectoryRegistryService:
                     raise ConflictError("Replication fork detected")
 
             self._store_replica_chain(chain)
+            self.delegation_history.setdefault(norm_path, {}).update(verified_epoch_chains)
             if logs:
                 self.logs[norm_path] = logs
                 self.locators[norm_path] = locator

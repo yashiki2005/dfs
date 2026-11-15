@@ -186,7 +186,7 @@ class TestCliAndSvcE2E(unittest.TestCase):
         src_dir = self.root / "src"
         src_dir.mkdir()
         sample_file = src_dir / "hello.txt"
-        sample_file.write_text("hello dfs e2e\n", encoding="utf-8")
+        sample_file.write_text("hello dfs e2e\n", encoding="utf-8", newline="\n")
 
         rc, out, err = _run_cli(["copy", str(sample_file), "dfs://e2e/dir1/"])
         self.assertEqual(rc, 0, f"copy failed: {out}\n{err}")

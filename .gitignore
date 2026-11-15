@@ -12,3 +12,7 @@ mnt/
 chunks*/
 output/
 tmp/
+dfs-archive-*
+*.archive.json
+*.par2
+*.torrent

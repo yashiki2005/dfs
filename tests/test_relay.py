@@ -681,3 +681,106 @@ def test_dfscli_quit_and_rejoin_another_domain(tmp_path: Path, monkeypatch: pyte
             h.server_close()
         for o in (ost_a, ost_b):
             o.close()
+
+
+def test_relay_hub_p2p_peer_allowlist_and_ice_announce(tmp_path: Path) -> None:
+    from dfs.relay import announce_ice_peer, discover_ice_candidates, fetch_p2p_peers, register_p2p_peer
+
+    hub = RelayHub()
+    observed_changes: List[List[str]] = []
+    hub.on_allowlist_change = lambda ids: observed_changes.append(list(ids))
+    ost, _pstate, httpd = _start_server(tmp_path, "p2p_hub", relay_hub=hub)
+    base_url = f"http://127.0.0.1:{httpd.server_port}"
+    try:
+        pid1 = "12D3KooWAllowPeerOne111111111111111111111111111111111"
+        pid2 = "12D3KooWAllowPeerTwo222222222222222222222222222222222"
+        addr1 = f"/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{pid1}"
+        addr2 = f"/ip4/127.0.0.1/udp/4002/quic-v1/p2p/{pid2}"
+
+        # 1) /_p2p/peers 自動登録と取得
+        reg_res = register_p2p_peer(base_url, pid1, node_id="n1", p2p_addrs=[addr1], role="seeder")
+        assert pid1 in reg_res["peer_ids"]
+        assert hub.is_peer_id_allowed(pid1)
+        assert not hub.is_peer_id_allowed(pid2)
+
+        # 2) /_ice/announce で peer_id / p2p_addrs も自動登録される
+        assert announce_ice_peer(
+            base_url,
+            node_id="n2",
+            direct_endpoints=[],
+            role="seeder",
+            peer_id=pid2,
+            p2p_addrs=[addr2],
+        )
+        fetched = fetch_p2p_peers(base_url)
+        assert set(fetched["peer_ids"]) == {pid1, pid2}
+        cands = discover_ice_candidates(base_url, node_id="n2")
+        assert any(c.get("type") == "libp2p" and c.get("peer_id") == pid2 and c.get("endpoint") == addr2 for c in cands)
+
+        # 3) revoke で許可リストから外れる
+        req = urllib.request.Request(
+            f"{base_url}/_p2p/peers/revoke",
+            data=json.dumps({"peer_id": pid1}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            revoked_body = json.loads(resp.read().decode("utf-8"))
+        assert revoked_body["revoked"] is True
+        assert pid1 not in revoked_body["peer_ids"]
+        assert not hub.is_peer_id_allowed(pid1)
+        assert len(observed_changes) >= 3
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        ost.close()
+
+
+def test_open_remote_preserves_relay_ost_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dfs.cli_main import open_remote
+    from dfs.remotes import Remote
+
+    hub = RelayHub(token="tok-fb")
+    hub_ost, _hub_state, hub_httpd = _start_server(tmp_path, "hub_fb", relay_hub=hub)
+    peer_ost, peer_state, peer_httpd = _start_server(tmp_path, "peer_fb")
+    hub_url = f"http://127.0.0.1:{hub_httpd.server_port}"
+    # NAT 配下ノードが死んだ L3 ポート (127.0.0.1:1) を広告し、Relay 経由で L2/OST を受ける想定
+    peer_state.ost_endpoint = "tls://127.0.0.1:1"
+    peer_state.ost_alternates = [f"{hub_url}/relay/natnode"]
+
+    agent = RelayAgent(relay_url=hub_url, node_id="natnode", local_port=peer_httpd.server_port, token="tok-fb")
+    agent.start()
+    try:
+        _wait_node_connected(hub_url, "tok-fb", "natnode")
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("DFS_LIBP2P", "0")
+        writer_priv, _writer_pub = _gen_ed25519(tmp_path / "writer")
+
+        remote = Remote(
+            name="natnode",
+            registry=f"{hub_url}/relay/natnode",
+            workdir=str(tmp_path / "mnt"),
+            key=str(writer_priv),
+            path="/example.com/nat",
+            secret="sec-nat",
+        )
+        node = open_remote(remote, create=True)
+        relay_ep = f"{hub_url}/relay/natnode"
+        assert relay_ep in node.ost_endpoints
+        assert any(getattr(c, "endpoint_uri", "") == relay_ep for c in node.read_ost.clients)
+
+        # 書き込み/読み取りが 127.0.0.1:1 から Relay HTTP OST へ自動フェイルオーバすること
+        import hashlib
+        blob = b"relay-fallback-ok"
+        wid = hashlib.sha256(blob).hexdigest()
+        assert node.ost.put_if_absent(wid, blob)
+        assert node.read_ost.get(wid) == blob
+    finally:
+        agent.close()
+        for h in (peer_httpd, hub_httpd):
+            h.shutdown()
+            h.server_close()
+        for o in (peer_ost, hub_ost):
+            o.close()

@@ -11,10 +11,10 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .crypto import ContentAddressedCrypto
-from .l2_registry import DirectoryRegistryService
+from .l2_registry import DirectoryRegistryService, ServiceUnavailableError
 from .l3_ost_adapter import (
     FailoverOSTClient,
     OSTClient,
@@ -26,6 +26,60 @@ from .fs import FileSystem
 from .fs.core import remove_tree
 from .l4_log import L4LogClient, MerkleTreeBuilder
 from .path_safety import safe_target, write_bytes_no_follow
+
+
+class _LocalChunkCache:
+    """pull 時に取得したチャンクをローカルディレクトリへ保存し、P2P シードとして配信する。"""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+
+    def _path_for(self, wire_id: str) -> Optional[Path]:
+        if len(wire_id) != 64 or any(c not in "0123456789abcdefABCDEF" for c in wire_id):
+            return None
+        return self.root / f"{wire_id.lower()}.blk"
+
+    def has_chunk(self, wire_id: str) -> bool:
+        p = self._path_for(wire_id)
+        return p is not None and p.is_file()
+
+    def get_chunk(self, wire_id: str) -> bytes:
+        p = self._path_for(wire_id)
+        if p is None or not p.is_file():
+            return b""
+        return p.read_bytes()
+
+    def put_chunk(self, wire_id: str, data: bytes) -> None:
+        p = self._path_for(wire_id)
+        if p is None or not data:
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_bytes(data)
+
+
+class _CachingOSTProxy:
+    """pull 時に取得したチャンクをローカルの P2P シード用キャッシュへ記録する薄いプロキシ。"""
+
+    def __init__(self, inner: Any, cache_store: _LocalChunkCache) -> None:
+        self._inner = inner
+        self._cache = cache_store
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def get_chunk(self, wire_id: str) -> bytes:
+        data = self._inner.get_chunk(wire_id)
+        if data:
+            self._cache.put_chunk(wire_id, data)
+        return data
+
+    def batch_get(self, wire_ids: List[str]) -> Dict[str, bytes]:
+        res = self._inner.batch_get(wire_ids)
+        for wid, data in res.items():
+            if data:
+                self._cache.put_chunk(wid, data)
+        return res
 
 
 class ClayFSAdapter:
@@ -114,6 +168,9 @@ class DFSNode:
         raw_endpoints = [primary_canonical] + [
             self._normalize_ost_endpoint(value) for value in (ost_alternates or [])
         ]
+        for reg_u in (getattr(registry, "registry_urls", None) or ()):
+            if "/relay/" in str(reg_u):
+                raw_endpoints.append(self._normalize_ost_endpoint(str(reg_u)))
         seen = set()
         self.ost_endpoints: List[str] = []
         ost_clients: List[Any] = []
@@ -151,17 +208,51 @@ class DFSNode:
             index_file=self.clayfs.clayfs_meta / "ost_index.json",
             compression=compression,
         )
+        self.libp2p_manager = None
         self.libp2p_client = None
-        if libp2p_peers:
+        self.p2p_chunk_store: Optional[_LocalChunkCache] = None
+        self.libp2p_psk = libp2p_psk or None
+        registry_urls = getattr(registry, "registry_urls", None)
+        want_p2p = bool(libp2p_peers) or (
+            bool(registry_urls) and os.environ.get("DFS_LIBP2P", "1").strip() != "0"
+        )
+        if want_p2p:
             try:
-                from .libp2p_chunk import Libp2pChunkClient
-            except ImportError as e:  # pragma: no cover - 依存環境
-                raise RuntimeError(
-                    "libp2p_peers requires the libp2p package"
-                ) from e
-            self.libp2p_client = Libp2pChunkClient(
-                libp2p_peers, psk=libp2p_psk or None
-            )
+                from .libp2p_chunk import (
+                    Libp2pChunkClient,
+                    Libp2pHostManager,
+                    is_libp2p_available,
+                )
+
+                if is_libp2p_available():
+                    self.p2p_chunk_store = _LocalChunkCache(self.clayfs.clayfs_meta / "p2p_chunks")
+                    self.libp2p_manager = Libp2pHostManager(
+                        store=self.p2p_chunk_store,
+                        psk=self.libp2p_psk,
+                        enable_dht=True,
+                        dht_mode="client",
+                        enable_relay=True,
+                        relay_hop=False,
+                        enable_dcutr=True,
+                    )
+                    if libp2p_peers:
+                        self.libp2p_client = Libp2pChunkClient(
+                            libp2p_peers,
+                            psk=self.libp2p_psk,
+                            manager=self.libp2p_manager,
+                        )
+                elif libp2p_peers:
+                    Libp2pChunkClient(libp2p_peers, psk=self.libp2p_psk)
+            except (ImportError, ServiceUnavailableError) as e:  # pragma: no cover - 依存環境
+                import warnings
+
+                warnings.warn(
+                    f"libp2p unavailable ({e}); continuing over TLS/HTTP/Relay",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self.libp2p_manager = None
+                self.libp2p_client = None
         read_clients: List[Any] = list(ost_clients)
         if self.libp2p_client is not None:
             read_clients.append(self.libp2p_client)
@@ -184,6 +275,8 @@ class DFSNode:
     def close(self) -> None:
         if self.libp2p_client is not None:
             self.libp2p_client.close()
+        if self.libp2p_manager is not None:
+            self.libp2p_manager.close()
 
     @staticmethod
     def _parse_ost_endpoint(value: str) -> Tuple[str, int]:
@@ -243,6 +336,53 @@ class DFSNode:
         registry_urls = getattr(self.registry, "registry_urls", None)
         if registry_urls and os.environ.get("DFS_ICE_DISCOVER", "1").strip() != "0":
             self.read_ost.discover_from_ice(registry_urls, timeout=0.5)
+        if (
+            self.libp2p_manager is not None
+            and registry_urls
+            and os.environ.get("DFS_LIBP2P", "1").strip() != "0"
+        ):
+            try:
+                self.libp2p_manager.start(timeout=5.0)
+                from .relay import fetch_p2p_peers, register_p2p_peer
+
+                domain_key = getattr(self.l4, "root_pubkey", None) or self.sub_path or "default"
+                pre_info = fetch_p2p_peers(registry_urls[0], timeout=1.0)
+                pre_peers = pre_info.get("peers") or []
+                if pre_peers and hasattr(self.libp2p_manager, "bootstrap_from_peers"):
+                    self.libp2p_manager.bootstrap_from_peers(pre_peers, timeout=1.5)
+                advertised_addrs = (
+                    self.libp2p_manager.effective_addrs()
+                    if hasattr(self.libp2p_manager, "effective_addrs")
+                    else list(self.libp2p_manager.addrs)
+                )
+                p2p_info = register_p2p_peer(
+                    registry_urls[0],
+                    self.libp2p_manager.peer_id,
+                    node_id=self.name,
+                    p2p_addrs=advertised_addrs,
+                    role="seeder",
+                    timeout=1.0,
+                )
+                peers_list = p2p_info.get("peers") or pre_peers
+                if peers_list and hasattr(self.libp2p_manager, "bootstrap_from_peers"):
+                    self.libp2p_manager.bootstrap_from_peers(peers_list, timeout=1.5)
+                if domain_key:
+                    self.libp2p_manager.provide_domain(domain_key, timeout=5.0, background=True)
+                relay_addrs = [
+                    str(a)
+                    for entry in peers_list
+                    if isinstance(entry, dict) and entry.get("role") in ("hub", "root", "writer")
+                    for a in (entry.get("addrs") or [])
+                ]
+                self.read_ost.discover_from_p2p(
+                    self.libp2p_manager,
+                    domain_key=domain_key,
+                    registry_urls=registry_urls,
+                    relay_addrs=relay_addrs,
+                    timeout=1.5,
+                )
+            except Exception:
+                pass
         self.read_builder = MerkleTreeBuilder(self.crypto, self.read_ost)
 
     def push(
@@ -290,10 +430,15 @@ class DFSNode:
         self.read_ost.reset_metrics()
 
         p = head_env["payload"]
+        dl_builder = (
+            MerkleTreeBuilder(self.crypto, _CachingOSTProxy(self.read_ost, self.p2p_chunk_store))
+            if self.p2p_chunk_store is not None
+            else self.read_builder
+        )
         with tempfile.TemporaryDirectory(prefix="dfs_stage_") as staging:
             staging_dir = Path(staging)
             with self.read_ost.session():
-                self.read_builder.download_directory(
+                dl_builder.download_directory(
                     p["root_plain_id"], p["root_wire_id"], staging_dir
                 )
             self.clayfs.replace_work_tree(staging_dir)
@@ -301,15 +446,40 @@ class DFSNode:
         snap = self.clayfs.take_snapshot(f"v{p['version']}")
         seed_ep = os.environ.get("DFS_SEED_ENDPOINT", "").strip()
         registry_urls = getattr(self.registry, "registry_urls", None)
-        if seed_ep and registry_urls:
-            from .relay import announce_ice_peer
+        if (seed_ep or self.libp2p_manager is not None) and registry_urls:
+            from .relay import announce_ice_peer, register_p2p_peer
 
+            peer_id = ""
+            p2p_addrs: List[str] = []
+            if self.libp2p_manager is not None:
+                try:
+                    self.libp2p_manager.start(timeout=5.0)
+                    peer_id = self.libp2p_manager.peer_id
+                    p2p_addrs = (
+                        self.libp2p_manager.effective_addrs()
+                        if hasattr(self.libp2p_manager, "effective_addrs")
+                        else list(self.libp2p_manager.addrs)
+                    )
+                    domain_key = getattr(self.l4, "root_pubkey", None) or self.sub_path or "default"
+                    self.libp2p_manager.provide_domain(domain_key, timeout=5.0, background=True)
+                    register_p2p_peer(
+                        registry_urls[0],
+                        peer_id,
+                        node_id=self.name,
+                        p2p_addrs=p2p_addrs,
+                        role="seeder",
+                        timeout=1.0,
+                    )
+                except Exception:
+                    pass
             announce_ice_peer(
                 registry_urls[0],
                 node_id=self.name,
-                direct_endpoints=[seed_ep],
+                direct_endpoints=[seed_ep] if seed_ep else [],
                 role="seeder",
                 timeout=0.5,
+                peer_id=peer_id,
+                p2p_addrs=p2p_addrs,
             )
         return snap
 
@@ -342,6 +512,17 @@ class DFSNode:
         with self.read_ost.session():
             return self.read_builder.list_tree(
                 p["root_plain_id"], p["root_wire_id"], root_store=root_store, prefix=prefix
+            )
+
+    def iter_remote(self, rel_path: str) -> Iterator[bytes]:
+        """リモートの 1 ファイルをチャンク単位でストリーミング取得する。"""
+        root_pid, root_wid, root_store, ver = self._head_root()
+        if ver == 0 or not root_wid:
+            raise FileNotFoundError(f"Remote has no versions yet: {rel_path}")
+        self.read_ost.reset_metrics()
+        with self.read_ost.session():
+            yield from self.read_builder.iter_remote_file(
+                root_pid, root_wid, rel_path, root_store=root_store
             )
 
     def read_remote(self, rel_path: str) -> bytes:
