@@ -1417,8 +1417,18 @@ def sync_from_peers(
     relay_addrs: Optional[Sequence[str]] = None,
     batch_size: int = 4,
     timeout: float = 30.0,
+    streams_per_peer: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Pull missing encrypted chunks in parallel across multiple *peers* via libp2p."""
+    if streams_per_peer is None:
+        raw_streams = os.environ.get("DFS_P2P_STREAMS_PER_PEER", "2").strip()
+        try:
+            streams_per_peer = max(1, min(4, int(raw_streams)))
+        except ValueError:
+            streams_per_peer = 2
+    else:
+        streams_per_peer = max(1, min(4, int(streams_per_peer)))
+
     merged: Dict[str, List[str]] = {}
     for raw_pid, raw_addrs in peers:
         pid = str(raw_pid or "").strip()
@@ -1433,7 +1443,7 @@ def sync_from_peers(
     if not merged:
         return {"remote_total": 0, "missing": 0, "fetched": 0, "bytes": 0, "per_peer": {}}
 
-    if len(merged) == 1:
+    if len(merged) == 1 and streams_per_peer <= 1:
         pid, addrs = next(iter(merged.items()))
         stats = sync_from_peer(
             manager,
@@ -1589,8 +1599,11 @@ def sync_from_peers(
                         if not is_endgame:
                             remaining.setdefault(wid, None)
 
-    with ThreadPoolExecutor(max_workers=min(8, len(active_peers))) as pool:
-        list(pool.map(_worker, active_peers))
+    worker_entries = [
+        peer_entry for peer_entry in active_peers for _ in range(streams_per_peer)
+    ]
+    with ThreadPoolExecutor(max_workers=min(16, len(worker_entries))) as pool:
+        list(pool.map(_worker, worker_entries))
 
     return {
         "remote_total": len(all_wids_ordered),

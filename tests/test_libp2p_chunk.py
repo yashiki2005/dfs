@@ -528,6 +528,36 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
         self.assertGreater(stats["per_peer"].get(s1_mgr.peer_id, 0), 0)
         self.assertLess(elapsed, 2.0)
 
+    def test_sync_from_peers_pipelines_multiple_streams_per_peer(self) -> None:
+        from dfs.libp2p_chunk import Libp2pHostManager, sync_from_peers
+
+        blobs = [f"pipe-chunk-{i}".encode("utf-8") for i in range(10)]
+        expected = {hashlib.sha256(b).hexdigest(): b for b in blobs}
+        s_store = dict(expected)
+        dst_store: dict[str, bytes] = {}
+        s_mgr = Libp2pHostManager(
+            store=s_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        dst_mgr = Libp2pHostManager(
+            store=dst_store,
+            listen=["/ip4/127.0.0.1/udp/0/quic-v1"],
+            enable_dht=False,
+        ).start()
+        self.addCleanup(s_mgr.close)
+        self.addCleanup(dst_mgr.close)
+
+        stats = sync_from_peers(
+            dst_mgr,
+            dst_store,
+            [(s_mgr.peer_id, s_mgr.addrs)],
+            batch_size=2,
+            streams_per_peer=3,
+        )
+        self.assertEqual(stats["fetched"], 10)
+        self.assertEqual(dst_store, expected)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
