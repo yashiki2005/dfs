@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequ
 
 from .crypto import ChunkIntegrityError
 from .l2_registry import ServiceUnavailableError
+from .nat import UPnPPortMapper
 
 PROTOCOL_ID = "/dfs/chunk/1.0.0"
 MAX_BATCH_ITEMS = 65_536
@@ -451,6 +452,7 @@ class Libp2pHostManager:
         relay_hop: bool = False,
         enable_dcutr: bool = True,
         bootstrap_peers: Sequence[str] = (),
+        enable_upnp: Optional[bool] = None,
     ) -> None:
         _require_libp2p()
         self.store = store
@@ -465,6 +467,12 @@ class Libp2pHostManager:
         self.key_pair = key_pair
         self.enable_dht = bool(enable_dht and _DHT_AVAILABLE)
         self.dht_mode = str(dht_mode or "server").lower()
+        if enable_upnp is None:
+            self.enable_upnp = os.environ.get("DFS_P2P_UPNP", "1").strip() != "0"
+        else:
+            self.enable_upnp = bool(enable_upnp)
+        self._upnp_mapper: Optional[UPnPPortMapper] = None
+        self.upnp_external_addrs: List[str] = []
         self.enable_relay = bool(enable_relay and _RELAY_V2_AVAILABLE)
         self.relay_hop = bool(relay_hop)
         self.enable_dcutr = bool(enable_dcutr and _RELAY_V2_AVAILABLE)
@@ -541,6 +549,14 @@ class Libp2pHostManager:
             raise ServiceUnavailableError("Timed out starting libp2p host")
         if self.error is not None:
             raise ServiceUnavailableError(f"Failed to start libp2p host: {self.error}") from self.error
+        if self.enable_upnp and any(
+            "/ip4/127." not in a and "/ip6/::1/" not in a for a in self.addrs
+        ):
+            threading.Thread(
+                target=self._try_upnp_mappings,
+                name="dfs-libp2p-upnp",
+                daemon=True,
+            ).start()
         return self
 
     def _thread_main(self) -> None:
@@ -687,6 +703,36 @@ class Libp2pHostManager:
                 non_loopback.append(circuit)
         return non_loopback if non_loopback else loopback
 
+    def _try_upnp_mappings(self) -> None:
+        mapper = UPnPPortMapper(timeout=1.5)
+        self._upnp_mapper = mapper
+        mapped_addrs: List[str] = []
+        seen: Set[Tuple[int, str]] = set()
+        for addr in list(self.addrs):
+            if "/ip4/" not in addr or "/ip4/127." in addr or "/p2p-circuit" in addr:
+                continue
+            parts = addr.split("/")
+            port = 0
+            proto = ""
+            is_quic = "quic-v1" in parts
+            for idx, tok in enumerate(parts):
+                if tok in ("udp", "tcp") and idx + 1 < len(parts) and parts[idx + 1].isdigit():
+                    proto = tok.upper()
+                    port = int(parts[idx + 1])
+                    break
+            if not port or (port, proto) in seen:
+                continue
+            seen.add((port, proto))
+            res = mapper.map_port(port, protocol=proto)
+            if res is not None:
+                ext_ip, ext_port = res
+                if proto == "UDP" and is_quic:
+                    mapped_addrs.append(f"/ip4/{ext_ip}/udp/{ext_port}/quic-v1/p2p/{self.peer_id}")
+                elif proto == "TCP":
+                    mapped_addrs.append(f"/ip4/{ext_ip}/tcp/{ext_port}/p2p/{self.peer_id}")
+        if mapped_addrs:
+            self.upnp_external_addrs = mapped_addrs
+
     def effective_addrs(self, relay_addrs: Sequence[str] = ()) -> List[str]:
         """自身の直接アドレス（0.0.0.0 はローカル IP へ展開）と接続済みリレー経由の `/p2p-circuit` アドレスを返す。"""
         combined: List[str] = []
@@ -712,6 +758,9 @@ class Libp2pHostManager:
             else:
                 if a not in combined:
                     combined.append(a)
+        for addr in self.upnp_external_addrs:
+            if addr not in combined:
+                combined.append(addr)
         source_relays = list(relay_addrs) if relay_addrs else list(self._relay_addrs)
         for addr in self.build_circuit_addrs(source_relays):
             if addr not in combined:
@@ -1092,6 +1141,12 @@ class Libp2pHostManager:
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=3.0)
         self._thread = None
+        if self._upnp_mapper is not None:
+            try:
+                self._upnp_mapper.close()
+            except Exception:
+                pass
+            self._upnp_mapper = None
         self._trio_token = None
         self._stop_event = None
 

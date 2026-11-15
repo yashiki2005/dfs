@@ -616,6 +616,7 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
         self.assertIn(s2_mgr.peer_id, stats["per_peer"])
 
     def test_sync_from_peers_rarest_first_ordering(self) -> None:
+        import threading
         from unittest.mock import patch
         from dfs.libp2p_chunk import Libp2pHostManager, Libp2pPeerClient, sync_from_peers
 
@@ -642,17 +643,22 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
 
         s1_first_batch: list[str] = []
         orig_batch_get = Libp2pPeerClient.batch_get
+        orig_list_chunks = Libp2pPeerClient.list_chunks
+        probe_barrier = threading.Barrier(2, timeout=5.0)
+
+        def synced_list_chunks(client_self, offset=0, limit=4096):
+            res = orig_list_chunks(client_self, offset=offset, limit=limit)
+            probe_barrier.wait()
+            return res
 
         def capture_s1(client_self, wire_ids):
             if client_self.peer_id == s1_mgr.peer_id and not s1_first_batch:
                 s1_first_batch.extend(wire_ids)
             return orig_batch_get(client_self, wire_ids)
 
-        with patch.object(Libp2pPeerClient, "batch_get", capture_s1):
-            dst_mgr.bootstrap_from_peers([
-                {"peer_id": s1_mgr.peer_id, "addrs": s1_mgr.addrs},
-                {"peer_id": s2_mgr.peer_id, "addrs": s2_mgr.addrs},
-            ])
+        with patch.object(Libp2pPeerClient, "list_chunks", synced_list_chunks), patch.object(
+            Libp2pPeerClient, "batch_get", capture_s1
+        ):
             stats = sync_from_peers(
                 dst_mgr,
                 dst_store,
@@ -726,6 +732,36 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
             )
         self.assertEqual(stats["fetched"], 4)
         self.assertLess(s1_done_at["t"] - t0, 0.8)
+
+    def test_upnp_port_mapper_soap_and_cleanup(self) -> None:
+        from unittest.mock import patch
+        from dfs import nat
+
+        soap_calls: list[str] = []
+
+        def fake_soap(ctrl_url, stype, action, body_xml, timeout=2.0):
+            soap_calls.append(action)
+            if action == "AddPortMapping":
+                return "<AddPortMappingResponse/>"
+            if action == "GetExternalIPAddress":
+                return "<NewExternalIPAddress>1.2.3.4</NewExternalIPAddress>"
+            if action == "DeletePortMapping":
+                return "<DeletePortMappingResponse/>"
+            return None
+
+        with patch.object(nat, "_ssdp_discover_igd", return_value="http://192.168.0.1:5000/rootDesc.xml"), patch.object(
+            nat,
+            "_find_wan_control_url",
+            return_value=("http://192.168.0.1:5000/ctl/IPConn", "urn:schemas-upnp-org:service:WANIPConnection:1"),
+        ), patch.object(nat, "_local_ip_for_target", return_value="192.168.0.10"), patch.object(
+            nat, "_upnp_soap_call", side_effect=fake_soap
+        ):
+            mapper = nat.UPnPPortMapper(timeout=1.0)
+            res = mapper.map_port(41337, protocol="UDP")
+            self.assertEqual(res, ("1.2.3.4", 41337))
+            mapper.close()
+
+        self.assertEqual(soap_calls, ["AddPortMapping", "GetExternalIPAddress", "DeletePortMapping"])
 
 
 if __name__ == "__main__":
