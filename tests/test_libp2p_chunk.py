@@ -649,6 +649,10 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
             return orig_batch_get(client_self, wire_ids)
 
         with patch.object(Libp2pPeerClient, "batch_get", capture_s1):
+            dst_mgr.bootstrap_from_peers([
+                {"peer_id": s1_mgr.peer_id, "addrs": s1_mgr.addrs},
+                {"peer_id": s2_mgr.peer_id, "addrs": s2_mgr.addrs},
+            ])
             stats = sync_from_peers(
                 dst_mgr,
                 dst_store,
@@ -670,6 +674,58 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
         self.assertEqual(_adapt_batch_size(8, 3.0), 4)
         self.assertEqual(_adapt_batch_size(4, 0.1, failed=True), 2)
         self.assertEqual(_adapt_batch_size(1, 3.0, failed=True), 1)
+
+    def test_sync_from_peers_starts_immediately_without_waiting_for_slow_probe(self) -> None:
+        import time
+        from unittest.mock import patch
+        from dfs.libp2p_chunk import Libp2pHostManager, Libp2pPeerClient, sync_from_peers
+
+        blobs = [f"fast-start-{i}".encode("utf-8") for i in range(4)]
+        expected = {hashlib.sha256(b).hexdigest(): b for b in blobs}
+        s1_store = dict(expected)
+        s2_store = dict(expected)
+        dst_store: dict[str, bytes] = {}
+
+        s1_mgr = Libp2pHostManager(
+            store=s1_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        s2_mgr = Libp2pHostManager(
+            store=s2_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        dst_mgr = Libp2pHostManager(
+            store=dst_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        self.addCleanup(s1_mgr.close)
+        self.addCleanup(s2_mgr.close)
+        self.addCleanup(dst_mgr.close)
+
+        orig_list = Libp2pPeerClient.list_chunks
+        s1_done_at = {"t": 0.0}
+        orig_get = Libp2pPeerClient.batch_get
+
+        def slow_probe_s2(client_self, offset=0, limit=4096):
+            if client_self.peer_id == s2_mgr.peer_id:
+                time.sleep(1.2)
+            return orig_list(client_self, offset=offset, limit=limit)
+
+        def track_get(client_self, wire_ids):
+            res = orig_get(client_self, wire_ids)
+            if client_self.peer_id == s1_mgr.peer_id and s1_done_at["t"] == 0.0:
+                s1_done_at["t"] = time.monotonic()
+            return res
+
+        t0 = time.monotonic()
+        with patch.object(Libp2pPeerClient, "list_chunks", slow_probe_s2), patch.object(
+            Libp2pPeerClient, "batch_get", track_get
+        ):
+            stats = sync_from_peers(
+                dst_mgr,
+                dst_store,
+                [(s1_mgr.peer_id, s1_mgr.addrs), (s2_mgr.peer_id, s2_mgr.addrs)],
+                batch_size=2,
+            )
+        self.assertEqual(stats["fetched"], 4)
+        self.assertLess(s1_done_at["t"] - t0, 0.8)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ import random
 import struct
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as futures_wait
 from contextlib import AsyncExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
@@ -1501,44 +1501,10 @@ def sync_from_peers(
 
     active_peers_map: Dict[str, Tuple[Libp2pPeerClient, Set[str]]] = {}
     all_wids_ordered: Dict[str, None] = {}
-    with ThreadPoolExecutor(max_workers=min(8, len(merged))) as probe_pool:
-        for res in probe_pool.map(_probe_peer, merged.items()):
-            if res is None:
-                continue
-            pid, client, wid_set, wid_list = res
-            active_peers_map[pid] = (client, wid_set)
-            for wid in wid_list:
-                all_wids_ordered.setdefault(wid, None)
-
-    if not active_peers_map or not all_wids_ordered:
-        return {
-            "remote_total": len(all_wids_ordered),
-            "missing": 0,
-            "fetched": 0,
-            "bytes": 0,
-            "per_peer": {},
-        }
-
-    missing = [wid for wid in all_wids_ordered if not _store_contains(store, wid)]
-    if not missing:
-        return {
-            "remote_total": len(all_wids_ordered),
-            "missing": 0,
-            "fetched": 0,
-            "bytes": 0,
-            "per_peer": {},
-        }
-
-    # Rarest-first with randomized tie-breaking across equally available chunks.
-    rng = random.Random()
-    owner_counts = {
-        wid: sum(1 for _, (_, wset) in active_peers_map.items() if wid in wset)
-        for wid in missing
-    }
-    missing.sort(key=lambda wid: (owner_counts.get(wid, 0), rng.random()))
-    remaining: Dict[str, None] = dict.fromkeys(missing)
+    remaining: Dict[str, None] = {}
     inflight: Dict[str, int] = {}
     completed: Set[str] = set()
+    missing_total = 0
     lock = threading.Lock()
     step = max(1, int(batch_size))
     fetched = 0
@@ -1547,6 +1513,48 @@ def sync_from_peers(
     write_sem = threading.Semaphore(8)
     write_futs: List[Any] = []
     writer_pool = ThreadPoolExecutor(max_workers=2)
+    rng = random.Random()
+
+    def _register_probe_result(
+        res: Optional[Tuple[str, Libp2pPeerClient, Set[str], List[str]]],
+    ) -> Optional[str]:
+        nonlocal missing_total
+        if res is None:
+            return None
+        pid, client, wid_set, wid_list = res
+        new_missing: List[str] = []
+        with lock:
+            if pid in active_peers_map:
+                return None
+            active_peers_map[pid] = (client, wid_set)
+            for wid in wid_list:
+                is_new = wid not in all_wids_ordered
+                all_wids_ordered.setdefault(wid, None)
+                if is_new and wid not in completed and not _store_contains(store, wid):
+                    new_missing.append(wid)
+            if new_missing:
+                missing_total += len(new_missing)
+                new_missing.sort(
+                    key=lambda w: (
+                        sum(1 for _, (_, ws) in active_peers_map.items() if w in ws),
+                        rng.random(),
+                    )
+                )
+                for w in new_missing:
+                    remaining.setdefault(w, None)
+            elif remaining:
+                # Re-sort remaining with updated rarest-first counts
+                cur_rem = list(remaining)
+                cur_rem.sort(
+                    key=lambda w: (
+                        sum(1 for _, (_, ws) in active_peers_map.items() if w in ws),
+                        rng.random(),
+                    )
+                )
+                remaining.clear()
+                for w in cur_rem:
+                    remaining[w] = None
+        return pid
 
     def _persist_batch(
         pid: str,
@@ -1648,18 +1656,47 @@ def sync_from_peers(
             with lock:
                 write_futs.append(wf)
 
+    probe_pool = ThreadPoolExecutor(max_workers=min(8, len(merged)))
+    probe_futs = {probe_pool.submit(_probe_peer, item) for item in merged.items()}
+    done_probes, pending_probes = futures_wait(probe_futs, return_when=FIRST_COMPLETED)
+    if pending_probes:
+        more_done, pending_probes = futures_wait(pending_probes, timeout=0.15)
+        done_probes = done_probes | more_done
+
     with ThreadPoolExecutor(max_workers=16) as pool:
-        futs = [
-            pool.submit(_worker, pid)
-            for pid in list(active_peers_map)
-            for _ in range(streams_per_peer)
-        ]
-        if peer_provider is not None:
-            interval = max(0.2, float(refresh_interval))
-            while any(not f.done() for f in futs):
-                time.sleep(min(interval, 0.5))
+        futs: List[Any] = []
+        ready_pids: List[str] = []
+        for pf in done_probes:
+            try:
+                pid = _register_probe_result(pf.result())
+            except Exception:
+                pid = None
+            if pid is not None:
+                ready_pids.append(pid)
+        for pid in ready_pids:
+            for _ in range(streams_per_peer):
+                futs.append(pool.submit(_worker, pid))
+
+        last_refresh = time.monotonic()
+        interval = max(0.2, float(refresh_interval))
+        while pending_probes or any(not f.done() for f in futs):
+            if pending_probes:
+                more_done, pending_probes = futures_wait(pending_probes, timeout=0.1)
+                for pf in more_done:
+                    try:
+                        pid = _register_probe_result(pf.result())
+                    except Exception:
+                        pid = None
+                    if pid is not None:
+                        for _ in range(streams_per_peer):
+                            futs.append(pool.submit(_worker, pid))
+            else:
+                time.sleep(0.1)
+
+            if peer_provider is not None and time.monotonic() - last_refresh >= interval:
+                last_refresh = time.monotonic()
                 with lock:
-                    done_all = not remaining and not inflight
+                    done_all = not pending_probes and not remaining and not inflight
                 if done_all:
                     break
                 try:
@@ -1675,23 +1712,20 @@ def sync_from_peers(
                     if already_active:
                         continue
                     res = _probe_peer((npid, [str(a).strip() for a in (raw_addrs or ()) if str(a).strip()]))
-                    if res is None:
-                        continue
-                    _, nclient, nwid_set, _ = res
-                    with lock:
-                        if npid not in active_peers_map:
-                            active_peers_map[npid] = (nclient, nwid_set)
-                            for _ in range(streams_per_peer):
-                                futs.append(pool.submit(_worker, npid))
+                    pid = _register_probe_result(res)
+                    if pid is not None:
+                        for _ in range(streams_per_peer):
+                            futs.append(pool.submit(_worker, pid))
         for f in futs:
             f.result()
+    probe_pool.shutdown(wait=False)
     for wf in write_futs:
         wf.result()
     writer_pool.shutdown(wait=True)
 
     return {
         "remote_total": len(all_wids_ordered),
-        "missing": len(missing),
+        "missing": missing_total,
         "fetched": fetched,
         "bytes": fetched_bytes,
         "per_peer": per_peer,
