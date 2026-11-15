@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import struct
 import threading
 import time
@@ -1516,6 +1517,13 @@ def sync_from_peers(
             "per_peer": {},
         }
 
+    # Rarest-first with randomized tie-breaking across equally available chunks.
+    rng = random.Random()
+    owner_counts = {
+        wid: sum(1 for _, (_, wset) in active_peers_map.items() if wid in wset)
+        for wid in missing
+    }
+    missing.sort(key=lambda wid: (owner_counts.get(wid, 0), rng.random()))
     remaining: Dict[str, None] = dict.fromkeys(missing)
     inflight: Dict[str, int] = {}
     completed: Set[str] = set()

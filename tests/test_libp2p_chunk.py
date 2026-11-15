@@ -615,6 +615,51 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
         self.assertEqual(dst_store, expected)
         self.assertIn(s2_mgr.peer_id, stats["per_peer"])
 
+    def test_sync_from_peers_rarest_first_ordering(self) -> None:
+        from unittest.mock import patch
+        from dfs.libp2p_chunk import Libp2pHostManager, Libp2pPeerClient, sync_from_peers
+
+        blobs = [f"rare-chunk-{i}".encode("utf-8") for i in range(6)]
+        wids = [hashlib.sha256(b).hexdigest() for b in blobs]
+        expected = dict(zip(wids, blobs))
+        # s1 has all 6, s2 has only the last 4 -> first 2 are rarest (count=1)
+        s1_store = dict(expected)
+        s2_store = {wids[i]: blobs[i] for i in range(2, 6)}
+        dst_store: dict[str, bytes] = {}
+
+        s1_mgr = Libp2pHostManager(
+            store=s1_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        s2_mgr = Libp2pHostManager(
+            store=s2_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        dst_mgr = Libp2pHostManager(
+            store=dst_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        self.addCleanup(s1_mgr.close)
+        self.addCleanup(s2_mgr.close)
+        self.addCleanup(dst_mgr.close)
+
+        s1_first_batch: list[str] = []
+        orig_batch_get = Libp2pPeerClient.batch_get
+
+        def capture_s1(client_self, wire_ids):
+            if client_self.peer_id == s1_mgr.peer_id and not s1_first_batch:
+                s1_first_batch.extend(wire_ids)
+            return orig_batch_get(client_self, wire_ids)
+
+        with patch.object(Libp2pPeerClient, "batch_get", capture_s1):
+            stats = sync_from_peers(
+                dst_mgr,
+                dst_store,
+                [(s1_mgr.peer_id, s1_mgr.addrs), (s2_mgr.peer_id, s2_mgr.addrs)],
+                batch_size=2,
+                streams_per_peer=1,
+            )
+
+        self.assertEqual(stats["fetched"], 6)
+        self.assertEqual(set(s1_first_batch), {wids[0], wids[1]})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
