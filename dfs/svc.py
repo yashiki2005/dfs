@@ -132,6 +132,8 @@ def find_consecutive_free_ports(
     count: int = 2,
     host: str = "127.0.0.1",
     limit: int = 1000,
+    *,
+    allow_reuse: bool = False,
 ) -> Tuple[int, int]:
     """``start`` から探し、連続して空いている ``count`` 個のポートを返す。
 
@@ -143,7 +145,7 @@ def find_consecutive_free_ports(
     port = start
     tried = 0
     while port + count - 1 <= 65535 and tried < limit:
-        if all(is_port_free(port + i, host) for i in range(count)):
+        if all(is_port_free(port + i, host, allow_reuse=allow_reuse) for i in range(count)):
             return port, port + 1
         port += 1
         tried += 1
@@ -619,7 +621,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         while True:
             while start_port in used:
                 start_port += 1
-            registry_port, ost_port = find_consecutive_free_ports(start_port, 2, host)
+            registry_port, ost_port = find_consecutive_free_ports(
+                start_port, 2, host, allow_reuse=(args.port is not None)
+            )
             if registry_port not in used and ost_port not in used:
                 break
             start_port = ost_port + 1
@@ -651,6 +655,26 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
     if join_url and not relay_node:
         relay_node = name if name != DEFAULT_NAME else socket.gethostname().split(".")[0]
+
+    sync_id = str(saved_cfg.get("sync_id") or "").strip()
+    if join_url and not sync_id:
+        import base64
+        import hashlib
+
+        seed = f"{socket.gethostname()}\n{name}\n{base}".encode("utf-8")
+        sync_id = base64.urlsafe_b64encode(hashlib.sha256(seed).digest()[:12]).decode("ascii").rstrip("=")
+
+    raw_subs = getattr(args, "subscribe", None)
+    if raw_subs:
+        subscribe_list = list(dict.fromkeys(
+            s.strip()
+            for item in raw_subs
+            for s in str(item).split(",")
+            if s.strip()
+        ))
+    else:
+        saved_subs = saved_cfg.get("subscribe")
+        subscribe_list = [str(s).strip() for s in saved_subs if str(s).strip()] if isinstance(saved_subs, list) else []
 
     effective_host = host
     if is_hub and host_arg is None and not (existing and existing.bind) and effective_host == "127.0.0.1":
@@ -714,6 +738,8 @@ def cmd_start(args: argparse.Namespace) -> int:
                 "relay_node": relay_node,
                 "relay_token": relay_token,
                 "advertise": effective_advertise,
+                "sync_id": sync_id,
+                "subscribe": subscribe_list,
             },
             ensure_ascii=False,
             indent=2,
@@ -775,7 +801,11 @@ def cmd_start(args: argparse.Namespace) -> int:
     if join_url:
         cmd.extend(["--relay", join_url])
     if relay_node:
-        cmd.extend(["--relay-node", relay_node])
+        cmd.append(f"--relay-node={relay_node}")
+    if sync_id:
+        cmd.append(f"--sync-id={sync_id}")
+    for sub_id in subscribe_list:
+        cmd.append(f"--subscribe={sub_id}")
     for replica in (getattr(args, "replica", None) or []):
         cmd.extend(["--replica", replica])
     if getattr(args, "role", None):
@@ -834,7 +864,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     try:
         if not args.no_delegate:
             raw_path = (args.path or "").strip() or (existing.sub_path if existing else "")
-            sub_path = raw_path.rstrip("/") if raw_path else f"{effective_root_anchor}/{name}"
+            default_leaf = sync_id if (join_url and sync_id) else name
+            sub_path = raw_path.rstrip("/") if raw_path else f"{effective_root_anchor}/{default_leaf}"
             if not sub_path.startswith("/"):
                 sub_path = "/" + sub_path
             # 根の直下でなければ、親のパスも委譲が要る（L1 は多段）
@@ -875,6 +906,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(f"[dfssvc] 起動しました: {name}（PID {proc.pid}）")
         print(f"  L2 Registry : {service.registry_url}")
         print(f"  L3 OST      : tls://{service.ost_endpoint}")
+        if sync_id:
+            print(f"  共有 ID     : {sync_id}")
+        if subscribe_list:
+            print(f"  購読 ID     : {', '.join(subscribe_list)}")
         print()
         print("[dfssvc] dfscli につなぐには:")
         key_hint = service.writer_key or "<書き手の Ed25519 秘密鍵>"
@@ -1220,6 +1255,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--join",
         help="指定した root ハブへ参加する（例: --join https://dfs.yashiki.top）",
+    )
+    p.add_argument(
+        "--subscribe",
+        action="append",
+        default=[],
+        help="自動同期・シードする相手の Base64 共有 ID（複数指定可）",
     )
     p.add_argument("--port", type=int, help=f"この番号から連続した空きを探す（既定 {DEFAULT_START_PORT}）")
     p.add_argument("--ost-dir", help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）")

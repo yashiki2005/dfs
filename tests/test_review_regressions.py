@@ -1464,6 +1464,21 @@ class TestReviewRegressions(unittest.TestCase):
                 finally:
                     srv.close()
 
+    def test_svc_find_consecutive_free_ports_passes_allow_reuse(self) -> None:
+        from unittest import mock
+        from dfs import svc
+
+        seen: list[bool] = []
+
+        def fake_free(port, host="127.0.0.1", *, allow_reuse=False):
+            seen.append(allow_reuse)
+            return True
+
+        with mock.patch.object(svc, "is_port_free", side_effect=fake_free):
+            p1, p2 = svc.find_consecutive_free_ports(9440, 2, allow_reuse=True)
+        self.assertEqual((p1, p2), (9440, 9441))
+        self.assertEqual(seen, [True, True])
+
     def test_download_directory_rejects_case_colliding_entries(self) -> None:
         from dfs.crypto import ChunkIntegrityError, ContentAddressedCrypto, canonical_json
         from dfs.l4_log import MerkleTreeBuilder
