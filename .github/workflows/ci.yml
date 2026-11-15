@@ -61,3 +61,12 @@ jobs:
           DFS_LANG=fr .wheel-venv/bin/python -c 'from dfs.i18n import _; key="巻き戻しを検出しました（B6）"; assert _(key) != key'
           .wheel-venv/bin/dfscli --help >/dev/null
           .wheel-venv/bin/dfssvc --help >/dev/null
+
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfs-python-dist
+          path: |
+            dist/dfs-*.whl
+            dist/dfs-*.tar.gz
+          if-no-files-found: error

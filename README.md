@@ -64,19 +64,25 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-#### macOS 15+ with Python 3.13
+#### Prebuilt Python wheels
 
-`libp2p 0.8.1` pins `fastecdsa==2.3.2`, which has no CPython 3.13
-macOS wheel. Prebuilt Arm64 and Intel wheels with GMP bundled are
-published on the
-[fastecdsa wheel release](https://github.com/yashiki2005/dfs/releases/tag/wheels-fastecdsa-2.3.2-cp313-macos).
-Download the wheel matching the host architecture and install it before
-installing dfs:
+Each GitHub Release includes a platform-independent
+`dfs-<version>-py3-none-any.whl` containing the complete `dfs` package,
+CLI entry points, and localization data. It requires Python 3.11 or newer:
 
 ```bash
-python -m pip install /path/to/fastecdsa-2.3.2-cp313-cp313-macosx_15_0_arm64.whl
-# Intel Macs: fastecdsa-2.3.2-cp313-cp313-macosx_15_0_x86_64.whl
-python -m pip install -e .
+python -m pip install dfs-<version>-py3-none-any.whl
+```
+
+Third-party dependencies are resolved by `pip`, as usual for Python wheels.
+On macOS with Python 3.13, the transitive `fastecdsa==2.3.2` dependency
+still requires GMP when no matching upstream wheel exists:
+
+```bash
+brew install gmp
+export CFLAGS="-I$(brew --prefix gmp)/include"
+export LDFLAGS="-L$(brew --prefix gmp)/lib"
+python -m pip install dfs-<version>-py3-none-any.whl
 ```
 
 ### 2. Start a Local Server (`dfssvc`)
