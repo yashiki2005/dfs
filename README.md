@@ -17,7 +17,7 @@ It lets you store, sync, mount, and share encrypted file trees across laptops, h
 - **Easy Sharing & Web UI**:
   - `dfscli web`: Start a browser-accessible file sharing & Web CLI UI (great for phones or quick transfers).
   - `dfscli invite` / `dfscli share`: Generate read-only invite tokens or one-line `curl | bash` bootstrap scripts for ephemeral workers (e.g., RunPod).
-- **NAT Traversal & Flexible Transport**: Connects directly over LAN/ICE when possible, falls back to an encrypted WebSocket relay across NATs, and optionally supports libp2p/QUIC chunk distribution.
+- **NAT Traversal & Flexible Transport**: Connects directly over LAN/ICE when possible, supports multi-seed libp2p/QUIC chunk distribution out of the box (required core dependency due to ~4x multi-seed throughput gains in 512 MiB benchmarks), and falls back to an encrypted WebSocket/HTTP relay across strict NATs.
 - **Archive & Offline Bundles**: Export/import portable `tar.gz` bundles (with optional PAR2 recovery blocks or BitTorrent metadata) via `dfscli archive` and `dfscli import`.
 - **Copy-on-Write Snapshots**: Integrates with APFS (`clonefile`) on macOS and Btrfs subvolumes on Linux for fast local snapshots (`dfscli fs`).
 
@@ -26,11 +26,17 @@ It lets you store, sync, mount, and share encrypted file trees across laptops, h
 ## Requirements
 
 - Python `3.10+`
-- OpenSSH (`ssh-keygen`) for Ed25519 key generation and signing
+- [OpenSSH](https://www.openssh.com/) (`ssh-keygen`) for Ed25519 key generation and signing
+- [OpenSSL](https://github.com/openssl/openssl) (`openssl`) for TLS certificate generation
+- Core Python libraries:
+  - [cryptography](https://github.com/pyca/cryptography) (ChaCha20-Poly1305 AEAD, HKDF, scrypt, TLS/X.509)
+  - [dnspython](https://github.com/rthalley/dnspython) (DNS / DNSSEC record lookup)
+  - [py-libp2p](https://github.com/libp2p/py-libp2p) (QUIC/TCP P2P chunk distribution & DHT; promoted to a required dependency after multi-seed benchmarks showed ~4x speedup)
+  - [python-zstandard](https://github.com/indygreg/python-zstandard) (Zstandard compression)
 - Optional:
-  - `fuse-t` / `fusepy` for `dfscli mount`
-  - `par2` (`par2cmdline`) for PAR2 parity in `dfscli archive`
-  - `libp2p` extra for QUIC chunk serving (`pip install -e ".[libp2p]"`)
+  - **FUSE mount (`dfscli mount`)**: [fusepy](https://github.com/fusepy/fusepy) + [macFUSE](https://github.com/macfuse/macfuse) / [FUSE-T](https://github.com/macos-fuse-t/fuse-t) (macOS) or [libfuse](https://github.com/libfuse/libfuse) (Linux)
+  - [par2cmdline](https://github.com/Parchive/par2cmdline) (`par2`) for PAR2 parity in `dfscli archive`
+  - [libqrencode](https://github.com/fukuchi/libqrencode) (`qrencode`) for terminal QR codes in `dfscli web`
 
 ---
 
@@ -122,8 +128,8 @@ dfscli pull local:dataset ./restored-dataset
   - **Linux (ext4)**: **Fully supported.** When CoW is unavailable on ext4, `dfs` automatically falls back to standard file copying (`CopyBackend`). All synchronization, encryption, and CLI features work 100% identically, with standard copying during snapshot staging.
   - **Windows (ReFS)**: Leverages `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block cloning where supported.
 - **FUSE Mount (`dfscli mount`)**:
-  - **Linux**: Mounts directly via kernel FUSE (`libfuse.so`).
-  - **macOS**: Probes and falls back in order: **macFUSE (FSKit backend)** → **fuse-t** (NFS/SMB loopback) → **macFUSE (legacy)**, selectable via `--backend`.
+  - **Linux**: Mounts directly via kernel FUSE ([libfuse](https://github.com/libfuse/libfuse), `libfuse.so`).
+  - **macOS**: Probes and falls back in order: **[macFUSE](https://github.com/macfuse/macfuse) (FSKit backend)** → **[FUSE-T](https://github.com/macos-fuse-t/fuse-t)** (NFS/SMB loopback) → **[macFUSE](https://github.com/macfuse/macfuse) (legacy)**, selectable via `--backend`.
 - **Extended Attributes (xattr)**:
   - **Linux**: Interacts through standard Linux `user.*` xattrs.
   - **macOS**: Preserves `user.*` as well as macOS-specific `com.apple.*` metadata attributes via native libc hooks.

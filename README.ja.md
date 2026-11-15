@@ -17,7 +17,7 @@
 - **手軽な共有とブラウザ UI**:
   - `dfscli web`: スマホやブラウザから直接閲覧・操作できるファイル共有 & Web CLI サーバーを起動します。
   - `dfscli invite` / `dfscli share`: RunPod などの一時的なクラウド環境向けに、読み取り専用招待トークンや 1 行の `curl | bash` ブートストラップコマンドを発行します。
-- **NAT 越え・柔軟なトランスポート**: LAN/ICE での直接接続を優先しつつ、NAT 越え時は暗号化 WebSocket リレーへ自動フォールバックし、オプションで libp2p/QUIC 配信にも対応します。
+- **NAT 越え・柔軟なトランスポート**: LAN/ICE での直接接続と libp2p/QUIC による複数シード分散配信を標準装備（512 MiB 実測で 1 シード比約 4 倍の高速化を確認したため必須依存化）しつつ、厳格な NAT 環境では暗号化 WebSocket/HTTP リレーへ自動フォールバックします。
 - **アーカイブ & オフライン配布**: `dfscli archive` / `dfscli import` で、可搬な `tar.gz` バンドル（PAR2 リカバリブロックや BitTorrent 対応）を作成・展開できます。
 - **Copy-on-Write スナップショット**: macOS の APFS（`clonefile`）や Linux の Btrfs サブボリュームを活用した高速なローカルスナップショット（`dfscli fs`）に対応しています。
 
@@ -26,11 +26,17 @@
 ## 動作要件
 
 - Python `3.10` 以上
-- OpenSSH（`ssh-keygen`）— Ed25519 鍵の生成および署名に使用
+- [OpenSSH](https://www.openssh.com/)（`ssh-keygen`）— Ed25519 鍵の生成および署名に使用
+- [OpenSSL](https://github.com/openssl/openssl)（`openssl`）— TLS 証明書の生成に使用
+- 主要 Python ライブラリ:
+  - [cryptography](https://github.com/pyca/cryptography)（ChaCha20-Poly1305 AEAD・HKDF・scrypt・TLS/X.509）
+  - [dnspython](https://github.com/rthalley/dnspython)（DNS / DNSSEC レコード参照）
+  - [py-libp2p](https://github.com/libp2p/py-libp2p)（QUIC/TCP P2P チャンク分散配信・DHT。複数シード分散による約 4 倍の高速化を受け必須依存化）
+  - [python-zstandard](https://github.com/indygreg/python-zstandard)（Zstandard 圧縮）
 - オプション:
-  - `fuse-t` / `fusepy`（`dfscli mount` 用）
-  - `par2` / `par2cmdline`（`dfscli archive` の PAR2 生成・修復用）
-  - `libp2p` extra（`pip install -e ".[libp2p]"`、QUIC チャンク配信用）
+  - **FUSE マウント（`dfscli mount`）**: [fusepy](https://github.com/fusepy/fusepy) + [macFUSE](https://github.com/macfuse/macfuse) / [FUSE-T](https://github.com/macos-fuse-t/fuse-t)（macOS）または [libfuse](https://github.com/libfuse/libfuse)（Linux）
+  - [par2cmdline](https://github.com/Parchive/par2cmdline)（`par2`）— `dfscli archive` の PAR2 生成・修復用
+  - [libqrencode](https://github.com/fukuchi/libqrencode)（`qrencode`）— `dfscli web` の QR コード表示用
 
 ---
 
@@ -122,8 +128,8 @@ dfscli pull local:dataset ./restored-dataset
   - **Linux（ext4）**: **完全に動作します。** ext4 のように Reflink 非対応のファイルシステムでは、自動的に標準の実コピー（`CopyBackend`）へフォールバックします。暗号化・同期・圧縮・FUSE マウントなど全機能が 100% 同様に動作します（スナップショット作成時に通常コピーが行われる点のみ異なります）。
   - **Windows（ReFS）**: `FSCTL_DUPLICATE_EXTENTS_TO_FILE` によるブロッククローンを利用します。
 - **FUSE マウント (`dfscli mount`)**:
-  - **Linux**: 標準のカーネル FUSE（`libfuse.so`）で直接マウントします。
-  - **macOS**: **macFUSE (FSKit バックエンド)** → **fuse-t**（NFS/SMB ループバック） → **macFUSE（通常）** の順で安全に自動試行・フォールバックします（`--backend` で固定も可能）。
+  - **Linux**: 標準のカーネル FUSE（[libfuse](https://github.com/libfuse/libfuse)、`libfuse.so`）で直接マウントします。
+  - **macOS**: **[macFUSE](https://github.com/macfuse/macfuse) (FSKit バックエンド)** → **[FUSE-T](https://github.com/macos-fuse-t/fuse-t)**（NFS/SMB ループバック） → **[macFUSE](https://github.com/macfuse/macfuse)（通常）** の順で安全に自動試行・フォールバックします（`--backend` で固定も可能）。
 - **拡張属性（xattr）**:
   - **Linux**: 標準の `user.*` 属性を操作・同期します。
   - **macOS**: libc を直接呼び出し、`user.*` に加えて macOS 固有の `com.apple.*` メタデータ属性も適切に処理します。

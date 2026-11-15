@@ -1,0 +1,9 @@
+# Core runtime dependencies (synced with pyproject.toml)
+cryptography>=41
+dnspython>=2.6
+libp2p>=0.8
+zstandard>=0.22
+
+# Optional extras:
+# fusepy>=3      # dfscli mount (FUSE / FUSE-T)
+# pytest>=8      # Running the test suite
