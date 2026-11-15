@@ -74,6 +74,7 @@ class TestEvilSuite(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        DFSNode.close_all()
         cls.tmpdir.cleanup()
 
     def _create_env(self, test_id: str) -> tuple[ChunkStoreServer, DirectoryRegistryService, DFSNode]:
@@ -176,6 +177,7 @@ class TestEvilSuite(unittest.TestCase):
             with self.assertRaises(ChunkIntegrityError):
                 node_b.pull()
         finally:
+            DFSNode.close_all()
             ost.close()
 
     def test_evil_A5_replay_attack(self) -> None:
@@ -190,6 +192,7 @@ class TestEvilSuite(unittest.TestCase):
             with self.assertRaises(ConflictError):
                 reg.announce_and_append("/example.com/alice", log_env_v1, loc_env_v1, now=self.now + 5)
         finally:
+            DFSNode.close_all()
             ost.close()
 
     def test_evil_B6_rollback_detection(self) -> None:
@@ -207,6 +210,7 @@ class TestEvilSuite(unittest.TestCase):
             with self.assertRaises(RollbackDetectedError):
                 node.pull()
         finally:
+            DFSNode.close_all()
             ost.close()
 
     def test_evil_B7_silent_drop_detection(self) -> None:
@@ -224,6 +228,7 @@ class TestEvilSuite(unittest.TestCase):
             # ピンが v1 のまま維持されていること
             self.assertEqual(node.l4.pin.version, 1)
         finally:
+            DFSNode.close_all()
             ost.close()
 
 

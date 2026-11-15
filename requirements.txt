@@ -7,3 +7,4 @@ zstandard>=0.22
 # Optional extras:
 # fusepy>=3      # dfscli mount (FUSE / FUSE-T)
 # pytest>=8      # Running the test suite
+# pytest-timeout>=2.3  # Per-test timeout guard

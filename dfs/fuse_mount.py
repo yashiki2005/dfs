@@ -239,7 +239,7 @@ class LocalTreeFuse:
         if self.read_only and flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
             raise OSError(errno.EROFS, os.strerror(errno.EROFS))
         no_follow = getattr(os, "O_NOFOLLOW", 0)
-        acc_mode = flags & os.O_ACCMODE
+        acc_mode = flags & getattr(os, "O_ACCMODE", 0o3)
         open_flags = acc_mode | (flags & (os.O_APPEND | os.O_TRUNC)) | no_follow
         fd = os.open(target, open_flags)
         if flags & os.O_TRUNC:

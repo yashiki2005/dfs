@@ -8,6 +8,7 @@ on:
 
 jobs:
   test:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -24,13 +25,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install macOS native build dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install gmp
+          echo "CFLAGS=-I$(brew --prefix gmp)/include" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-L$(brew --prefix gmp)/lib" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: uv sync --extra test
 
       - name: Run pytest
-        run: uv run --extra test pytest -q tests
+        run: uv run --extra test pytest -q --timeout=120 tests
 
   package:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
 
     steps:

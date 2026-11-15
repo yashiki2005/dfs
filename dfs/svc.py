@@ -47,7 +47,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .dnssec import DEFAULT_RECORD_PREFIX, parse_discovery_text
 from .paths import config_dir, dfs_home, restrict_to_owner
@@ -1166,24 +1166,37 @@ def _recorded_server_is_alive(service: Service) -> bool:
 def _stop_process(s: Service) -> bool:
     if not s.is_running() and not _recorded_server_is_alive(s):
         return False
+
+    def _server_stopped() -> bool:
+        if sys.platform == "win32":
+            # Windowsではポートが閉じてもserve.logを書き終えるまで待つ。
+            return not _process_alive(s.pid)
+        # POSIXではdetached serverが親に回収されず、ゾンビの間は
+        # _process_alive()が真を返すため、待受終了を停止完了とする。
+        return not s.is_running()
+
     # まずは穏当に。サーバは stop.request を見て httpd.shutdown() し、
     # finally で状態とチャンクを保存してから終了する（データを落とさない）。
     _request_stop(Path(s.state_dir))
     deadline = time.time() + 10
     while time.time() < deadline:
-        if not s.is_running():
+        if _server_stopped():
             return True
         time.sleep(0.3)
     # 応答が無ければ強制終了に切り替える。
     _signal_terminate(s.pid)
     deadline = time.time() + 3
     while time.time() < deadline:
-        if not s.is_running():
+        if _server_stopped():
             return True
         time.sleep(0.3)
     _signal_kill(s.pid)
-    time.sleep(0.5)
-    return not s.is_running()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if _server_stopped():
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def cmd_env(args: argparse.Namespace) -> int:

@@ -63,6 +63,21 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+#### macOS 15 以降 + Python 3.13
+
+`libp2p 0.8.1` は `fastecdsa==2.3.2` に固定されていますが、この版には
+CPython 3.13 用 macOS wheel がありません。GMPを同梱した Arm64／Intel
+向けwheelを
+[fastecdsa wheel release](https://github.com/yashiki2005/dfs/releases/tag/wheels-fastecdsa-2.3.2-cp313-macos)
+で配布しています。ホストのアーキテクチャに合うwheelを先にインストールしてから、
+dfsをインストールしてください。
+
+```bash
+python -m pip install /path/to/fastecdsa-2.3.2-cp313-cp313-macosx_15_0_arm64.whl
+# Intel Mac の場合: fastecdsa-2.3.2-cp313-cp313-macosx_15_0_x86_64.whl
+python -m pip install -e .
+```
+
 ### 2. ローカルサーバーの起動 (`dfssvc`)
 
 ```bash

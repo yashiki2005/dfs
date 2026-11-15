@@ -51,6 +51,10 @@ from .path_safety import UnsafePathError, _open_no_follow
 from .private_io import write_private_json
 
 
+_ACTIVE_BUILDERS: "set[MerkleTreeBuilder]" = set()
+_ACTIVE_BUILDERS_LOCK = threading.Lock()
+
+
 class RollbackDetectedError(Exception):
     """evil B6: リモートの先頭版またはハッシュがローカルピンより古い・不一致"""
 
@@ -106,6 +110,7 @@ class SQLiteChunkIndex(MutableMapping[str, Tuple[str, str, str]]):
         self.db_path = Path(db_path).expanduser()
         self.address_key = str(address_key)
         self._lock = threading.RLock()
+        self._closed = False
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         legacy_entries = self._extract_legacy_json_if_needed()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -220,6 +225,9 @@ class SQLiteChunkIndex(MutableMapping[str, Tuple[str, str, str]]):
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.close()
 
 
@@ -337,6 +345,30 @@ class MerkleTreeBuilder:
         self.compression = normalize_policy(compression)
         if self.index_file is not None and index is None:
             self.index = SQLiteChunkIndex(self.index_file, self.index_key)
+        self._closed = False
+        with _ACTIVE_BUILDERS_LOCK:
+            _ACTIVE_BUILDERS.add(self)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if isinstance(self.index, SQLiteChunkIndex):
+                self.index.close()
+        finally:
+            with _ACTIVE_BUILDERS_LOCK:
+                _ACTIVE_BUILDERS.discard(self)
+
+    @classmethod
+    def close_all(cls) -> None:
+        with _ACTIVE_BUILDERS_LOCK:
+            builders = list(_ACTIVE_BUILDERS)
+        for builder in builders:
+            try:
+                builder.close()
+            except Exception:
+                pass
 
     def _save_index_file(self) -> None:
         if isinstance(self.index, SQLiteChunkIndex):

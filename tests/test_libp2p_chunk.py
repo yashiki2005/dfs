@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -222,7 +223,13 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
 
         domain_key = "example.com:bootstrapped"
         self.assertTrue(client_mgr.provide_domain(domain_key, timeout=5.0))
-        provs = server_mgr.find_domain_providers(domain_key, timeout=5.0)
+        deadline = time.monotonic() + 15.0
+        provs = []
+        while time.monotonic() < deadline:
+            provs = server_mgr.find_domain_providers(domain_key, timeout=3.0)
+            if any(p["peer_id"] == client_mgr.peer_id for p in provs):
+                break
+            time.sleep(0.5)
         self.assertTrue(any(p["peer_id"] == client_mgr.peer_id for p in provs))
 
     def test_circuit_relay_v2_chunk_fetch_through_hop(self) -> None:

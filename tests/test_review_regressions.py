@@ -555,13 +555,19 @@ class TestReviewRegressions(unittest.TestCase):
 
     def test_pyinstaller_entrypoints_run_without_relative_import_error(self) -> None:
         repo = Path(__file__).resolve().parents[1]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(repo) + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+        )
         for script in ("scripts/pyinstaller_cli.py", "scripts/pyinstaller_svc.py"):
             res = subprocess.run(
                 [sys.executable, str(repo / script), "--help"],
                 cwd=str(repo),
+                env=env,
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=30,
             )
             self.assertEqual(res.returncode, 0, msg=res.stderr)
 
@@ -1517,8 +1523,18 @@ class TestReviewRegressions(unittest.TestCase):
             sig = ssh_sign(priv, "dfs", payload)
             self.assertTrue(ssh_verify(pub, "alice@example.com", "dfs", payload, sig))
             self.assertTrue(ssh_verify(pub, "/example.com/my team", "dfs", payload, sig))
-            with mock.patch("dfs.crypto._ssh_verify_ed25519", return_value=None):
+            completed = subprocess.CompletedProcess([], 0, b"", b"")
+            with (
+                mock.patch("dfs.crypto._ssh_verify_ed25519", return_value=None),
+                mock.patch("dfs.crypto.subprocess.run", return_value=completed) as run,
+            ):
                 self.assertTrue(ssh_verify(pub, "/example.com/my team", "dfs", payload, sig))
+                command = run.call_args.args[0]
+                safe_identity = __import__("hashlib").sha256(
+                    b"/example.com/my team"
+                ).hexdigest()
+                self.assertIn(safe_identity, command)
+                self.assertEqual(run.call_args.kwargs["timeout"], 30.0)
             for bad_id in ("", "alice\nbob", "alice\rbob", "alice\x00bob"):
                 self.assertFalse(ssh_verify(pub, bad_id, "dfs", payload, sig))
 
@@ -2430,6 +2446,7 @@ class TestReviewRegressions(unittest.TestCase):
             finally:
                 ost.close()
 
+    @unittest.skipIf(os.name == "nt", "Windows chmod only maps the read-only bit")
     def test_fuse_chmod_strips_special_bits_and_tracks_fd(self) -> None:
         from dfs.fuse_mount import LocalTreeFuse
 

@@ -44,9 +44,9 @@ class LocalTreeFuseTests(unittest.TestCase):
         self.assertEqual((self.root / "hello.txt").read_bytes(), b"HELLO world")
         self.assertEqual(self.flushes, 1)
 
-        ops.create("/new.txt", 0o644, 0)
-        ops.write("/new.txt", b"new", 6, 0)
-        ops.release("/new.txt", 0)
+        new_fh = ops.create("/new.txt", 0o644, 0)
+        ops.write("/new.txt", b"new", 6, new_fh)
+        ops.release("/new.txt", new_fh)
         self.assertEqual((self.root / "new.txt").read_bytes(), b"\x00" * 6 + b"new")
         self.assertEqual(self.flushes, 2)
 

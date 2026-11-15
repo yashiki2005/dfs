@@ -67,8 +67,12 @@ class TestBencode(unittest.TestCase):
     def test_torrent_download_uses_external_cli_dht(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dfs_bt_cli_") as tmp:
             base = Path(tmp)
-            executable = base / "aria2c"
-            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            if os.name == "nt":
+                executable = base / "aria2c.cmd"
+                executable.write_text("@echo off\r\n", encoding="utf-8")
+            else:
+                executable = base / "aria2c"
+                executable.write_text("#!/bin/sh\n", encoding="utf-8")
             executable.chmod(0o700)
             completed = subprocess.CompletedProcess([], 0, "", "")
             with patch("dfs.archive.subprocess.run", return_value=completed) as run:
@@ -125,6 +129,7 @@ class TestArchive(unittest.TestCase):
         self.node.push(delegation_epoch=1, now=self.now)
 
     def tearDown(self) -> None:
+        self.node.close()
         self._tmp.cleanup()
 
     def test_create_verify_and_extract(self) -> None:

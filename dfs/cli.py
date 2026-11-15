@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -1444,6 +1444,14 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 return
             time.sleep(0.5)
 
+    # L2 の受付を libp2p 初期化から分離する。P2P/DHT の起動や DNS
+    # 公開が遅い環境でも、dfssvc の起動確認と HTTP API は先に利用可能にする。
+    httpd_thread = threading.Thread(
+        target=httpd.serve_forever,
+        name="dfs-l2-http",
+        daemon=True,
+    )
+    httpd_thread.start()
     threading.Thread(target=_watch_stop, daemon=True).start()
 
     p2p_manager = None
@@ -1735,10 +1743,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if subscribe_ids:
         print(f"[dfs serve] P2P Sub     : {', '.join(sorted(subscribe_ids))}")
     try:
-        httpd.serve_forever()
+        httpd_thread.join()
     except KeyboardInterrupt:
         print("\n[dfs serve] Shutting down...")
     finally:
+        httpd.shutdown()
+        httpd_thread.join(timeout=5.0)
         p2p_sync_stop.set()
         if p2p_manager is not None:
             p2p_manager.close()
@@ -2088,7 +2098,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    finally:
+        from .l4_log import MerkleTreeBuilder
+        from .l5_fs import DFSNode
+
+        DFSNode.close_all()
+        MerkleTreeBuilder.close_all()
 
 
 if __name__ == "__main__":

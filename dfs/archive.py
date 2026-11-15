@@ -1187,7 +1187,10 @@ def extract_bundle(bundle: Path | str, dest: Path | str, tree_secret: str) -> Pa
         ContentAddressedCrypto(tree_secret, kdf_version=kdf_version),
         local_ost,
     )
-    builder.download_directory(
-        str(meta["root_plain_id"]), str(meta["root_wire_id"]), out
-    )
+    try:
+        builder.download_directory(
+            str(meta["root_plain_id"]), str(meta["root_wire_id"]), out
+        )
+    finally:
+        builder.close()
     return out

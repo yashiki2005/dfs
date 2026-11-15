@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -26,6 +27,10 @@ from .fs import FileSystem
 from .fs.core import remove_tree
 from .l4_log import L4LogClient, MerkleTreeBuilder
 from .path_safety import safe_target, write_bytes_no_follow
+
+
+_ACTIVE_NODES: "set[DFSNode]" = set()
+_ACTIVE_NODES_LOCK = threading.Lock()
 
 
 class _LocalChunkCache:
@@ -271,16 +276,44 @@ class DFSNode:
             pin_file=pin_file, root_pubkey=root_pubkey,
             allow_tofu=bool(allow_tofu),
         )
+        self._closed = False
+        with _ACTIVE_NODES_LOCK:
+            _ACTIVE_NODES.add(self)
 
     def switch_credentials(self, new_priv_key: Path | str, new_pub_key_str: str) -> None:
         self.l4.priv_key_path = Path(new_priv_key)
         self.l4.pub_key_str = new_pub_key_str.strip()
 
     def close(self) -> None:
-        if self.libp2p_client is not None:
-            self.libp2p_client.close()
-        if self.libp2p_manager is not None:
-            self.libp2p_manager.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            try:
+                try:
+                    if self.libp2p_client is not None:
+                        self.libp2p_client.close()
+                finally:
+                    if self.libp2p_manager is not None:
+                        self.libp2p_manager.close()
+            finally:
+                # SQLite索引はlibp2p側のclose失敗に巻き込まれず必ず閉じる。
+                self.builder.close()
+                self.read_builder.close()
+        finally:
+            with _ACTIVE_NODES_LOCK:
+                _ACTIVE_NODES.discard(self)
+
+    @classmethod
+    def close_all(cls) -> None:
+        """プロセス内で開いた全ノードを、CLI終了時などに確実に閉じる。"""
+        with _ACTIVE_NODES_LOCK:
+            nodes = list(_ACTIVE_NODES)
+        for node in nodes:
+            try:
+                node.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _parse_ost_endpoint(value: str) -> Tuple[str, int]:
@@ -387,6 +420,7 @@ class DFSNode:
                 )
             except Exception:
                 pass
+        self.read_builder.close()
         self.read_builder = MerkleTreeBuilder(self.crypto, self.read_ost)
 
     def push(
@@ -441,10 +475,14 @@ class DFSNode:
         )
         with tempfile.TemporaryDirectory(prefix="dfs_stage_") as staging:
             staging_dir = Path(staging)
-            with self.read_ost.session():
-                dl_builder.download_directory(
-                    p["root_plain_id"], p["root_wire_id"], staging_dir
-                )
+            try:
+                with self.read_ost.session():
+                    dl_builder.download_directory(
+                        p["root_plain_id"], p["root_wire_id"], staging_dir
+                    )
+            finally:
+                if dl_builder is not self.read_builder:
+                    dl_builder.close()
             self.clayfs.replace_work_tree(staging_dir)
 
         snap = self.clayfs.take_snapshot(f"v{p['version']}")

@@ -142,6 +142,7 @@ class AvailabilityCase(unittest.TestCase):
         self.loc = _make_locator(self.alice_key, self.path, self.log, self.now)
 
     def tearDown(self) -> None:
+        DFSNode.close_all()
         self._tmp.cleanup()
 
     def _registry(self, name: str) -> DirectoryRegistryService:

@@ -89,6 +89,7 @@ from .l1_delegation import DelegationError, create_delegation_envelope, verify_d
 from .l4_log import (
     FILE_CHUNK_BYTES,
     L4LogClient,
+    MerkleTreeBuilder,
     RollbackDetectedError,
     SilentDropDetectedError,
 )
@@ -190,7 +191,16 @@ def public_key_of(priv_key: Path) -> str:
         return pub.read_text(encoding="utf-8").strip()
     import subprocess
 
-    res = subprocess.run(["ssh-keygen", "-y", "-f", str(priv_key)], capture_output=True, text=True)
+    try:
+        res = subprocess.run(
+            ["ssh-keygen", "-y", "-f", str(priv_key)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise UsageError(f"Timed out reading public key from {priv_key}") from e
     if res.returncode != 0:
         raise UsageError(f"Cannot read public key from {priv_key}: {res.stderr.strip()}")
     return res.stdout.strip()
@@ -2153,6 +2163,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise
     except BaseException as e:  # noqa: BLE001 - CLI の最外殻でまとめて扱う
         return _friendly_error(e)
+    finally:
+        DFSNode.close_all()
+        MerkleTreeBuilder.close_all()
 
 
 if __name__ == "__main__":

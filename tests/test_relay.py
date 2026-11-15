@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import List
 
 import pytest
 
@@ -159,6 +160,7 @@ def test_relay_end_to_end_push_and_pull(tmp_path: Path) -> None:
         reader.pull()
         assert (reader.clayfs.work_tree / "hello.txt").read_text(encoding="utf-8") == "through-relay\n"
     finally:
+        DFSNode.close_all()
         agent.close()
         nat_httpd.shutdown()
         nat_httpd.server_close()
@@ -283,6 +285,7 @@ def test_direct_first_and_relay_fallback(tmp_path: Path) -> None:
         fallback_node.push(delegation_epoch=1, now=now + 1)
         assert len(forward_calls) > 0
     finally:
+        DFSNode.close_all()
         agent.close()
         nat_httpd.shutdown()
         nat_httpd.server_close()
