@@ -17,7 +17,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .crypto import normalize_path
+from .crypto import (
+    KDF_DEFAULT,
+    KDF_LEGACY_SHA256,
+    CryptoError,
+    normalize_kdf_version,
+    normalize_path,
+)
 from .paths import cache_dir, config_dir, restrict_to_owner
 
 CONFIG_ENV = "DFS_CONFIG"
@@ -48,6 +54,7 @@ class Remote:
     libp2p_psk: str = ""                 # private swarm 用 pre-shared key
     path: str = ""                      # サブツリーのパス。空ならロケータの path を使う
     secret: str = ""                    # tree_secret。空なら --secret を後で渡す
+    kdf: str = KDF_DEFAULT              # secret の鍵導出方式（旧設定は legacy）
     workdir: str = ""                   # 作業ディレクトリ（既定: ~/.cache/dfs/<name>）
     epoch: int = 1                      # 委譲のエポック
     role_epoch: int = 1                 # registry primary/secondary の fencing 世代
@@ -98,6 +105,14 @@ class Remote:
         raw_libp2p_peers = data.get("libp2p_peers") or []
         if isinstance(raw_libp2p_peers, str):
             raw_libp2p_peers = [raw_libp2p_peers]
+        raw_kdf = data.get("kdf")
+        try:
+            kdf = normalize_kdf_version(
+                raw_kdf,
+                default=KDF_LEGACY_SHA256 if raw_kdf is None else KDF_DEFAULT,
+            )
+        except CryptoError as e:
+            raise RemoteError(f"Invalid remote KDF version: {e}") from e
         return cls(
             name=str(data["name"]),
             registry=str(data["registry"]),
@@ -113,6 +128,7 @@ class Remote:
             libp2p_psk=str(data.get("libp2p_psk", "") or ""),
             path=normalize_path(raw_path) if raw_path else "",
             secret=str(data.get("secret", "") or ""),
+            kdf=kdf,
             workdir=str(data.get("workdir", "")),
             epoch=int(data.get("epoch", 1)),
             role_epoch=int(data.get("role_epoch", 1)),

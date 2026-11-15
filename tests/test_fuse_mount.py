@@ -85,6 +85,13 @@ class LocalTreeFuseTests(unittest.TestCase):
         ops.truncate("/sized.bin", 16)
         self.assertEqual((self.root / "sized.bin").stat().st_size, 16)
 
+    def test_open_with_trunc_marks_dirty_and_flushes(self) -> None:
+        ops = LocalTreeFuse(self.root, self._flush)
+        fh = ops.open("/hello.txt", os.O_WRONLY | os.O_TRUNC)
+        self.assertEqual((self.root / "hello.txt").stat().st_size, 0)
+        ops.release("/hello.txt", fh)
+        self.assertEqual(self.flushes, 1)
+
 
 class FuseRequirementTests(unittest.TestCase):
     def test_macos_without_fuse_reports_clear_error(self) -> None:

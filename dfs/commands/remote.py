@@ -390,6 +390,7 @@ def cmd_listremotes(args: argparse.Namespace) -> int:
 def cmd_config(args: argparse.Namespace) -> int:
     store = _cm.RemoteStore()
     if args.action == "create":
+        existing_remote = store.remotes.get(args.name)
         dnssec_domain = getattr(args, "dnssec_domain", None)
         candidacy_urls = [
             value.strip()
@@ -571,6 +572,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             root_fingerprint=root_fingerprint,
             ost_cert_sha256=ost_cert_sha256,
             allow_tofu=bool(getattr(args, "allow_tofu", False)),
+            kdf=existing_remote.kdf if existing_remote is not None else _cm.KDF_DEFAULT,
         )
         store.set(remote)
         print(f"[dfscli] リモート {remote.name!r} を保存しました: {store.path}")
@@ -619,7 +621,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         for key in ("name", "registry", "registry_alternates", "ost", "ost_alternates",
                     "ost_cert_sha256", "libp2p_peers", "libp2p_psk", "path", "key", "workdir",
                     "epoch", "role_epoch", "compression", "node_name", "root_fingerprint",
-                    "allow_tofu"):
+                    "allow_tofu", "kdf"):
             value = getattr(r, key)
             if key in ("secret", "libp2p_psk"):
                 value = "***"
@@ -804,6 +806,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
             ost_alternates=info["ost_alternates"],
             path=info["path"],
             secret=info["tree_secret"],
+            kdf=info["kdf"],
             workdir=workdir,
             role_epoch=role_epoch,
             node_name=remote_name,
@@ -854,6 +857,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
                 ost_alternates=info["ost_alternates"],
                 path=write_info["path"],
                 secret=info["tree_secret"],
+                kdf=info["kdf"],
                 workdir=write_workdir,
                 epoch=int(write_info["epoch"]),
                 role_epoch=role_epoch,
@@ -1146,6 +1150,7 @@ def cmd_join(args: argparse.Namespace) -> int:
             ost_alternates=alt_osts,
             path=remote_path,
             secret=secret_value,
+            kdf=existing_remote.kdf if existing_remote is not None else _cm.KDF_DEFAULT,
             role_epoch=int(discovered.epoch) if discovered is not None else 1,
             node_name=remote_name,
             root_pubkey=join_root_pub,

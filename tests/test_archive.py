@@ -138,9 +138,27 @@ class TestArchive(unittest.TestCase):
 
         meta = verify_bundle(bundle)
         self.assertEqual(meta["version"], 1)
+        self.assertEqual(meta["kdf"], "scrypt-v1")
         out = self.base / "restored"
         extract_bundle(bundle, out, "archive-secret")
         self.assertEqual((out / "note.txt").read_text(encoding="utf-8"), "archived")
+
+    def test_legacy_archive_without_kdf_uses_legacy_derivation(self) -> None:
+        bundle = self.base / "legacy_bundle"
+        out = self.base / "legacy_restored"
+        with (
+            patch(
+                "dfs.archive.verify_bundle",
+                return_value={
+                    "root_plain_id": "aa" * 32,
+                    "root_wire_id": "bb" * 32,
+                },
+            ),
+            patch("dfs.archive.MerkleTreeBuilder") as builder_cls,
+        ):
+            extract_bundle(bundle, out, "archive-secret")
+        crypto = builder_cls.call_args.args[0]
+        self.assertEqual(crypto.kdf_version, "legacy-sha256-v1")
 
     def test_tampered_chunk_is_rejected(self) -> None:
         bundle = self.base / "bundle_tamper"

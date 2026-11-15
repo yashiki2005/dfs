@@ -2289,6 +2289,22 @@ class TestReviewRegressions(unittest.TestCase):
                     2, 1, now - 30, now + 7200,
                 )
                 primary.register_delegation(del2, now=now + 1)
+
+                # 新エポックの最初の L4 書き込み前でも、旧エポックの先頭を複製できる。
+                rotation_bundle = primary.replication_bundle("/example.com/alice")
+                self.assertIsNotNone(rotation_bundle)
+                self.assertTrue(
+                    secondary.ingest_replica(rotation_bundle, now=now + 1)
+                )
+                rotation_delegation, _l, rotation_head = secondary.resolve(
+                    "/example.com/alice"
+                )
+                self.assertEqual(rotation_head["payload"]["delegation_epoch"], 1)
+                self.assertEqual(
+                    rotation_delegation["chain"][-1]["payload"]["writer"],
+                    alice1_pub,
+                )
+
                 writer2 = DFSNode(
                     "w2", "/example.com/alice", root / "wd2",
                     alice2_priv, alice2_pub, "sec", primary,
@@ -2304,6 +2320,31 @@ class TestReviewRegressions(unittest.TestCase):
                 _d, _l, head = secondary.resolve("/example.com/alice")
                 self.assertEqual(head["payload"]["version"], 2)
                 self.assertEqual(head["payload"]["delegation_epoch"], 2)
+
+                # 再起動後も各エポックのチェーンを保持し、複製を継続できる。
+                state = cli_mod.PersistentRegistryState(
+                    root / "restart_state",
+                    "/example.com",
+                    root_pub,
+                )
+                state.service = primary
+                state.save()
+                reloaded = cli_mod.PersistentRegistryState(
+                    root / "restart_state",
+                    "/example.com",
+                    root_pub,
+                )
+                persisted = reloaded.service.replication_bundle(
+                    "/example.com/alice"
+                )
+                self.assertIsNotNone(persisted)
+                self.assertEqual(set(persisted["epoch_chains"]), {"1", "2"})
+                after_restart = DirectoryRegistryService(
+                    "/example.com", root_pub
+                )
+                self.assertTrue(
+                    after_restart.ingest_replica(persisted, now=now + 2)
+                )
             finally:
                 ost.close()
 
@@ -2409,16 +2450,57 @@ class TestReviewRegressions(unittest.TestCase):
 
     def test_content_addressed_crypto_uses_hardened_kdf(self) -> None:
         import hashlib
+        from dfs.crypto import KDF_LEGACY_SHA256
 
         c1 = ContentAddressedCrypto("passphrase")
         c2 = ContentAddressedCrypto("passphrase")
+        legacy = ContentAddressedCrypto(
+            "passphrase",
+            kdf_version=KDF_LEGACY_SHA256,
+        )
         self.assertEqual(c1.tree_secret, c2.tree_secret)
         self.assertNotEqual(
             c1.tree_secret,
             hashlib.sha256(b"passphrase").digest(),
         )
+        if hasattr(hashlib, "scrypt"):
+            self.assertEqual(
+                c1.tree_secret,
+                hashlib.scrypt(
+                    b"passphrase",
+                    salt=b"dfs-kdf-v1:tree",
+                    n=2**14,
+                    r=8,
+                    p=1,
+                    dklen=32,
+                    maxmem=32 * 1024 * 1024,
+                ),
+            )
+        self.assertEqual(
+            legacy.tree_secret,
+            hashlib.sha256(b"passphrase").digest(),
+        )
         c3 = ContentAddressedCrypto("passphrase", address_secret="passphrase")
         self.assertNotEqual(c3.tree_secret, c3.address_secret)
+
+        plain_id, wire_id, blob = legacy.pack_chunk(b"legacy payload")
+        self.assertEqual(
+            legacy.unpack_chunk(plain_id, wire_id, blob),
+            b"legacy payload",
+        )
+        self.assertTrue(plain_id)
+
+    def test_remote_without_kdf_version_uses_legacy_compatibility(self) -> None:
+        remote = Remote.from_dict(
+            {
+                "name": "old",
+                "registry": "https://l2.example.com",
+                "key": "/tmp/old-key",
+                "secret": "old-secret",
+            }
+        )
+        self.assertEqual(remote.kdf, "legacy-sha256-v1")
+        self.assertEqual(Remote(name="new", registry="https://l2.example.com", key="").kdf, "scrypt-v1")
 
     def test_p2p_status_endpoint_and_fetch(self) -> None:
         import threading

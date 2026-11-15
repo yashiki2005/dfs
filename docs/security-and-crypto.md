@@ -27,6 +27,9 @@
    - A shared secret held by writers and authorized readers of a subtree.
    - Never sent to L2 registries or L3 OST servers.
    - Used to derive `address_secret` and per-chunk encryption keys.
+   - String secrets use the versioned `scrypt-v1` KDF. Configs, invites, and
+     archives without an explicit KDF version retain the legacy SHA-256
+     derivation so existing data remains readable.
 
 ---
 

@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from .crypto import ContentAddressedCrypto
+from .crypto import KDF_DEFAULT, ContentAddressedCrypto
 from .l2_registry import DirectoryRegistryService, ServiceUnavailableError
 from .l3_ost_adapter import (
     FailoverOSTClient,
@@ -155,11 +155,15 @@ class DFSNode:
         ost_endpoint: Optional[str] = None,
         ost_cert_sha256: Optional[str] = None,
         allow_tofu: bool = False,
+        kdf_version: str = KDF_DEFAULT,
     ):
         self.name = name
         self.sub_path = sub_path
         self.clayfs = ClayFSAdapter(mount_root)
-        self.crypto = ContentAddressedCrypto(tree_secret)
+        self.crypto = ContentAddressedCrypto(
+            tree_secret,
+            kdf_version=kdf_version,
+        )
         self.ost_cert_sha256: Optional[str] = (ost_cert_sha256 or "").strip().lower() or None
         if ost_endpoint:
             primary_canonical = self._normalize_ost_endpoint(ost_endpoint)

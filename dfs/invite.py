@@ -11,7 +11,14 @@ import base64
 import json
 from typing import Any, Dict, List, Optional, Sequence
 
-from .crypto import canonical_json, normalize_path
+from .crypto import (
+    KDF_DEFAULT,
+    KDF_LEGACY_SHA256,
+    CryptoError,
+    canonical_json,
+    normalize_kdf_version,
+    normalize_path,
+)
 from .dnssec import _validate_registry_url
 
 INVITE_RO_SCHEMA = "dfs-invite-ro-v1"
@@ -37,6 +44,7 @@ def encode_ro_invite(
     role_epoch: int = 1,
     poll_seconds: int = 30,
     use_candidacy: bool = False,
+    kdf: str = KDF_DEFAULT,
 ) -> str:
     """読み取り専用招待トークン（``dfs-ro-v1:<base64url>``）を生成する。"""
     clean_pub = " ".join(str(root_pubkey or "").split())
@@ -59,6 +67,10 @@ def encode_ro_invite(
         raise InviteError("At least one registry URL is required")
 
     norm_path = normalize_path(path) if path else ""
+    try:
+        kdf_version = normalize_kdf_version(kdf)
+    except CryptoError as e:
+        raise InviteError(str(e)) from e
     payload: Dict[str, Any] = {
         "mode": "read-only",
         "name": str(name or "ro").strip() or "ro",
@@ -73,6 +85,7 @@ def encode_ro_invite(
         "schema": INVITE_RO_SCHEMA,
         "tree_secret": str(tree_secret),
         "use_candidacy": bool(use_candidacy),
+        "kdf": kdf_version,
     }
     raw_bytes = canonical_json(payload)
     b64 = base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
@@ -115,6 +128,14 @@ def decode_ro_invite(token: str) -> Dict[str, Any]:
     raw_path = str(data.get("path", "") or "")
     norm_path = normalize_path(raw_path) if raw_path else ""
 
+    try:
+        kdf_version = normalize_kdf_version(
+            data.get("kdf"),
+            default=KDF_LEGACY_SHA256,
+        )
+    except CryptoError as e:
+        raise InviteError(str(e)) from e
+
     return {
         "schema": INVITE_RO_SCHEMA,
         "mode": "read-only",
@@ -133,6 +154,7 @@ def decode_ro_invite(token: str) -> Dict[str, Any]:
         "role_epoch": max(1, int(data.get("role_epoch", 1))),
         "poll_seconds": max(1, int(data.get("poll_seconds", 30))),
         "use_candidacy": bool(data.get("use_candidacy", False)),
+        "kdf": kdf_version,
     }
 
 
@@ -154,6 +176,7 @@ def encode_rw_invite(
     role_epoch: int = 1,
     poll_seconds: int = 30,
     use_candidacy: bool = False,
+    kdf: str = KDF_DEFAULT,
 ) -> str:
     """読み取り専用入力 + 出力専用一時書き手鍵を含む招待トークン (``dfs-rw-v1:<base64url>``) を生成する。"""
     ro_token = encode_ro_invite(
@@ -168,6 +191,7 @@ def encode_rw_invite(
         role_epoch=role_epoch,
         poll_seconds=poll_seconds,
         use_candidacy=use_candidacy,
+        kdf=kdf,
     )
     base_payload = decode_ro_invite(ro_token)
     norm_write_path = normalize_path(write_path)

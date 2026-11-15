@@ -30,6 +30,11 @@ NS_L4_LOG: str = "dfs-l4-log-v1"
 NS_ARCHIVE: str = "dfs-archive-descriptor-v1"
 NS_CANDIDACY: str = "dfs-candidacy-v1"
 
+KDF_LEGACY_SHA256: str = "legacy-sha256-v1"
+KDF_SCRYPT: str = "scrypt-v1"
+KDF_DEFAULT: str = KDF_SCRYPT
+KDF_SUPPORTED: frozenset[str] = frozenset({KDF_LEGACY_SHA256, KDF_SCRYPT})
+
 
 class CryptoError(Exception):
     """dfs 暗号・署名・整合性エラーの基底クラス"""
@@ -89,6 +94,20 @@ def canonical_json(obj: Dict[str, Any]) -> bytes:
     """jq -cnS 互換の正規化 JSON バイト列（辞書順ソート・空白なし・末尾LF）を返す。"""
     text = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
     return text.encode("utf-8")
+
+
+def normalize_kdf_version(value: Any, *, default: str = KDF_DEFAULT) -> str:
+    """設定に保存された KDF 識別子を検証する。
+
+    識別子が無い旧設定は呼び出し側が ``default`` に
+    ``KDF_LEGACY_SHA256`` を指定して互換動作へ落とす。
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        text = default
+    if text not in KDF_SUPPORTED:
+        raise CryptoError(f"Unsupported KDF version: {text!r}")
+    return text
 
 
 def sha256_hex(data: bytes) -> str:
@@ -398,24 +417,33 @@ class ContentAddressedCrypto:
 
     @staticmethod
     @functools.lru_cache(maxsize=256)
-    def _derive_key_from_str(secret: str, domain: bytes) -> bytes:
+    def _derive_key_from_str(secret: str, domain: bytes, kdf_version: str) -> bytes:
         raw = secret.encode("utf-8")
         salt = b"dfs-kdf-v1:" + domain
-        if hasattr(hashlib, "scrypt"):
-            return hashlib.scrypt(
-                raw,
-                salt=salt,
-                n=2**14,
-                r=8,
-                p=1,
-                dklen=32,
-                maxmem=32 * 1024 * 1024,
-            )
-        return hashlib.pbkdf2_hmac("sha256", raw, salt, 600_000, dklen=32)
+        if kdf_version == KDF_LEGACY_SHA256:
+            return hashlib.sha256(raw).digest()
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
-    def __init__(self, tree_secret: bytes | str, address_secret: bytes | str | None = None):
+        return Scrypt(
+            salt=salt,
+            length=32,
+            n=2**14,
+            r=8,
+            p=1,
+        ).derive(raw)
+
+    def __init__(
+        self,
+        tree_secret: bytes | str,
+        address_secret: bytes | str | None = None,
+        *,
+        kdf_version: str = KDF_DEFAULT,
+    ):
+        self.kdf_version = normalize_kdf_version(kdf_version)
         if isinstance(tree_secret, str):
-            tree_secret = self._derive_key_from_str(tree_secret, b"tree")
+            tree_secret = self._derive_key_from_str(
+                tree_secret, b"tree", self.kdf_version
+            )
         self.tree_secret: bytes = tree_secret
         # 内容アドレス鍵は暗号化鍵と分離する。未指定なら tree_secret から決定的に導出する。
         if address_secret is None:
@@ -423,7 +451,9 @@ class ContentAddressedCrypto:
                 b"dfs-address-key-v1", tree_secret, hashlib.sha256
             ).digest()
         elif isinstance(address_secret, str):
-            self.address_secret = self._derive_key_from_str(address_secret, b"address")
+            self.address_secret = self._derive_key_from_str(
+                address_secret, b"address", self.kdf_version
+            )
         else:
             self.address_secret = address_secret
 

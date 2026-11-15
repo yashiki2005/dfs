@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ from unittest.mock import patch
 
 from dfs import cli as cli_mod
 from dfs import cli_main
+from dfs.crypto import canonical_json
 from dfs.invite import InviteError, decode_ro_invite, encode_ro_invite
 from dfs.l1_delegation import create_delegation_envelope
 from dfs.l3_ost_adapter import ChunkStoreServer
@@ -97,6 +99,15 @@ class ReadOnlyInviteTests(unittest.TestCase):
         self.assertEqual(info["name"], "runpod")
         self.assertEqual(info["path"], "/example.com/data")
         self.assertEqual(info["poll_seconds"], 15)
+        self.assertEqual(info["kdf"], "scrypt-v1")
+
+        legacy_payload = dict(info)
+        legacy_payload.pop("kdf")
+        encoded = base64.urlsafe_b64encode(
+            canonical_json(legacy_payload)
+        ).decode("ascii").rstrip("=")
+        legacy_info = decode_ro_invite(f"dfs-ro-v1:{encoded}")
+        self.assertEqual(legacy_info["kdf"], "legacy-sha256-v1")
 
         with self.assertRaises(InviteError):
             decode_ro_invite("dfs-ro-v1:not-valid-base64!!!")

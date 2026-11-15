@@ -93,7 +93,7 @@ from .l4_log import (
     SilentDropDetectedError,
 )
 from .l5_fs import DFSNode
-from .crypto import ssh_key_fingerprint
+from .crypto import KDF_DEFAULT, KDF_LEGACY_SHA256, ssh_key_fingerprint
 from .fs.core import remove_tree
 from .path_safety import UnsafePathError, copyfile_no_follow, safe_target
 from .paths import config_dir, restrict_to_owner
@@ -308,6 +308,7 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
             "root_pubkey": remote.root_pubkey,
             "sub_path": sub_path,
             "tree_secret": remote.secret,
+            "kdf": remote.kdf,
         }
         write_private_json(cfg_path, cfg)
 
@@ -382,6 +383,13 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
     if remote.secret and cfg.get("tree_secret") != remote.secret:
         cfg["tree_secret"] = remote.secret
         changed = True
+    current_kdf = cfg.get("kdf")
+    if current_kdf is None:
+        current_kdf = KDF_LEGACY_SHA256
+    if str(current_kdf) != remote.kdf:
+        cfg["kdf"] = remote.kdf
+        changed = True
+        tree_identity_changed = True
     desired_priv_key = "" if remote.read_only else str(Path(remote.key).expanduser())
     if cfg.get("priv_key") != desired_priv_key:
         cfg["priv_key"] = desired_priv_key
@@ -1301,6 +1309,7 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
                 role_epoch=remote.role_epoch,
                 poll_seconds=int(args.poll),
                 use_candidacy=bool(args.candidacy),
+                kdf=remote.kdf,
             )
         return encode_ro_invite(
             name=args.name or remote.name,
@@ -1314,6 +1323,7 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
             role_epoch=remote.role_epoch,
             poll_seconds=int(args.poll),
             use_candidacy=bool(args.candidacy),
+            kdf=remote.kdf,
         )
     except (InviteError, DelegationError, cli_mod.RegistryError) as e:
         raise UsageError(f"招待トークンを作成できませんでした: {e}") from e

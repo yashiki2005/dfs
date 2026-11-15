@@ -487,9 +487,28 @@ class DirectoryRegistryService:
             if logs:
                 if not locator:
                     raise RegistryError("Replication bundle has logs but no locator")
-                loc_p = verify_locator_envelope(locator, norm_path, leaf["writer"], now)
-                if loc_p.get("delegation_epoch") != leaf["epoch"]:
-                    raise DelegationError("Replication locator delegation_epoch mismatch")
+                raw_locator_payload = locator.get("payload")
+                if not isinstance(raw_locator_payload, dict):
+                    raise RegistryError("Malformed replication locator")
+                try:
+                    locator_epoch = int(raw_locator_payload["delegation_epoch"])
+                except (KeyError, TypeError, ValueError) as e:
+                    raise RegistryError("Replication locator has no valid epoch") from e
+                if locator_epoch != prev_epoch:
+                    raise DelegationError(
+                        "Replication locator does not match the log head epoch"
+                    )
+                locator_leaf = verified_epochs.get(locator_epoch)
+                if locator_leaf is None:
+                    raise DelegationError(
+                        "Replication locator epoch has no verified delegation chain"
+                    )
+                loc_p = verify_locator_envelope(
+                    locator,
+                    norm_path,
+                    locator_leaf["writer"],
+                    now,
+                )
                 if loc_p["head_version"] != prev_version or loc_p["head_hash"] != prev_hash:
                     raise RegistryError("Replication locator does not match the log head")
             elif locator is not None:
@@ -577,17 +596,9 @@ class DirectoryRegistryService:
             loc_env = self.locators.get(norm_path)
             log_list = self.logs.get(norm_path, [])
 
-            # 末端の委譲に、チェーンと root アンカーの情報を足して返す。
-            # クライアントはこの組で root から検証する（名簿を信頼しない）。
-            if del_env is not None:
-                del_env = dict(del_env)
-                del_env["chain"] = self.delegation_chain(norm_path)
-                del_env["root_anchor"] = self.root_anchor_path
-
             if not log_list:
-                return del_env, loc_env, None
-
-            if version is not None:
+                selected = None
+            elif version is not None:
                 try:
                     wanted = int(version)
                 except (TypeError, ValueError) as e:
@@ -601,16 +612,50 @@ class DirectoryRegistryService:
                     raise RegistryError(
                         f"Version {wanted} not found for {norm_path!r}"
                     )
-                # ロケータは現在の先頭版にしか対応しない。過去版では返さない。
-                selected_locator = loc_env if selected is log_list[-1] else None
-                return del_env, selected_locator, selected
+            elif 0 <= self.simulate_rollback_b6_to_index < len(log_list):
+                # evil B6 シミュレーション（古いログエントリを先頭と見せかける）
+                selected = log_list[self.simulate_rollback_b6_to_index]
+            else:
+                selected = log_list[-1]
 
-            # evil B6 シミュレーション（古いログエントリを先頭と見せかける）
-            if 0 <= self.simulate_rollback_b6_to_index < len(log_list):
-                stale_head = log_list[self.simulate_rollback_b6_to_index]
-                return del_env, loc_env, stale_head
+            # 署名検証には、選択した head を書いた時点の委譲チェーンを返す。
+            # エポック切替直後は現在のチェーンと head のエポックが異なるため、
+            # 常に現在のチェーンを返すと旧 head の署名検証に失敗する。
+            response_chain: List[Dict[str, Any]] = []
+            if del_env is not None:
+                response_epoch = (
+                    int(selected["payload"]["delegation_epoch"])
+                    if selected is not None
+                    else int(del_env["payload"]["epoch"])
+                )
+                response_chain = list(
+                    self.delegation_history.get(norm_path, {}).get(
+                        response_epoch, []
+                    )
+                )
+                if not response_chain:
+                    current_chain = self.delegation_chain(norm_path)
+                    if (
+                        current_chain
+                        and int(
+                            current_chain[-1].get("payload", {}).get("epoch", -1)
+                        )
+                        == response_epoch
+                    ):
+                        response_chain = current_chain
 
-            return del_env, loc_env, log_list[-1]
+            if response_chain:
+                del_env = dict(response_chain[-1])
+                del_env["chain"] = response_chain
+                del_env["root_anchor"] = self.root_anchor_path
+            elif del_env is not None:
+                del_env = dict(del_env)
+
+            if selected is None:
+                return del_env, loc_env, None
+            # ロケータは現在の先頭版にしか対応しない。過去版では返さない。
+            selected_locator = loc_env if selected is log_list[-1] else None
+            return del_env, selected_locator, selected
 
     def history(self, path: str, limit: int = 50) -> List[Dict[str, Any]]:
         """指定パスの L4 ログ履歴を新しい順に返す（署名済みエンベロープの要約）。"""

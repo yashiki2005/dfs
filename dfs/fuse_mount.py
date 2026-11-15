@@ -242,6 +242,9 @@ class LocalTreeFuse:
         acc_mode = flags & os.O_ACCMODE
         open_flags = acc_mode | (flags & (os.O_APPEND | os.O_TRUNC)) | no_follow
         fd = os.open(target, open_flags)
+        if flags & os.O_TRUNC:
+            with self._lock:
+                self._mark_dirty()
         return self._alloc_fh(fd)
 
     def read(

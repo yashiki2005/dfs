@@ -22,11 +22,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .crypto import (
+    KDF_LEGACY_SHA256,
     NS_ARCHIVE,
     NS_L4_LOG,
     ContentAddressedCrypto,
+    CryptoError,
     SignatureVerificationError,
     canonical_json,
+    normalize_kdf_version,
     normalize_path,
     sha256_hex,
     ssh_sign,
@@ -805,6 +808,7 @@ def create_archive(
         "delegation": del_env,
         "locator": loc_env,
         "head_log": head,
+        "kdf": node.crypto.kdf_version,
         "chunks": sorted(chunk_rows, key=lambda row: row["wire_id"]),
     }
     meta_bytes = json.dumps(
@@ -1172,7 +1176,17 @@ def extract_bundle(bundle: Path | str, dest: Path | str, tree_secret: str) -> Pa
     root = Path(bundle).expanduser()
     out = Path(dest).expanduser()
     local_ost = _BundleOST(root)
-    builder = MerkleTreeBuilder(ContentAddressedCrypto(tree_secret), local_ost)
+    try:
+        kdf_version = normalize_kdf_version(
+            meta.get("kdf"),
+            default=KDF_LEGACY_SHA256,
+        )
+    except CryptoError as e:
+        raise ArchiveError(f"Unsupported archive KDF: {e}") from e
+    builder = MerkleTreeBuilder(
+        ContentAddressedCrypto(tree_secret, kdf_version=kdf_version),
+        local_ost,
+    )
     builder.download_directory(
         str(meta["root_plain_id"]), str(meta["root_wire_id"]), out
     )

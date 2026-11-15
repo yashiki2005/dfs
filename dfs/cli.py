@@ -32,7 +32,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from dfs.crypto import ChunkIntegrityError, normalize_path
+    from dfs.crypto import (
+        KDF_DEFAULT,
+        KDF_LEGACY_SHA256,
+        ChunkIntegrityError,
+        normalize_path,
+    )
     from dfs.l1_delegation import DelegationError, create_delegation_envelope
     from dfs.l2_registry import (
         ConflictError,
@@ -62,7 +67,12 @@ if __package__ in (None, ""):
         encode_relay_frame,
     )
 else:
-    from .crypto import ChunkIntegrityError, normalize_path
+    from .crypto import (
+        KDF_DEFAULT,
+        KDF_LEGACY_SHA256,
+        ChunkIntegrityError,
+        normalize_path,
+    )
     from .l1_delegation import DelegationError, create_delegation_envelope
     from .l2_registry import (
         ConflictError,
@@ -446,6 +456,23 @@ class PersistentRegistryState:
         self.service.delegations = data.get("delegations", {})
         self.service.logs = data.get("logs", {})
         self.service.locators = data.get("locators", {})
+        self.service.delegation_history = {}
+        raw_history = data.get("delegation_history", {})
+        if isinstance(raw_history, dict):
+            for path, epochs in raw_history.items():
+                if not isinstance(epochs, dict):
+                    continue
+                parsed_epochs: Dict[int, List[Dict[str, Any]]] = {}
+                for epoch, chain in epochs.items():
+                    if not isinstance(chain, list):
+                        continue
+                    try:
+                        parsed_epochs[int(epoch)] = [
+                            dict(env) for env in chain if isinstance(env, dict)
+                        ]
+                    except (TypeError, ValueError):
+                        continue
+                self.service.delegation_history[str(path)] = parsed_epochs
         raw_archives = data.get("archives", {})
         self.service.archives = {}
         if isinstance(raw_archives, dict):
@@ -466,6 +493,7 @@ class PersistentRegistryState:
     def save(self) -> None:
         data = {
             "delegations": self.service.delegations,
+            "delegation_history": self.service.delegation_history,
             "archives": self.service.archives,
             "candidacy": self.service.candidacy,
             "locators": self.service.locators,
@@ -1256,6 +1284,7 @@ def load_node_from_mount(
         compression=str(cfg.get("compression", "auto") or "auto"),
         ost_cert_sha256=cfg.get("ost_cert_sha256") or None,
         allow_tofu=bool(cfg.get("allow_tofu", False)),
+        kdf_version=str(cfg.get("kdf") or KDF_LEGACY_SHA256),
     )
     return node, cfg, reg_client
 
@@ -1794,6 +1823,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         "registry_url": args.registry,
         "sub_path": normalize_path(args.path),
         "tree_secret": args.secret,
+        "kdf": KDF_DEFAULT,
     }
     cfg_path = clayfs_dir / CONFIG_FILENAME
     write_private_json(cfg_path, cfg)
