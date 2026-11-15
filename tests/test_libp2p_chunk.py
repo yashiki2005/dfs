@@ -783,6 +783,20 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
         self.assertGreaterEqual(summary["direct"], 1)
         self.assertEqual(summary["relayed"], 0)
 
+    def test_rank_and_prune_dead_multiaddrs(self) -> None:
+        from dfs.libp2p_chunk import Libp2pHostManager
+
+        mgr = Libp2pHostManager(store={}, enable_dht=False)
+        dead = "/ip4/192.0.2.1/tcp/4001/p2p/12D3KooWDead"
+        good = "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWGood"
+        for _ in range(3):
+            mgr._record_addr_outcome(dead, ok=False)
+        ranked = mgr._rank_and_prune_addrs([dead, good], cooldown_s=60.0, max_fails=3)
+        self.assertEqual(ranked, [good])
+        mgr._record_addr_outcome(dead, ok=True)
+        ranked2 = mgr._rank_and_prune_addrs([dead, good], cooldown_s=60.0, max_fails=3)
+        self.assertEqual(ranked2, [dead, good])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

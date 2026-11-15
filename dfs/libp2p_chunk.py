@@ -473,6 +473,7 @@ class Libp2pHostManager:
             self.enable_upnp = bool(enable_upnp)
         self._upnp_mapper: Optional[UPnPPortMapper] = None
         self.upnp_external_addrs: List[str] = []
+        self._addr_failures: Dict[str, Tuple[int, float]] = {}
         self.enable_relay = bool(enable_relay and _RELAY_V2_AVAILABLE)
         self.relay_hop = bool(relay_hop)
         self.enable_dcutr = bool(enable_dcutr and _RELAY_V2_AVAILABLE)
@@ -928,6 +929,34 @@ class Libp2pHostManager:
         except RuntimeError as e:
             raise ServiceUnavailableError(f"libp2p host stopped: {e}") from e
 
+    def _rank_and_prune_addrs(
+        self, addrs: Sequence[str], *, cooldown_s: float = 60.0, max_fails: int = 3
+    ) -> List[str]:
+        """失敗回数が多い古いマルチアドレスをクールダウン中は除外（全滅時は末尾にフォールバック）する。"""
+        now = time.monotonic()
+        healthy: List[Tuple[int, str]] = []
+        stale: List[Tuple[int, str]] = []
+        with self._lock:
+            for a in addrs:
+                cnt, ts = self._addr_failures.get(a, (0, 0.0))
+                if cnt >= max_fails and (now - ts) < cooldown_s:
+                    stale.append((cnt, a))
+                else:
+                    healthy.append((cnt, a))
+        if healthy:
+            healthy.sort(key=lambda x: x[0])
+            return [a for _, a in healthy]
+        stale.sort(key=lambda x: x[0])
+        return [a for _, a in stale]
+
+    def _record_addr_outcome(self, addr: str, *, ok: bool) -> None:
+        with self._lock:
+            if ok:
+                self._addr_failures.pop(addr, None)
+            else:
+                cnt, _ = self._addr_failures.get(addr, (0, 0.0))
+                self._addr_failures[addr] = (cnt + 1, time.monotonic())
+
     async def _ensure_connected_async(
         self,
         peer_id_str: str,
@@ -943,6 +972,7 @@ class Libp2pHostManager:
             return pid
 
         direct_list, embedded_relay = _split_p2p_addrs(addrs)
+        direct_list = self._rank_and_prune_addrs(direct_list)
         raw_relays: List[str] = list(embedded_relay)
         for ra in relay_addrs:
             s = str(ra or "").strip().rstrip("/")
@@ -952,7 +982,7 @@ class Libp2pHostManager:
                 s = f"{s}/p2p-circuit/p2p/{peer_id_str}"
             if s not in raw_relays:
                 raw_relays.append(s)
-        all_relay = sorted(raw_relays, key=_is_private_multiaddr)
+        all_relay = self._rank_and_prune_addrs(sorted(raw_relays, key=_is_private_multiaddr))
         last_err: Optional[BaseException] = None
 
         if direct_list:
@@ -963,9 +993,11 @@ class Libp2pHostManager:
                 nonlocal won, last_err
                 try:
                     await self._connect_multiaddr_async(addr_str)
+                    self._record_addr_outcome(addr_str, ok=True)
                     won = True
                     cancel_scope.cancel()
                 except Exception as e:
+                    self._record_addr_outcome(addr_str, ok=False)
                     last_err = e
 
             with trio.move_on_after(direct_timeout) as cs:
@@ -992,8 +1024,10 @@ class Libp2pHostManager:
                     else:
                         await self._host.connect(PeerInfo(pid, [Multiaddr(ca)]))
                     relay_won = True
+                    self._record_addr_outcome(ca, ok=True)
                     cancel_scope.cancel()
                 except Exception as e:
+                    self._record_addr_outcome(ca, ok=False)
                     last_err = e
 
             with trio.move_on_after(timeout) as cs:
