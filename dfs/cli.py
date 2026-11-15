@@ -1434,6 +1434,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         def _p2p_sync_loop() -> None:
             interval = max(1.0, float(os.environ.get("DFS_P2P_SYNC_INTERVAL", "5.0")))
             last_registered_addrs: Optional[Tuple[str, ...]] = tuple(p2p_manager.effective_addrs())
+            probe_cache: Dict[str, Tuple[int, str, float]] = {}
             p2p_sync_stop.wait(0.5)
             while not p2p_sync_stop.is_set():
                 try:
@@ -1518,6 +1519,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                     matched_peers,
                                     relay_addrs=hub_relays,
                                     peer_provider=_refresh_peers,
+                                    probe_cache=probe_cache,
                                 )
                                 if stats.get("fetched", 0) > 0:
                                     with pstate.lock:

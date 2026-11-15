@@ -1594,6 +1594,7 @@ def sync_from_peers(
     peer_provider: Optional[Callable[[], Sequence[Tuple[str, Sequence[str]]]]] = None,
     refresh_interval: float = 5.0,
     adaptive_batch: bool = True,
+    probe_cache: Optional[Dict[str, Tuple[int, str, float]]] = None,
 ) -> Dict[str, Any]:
     """Pull missing encrypted chunks in parallel across multiple *peers* via libp2p."""
     if streams_per_peer is None:
@@ -1646,14 +1647,25 @@ def sync_from_peers(
         wids: List[str] = []
         offset = 0
         try:
-            while True:
+            cached = probe_cache.get(pid) if probe_cache is not None else None
+            first_limit = 1 if cached is not None else 4096
+            total, page = client.list_chunks(offset=0, limit=first_limit)
+            first_wid = page[0] if page else ""
+            if cached is not None:
+                prev_total, prev_first, prev_ts = cached
+                if total == prev_total and first_wid == prev_first and (time.monotonic() - prev_ts) < 30.0:
+                    return None
+            if page:
+                wids.extend(page)
+                offset += len(page)
+            while offset < total:
                 total, page = client.list_chunks(offset=offset, limit=4096)
                 if not page:
                     break
                 wids.extend(page)
                 offset += len(page)
-                if offset >= total:
-                    break
+            if probe_cache is not None:
+                probe_cache[pid] = (total, wids[0] if wids else "", time.monotonic())
         except Exception:
             return None
         if not wids:

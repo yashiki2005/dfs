@@ -797,6 +797,44 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
         ranked2 = mgr._rank_and_prune_addrs([dead, good], cooldown_s=60.0, max_fails=3)
         self.assertEqual(ranked2, [dead, good])
 
+    def test_sync_from_peers_probe_cache_skips_unchanged_list_chunks(self) -> None:
+        from unittest.mock import patch
+        from dfs.libp2p_chunk import Libp2pHostManager, Libp2pPeerClient, sync_from_peers
+
+        blobs = [f"cache-chunk-{i}".encode("utf-8") for i in range(4)]
+        expected = {hashlib.sha256(b).hexdigest(): b for b in blobs}
+        s_store = dict(expected)
+        d_store: dict[str, bytes] = {}
+        s_mgr = Libp2pHostManager(
+            store=s_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        d_mgr = Libp2pHostManager(
+            store=d_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        self.addCleanup(s_mgr.close)
+        self.addCleanup(d_mgr.close)
+
+        probe_cache: dict = {}
+        stats1 = sync_from_peers(
+            d_mgr, d_store, [(s_mgr.peer_id, s_mgr.addrs)], probe_cache=probe_cache
+        )
+        self.assertEqual(stats1["fetched"], 4)
+        self.assertIn(s_mgr.peer_id, probe_cache)
+
+        limits_seen: list[int] = []
+        orig_list = Libp2pPeerClient.list_chunks
+
+        def spy_list(client_self, offset=0, limit=4096):
+            limits_seen.append(limit)
+            return orig_list(client_self, offset=offset, limit=limit)
+
+        with patch.object(Libp2pPeerClient, "list_chunks", spy_list):
+            stats2 = sync_from_peers(
+                d_mgr, d_store, [(s_mgr.peer_id, s_mgr.addrs)], probe_cache=probe_cache
+            )
+        self.assertEqual(stats2["fetched"], 0)
+        self.assertEqual(limits_seen, [1])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
