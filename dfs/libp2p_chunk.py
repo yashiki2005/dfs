@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequ
 
 from .crypto import ChunkIntegrityError
 from .l2_registry import ServiceUnavailableError
+from .l3_ost_adapter import _get_available_memory_bytes
 from .nat import UPnPPortMapper
 
 PROTOCOL_ID = "/dfs/chunk/1.0.0"
@@ -1571,6 +1572,20 @@ def sync_from_peer(
     }
 
 
+def _memory_budget_caps() -> Tuple[int, int, int]:
+    """空きメモリに応じて (max_streams_per_peer, max_batch_step, max_write_queue) を返す。"""
+    avail = _get_available_memory_bytes()
+    if avail is None or avail <= 0:
+        return 4, 16, 8
+    if avail < 128 * 1024 * 1024:
+        return 1, 2, 2
+    if avail < 256 * 1024 * 1024:
+        return 1, 4, 4
+    if avail < 512 * 1024 * 1024:
+        return 2, 8, 6
+    return 4, 16, 8
+
+
 def _adapt_batch_size(current: int, elapsed_s: float, *, failed: bool = False, max_step: int = 16) -> int:
     """直近のバッチ取得所要時間・成否に応じて次回バッチサイズを動的調整する。"""
     if failed:
@@ -1597,12 +1612,13 @@ def sync_from_peers(
     probe_cache: Optional[Dict[str, Tuple[int, str, float]]] = None,
 ) -> Dict[str, Any]:
     """Pull missing encrypted chunks in parallel across multiple *peers* via libp2p."""
+    mem_max_streams, mem_max_step, mem_max_wq = _memory_budget_caps()
     if streams_per_peer is None:
         raw_streams = os.environ.get("DFS_P2P_STREAMS_PER_PEER", "2").strip()
         try:
-            streams_per_peer = max(1, min(4, int(raw_streams)))
+            streams_per_peer = max(1, min(mem_max_streams, int(raw_streams)))
         except ValueError:
-            streams_per_peer = 2
+            streams_per_peer = min(2, mem_max_streams)
     else:
         streams_per_peer = max(1, min(4, int(streams_per_peer)))
 
@@ -1679,11 +1695,11 @@ def sync_from_peers(
     completed: Set[str] = set()
     missing_total = 0
     lock = threading.Lock()
-    step = max(1, int(batch_size))
+    step = max(1, min(mem_max_step, int(batch_size)))
     fetched = 0
     fetched_bytes = 0
     per_peer: Dict[str, int] = {}
-    write_sem = threading.Semaphore(8)
+    write_sem = threading.Semaphore(mem_max_wq)
     write_futs: List[Any] = []
     writer_pool = ThreadPoolExecutor(max_workers=2)
     rng = random.Random()
@@ -1822,7 +1838,9 @@ def sync_from_peers(
                 continue
 
             if adaptive_batch:
-                cur_step = _adapt_batch_size(cur_step, time.monotonic() - t_req, failed=False)
+                cur_step = _adapt_batch_size(
+                    cur_step, time.monotonic() - t_req, failed=False, max_step=mem_max_step
+                )
             consec_err = 0
             write_sem.acquire()
             wf = writer_pool.submit(_persist_batch, pid, batch, blobs, is_endgame)

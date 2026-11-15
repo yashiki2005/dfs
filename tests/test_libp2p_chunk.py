@@ -617,6 +617,7 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
 
     def test_sync_from_peers_rarest_first_ordering(self) -> None:
         import threading
+        import time
         from unittest.mock import patch
         from dfs.libp2p_chunk import Libp2pHostManager, Libp2pPeerClient, sync_from_peers
 
@@ -649,6 +650,8 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
         def synced_list_chunks(client_self, offset=0, limit=4096):
             res = orig_list_chunks(client_self, offset=offset, limit=limit)
             probe_barrier.wait()
+            if client_self.peer_id == s1_mgr.peer_id:
+                time.sleep(0.02)
             return res
 
         def capture_s1(client_self, wire_ids):
@@ -834,6 +837,19 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
             )
         self.assertEqual(stats2["fetched"], 0)
         self.assertEqual(limits_seen, [1])
+
+    def test_memory_budget_caps_scale_with_available_ram(self) -> None:
+        from unittest.mock import patch
+        from dfs import libp2p_chunk
+
+        with patch.object(libp2p_chunk, "_get_available_memory_bytes", return_value=100 * 1024 * 1024):
+            self.assertEqual(libp2p_chunk._memory_budget_caps(), (1, 2, 2))
+        with patch.object(libp2p_chunk, "_get_available_memory_bytes", return_value=200 * 1024 * 1024):
+            self.assertEqual(libp2p_chunk._memory_budget_caps(), (1, 4, 4))
+        with patch.object(libp2p_chunk, "_get_available_memory_bytes", return_value=400 * 1024 * 1024):
+            self.assertEqual(libp2p_chunk._memory_budget_caps(), (2, 8, 6))
+        with patch.object(libp2p_chunk, "_get_available_memory_bytes", return_value=2 * 1024**3):
+            self.assertEqual(libp2p_chunk._memory_budget_caps(), (4, 16, 8))
 
 
 if __name__ == "__main__":
