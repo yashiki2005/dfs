@@ -1397,17 +1397,49 @@ def cmd_serve(args: argparse.Namespace) -> None:
         from .libp2p_chunk import sync_from_peers
         from .relay import fetch_p2p_peers, register_p2p_peer
 
+        def _fetch_merged_peers() -> Tuple[List[str], List[Dict[str, Any]]]:
+            merged_ids: List[str] = []
+            seen_ids: Set[str] = set()
+            merged_peers: Dict[str, Dict[str, Any]] = {}
+            for rurl in relay_urls:
+                try:
+                    info = fetch_p2p_peers(rurl, token=relay_token, timeout=2.0)
+                except Exception:
+                    continue
+                for pid in (info.get("peer_ids") or []):
+                    spid = str(pid or "").strip()
+                    if spid and spid not in seen_ids:
+                        seen_ids.add(spid)
+                        merged_ids.append(spid)
+                for p in (info.get("peers") or []):
+                    if not isinstance(p, dict):
+                        continue
+                    spid = str(p.get("peer_id") or "").strip()
+                    if not spid:
+                        continue
+                    existing = merged_peers.get(spid)
+                    if existing is None:
+                        merged_peers[spid] = dict(p)
+                        merged_peers[spid]["addrs"] = [
+                            str(a).strip() for a in (p.get("addrs") or []) if str(a).strip()
+                        ]
+                    else:
+                        cur_addrs = existing.setdefault("addrs", [])
+                        for a in (p.get("addrs") or []):
+                            sa = str(a).strip()
+                            if sa and sa not in cur_addrs:
+                                cur_addrs.append(sa)
+            return merged_ids, list(merged_peers.values())
+
         def _p2p_sync_loop() -> None:
             interval = max(1.0, float(os.environ.get("DFS_P2P_SYNC_INTERVAL", "5.0")))
             last_registered_addrs: Optional[Tuple[str, ...]] = tuple(p2p_manager.effective_addrs())
             p2p_sync_stop.wait(0.5)
             while not p2p_sync_stop.is_set():
                 try:
-                    info = fetch_p2p_peers(relay_urls[0], token=relay_token, timeout=2.0)
-                    peer_ids = info.get("peer_ids")
-                    if isinstance(peer_ids, list) and peer_ids:
+                    peer_ids, peers = _fetch_merged_peers()
+                    if peer_ids:
                         p2p_manager.set_allowed_peer_ids(peer_ids)
-                    peers = [p for p in (info.get("peers") or []) if isinstance(p, dict)]
                     hub_relays = [
                         str(a).strip()
                         for p in peers
@@ -1419,27 +1451,31 @@ def cmd_serve(args: argparse.Namespace) -> None:
                         p2p_manager.bootstrap_from_peers(peers, timeout=5.0)
                         cur_addrs = p2p_manager.effective_addrs(relay_addrs=hub_relays)
                         if tuple(cur_addrs) != last_registered_addrs:
-                            try:
-                                reg_info = register_p2p_peer(
-                                    relay_urls[0],
-                                    p2p_manager.peer_id,
-                                    node_id=relay_node or pstate.role,
-                                    p2p_addrs=cur_addrs,
-                                    role=pstate.role,
-                                    sync_id=sync_id_arg,
-                                    sub_path=sub_path_arg,
-                                    token=relay_token,
-                                    timeout=2.0,
-                                )
+                            any_ok = False
+                            for rurl in relay_urls:
+                                try:
+                                    reg_info = register_p2p_peer(
+                                        rurl,
+                                        p2p_manager.peer_id,
+                                        node_id=relay_node or pstate.role,
+                                        p2p_addrs=cur_addrs,
+                                        role=pstate.role,
+                                        sync_id=sync_id_arg,
+                                        sub_path=sub_path_arg,
+                                        token=relay_token,
+                                        timeout=2.0,
+                                    )
+                                    any_ok = True
+                                    reg_peer_ids = reg_info.get("peer_ids")
+                                    if isinstance(reg_peer_ids, list) and reg_peer_ids:
+                                        p2p_manager.set_allowed_peer_ids(reg_peer_ids)
+                                except Exception:
+                                    pass
+                            if any_ok:
                                 last_registered_addrs = tuple(cur_addrs)
                                 disc = getattr(getattr(p2p_manager, "_relay_discovery", None), "_discovered_relays", {}) or {}
                                 res_map = {str(k): bool(getattr(v, "has_reservation", False)) for k, v in disc.items()}
                                 print(f"[dfs p2p] registered {len(cur_addrs)} addrs, relay_reservations={res_map}", flush=True)
-                                reg_peer_ids = reg_info.get("peer_ids")
-                                if isinstance(reg_peer_ids, list) and reg_peer_ids:
-                                    p2p_manager.set_allowed_peer_ids(reg_peer_ids)
-                            except Exception:
-                                pass
                     if subscribe_ids:
                         matched_peers: List[Tuple[str, List[str]]] = []
                         for entry in peers:
@@ -1459,9 +1495,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                             matched_peers.append((pid, addrs))
                         if matched_peers and not p2p_sync_stop.is_set():
                             def _refresh_peers() -> List[Tuple[str, List[str]]]:
-                                latest = fetch_p2p_peers(
-                                    relay_urls[0], token=relay_token, timeout=2.0
-                                )
+                                _, latest = _fetch_merged_peers()
                                 out: List[Tuple[str, List[str]]] = []
                                 for e in latest:
                                     epid = str(e.get("peer_id") or "").strip()
