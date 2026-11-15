@@ -531,6 +531,7 @@ def make_registry_http_handler(
     pstate: PersistentRegistryState,
     ost: ChunkStoreServer,
     relay_hub: Optional[RelayHub] = None,
+    status_provider: Optional[Callable[[], Dict[str, Any]]] = None,
 ):
     ost_load_lock = threading.Lock()
     ost_inflight = [0]
@@ -832,7 +833,64 @@ def make_registry_http_handler(
                 self.connection.settimeout(self.request_timeout)
             return True
 
+        def _is_loopback_direct(self) -> bool:
+            if self.headers.get("X-Forwarded-For"):
+                return False
+            peer_ip = str(self.client_address[0]) if self.client_address and self.client_address[0] else ""
+            if not peer_ip:
+                return False
+            try:
+                return ipaddress.ip_address(peer_ip.split("%", 1)[0]).is_loopback
+            except ValueError:
+                return False
+
+        def _handle_p2p_status(self) -> bool:
+            from urllib.parse import urlsplit
+            from .l3_ost_adapter import _get_available_memory_bytes, check_storage_health
+
+            parsed = urlsplit(self.path)
+            if parsed.path != "/_p2p/status":
+                return False
+            if not self._is_loopback_direct():
+                if relay_hub is None:
+                    self._send_json(403, {"error_type": "RegistryError", "message": "Remote status requires relay token"})
+                    return True
+                try:
+                    relay_hub.verify_token(self.headers.get("X-DFS-Relay-Token"))
+                except RelayAuthError as e:
+                    self._send_json(403, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+
+            chunks_dir = getattr(ost, "chunks_dir", None)
+            storage_health = check_storage_health(chunks_dir) if chunks_dir is not None else {}
+            mem_avail = _get_available_memory_bytes()
+            ost_lock = getattr(ost, "_store_lock", None) or getattr(ost, "lock", None)
+            if ost_lock is not None:
+                with ost_lock:
+                    ost_info = {
+                        "ram_bytes": int(getattr(ost, "_ram_bytes", 0)),
+                        "max_ram_bytes": int(getattr(ost, "max_ram_bytes", 0)),
+                        "disk_bytes": int(getattr(ost, "_disk_bytes", 0)),
+                        "chunks_count": len(ost.store),
+                        "mem_available_bytes": mem_avail,
+                        "storage_health": storage_health,
+                    }
+            else:
+                ost_info = {
+                    "ram_bytes": int(getattr(ost, "_ram_bytes", 0)),
+                    "max_ram_bytes": int(getattr(ost, "max_ram_bytes", 0)),
+                    "disk_bytes": int(getattr(ost, "_disk_bytes", 0)),
+                    "chunks_count": len(ost.store),
+                    "mem_available_bytes": mem_avail,
+                    "storage_health": storage_health,
+                }
+            p2p_info: Dict[str, Any] = status_provider() if status_provider is not None else {"enabled": False}
+            self._send_json(200, {"ost": ost_info, "p2p": p2p_info})
+            return True
+
         def do_GET(self) -> None:
+            if self._handle_p2p_status():
+                return
             if self._handle_ice():
                 return
             if self._handle_relay_control():
@@ -1293,7 +1351,30 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 pstate.ost_alternates.append(ep)
         pstate.relay_endpoint = pstate.relay_endpoints[0]
 
-    handler = make_registry_http_handler(pstate, ost, relay_hub=relay_hub)
+    p2p_manager_ref: List[Any] = [None]
+    p2p_status_lock = threading.Lock()
+    p2p_runtime_status: Dict[str, Any] = {"last_sync": None}
+
+    def _get_p2p_status() -> Dict[str, Any]:
+        mgr = p2p_manager_ref[0]
+        with p2p_status_lock:
+            last_sync = dict(p2p_runtime_status["last_sync"]) if p2p_runtime_status["last_sync"] else None
+        if mgr is None:
+            return {"enabled": False, "last_sync": last_sync}
+        try:
+            conns = mgr.connection_summary()
+        except Exception:
+            conns = {}
+        return {
+            "enabled": True,
+            "peer_id": getattr(mgr, "peer_id", ""),
+            "connections": conns,
+            "last_sync": last_sync,
+        }
+
+    handler = make_registry_http_handler(
+        pstate, ost, relay_hub=relay_hub, status_provider=_get_p2p_status
+    )
     httpd = BoundedThreadingHTTPServer((args.bind, args.registry_port), handler)
 
     relay_agents: List[RelayAgent] = []
@@ -1349,6 +1430,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                     enable_dcutr=True,
                 )
                 p2p_manager.start(timeout=5.0)
+                p2p_manager_ref[0] = p2p_manager
                 if relay_hub is not None:
                     relay_hub.on_allowlist_change = p2p_manager.set_allowed_peer_ids
                     relay_hub.allow_peer_id(
@@ -1385,6 +1467,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 except Exception:
                     pass
                 p2p_manager = None
+                p2p_manager_ref[0] = None
 
     subscribe_ids = {
         s.strip()
@@ -1513,6 +1596,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                 return out
 
                             try:
+                                sync_t0 = time.monotonic()
                                 stats = sync_from_peers(
                                     p2p_manager,
                                     ost,
@@ -1521,16 +1605,30 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                     peer_provider=_refresh_peers,
                                     probe_cache=probe_cache,
                                 )
+                                sync_elapsed = max(0.0, time.monotonic() - sync_t0)
                                 if stats.get("fetched", 0) > 0:
                                     with pstate.lock:
                                         pstate.save_ost_chunks(ost)
                                     per_peer = stats.get("per_peer") or {}
+                                    synced_bytes = int(stats.get("bytes", 0))
+                                    bps = round(synced_bytes / sync_elapsed, 1) if sync_elapsed > 0 else 0.0
+                                    with p2p_status_lock:
+                                        p2p_runtime_status["last_sync"] = {
+                                            "fetched": int(stats["fetched"]),
+                                            "remote_total": int(stats.get("remote_total", 0)),
+                                            "bytes": synced_bytes,
+                                            "duration_s": round(sync_elapsed, 3),
+                                            "bps": bps,
+                                            "per_peer": dict(per_peer),
+                                            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                        }
                                     peer_summary = ", ".join(
                                         f"{k[:12]}={v}" for k, v in per_peer.items()
                                     )
+                                    mbps = (synced_bytes / (1024 * 1024)) / sync_elapsed if sync_elapsed > 0 else 0.0
                                     print(
                                         f"[dfs p2p-sync] fetched={stats['fetched']}/{stats['remote_total']} "
-                                        f"({stats['bytes']} B) [{peer_summary}]",
+                                        f"({stats['bytes']} B in {sync_elapsed:.2f}s, {mbps:.2f} MiB/s) [{peer_summary}]",
                                         flush=True,
                                     )
                                     csum = p2p_manager.connection_summary()

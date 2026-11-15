@@ -945,12 +945,36 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fetch_runtime_status(registry_url: str) -> Optional[Dict[str, Any]]:
+    import urllib.request
+
+    headers: Dict[str, str] = {}
+    token = os.environ.get("DFS_RELAY_TOKEN", "").strip()
+    if token:
+        headers["X-DFS-Relay-Token"] = token
+    req = urllib.request.Request(
+        f"{registry_url.rstrip('/')}/_p2p/status",
+        headers=headers,
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = ServiceStore()
     s = store.get(_resolve_service_name(args))
     alive = s.is_running()
+    runtime = _fetch_runtime_status(s.registry_url) if alive else None
     if args.json:
-        print(json.dumps(s.to_dict(), ensure_ascii=False, indent=2))
+        payload = s.to_dict()
+        if runtime is not None:
+            payload["runtime_status"] = runtime
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0 if alive else 1
     print(f"Name        : {s.name}")
     print(f"State       : {'稼働中' if alive else '停止'}")
@@ -987,6 +1011,45 @@ def cmd_status(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001 - 表示のため
         print(f"L2 応答     : 失敗（{e}）")
         return 1
+    if runtime:
+        ost_info = runtime.get("ost") or {}
+        ram_mb = (ost_info.get("ram_bytes") or 0) / (1024 * 1024)
+        max_ram_mb = (ost_info.get("max_ram_bytes") or 0) / (1024 * 1024)
+        disk_mb = (ost_info.get("disk_bytes") or 0) / (1024 * 1024)
+        avail = ost_info.get("mem_available_bytes")
+        avail_str = f", Avail={avail / (1024 * 1024):.1f} MiB" if avail is not None else ""
+        print(
+            f"OST Memory  : RAM {ram_mb:.1f} / {max_ram_mb:.1f} MiB, "
+            f"Disk {disk_mb:.1f} MiB ({ost_info.get('chunks_count', 0)} chunks{avail_str})"
+        )
+        sh = ost_info.get("storage_health") or {}
+        if sh:
+            kind = "tmpfs" if sh.get("is_tmpfs") else "disk"
+            free_gb = (sh.get("free_bytes") or 0) / (1024 ** 3)
+            print(f"Storage     : {kind}, free={free_gb:.2f} GiB")
+        p2p_info = runtime.get("p2p") or {}
+        if p2p_info.get("enabled"):
+            conns = p2p_info.get("connections") or {}
+            pid = str(p2p_info.get("peer_id") or "")
+            short_pid = pid[:16] + "..." if len(pid) > 16 else pid
+            print(
+                f"P2P Paths   : peer={short_pid}, total={conns.get('total', 0)} "
+                f"(direct={conns.get('direct', 0)}, relay={conns.get('relayed', 0)}, "
+                f"ipv6={conns.get('ipv6', 0)}, dcutr={conns.get('dcutr_active', 0)})"
+            )
+            ls = p2p_info.get("last_sync")
+            if isinstance(ls, dict):
+                mb = (ls.get("bytes") or 0) / (1024 * 1024)
+                mbps = (ls.get("bps") or 0.0) / (1024 * 1024)
+                per_peer = ls.get("per_peer") or {}
+                peer_dist = ", ".join(f"{str(k)[:10]}={v}" for k, v in per_peer.items())
+                print(
+                    f"Last Sync   : {ls.get('fetched', 0)}/{ls.get('remote_total', 0)} chunks "
+                    f"({mb:.2f} MiB in {ls.get('duration_s', 0)}s, {mbps:.2f} MiB/s)"
+                    + (f" [{peer_dist}]" if peer_dist else "")
+                )
+        else:
+            print("P2P Paths   : disabled")
     return 0
 
 

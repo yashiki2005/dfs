@@ -2420,6 +2420,59 @@ class TestReviewRegressions(unittest.TestCase):
         c3 = ContentAddressedCrypto("passphrase", address_secret="passphrase")
         self.assertNotEqual(c3.tree_secret, c3.address_secret)
 
+    def test_p2p_status_endpoint_and_fetch(self) -> None:
+        import threading
+        from http.server import ThreadingHTTPServer
+        from dfs.cli import PersistentRegistryState, make_registry_http_handler
+        from dfs.svc import _fetch_runtime_status
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chunks_dir = root / "chunks"
+            chunks_dir.mkdir(parents=True, exist_ok=True)
+
+            class FakeOST:
+                _store_lock = threading.RLock()
+                _ram_bytes = 1024
+                max_ram_bytes = 4096
+                _disk_bytes = 2048
+                store = {"w1": b"x"}
+
+                def __init__(self, d: Path) -> None:
+                    self.chunks_dir = d
+
+            ost = FakeOST(chunks_dir)
+            pstate = PersistentRegistryState(
+                state_dir=root / "state",
+                root_anchor="/test",
+                root_pubkey="pk",
+            )
+            handler = make_registry_http_handler(
+                pstate,
+                ost,  # type: ignore[arg-type]
+                status_provider=lambda: {
+                    "enabled": True,
+                    "peer_id": "12D3KooWTestPeer",
+                    "connections": {"total": 2, "direct": 1, "relayed": 1, "ipv6": 0, "dcutr_active": 1},
+                    "last_sync": {"fetched": 4, "remote_total": 4, "bytes": 4096, "duration_s": 0.5, "bps": 8192.0, "per_peer": {"peerA": 4}},
+                },
+            )
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            th = threading.Thread(target=srv.serve_forever, daemon=True)
+            th.start()
+            try:
+                url = f"http://127.0.0.1:{srv.server_address[1]}"
+                data = _fetch_runtime_status(url)
+                assert data is not None
+                self.assertEqual(data["ost"]["max_ram_bytes"], 4096)
+                self.assertIn("storage_health", data["ost"])
+                self.assertTrue(data["p2p"]["enabled"])
+                self.assertEqual(data["p2p"]["connections"]["direct"], 1)
+                self.assertEqual(data["p2p"]["last_sync"]["fetched"], 4)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
