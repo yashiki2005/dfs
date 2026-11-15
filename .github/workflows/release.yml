@@ -126,7 +126,9 @@ jobs:
           python-version: "3.12"
 
       - name: Build universal Python distributions
-        run: uv build --out-dir python-dist
+        run: |
+          uv build --out-dir python-dist
+          cp fastecdsa-overrides.txt python-dist/
 
       - name: Verify universal wheel
         shell: bash
@@ -142,7 +144,10 @@ jobs:
           esac
           unzip -l "$WHEEL" | grep -q 'dfs/i18n/catalogs.json'
           uv venv --python 3.12 .wheel-venv
-          uv pip install --python .wheel-venv/bin/python "$WHEEL"
+          uv pip install \
+            --python .wheel-venv/bin/python \
+            --overrides fastecdsa-overrides.txt \
+            "$WHEEL"
           DFS_LANG=fr .wheel-venv/bin/python -c 'from dfs.i18n import _; key="巻き戻しを検出しました（B6）"; assert _(key) != key'
           .wheel-venv/bin/dfscli --help >/dev/null
           .wheel-venv/bin/dfssvc --help >/dev/null
@@ -181,7 +186,7 @@ jobs:
       - name: Compute SHA256SUMS and render Homebrew formula
         run: |
           cd artifacts
-          sha256sum dfs-* > SHA256SUMS.txt
+          sha256sum dfs-* fastecdsa-overrides.txt > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
           SHA_DARWIN_ARM64=$(grep "darwin-arm64.tar.gz" SHA256SUMS.txt | awk '{print $1}')
@@ -209,6 +214,7 @@ jobs:
           files: |
             artifacts/dfs-*
             artifacts/SHA256SUMS.txt
+            artifacts/fastecdsa-overrides.txt
             artifacts/dfs.rb
           generate_release_notes: true
 
@@ -228,7 +234,7 @@ jobs:
         shell: bash
         run: |
           cd wheel-dist
-          sha256sum dfs-*.whl > SHA256SUMS.txt
+          sha256sum dfs-*.whl fastecdsa-overrides.txt > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publish Python wheel
@@ -237,5 +243,6 @@ jobs:
           tag_name: ${{ inputs.tag }}
           files: |
             wheel-dist/dfs-*.whl
+            wheel-dist/fastecdsa-overrides.txt
             wheel-dist/SHA256SUMS.txt
           generate_release_notes: true

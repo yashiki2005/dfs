@@ -1,6 +1,7 @@
 # Core runtime dependencies (synced with pyproject.toml)
 cryptography>=41
 dnspython>=2.6
+fastecdsa==4.0.0
 libp2p>=0.8
 zstandard>=0.22
 

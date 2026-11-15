@@ -73,16 +73,20 @@ Python 3.11以上で利用できます。
 python -m pip install dfs-<version>-py3-none-any.whl
 ```
 
-サードパーティ依存は通常のPython wheelと同様に`pip`が解決します。
-macOS + Python 3.13では、上流に対応wheelがない場合、
-推移依存の`fastecdsa==2.3.2`ビルド用にGMPが必要です。
+サードパーティ依存は通常のPython wheelと同様に解決します。
+`dfs`は`fastecdsa==4.0.0`を明示し、`py-libp2p 0.8.1`の古い推移依存を
+overrideするため、以前必要だったmacOSのGMPビルドは不要です。
 
 ```bash
-brew install gmp
-export CFLAGS="-I$(brew --prefix gmp)/include"
-export LDFLAGS="-L$(brew --prefix gmp)/lib"
-python -m pip install dfs-<version>-py3-none-any.whl
+uv pip install \
+  --overrides fastecdsa-overrides.txt \
+  dfs-<version>-py3-none-any.whl
 ```
+
+`py-libp2p 0.8.1`のmetadataは引き続き`fastecdsa==2.3.2`を宣言しており、
+DFSが要求する4.0.0と衝突します。py-libp2p側でこの宣言が更新されるまでは、
+通常の`pip`では解決できません。wheelと一緒に配布するoverrideファイルを
+指定してuvでインストールしてください。
 
 ### 2. ローカルサーバーの起動 (`dfssvc`)
 

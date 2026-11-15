@@ -74,16 +74,20 @@ CLI entry points, and localization data. It requires Python 3.11 or newer:
 python -m pip install dfs-<version>-py3-none-any.whl
 ```
 
-Third-party dependencies are resolved by `pip`, as usual for Python wheels.
-On macOS with Python 3.13, the transitive `fastecdsa==2.3.2` dependency
-still requires GMP when no matching upstream wheel exists:
+Third-party dependencies are resolved as usual for Python wheels. `dfs`
+requires `fastecdsa==4.0.0` and overrides the stale transitive pin in
+`py-libp2p 0.8.1`; this removes the former macOS GMP build requirement:
 
 ```bash
-brew install gmp
-export CFLAGS="-I$(brew --prefix gmp)/include"
-export LDFLAGS="-L$(brew --prefix gmp)/lib"
-python -m pip install dfs-<version>-py3-none-any.whl
+uv pip install \
+  --overrides fastecdsa-overrides.txt \
+  dfs-<version>-py3-none-any.whl
 ```
+
+`py-libp2p 0.8.1` metadata still declares `fastecdsa==2.3.2`, which
+conflicts with the DFS-required 4.0.0 pin. Plain `pip` therefore cannot
+resolve the wheel until py-libp2p updates that declaration. Use the
+override file shipped with the wheel with uv.
 
 ### 2. Start a Local Server (`dfssvc`)
 

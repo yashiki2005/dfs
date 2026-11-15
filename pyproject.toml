@@ -16,6 +16,7 @@ authors = [
 dependencies = [
     "cryptography>=41",
     "dnspython>=2.6",
+    "fastecdsa==4.0.0; sys_platform != 'win32'",
     "libp2p>=0.8",
     "zstandard>=0.22",
 ]
@@ -47,3 +48,8 @@ Security = "https://github.com/yashiki2005/dfs/security/policy"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv]
+# py-libp2p 0.8.1 still pins fastecdsa==2.3.2, but its Ed25519 code is
+# compatible with fastecdsa 4.0.0. Override that stale transitive pin.
+override-dependencies = ["fastecdsa==4.0.0"]
