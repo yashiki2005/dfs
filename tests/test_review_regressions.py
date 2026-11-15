@@ -543,7 +543,8 @@ class TestReviewRegressions(unittest.TestCase):
                 cfg_file = svc_mod._base_dir("hubsvc") / "dfssvc.json"
                 self.assertTrue(cfg_file.is_file())
             mode = stat.S_IMODE(cfg_file.stat().st_mode)
-            self.assertEqual(mode, 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(mode, 0o600)
             cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
             self.assertTrue(cfg["relay_token"])
             self.assertNotIn("--relay-token", captured["cmd"])  # type: ignore[arg-type]
@@ -1250,7 +1251,8 @@ class TestReviewRegressions(unittest.TestCase):
             f.write_text("#!/bin/sh\n", encoding="utf-8")
             os.chmod(f, 0o644)
             MerkleTreeBuilder._apply_metadata(f, {"mode": 0o4755})
-            self.assertEqual(f.stat().st_mode & 0o7777, 0o755)
+            expected_mode = 0o666 if sys.platform == "win32" else 0o755
+            self.assertEqual(f.stat().st_mode & 0o7777, expected_mode)
 
     def test_save_ost_chunks_writes_only_dirty_wire_ids(self) -> None:
         from dfs.crypto import sha256_hex
@@ -1395,6 +1397,72 @@ class TestReviewRegressions(unittest.TestCase):
                 self.assertEqual(cli.batch_has([w3]), {w3: False})
             finally:
                 srv.close()
+
+    def test_ost_max_ram_bytes_adapts_to_available_memory(self) -> None:
+        from unittest import mock
+        from dfs import l3_ost_adapter
+
+        with tempfile.TemporaryDirectory() as td:
+            chunks_dir = Path(td) / "chunks"
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("DFS_OST_MAX_RAM_BYTES", None)
+                with mock.patch.object(
+                    l3_ost_adapter, "_get_available_memory_bytes", return_value=200 * 1024 * 1024
+                ):
+                    self.assertEqual(l3_ost_adapter._default_ost_max_ram_bytes(chunks_dir), 0)
+                with mock.patch.object(
+                    l3_ost_adapter, "_get_available_memory_bytes", return_value=512 * 1024 * 1024
+                ):
+                    self.assertEqual(
+                        l3_ost_adapter._default_ost_max_ram_bytes(chunks_dir), 32 * 1024 * 1024
+                    )
+                with mock.patch.object(
+                    l3_ost_adapter, "_get_available_memory_bytes", return_value=16 * 1024**3
+                ):
+                    self.assertEqual(
+                        l3_ost_adapter._default_ost_max_ram_bytes(chunks_dir), 64 * 1024 * 1024
+                    )
+
+    def test_ost_storage_health_and_low_disk_guard(self) -> None:
+        from collections import namedtuple
+        from unittest import mock
+        from dfs import l3_ost_adapter
+        from dfs.crypto import sha256_hex
+        from dfs.l3_ost_adapter import ChunkStoreServer
+
+        Usage = namedtuple("Usage", ["total", "used", "free"])
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chunks_dir = root / "chunks"
+            cert = root / "cert.pem"
+            key = root / "key.pem"
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert),
+                    "-days", "1", "-nodes", "-subj", "/CN=localhost",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            with mock.patch.object(
+                l3_ost_adapter.shutil, "disk_usage", return_value=Usage(1000, 990, 10)
+            ), mock.patch.object(l3_ost_adapter, "_is_tmpfs_path", return_value=True):
+                health = l3_ost_adapter.check_storage_health(root, min_free_bytes=100)
+                self.assertTrue(health["is_tmpfs"])
+                self.assertTrue(health["low_space"])
+
+            with mock.patch.dict(os.environ, {"DFS_OST_MIN_FREE_BYTES": "1000"}, clear=False):
+                srv = ChunkStoreServer(cert, key, chunks_dir=chunks_dir)
+                try:
+                    blob = b"low-disk-test"
+                    wid = sha256_hex(blob)
+                    with mock.patch.object(
+                        l3_ost_adapter.shutil, "disk_usage", return_value=Usage(2000, 1500, 500)
+                    ):
+                        self.assertFalse(srv._put_chunk(wid, blob))
+                finally:
+                    srv.close()
 
     def test_download_directory_rejects_case_colliding_entries(self) -> None:
         from dfs.crypto import ChunkIntegrityError, ContentAddressedCrypto, canonical_json
@@ -2154,6 +2222,188 @@ class TestReviewRegressions(unittest.TestCase):
                     cli_main._resolve_remote(r_store, "auto")
                 self.assertIn("dfscli config create auto", str(ctx.exception))
                 self.assertNotIn("auto", r_store.remotes)
+
+    def test_intermixed_archive_argv_works_for_sys_argv_and_leading_remote(self) -> None:
+        norm = cli_main._normalize_intermixed_archive_argv(
+            ["--remote", "myrem", "archive", "extract", "/tmp/a.bundle", "--secret", "pw", "/tmp/out"]
+        )
+        self.assertEqual(
+            norm,
+            ["--remote", "myrem", "archive", "extract", "/tmp/a.bundle", "/tmp/out", "--secret", "pw"],
+        )
+        with patch.object(
+            sys, "argv", ["dfscli", "archive", "extract", "/tmp/missing.bundle", "--secret", "pw", "/tmp/out"]
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                # 正常に argparse を通過して cmd_archive まで到達する（存在しない bundle なので UsageError -> exit code 2）
+                rc = cli_main.main()
+                raise SystemExit(rc)
+            self.assertEqual(ctx.exception.code, 2)
+
+    def test_replica_ingest_across_delegation_epoch_rotation(self) -> None:
+        import time
+        from dfs.l5_fs import DFSNode
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = _self_signed_cert(root)
+            root_priv, root_pub = _keypair(root, "root")
+            alice1_priv, alice1_pub = _keypair(root, "alice1")
+            alice2_priv, alice2_pub = _keypair(root, "alice2")
+            ost = ChunkStoreServer(cert, key)
+            primary = DirectoryRegistryService("/example.com", root_pub)
+            secondary = DirectoryRegistryService("/example.com", root_pub)
+            now = int(time.time())
+            try:
+                del1 = create_delegation_envelope(
+                    root_priv, "/example.com", "/example.com/alice", alice1_pub,
+                    1, 0, now - 60, now + 3600,
+                )
+                primary.register_delegation(del1, now=now)
+                writer1 = DFSNode(
+                    "w1", "/example.com/alice", root / "wd1",
+                    alice1_priv, alice1_pub, "sec", primary,
+                    "127.0.0.1", ost.port, root_pubkey=root_pub, ost_cert_sha256=ost.cert_sha256,
+                )
+                (writer1.clayfs.work_tree / "a.txt").write_text("v1", encoding="utf-8")
+                writer1.push(1, now=now)
+
+                # Epoch 2 へ鍵ローテーション
+                del2 = create_delegation_envelope(
+                    root_priv, "/example.com", "/example.com/alice", alice2_pub,
+                    2, 1, now - 30, now + 7200,
+                )
+                primary.register_delegation(del2, now=now + 1)
+                writer2 = DFSNode(
+                    "w2", "/example.com/alice", root / "wd2",
+                    alice2_priv, alice2_pub, "sec", primary,
+                    "127.0.0.1", ost.port, root_pubkey=root_pub, ost_cert_sha256=ost.cert_sha256,
+                )
+                writer2.pull(expected_writer_pubkey=alice1_pub)
+                (writer2.clayfs.work_tree / "b.txt").write_text("v2", encoding="utf-8")
+                writer2.push(2, now=now + 2)
+
+                bundle = primary.replication_bundle("/example.com/alice")
+                self.assertIsNotNone(bundle)
+                self.assertTrue(secondary.ingest_replica(bundle, now=now + 2))
+                _d, _l, head = secondary.resolve("/example.com/alice")
+                self.assertEqual(head["payload"]["version"], 2)
+                self.assertEqual(head["payload"]["delegation_epoch"], 2)
+            finally:
+                ost.close()
+
+    def test_ice_candidates_requires_token_and_ignores_invalid_xff(self) -> None:
+        import urllib.error
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        from dfs.relay import RelayHub
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = _self_signed_cert(root)
+            _root_priv, root_pub = _keypair(root, "root")
+            ost = ChunkStoreServer(cert, key)
+            pstate = cli_mod.PersistentRegistryState(root / "state", "/example.com", root_pub)
+            hub = RelayHub(token="secret-relay-token")
+            httpd = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                cli_mod.make_registry_http_handler(pstate, ost=ost, relay_hub=hub),
+            )
+            th = threading.Thread(target=httpd.serve_forever, daemon=True)
+            th.start()
+            base_url = f"http://127.0.0.1:{httpd.server_port}"
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"{base_url}/_ice/candidates", timeout=5)
+                self.assertEqual(ctx.exception.code, 403)
+                ctx.exception.close()
+
+                req = urllib.request.Request(
+                    f"{base_url}/_ice/candidates",
+                    headers={"X-DFS-Relay-Token": "secret-relay-token"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+
+                # 不正な XFF 値は無視され client_address にフォールバックする
+                stun_req = urllib.request.Request(
+                    f"{base_url}/_ice/stun",
+                    headers={"X-Forwarded-For": "not-an-ip;evil"},
+                )
+                with urllib.request.urlopen(stun_req, timeout=5) as resp:
+                    stun_data = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(stun_data["observed_ip"], "127.0.0.1")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                ost.close()
+
+    def test_iter_remote_and_ram_store_budget(self) -> None:
+        import time
+        from dfs.l5_fs import DFSNode
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert, key = _self_signed_cert(root)
+            root_priv, root_pub = _keypair(root, "root")
+            alice_priv, alice_pub = _keypair(root, "alice")
+            ost = ChunkStoreServer(cert, key, max_store_bytes=1024 * 1024)
+            reg = DirectoryRegistryService("/example.com", root_pub)
+            now = int(time.time())
+            try:
+                reg.register_delegation(
+                    create_delegation_envelope(
+                        root_priv, "/example.com", "/example.com/alice", alice_pub,
+                        1, 0, now - 60, now + 3600,
+                    ),
+                    now=now,
+                )
+                writer = DFSNode(
+                    "w", "/example.com/alice", root / "wd",
+                    alice_priv, alice_pub, "sec", reg,
+                    "127.0.0.1", ost.port, root_pubkey=root_pub, ost_cert_sha256=ost.cert_sha256,
+                )
+                payload = b"chunk-stream-data-" * 5000
+                (writer.clayfs.work_tree / "big.bin").write_bytes(payload)
+                writer.push(1, now=now)
+
+                got = b"".join(writer.iter_remote("big.bin"))
+                self.assertEqual(got, payload)
+                self.assertGreater(ost._ram_bytes, 0)
+                self.assertFalse(ost._put_chunk("0" * 64, b"x" * (2 * 1024 * 1024)))
+            finally:
+                ost.close()
+
+    def test_fuse_chmod_strips_special_bits_and_tracks_fd(self) -> None:
+        from dfs.fuse_mount import LocalTreeFuse
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fuse_ops = LocalTreeFuse(root, lambda: None)
+            try:
+                fh = fuse_ops.create("/sample.txt", 0o644)
+                self.assertGreater(fh, 0)
+                self.assertEqual(fuse_ops.write("/sample.txt", b"hello", 0, fh), 5)
+                self.assertEqual(fuse_ops.read("/sample.txt", 5, 0, fh), b"hello")
+                fuse_ops.release("/sample.txt", fh)
+                fuse_ops.chmod("/sample.txt", 0o4755)
+                mode = (root / "sample.txt").stat().st_mode & 0o7777
+                self.assertEqual(mode, 0o755)
+            finally:
+                fuse_ops.destroy("/")
+
+    def test_content_addressed_crypto_uses_hardened_kdf(self) -> None:
+        import hashlib
+
+        c1 = ContentAddressedCrypto("passphrase")
+        c2 = ContentAddressedCrypto("passphrase")
+        self.assertEqual(c1.tree_secret, c2.tree_secret)
+        self.assertNotEqual(
+            c1.tree_secret,
+            hashlib.sha256(b"passphrase").digest(),
+        )
+        c3 = ContentAddressedCrypto("passphrase", address_secret="passphrase")
+        self.assertNotEqual(c3.tree_secret, c3.address_secret)
 
 
 if __name__ == "__main__":

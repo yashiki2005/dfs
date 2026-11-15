@@ -7,9 +7,12 @@ macOS / Linux 両対応・デッドロック完全排除版 L3 OST サーバ & �
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import http.client
 import json
 import os
+import shutil
 import socket
 import ssl
 import struct
@@ -41,6 +44,147 @@ def _decode_wire_id(raw: bytes) -> str:
     if len(raw) != 64 or any(ch not in WIRE_ID_HEX for ch in raw):
         raise OSTProtocolError("invalid wire_id")
     return raw.decode("ascii")
+
+
+def _get_available_memory_bytes() -> Optional[int]:
+    """OS の空きメモリ（バイト数）を取得する。取得できない場合は None。"""
+    try:
+        if sys.platform.startswith("linux"):
+            meminfo: Dict[str, int] = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if ":" not in line:
+                        continue
+                    key, rest = line.split(":", 1)
+                    parts = rest.strip().split()
+                    if parts and parts[0].isdigit():
+                        meminfo[key] = int(parts[0]) * 1024
+            if "MemAvailable" in meminfo:
+                return meminfo["MemAvailable"]
+            if "MemFree" in meminfo:
+                return (
+                    meminfo["MemFree"]
+                    + meminfo.get("Buffers", 0)
+                    + meminfo.get("Cached", 0)
+                )
+        elif sys.platform == "darwin":
+            libc_path = ctypes.util.find_library("c")
+            if not libc_path:
+                return None
+            libc = ctypes.CDLL(libc_path)
+
+            class _VMStats64(ctypes.Structure):
+                _fields_ = [
+                    ("free_count", ctypes.c_uint32),
+                    ("active_count", ctypes.c_uint32),
+                    ("inactive_count", ctypes.c_uint32),
+                    ("wire_count", ctypes.c_uint32),
+                    ("zero_fill_count", ctypes.c_uint64),
+                    ("reactivations", ctypes.c_uint64),
+                    ("pageins", ctypes.c_uint64),
+                    ("pageouts", ctypes.c_uint64),
+                    ("faults", ctypes.c_uint64),
+                    ("cow_faults", ctypes.c_uint64),
+                    ("lookups", ctypes.c_uint64),
+                    ("hits", ctypes.c_uint64),
+                    ("purges", ctypes.c_uint64),
+                    ("purgeable_count", ctypes.c_uint32),
+                    ("speculative_count", ctypes.c_uint32),
+                    ("decompressions", ctypes.c_uint64),
+                    ("compressions", ctypes.c_uint64),
+                    ("swapins", ctypes.c_uint64),
+                    ("swapouts", ctypes.c_uint64),
+                    ("compressor_page_count", ctypes.c_uint32),
+                    ("throttled_count", ctypes.c_uint32),
+                    ("external_page_count", ctypes.c_uint32),
+                    ("internal_page_count", ctypes.c_uint32),
+                    ("total_uncompressed_pages_in_compressor", ctypes.c_uint64),
+                ]
+
+            stats = _VMStats64()
+            count = ctypes.c_uint32(ctypes.sizeof(_VMStats64) // 4)
+            if libc.host_statistics64(libc.mach_host_self(), 4, ctypes.byref(stats), ctypes.byref(count)) == 0:
+                psize = os.sysconf("SC_PAGE_SIZE")
+                return int(stats.free_count + stats.inactive_count + stats.purgeable_count) * int(psize)
+        elif os.name == "nt":
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):  # type: ignore[attr-defined]
+                return int(status.ullAvailPhys)
+    except Exception:
+        return None
+    return None
+
+
+def _default_ost_max_ram_bytes(chunks_dir: Optional[Path]) -> int:
+    """OST RAM キャッシュ上限を空きメモリに応じて安全に決定する。"""
+    raw = os.environ.get("DFS_OST_MAX_RAM_BYTES", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    avail = _get_available_memory_bytes()
+    if chunks_dir is not None:
+        if avail is None or avail <= 0:
+            return 16 * 1024 * 1024
+        if avail < 256 * 1024 * 1024:
+            return 0
+        return min(64 * 1024 * 1024, avail // 16)
+    if avail is None or avail <= 0:
+        return 256 * 1024 * 1024
+    return max(16 * 1024 * 1024, min(256 * 1024 * 1024, avail // 4))
+
+
+def _is_tmpfs_path(path: Path) -> bool:
+    """Linux の /proc/mounts から指定パスが tmpfs / ramfs 上にあるか判定する。"""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        resolved = str(path.resolve())
+        best_mount = ""
+        best_fstype = ""
+        with open("/proc/mounts", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt, fstype = parts[1], parts[2]
+                if resolved == mnt or (mnt == "/" and resolved.startswith("/")) or resolved.startswith(mnt.rstrip("/") + "/"):
+                    if len(mnt) > len(best_mount):
+                        best_mount = mnt
+                        best_fstype = fstype
+        return best_fstype in ("tmpfs", "ramfs")
+    except OSError:
+        return False
+
+
+def check_storage_health(
+    path: Path, min_free_bytes: int = 64 * 1024 * 1024
+) -> Dict[str, Any]:
+    """指定ディレクトリの空き容量と tmpfs 判定を返す。"""
+    usage = shutil.disk_usage(str(path))
+    is_tmpfs = _is_tmpfs_path(path)
+    return {
+        "path": str(path),
+        "free_bytes": int(usage.free),
+        "total_bytes": int(usage.total),
+        "is_tmpfs": is_tmpfs,
+        "low_space": int(usage.free) < max(0, int(min_free_bytes)),
+    }
 
 
 def _decode_wire_ids(raw: bytes, count: int) -> List[str]:
@@ -173,6 +317,8 @@ class ChunkStoreServer:
         chunks_dir: Optional[Path | str] = None,
         max_store_bytes: Optional[int] = None,
         max_ram_bytes: Optional[int] = None,
+        chunk_ttl_seconds: Optional[float] = None,
+        evict_on_full: Optional[bool] = None,
     ):
         self.store: Dict[str, bytes] = OrderedDict()
         self._dirty_wire_ids: set[str] = set()
@@ -185,16 +331,59 @@ class ChunkStoreServer:
         )
         if self.chunks_dir is not None:
             self.chunks_dir.mkdir(parents=True, exist_ok=True)
+        env_min_free = os.environ.get("DFS_OST_MIN_FREE_BYTES", "").strip()
+        self._storage_min_free_bytes: int = (
+            max(0, int(env_min_free)) if env_min_free else 16 * 1024 * 1024
+        )
+        if self.chunks_dir is not None:
+            try:
+                health = check_storage_health(
+                    self.chunks_dir,
+                    min_free_bytes=max(self._storage_min_free_bytes, 64 * 1024 * 1024),
+                )
+                if health["is_tmpfs"]:
+                    print(
+                        f"[dfs ost] WARNING: chunks_dir {self.chunks_dir} is on tmpfs (RAM-backed); "
+                        f"free={health['free_bytes'] // (1024 * 1024)} MiB",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                elif health["low_space"]:
+                    print(
+                        f"[dfs ost] WARNING: low disk space on {self.chunks_dir}: "
+                        f"free={health['free_bytes'] // (1024 * 1024)} MiB",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except OSError:
+                pass
         env_max_store = os.environ.get("DFS_OST_MAX_BYTES", "").strip()
         self.max_store_bytes: Optional[int] = (
             max_store_bytes
             if max_store_bytes is not None
             else (int(env_max_store) if env_max_store else None)
         )
+        self._explicit_max_ram_bytes: bool = (
+            max_ram_bytes is not None
+            or bool(os.environ.get("DFS_OST_MAX_RAM_BYTES", "").strip())
+        )
         self.max_ram_bytes: int = (
-            max_ram_bytes
+            max(0, max_ram_bytes)
             if max_ram_bytes is not None
-            else int(os.environ.get("DFS_OST_MAX_RAM_BYTES", str(256 * 1024 * 1024)))
+            else _default_ost_max_ram_bytes(self.chunks_dir)
+        )
+        self._last_mem_check: float = 0.0
+        env_ttl = os.environ.get("DFS_OST_CHUNK_TTL", "").strip()
+        self.chunk_ttl_seconds: Optional[float] = (
+            float(chunk_ttl_seconds)
+            if chunk_ttl_seconds is not None
+            else (float(env_ttl) if env_ttl else None)
+        )
+        env_evict = os.environ.get("DFS_OST_EVICT_ON_FULL", "").strip()
+        self.evict_on_full: bool = (
+            bool(evict_on_full)
+            if evict_on_full is not None
+            else (env_evict == "1")
         )
         self._ram_bytes: int = 0
         self._disk_bytes: int = 0
@@ -227,6 +416,112 @@ class ChunkStoreServer:
     @property
     def endpoint_uri(self) -> str:
         return f"tls://{self.host}:{self.port}"
+
+    def _gc_ram_locked(
+        self,
+        *,
+        now: float,
+        max_bytes: Optional[int],
+        ttl_seconds: Optional[float],
+    ) -> Tuple[int, int]:
+        """RAM ストアを FIFO/LRU 順でサイズ上限まで解放する（ロック保持下で呼ぶ）。"""
+        evicted = 0
+        freed = 0
+        if max_bytes is not None and max_bytes >= 0:
+            while self.store and self._ram_bytes > max_bytes:
+                _wid, old_blob = self.store.popitem(last=False)
+                self._ram_bytes -= len(old_blob)
+                evicted += 1
+                freed += len(old_blob)
+        return evicted, freed
+
+    def _gc_disk_locked(
+        self,
+        *,
+        now: float,
+        max_bytes: Optional[int],
+        ttl_seconds: Optional[float],
+    ) -> Tuple[int, int]:
+        """ディスク上の .blk チャンクを TTL 超過 → 古い順（mtime 昇順）で削除する。"""
+        if self.chunks_dir is None:
+            return 0, 0
+        entries: List[Tuple[float, int, str, Path]] = []
+        total_disk = 0
+        for p in self.chunks_dir.glob("*.blk"):
+            if not p.is_file():
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            wid = p.stem
+            if wid in self._inflight_puts:
+                continue
+            total_disk += st.st_size
+            entries.append((st.st_mtime, st.st_size, wid, p))
+        self._disk_bytes = total_disk
+
+        evicted = 0
+        freed = 0
+        remaining: List[Tuple[float, int, str, Path]] = []
+        if ttl_seconds is not None and ttl_seconds > 0:
+            cutoff = now - ttl_seconds
+            for mtime, size, wid, p in entries:
+                if mtime < cutoff:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        remaining.append((mtime, size, wid, p))
+                        continue
+                    self._disk_bytes = max(0, self._disk_bytes - size)
+                    old = self.store.pop(wid, None)
+                    if old is not None:
+                        self._ram_bytes -= len(old)
+                    evicted += 1
+                    freed += size
+                else:
+                    remaining.append((mtime, size, wid, p))
+        else:
+            remaining = entries
+
+        if max_bytes is not None and max_bytes >= 0 and self._disk_bytes > max_bytes:
+            remaining.sort(key=lambda item: item[0])
+            for _mtime, size, wid, p in remaining:
+                if self._disk_bytes <= max_bytes:
+                    break
+                try:
+                    p.unlink()
+                except OSError:
+                    continue
+                self._disk_bytes = max(0, self._disk_bytes - size)
+                old = self.store.pop(wid, None)
+                if old is not None:
+                    self._ram_bytes -= len(old)
+                evicted += 1
+                freed += size
+        return evicted, freed
+
+    def gc(
+        self,
+        *,
+        now: Optional[float] = None,
+        max_bytes: Optional[int] = None,
+        ttl_seconds: Optional[float] = None,
+    ) -> Dict[str, int]:
+        """TTL 超過およびサイズ上限超過のチャンクを回収する。"""
+        ts = time.time() if now is None else float(now)
+        eff_max = self.max_store_bytes if max_bytes is None else max_bytes
+        eff_ttl = self.chunk_ttl_seconds if ttl_seconds is None else ttl_seconds
+        with self._store_lock:
+            if self.chunks_dir is None:
+                evicted, freed = self._gc_ram_locked(
+                    now=ts, max_bytes=eff_max, ttl_seconds=eff_ttl
+                )
+            else:
+                evicted, freed = self._gc_disk_locked(
+                    now=ts, max_bytes=eff_max, ttl_seconds=eff_ttl
+                )
+        return {"evicted": evicted, "freed_bytes": freed}
 
     def _accept_loop(self) -> None:
         while self.running:
@@ -263,11 +558,22 @@ class ChunkStoreServer:
         return bytes(buf)
 
     def _cache_ram(self, wid: str, blob: bytes) -> None:
+        if self.chunks_dir is not None and not self._explicit_max_ram_bytes:
+            now = time.monotonic()
+            if now - self._last_mem_check >= 5.0:
+                self._last_mem_check = now
+                avail = _get_available_memory_bytes()
+                if avail is not None and avail < 128 * 1024 * 1024:
+                    self.store.clear()
+                    self._ram_bytes = 0
+                    return
         if wid in self.store:
             if isinstance(self.store, OrderedDict):
                 self.store.move_to_end(wid)
             return
-        if self.chunks_dir is not None and len(blob) > self.max_ram_bytes:
+        if self.chunks_dir is not None and (
+            self.max_ram_bytes <= 0 or len(blob) > self.max_ram_bytes
+        ):
             return
         self.store[wid] = blob
         self._ram_bytes += len(blob)
@@ -291,6 +597,31 @@ class ChunkStoreServer:
             except FileNotFoundError:
                 return 0
         return 0
+
+    def has_chunk(self, wid: str) -> bool:
+        """Return whether *wid* is present in memory or on disk."""
+        return self._has_chunk(wid)
+
+    def get_chunk(self, wid: str) -> Optional[bytes]:
+        """Return encrypted chunk bytes for *wid*, or ``None`` if absent."""
+        return self._get_chunk(wid)
+
+    def put_chunk(self, wid: str, blob: bytes) -> bool:
+        """Store encrypted chunk bytes for *wid*."""
+        return self._put_chunk(wid, blob)
+
+    def list_chunks(self) -> List[str]:
+        """Return sorted unique chunk ``wire_id`` values stored on this server."""
+        with self._store_lock:
+            ids = set(self.store.keys())
+        if self.chunks_dir is not None:
+            try:
+                for p in self.chunks_dir.glob("*.blk"):
+                    if p.is_file():
+                        ids.add(p.stem)
+            except OSError:
+                pass
+        return sorted(ids)
 
     def _has_chunk(self, wid: str) -> bool:
         with self._store_lock:
@@ -323,11 +654,22 @@ class ChunkStoreServer:
             with self._store_lock:
                 if wid in self.store:
                     return True
-                if self.max_store_bytes is not None:
-                    current_total = sum(len(v) for v in self.store.values())
-                    if current_total + len(blob) > self.max_store_bytes:
+                if self.max_store_bytes is not None and self._ram_bytes + len(blob) > self.max_store_bytes:
+                    if self.evict_on_full or (self.chunk_ttl_seconds and self.chunk_ttl_seconds > 0):
+                        target_cap = (
+                            max(0, self.max_store_bytes - len(blob))
+                            if self.evict_on_full
+                            else self.max_store_bytes
+                        )
+                        self._gc_ram_locked(
+                            now=time.time(),
+                            max_bytes=target_cap if self.evict_on_full else None,
+                            ttl_seconds=self.chunk_ttl_seconds,
+                        )
+                    if self._ram_bytes + len(blob) > self.max_store_bytes:
                         return False
                 self.store[wid] = blob
+                self._ram_bytes += len(blob)
                 self._dirty_wire_ids.add(wid)
                 return True
 
@@ -340,7 +682,28 @@ class ChunkStoreServer:
             if dest.is_file():
                 self._cache_ram(wid, blob)
                 return True
-            if self.max_store_bytes is not None:
+            if self._storage_min_free_bytes > 0:
+                try:
+                    free_bytes = shutil.disk_usage(str(self.chunks_dir)).free
+                    if free_bytes < len(blob) + self._storage_min_free_bytes:
+                        return False
+                except OSError:
+                    pass
+            if (
+                self.max_store_bytes is not None
+                and self._disk_bytes + self._reserved_bytes + len(blob) > self.max_store_bytes
+            ):
+                if self.evict_on_full or (self.chunk_ttl_seconds and self.chunk_ttl_seconds > 0):
+                    target_cap = (
+                        max(0, self.max_store_bytes - self._reserved_bytes - len(blob))
+                        if self.evict_on_full
+                        else self.max_store_bytes
+                    )
+                    self._gc_disk_locked(
+                        now=time.time(),
+                        max_bytes=target_cap if self.evict_on_full else None,
+                        ttl_seconds=self.chunk_ttl_seconds,
+                    )
                 if self._disk_bytes + self._reserved_bytes + len(blob) > self.max_store_bytes:
                     return False
             self._reserved_bytes += len(blob)
@@ -684,6 +1047,8 @@ class OSTClient:
                 raise ServiceUnavailableError(
                     f"L3 OST TLS certificate pin mismatch at {self.host}:{self.port}"
                 )
+        if timeout is None:
+            ssl_conn.settimeout(ost_socket_timeout())
         self.tls_handshakes += 1
         return ssl_conn
 
@@ -1550,6 +1915,8 @@ class SwarmOSTClient(FailoverOSTClient):
         self.safe_mode_reason: str = "env:DFS_SAFE_MODE" if self.safe_mode else ""
         self._overloaded_until: Dict[str, float] = {}
         self._slow_hosts: set[str] = set()
+        self._peer_bps: Dict[str, float] = {}
+        self._peer_bps_lock = threading.Lock()
         self.overload_cooldown: float = float(
             os.environ.get("DFS_OVERLOAD_COOLDOWN", "15.0") or "15.0"
         )
@@ -1603,6 +1970,58 @@ class SwarmOSTClient(FailoverOSTClient):
             time.monotonic() + self.overload_cooldown
         )
 
+    def _compute_peer_weights(
+        self,
+        active_indices: Sequence[int],
+        direct_tier: Sequence[Any],
+        probe_rtt: Dict[int, float],
+    ) -> Dict[int, float]:
+        """実測スループット (EWMA) とプローブ RTT の逆数からピアごとの配分重みを決める。"""
+        with self._peer_bps_lock:
+            bps_snapshot = dict(self._peer_bps)
+
+        measured_vals: List[float] = []
+        measured_rtts: List[float] = []
+        for idx in active_indices:
+            uri = self._client_uri(direct_tier[idx])
+            bps = bps_snapshot.get(uri)
+            if bps is not None and bps > 0:
+                measured_vals.append(bps)
+                measured_rtts.append(max(0.002, probe_rtt.get(idx, 0.05)))
+
+        if measured_vals:
+            sorted_vals = sorted(measured_vals)
+            sorted_rtts = sorted(measured_rtts)
+            ref_bps = sorted_vals[len(sorted_vals) // 2]
+            ref_rtt = sorted_rtts[len(sorted_rtts) // 2]
+        else:
+            ref_bps = 1.0
+            ref_rtt = min(max(0.002, probe_rtt.get(idx, 0.05)) for idx in active_indices)
+
+        weights: Dict[int, float] = {}
+        for idx in active_indices:
+            uri = self._client_uri(direct_tier[idx])
+            measured = bps_snapshot.get(uri)
+            if measured is not None and measured > 0:
+                weights[idx] = measured
+            else:
+                rtt = max(0.002, probe_rtt.get(idx, ref_rtt))
+                est = ref_bps * (ref_rtt / rtt)
+                if measured_vals:
+                    est = max(0.1 * ref_bps, min(10.0 * ref_bps, est))
+                weights[idx] = max(1e-6, est)
+        return weights
+
+    def _record_peer_throughput(self, client: Any, got_bytes: int, dt: float) -> None:
+        """十分大きい応答からピアの実効帯域 (bytes/s) を EWMA 更新する。"""
+        if got_bytes < 64 * 1024 or dt <= 0:
+            return
+        bps = got_bytes / dt
+        uri = self._client_uri(client)
+        with self._peer_bps_lock:
+            prev = self._peer_bps.get(uri)
+            self._peer_bps[uri] = bps if prev is None else (0.6 * bps + 0.4 * prev)
+
     def batch_get(self, wire_ids: Sequence[str]) -> Dict[str, bytes]:
         unique_ids = list(dict.fromkeys(wire_ids))
         if not unique_ids:
@@ -1615,172 +2034,198 @@ class SwarmOSTClient(FailoverOSTClient):
         ):
             return super().batch_get(unique_ids)
 
-        # Phase B: まず過負荷でない最速の直接ホスト 1 台 (keep-alive) で一括取得を試みる。
-        # 過負荷または極端に遅いホストしか残らない場合のみ Phase A (並列 keep-alive) へ移る。
-        now = time.monotonic()
-        active_direct = [c for c in direct_tier if not self._is_overloaded(c, now)]
-        if not active_direct:
-            self._overloaded_until.clear()
-            active_direct = list(direct_tier)
-
         last_error: Optional[BaseException] = None
         result: Dict[str, bytes] = {}
         remaining = list(unique_ids)
 
-        # 過負荷除外の結果、既知の低速ホストしか残らず、かつ複数ホストで束ねられるなら最初から Phase A (並列) へ
-        skip_phase_b = (
-            len(active_direct) >= 2
-            and len(remaining) >= 8
-            and all(self._client_uri(c) in self._slow_hosts for c in active_direct)
-        )
-
-        for idx, client in enumerate([] if skip_phase_b else active_direct):
-            t0 = time.perf_counter()
-            try:
-                fetched = client.batch_get(remaining)
-                dt = max(0.001, time.perf_counter() - t0)
-                got_bytes = sum(len(v) for v in fetched.values())
-                if got_bytes >= 256 * 1024:
-                    bps = got_bytes / dt
-                    key = self._client_uri(client)
-                    if bps < self.min_single_bps:
-                        self._slow_hosts.add(key)
-                    else:
-                        self._slow_hosts.discard(key)
-                result.update(fetched)
-                self._active = client
-                remaining = [wid for wid in remaining if wid not in result]
-                overloaded = bool(getattr(client, "last_overloaded", False))
-                if overloaded:
-                    self._mark_overloaded(client)
-                if not remaining:
-                    if not overloaded:
-                        return result
-                    # 過負荷ホストから全件取れた場合でも、次回は別ホストへ逃がすため記録済み
-                    return result
-                # 一部欠損なら残りだけ他のピアへ（次のループまたは Phase A）
-            except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
-                last_error = e
-                if bool(getattr(client, "last_overloaded", False)) or isinstance(
-                    e, ServiceUnavailableError
-                ):
-                    self._mark_overloaded(client)
-                # 最初の高速ホストが失敗/過負荷なら次へ、または残りホストが少なければ Phase A へ
-                if len(active_direct) - idx - 1 >= 2 and len(remaining) >= 16:
-                    # 残りの複数ホストが低速な可能性があるため、ここで Phase A (並列) を検討
-                    break
-                continue
-
-        if not remaining:
-            return result
-
-        # Phase A: 単一高速ホストで完結しなかった残チャンクを複数直接ピアの並列 keep-alive Work Stealing で取得
-        # メインスレッドの pooled_conn を閉じて各ワーカースレッド専用の session() を張る
-        for c in direct_tier:
-            close_fn = getattr(c, "_close_pooled_conn", None)
-            if callable(close_fn):
-                close_fn()
-
-        availability: Dict[int, Dict[str, bool]] = {}
-        probe_rtt: Dict[int, float] = {}
-
-        def _probe_has(idx: int, client: Any) -> Tuple[Dict[str, bool], float]:
-            t0 = time.perf_counter()
-            with client.session():
-                res = client.batch_has(remaining)
-            return res, max(0.0005, time.perf_counter() - t0)
-
-        with ThreadPoolExecutor(max_workers=min(8, len(direct_tier))) as pool:
-            fut_map = {
-                pool.submit(_probe_has, idx, client): idx
-                for idx, client in enumerate(direct_tier)
-            }
-            for fut in as_completed(fut_map):
-                idx = fut_map[fut]
+        # 1 件のみの要求は分割不要なため、過負荷でない直接ピアを順に試して必要ならリレーへフォールバックする
+        if len(remaining) == 1:
+            now = time.monotonic()
+            active_direct = [c for c in direct_tier if not self._is_overloaded(c, now)]
+            if not active_direct:
+                self._overloaded_until.clear()
+                active_direct = list(direct_tier)
+            for client in active_direct:
+                t0 = time.perf_counter()
                 try:
-                    availability[idx], probe_rtt[idx] = fut.result()
+                    fetched = client.batch_get(remaining)
+                    dt = max(0.001, time.perf_counter() - t0)
+                    got_bytes = sum(len(v) for v in fetched.values())
+                    self._record_peer_throughput(client, got_bytes, dt)
+                    result.update(fetched)
+                    self._active = client
+                    if getattr(client, "last_overloaded", False):
+                        self._mark_overloaded(client)
+                    remaining = [wid for wid in remaining if wid not in result]
+                    if not remaining:
+                        return result
                 except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
                     last_error = e
+                    if bool(getattr(client, "last_overloaded", False)) or isinstance(
+                        e, ServiceUnavailableError
+                    ):
+                        self._mark_overloaded(client)
+            healthy_indices: List[int] = []
+            availability: Dict[int, Dict[str, bool]] = {}
+            failed_clients: set[int] = set()
+            pending: List[str] = []
+            unassigned: List[str] = list(remaining)
+        else:
+            # 全生存直接ピアから RTT/実測帯域に比例したサイズで並列取得する。
+            # メインスレッドの pooled_conn を閉じて各ワーカースレッド専用の session() を張る。
+            for c in direct_tier:
+                close_fn = getattr(c, "_close_pooled_conn", None)
+                if callable(close_fn):
+                    close_fn()
 
-        healthy_indices = sorted(
-            (i for i in availability.keys() if not self._is_overloaded(direct_tier[i], time.monotonic())),
-            key=lambda i: probe_rtt.get(i, 999.0),
-        )
-        if not healthy_indices:
-            healthy_indices = sorted(availability.keys(), key=lambda i: probe_rtt.get(i, 999.0))
+            availability = {}
+            probe_rtt: Dict[int, float] = {}
 
-        failed_clients: set[int] = set()
-        lock = threading.Lock()
-        pending: List[str] = []
-        owner_counts: Dict[str, int] = {}
-        unassigned: List[str] = []
-        for wid in remaining:
-            cnt = sum(1 for idx in healthy_indices if availability[idx].get(wid))
-            if cnt > 0:
-                owner_counts[wid] = cnt
-                pending.append(wid)
-            else:
-                unassigned.append(wid)
-        # BitTorrent 式 Rarest-first: 保有ピア数が少ない希少チャンクを優先して取得する
-        pending.sort(key=lambda w: owner_counts.get(w, 0))
-
-        if pending and healthy_indices:
-            min_rtt = max(0.001, probe_rtt[healthy_indices[0]])
-            base_q = max(4, min(16, len(pending) // max(1, len(healthy_indices) * 2)))
-            active_indices = [
-                idx for idx in healthy_indices
-                if any(availability[idx].get(wid) for wid in pending)
-            ]
-
-            def _worker(idx: int) -> None:
-                nonlocal last_error
-                client = direct_tier[idx]
-                ratio = min(1.0, min_rtt / max(0.001, probe_rtt.get(idx, min_rtt)))
-                quantum = max(1, int(round(base_q * ratio)))
-                avail = availability[idx]
+            def _probe_has(idx: int, client: Any) -> Tuple[Dict[str, bool], float]:
+                t0 = time.perf_counter()
                 with client.session():
-                    while True:
-                        batch: List[str] = []
-                        with lock:
-                            if not pending:
-                                return
-                            keep: List[str] = []
-                            for wid in pending:
-                                if len(batch) < quantum and avail.get(wid):
-                                    batch.append(wid)
-                                else:
-                                    keep.append(wid)
-                            pending[:] = keep
-                        if not batch:
-                            return
-                        t0 = time.perf_counter()
-                        try:
-                            fetched = client.batch_get(batch)
-                            dt = max(0.001, time.perf_counter() - t0)
-                            with lock:
-                                result.update(fetched)
-                                self._active = client
-                                missing_in_batch = [w for w in batch if w not in fetched]
-                                if missing_in_batch:
-                                    unassigned.extend(missing_in_batch)
-                            if getattr(client, "last_overloaded", False):
-                                self._mark_overloaded(client)
-                            if dt < 0.15 and len(batch) == quantum:
-                                quantum = min(24, quantum * 2)
-                            elif dt > 0.6 and quantum > 1:
-                                quantum = max(1, quantum // 2)
-                        except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
-                            with lock:
-                                last_error = e
-                                failed_clients.add(idx)
-                                pending.extend(batch)
-                            return
+                    res = client.batch_has(remaining)
+                return res, max(0.0005, time.perf_counter() - t0)
 
-            if active_indices:
-                with ThreadPoolExecutor(max_workers=min(8, len(active_indices))) as pool:
-                    futs = [pool.submit(_worker, idx) for idx in active_indices]
-                    for fut in as_completed(futs):
-                        fut.result()
+            with ThreadPoolExecutor(max_workers=min(8, len(direct_tier))) as pool:
+                fut_map = {
+                    pool.submit(_probe_has, idx, client): idx
+                    for idx, client in enumerate(direct_tier)
+                }
+                for fut in as_completed(fut_map):
+                    idx = fut_map[fut]
+                    try:
+                        availability[idx], probe_rtt[idx] = fut.result()
+                    except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                        last_error = e
+
+            healthy_indices = sorted(
+                (i for i in availability.keys() if not self._is_overloaded(direct_tier[i], time.monotonic())),
+                key=lambda i: probe_rtt.get(i, 999.0),
+            )
+            if not healthy_indices:
+                self._overloaded_until.clear()
+                healthy_indices = sorted(availability.keys(), key=lambda i: probe_rtt.get(i, 999.0))
+
+            failed_clients = set()
+            lock = threading.Lock()
+            pending = []
+            owner_counts: Dict[str, int] = {}
+            unassigned = []
+            for wid in remaining:
+                cnt = sum(1 for idx in healthy_indices if availability[idx].get(wid))
+                if cnt > 0:
+                    owner_counts[wid] = cnt
+                    pending.append(wid)
+                else:
+                    unassigned.append(wid)
+            # BitTorrent 式 Rarest-first: 保有ピア数が少ない希少チャンクを優先して取得する
+            pending.sort(key=lambda w: owner_counts.get(w, 0))
+
+            if pending and healthy_indices:
+                active_indices = [
+                    idx for idx in healthy_indices
+                    if any(availability[idx].get(wid) for wid in pending)
+                ]
+                if active_indices:
+                    weights = self._compute_peer_weights(active_indices, direct_tier, probe_rtt)
+                    total_weight = max(1e-9, sum(weights.values()))
+                    ranked_indices = sorted(active_indices, key=lambda i: weights[i], reverse=True)
+                    n_wave = min(len(pending), 24 * len(ranked_indices))
+                    alloc: Dict[int, int] = {
+                        idx: max(1, int(round(n_wave * (weights[idx] / total_weight))))
+                        for idx in ranked_indices
+                    }
+                    while sum(alloc.values()) > n_wave:
+                        for idx in reversed(ranked_indices):
+                            if alloc[idx] > 1 and sum(alloc.values()) > n_wave:
+                                alloc[idx] -= 1
+                            elif sum(alloc.values()) <= n_wave:
+                                break
+                        else:
+                            break
+                    while sum(alloc.values()) < n_wave:
+                        for idx in ranked_indices:
+                            if sum(alloc.values()) < n_wave:
+                                alloc[idx] += 1
+
+                    initial_batches: Dict[int, List[str]] = {idx: [] for idx in ranked_indices}
+                    remaining_pending: List[str] = []
+                    for wid in pending:
+                        placed = False
+                        candidates = [
+                            idx for idx in ranked_indices
+                            if len(initial_batches[idx]) < alloc[idx] and availability[idx].get(wid)
+                        ]
+                        if candidates:
+                            best_idx = max(
+                                candidates,
+                                key=lambda i: (alloc[i] - len(initial_batches[i])) / max(1, alloc[i]),
+                            )
+                            initial_batches[best_idx].append(wid)
+                            placed = True
+                        if not placed:
+                            remaining_pending.append(wid)
+                    pending[:] = remaining_pending
+
+                    def _worker(idx: int) -> None:
+                        nonlocal last_error
+                        client = direct_tier[idx]
+                        share = weights[idx] / total_weight
+                        quantum = max(1, min(24, int(round(n_wave * share))))
+                        avail = availability[idx]
+                        first_batch = initial_batches.get(idx, [])
+                        with client.session():
+                            while True:
+                                if first_batch:
+                                    batch = first_batch
+                                    first_batch = []
+                                else:
+                                    batch = []
+                                    with lock:
+                                        if not pending:
+                                            return
+                                        cur_q = min(quantum, max(1, len(pending)))
+                                        keep: List[str] = []
+                                        for wid in pending:
+                                            if len(batch) < cur_q and avail.get(wid):
+                                                batch.append(wid)
+                                            else:
+                                                keep.append(wid)
+                                        pending[:] = keep
+                                    if not batch:
+                                        return
+                                t0 = time.perf_counter()
+                                try:
+                                    fetched = client.batch_get(batch)
+                                    dt = max(0.001, time.perf_counter() - t0)
+                                    got_bytes = sum(len(v) for v in fetched.values())
+                                    self._record_peer_throughput(client, got_bytes, dt)
+                                    with lock:
+                                        result.update(fetched)
+                                        self._active = client
+                                        missing_in_batch = [w for w in batch if w not in fetched]
+                                        if missing_in_batch:
+                                            unassigned.extend(missing_in_batch)
+                                    if getattr(client, "last_overloaded", False):
+                                        self._mark_overloaded(client)
+                                    if dt < 0.15 and len(batch) == quantum:
+                                        quantum = min(24, quantum * 2)
+                                    elif dt > 0.6 and quantum > 1:
+                                        quantum = max(1, quantum // 2)
+                                except (ServiceUnavailableError, ChunkIntegrityError, OSError) as e:
+                                    with lock:
+                                        last_error = e
+                                        failed_clients.add(idx)
+                                        pending.extend(batch)
+                                        if first_batch:
+                                            pending.extend(first_batch)
+                                    return
+
+                    with ThreadPoolExecutor(max_workers=min(8, len(ranked_indices))) as pool:
+                        futs = [pool.submit(_worker, idx) for idx in ranked_indices]
+                        for fut in as_completed(futs):
+                            fut.result()
 
         # 失敗・欠損分は未試行の健全な直接ピア → 最後にリレー層へフォールバック
         remaining = [wid for wid in (pending + unassigned) if wid not in result]
@@ -1850,7 +2295,7 @@ class SwarmOSTClient(FailoverOSTClient):
             for cand in discover_ice_candidates(base, node_id=node_id, timeout=timeout):
                 ctype = str(cand.get("type") or "")
                 ep = str(cand.get("endpoint") or "").strip().rstrip("/")
-                if not ep or ctype == "relay":
+                if not ep or ctype in ("relay", "libp2p"):
                     continue
                 if ep in seen_raw:
                     continue
@@ -1902,6 +2347,168 @@ class SwarmOSTClient(FailoverOSTClient):
             self.adapt_order(force=True)
         elif pending:
             self.enter_safe_mode("ice_candidates_unreachable")
+        return added
+
+    def discover_from_p2p(
+        self,
+        host_manager: Any,
+        *,
+        domain_key: str = "",
+        registry_urls: Sequence[str] = (),
+        relay_addrs: Sequence[str] = (),
+        node_id: Optional[str] = None,
+        timeout: float = 2.0,
+    ) -> List[str]:
+        """Kademlia DHT を優先して libp2p ピアを発見し、失敗時は既存ハブ (/_p2p/peers, /_ice/candidates) へフォールバックする。"""
+        if self.safe_mode or host_manager is None:
+            return []
+        try:
+            from .libp2p_chunk import Libp2pPeerClient, is_libp2p_available
+        except ImportError:
+            return []
+        if not is_libp2p_available():
+            return []
+
+        from urllib.parse import urlsplit
+        from .relay import discover_ice_candidates, fetch_p2p_peers
+
+        existing_keys = {self._client_uri(c).rstrip("/") for c in self.clients}
+        self_peer_id = str(getattr(host_manager, "peer_id", "") or "")
+        peer_addrs: Dict[str, List[str]] = {}
+        allowed_ids: set[str] = set()
+        hub_entries: List[Dict[str, Any]] = []
+        auto_relay_addrs: List[str] = [str(r).strip() for r in relay_addrs if str(r).strip()]
+
+        # 1) ハブ (/_p2p/peers & /_ice/candidates) で許可リスト・ピア一覧を取得し DHT へブートストラップ
+        seen_hubs: set[str] = set()
+        for reg_url in registry_urls:
+            base = str(reg_url or "").strip().rstrip("/")
+            if not base:
+                continue
+            if "/relay/" in base:
+                parts = urlsplit(base)
+                if parts.scheme and parts.netloc:
+                    base = f"{parts.scheme}://{parts.netloc}"
+            if base in seen_hubs:
+                continue
+            seen_hubs.add(base)
+
+            p2p_info = fetch_p2p_peers(base, timeout=timeout)
+            for pid in p2p_info.get("peer_ids") or []:
+                s = str(pid).strip()
+                if s:
+                    allowed_ids.add(s)
+            for entry in p2p_info.get("peers") or []:
+                if not isinstance(entry, dict):
+                    continue
+                pid = str(entry.get("peer_id") or "").strip()
+                if not pid:
+                    continue
+                allowed_ids.add(pid)
+                if pid == self_peer_id:
+                    continue
+                hub_entries.append(entry)
+                is_relay_role = str(entry.get("role") or "").strip().lower() in ("hub", "root", "writer")
+                for a in entry.get("addrs") or []:
+                    sa = str(a).strip()
+                    if sa:
+                        lst = peer_addrs.setdefault(pid, [])
+                        if sa not in lst:
+                            lst.append(sa)
+                        if is_relay_role and "/p2p-circuit" not in sa and sa not in auto_relay_addrs:
+                            auto_relay_addrs.append(sa)
+
+            for cand in discover_ice_candidates(base, node_id=node_id, timeout=timeout):
+                if str(cand.get("type") or "") != "libp2p":
+                    continue
+                pid = str(cand.get("peer_id") or "").strip()
+                ep = str(cand.get("endpoint") or "").strip()
+                if not pid or not ep or pid == self_peer_id:
+                    continue
+                allowed_ids.add(pid)
+                lst = peer_addrs.setdefault(pid, [])
+                if ep not in lst:
+                    lst.append(ep)
+
+        if allowed_ids and hasattr(host_manager, "set_allowed_peer_ids"):
+            if self_peer_id:
+                allowed_ids.add(self_peer_id)
+            host_manager.set_allowed_peer_ids(allowed_ids)
+
+        if hub_entries and hasattr(host_manager, "bootstrap_from_peers"):
+            try:
+                host_manager.bootstrap_from_peers(hub_entries, timeout=min(float(timeout), 1.5))
+            except Exception:
+                pass
+
+        # 2) ブートストラップ済み Kademlia DHT からドメイン内プロバイダを検索・補完
+        if domain_key:
+            try:
+                dht_provs = host_manager.find_domain_providers(domain_key, timeout=timeout)
+                for prov in dht_provs:
+                    pid = str(prov.get("peer_id") or "").strip()
+                    if not pid or pid == self_peer_id:
+                        continue
+                    addrs = [str(a).strip() for a in (prov.get("addrs") or []) if str(a).strip()]
+                    peer_addrs.setdefault(pid, [])
+                    for a in addrs:
+                        if a not in peer_addrs[pid]:
+                            peer_addrs[pid].append(a)
+            except Exception:
+                pass
+
+        pending: List[Tuple[str, Any]] = []
+        for pid, addrs in peer_addrs.items():
+            if allowed_ids and pid not in allowed_ids:
+                continue
+            uri = f"libp2p://{pid}"
+            if uri in existing_keys:
+                continue
+            existing_keys.add(uri)
+            circuit_addrs = [
+                f"{r.rstrip('/')}/p2p-circuit/p2p/{pid}"
+                for r in auto_relay_addrs
+                if str(r).strip()
+                and "/p2p/" in str(r)
+                and "/p2p-circuit" not in str(r)
+                and not str(r).rstrip("/").endswith(f"/p2p/{pid}")
+            ]
+            client = Libp2pPeerClient(
+                host_manager,
+                pid,
+                addrs,
+                relay_addrs=circuit_addrs,
+                timeout=timeout,
+            )
+            pending.append((uri, client))
+
+        if not pending:
+            return []
+
+        added: List[str] = []
+        with ThreadPoolExecutor(max_workers=min(8, len(pending))) as pool:
+            fut_map = {
+                pool.submit(self._probe_one, client, timeout): (uri, client)
+                for uri, client in pending
+            }
+            for fut in as_completed(fut_map):
+                uri, client = fut_map[fut]
+                ok = False
+                try:
+                    ok, _rtt = fut.result()
+                except Exception:
+                    ok = False
+                if ok:
+                    self.clients.append(client)
+                    added.append(uri)
+                else:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+        if added:
+            self.adapt_order(force=True)
         return added
 
 

@@ -9,12 +9,16 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sqlite3
 import stat
+import sys
 import tempfile
+import threading
 import time
+from collections.abc import MutableMapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .crypto import (
     EMPTY_SHA256,
@@ -42,7 +46,7 @@ from .l2_registry import (
     create_locator_envelope,
     verify_locator_envelope,
 )
-from .l3_ost_adapter import OSTClient
+from .l3_ost_adapter import OSTClient, _get_available_memory_bytes
 from .path_safety import UnsafePathError, _open_no_follow
 from .private_io import write_private_json
 
@@ -61,6 +65,162 @@ def _env_positive_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+MIN_DYNAMIC_BATCH_BYTES = 8 * 1024 * 1024
+MAX_DYNAMIC_BATCH_BYTES = 256 * 1024 * 1024
+
+
+def _dynamic_batch_bytes(default: int = 16 * 1024 * 1024) -> int:
+    """DFS_BATCH_BYTES 未指定時、空きメモリの 1/8 を上限（8MiB〜256MiB）として返す。"""
+    raw = os.environ.get("DFS_BATCH_BYTES")
+    if raw is not None and raw.strip() != "":
+        return _env_positive_int("DFS_BATCH_BYTES", default)
+    avail = _get_available_memory_bytes()
+    if avail is None or avail <= 0:
+        return default
+    budget = avail // 8
+    return max(MIN_DYNAMIC_BATCH_BYTES, min(MAX_DYNAMIC_BATCH_BYTES, budget))
+
+
+def _normalize_index_entry(entry: Any) -> Optional[Tuple[str, str, str]]:
+    """索引エントリを ``(wire_id, store_id, codec)`` へ正規化する。"""
+    if isinstance(entry, str) and entry:
+        return entry, "", "none"
+    if isinstance(entry, (tuple, list)):
+        if len(entry) == 2:
+            wire_id, store_id = entry
+            if isinstance(wire_id, str) and wire_id:
+                return wire_id, str(store_id or ""), "none"
+        elif len(entry) >= 3:
+            wire_id, store_id, codec = entry[0], entry[1], entry[2]
+            if isinstance(wire_id, str) and wire_id:
+                return wire_id, str(store_id or ""), str(codec or "none")
+    return None
+
+
+class SQLiteChunkIndex(MutableMapping[str, Tuple[str, str, str]]):
+    """全件をメモリに載せず SQLite 上で重複排除索引を保持する辞書互換ストア。"""
+
+    def __init__(self, db_path: Path, address_key: str) -> None:
+        self.db_path = Path(db_path).expanduser()
+        self.address_key = str(address_key)
+        self._lock = threading.RLock()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_entries = self._extract_legacy_json_if_needed()
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS ost_index ("
+            "plain_id TEXT PRIMARY KEY, "
+            "wire_id TEXT NOT NULL, "
+            "store_id TEXT NOT NULL, "
+            "codec TEXT NOT NULL"
+            ") WITHOUT ROWID"
+        )
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'address_key'"
+        ).fetchone()
+        if row is not None and row[0] != self.address_key:
+            self._conn.execute("DELETE FROM ost_index")
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('address_key', ?)",
+            (self.address_key,),
+        )
+        if legacy_entries:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO ost_index (plain_id, wire_id, store_id, codec) "
+                "VALUES (?, ?, ?, ?)",
+                legacy_entries,
+            )
+        self._conn.commit()
+        if os.name != "nt":
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError:
+                pass
+
+    def _extract_legacy_json_if_needed(self) -> List[Tuple[str, str, str, str]]:
+        if not self.db_path.is_file() or self.db_path.stat().st_size == 0:
+            return []
+        try:
+            with open(self.db_path, "rb") as fh:
+                magic = fh.read(16)
+        except OSError:
+            return []
+        if magic.startswith(b"SQLite format 3\x00"):
+            return []
+        migrated: List[Tuple[str, str, str, str]] = []
+        try:
+            data = json.loads(self.db_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(data, dict)
+                and data.get("schema") == "dfs-ost-index-v1"
+                and data.get("address_key") == self.address_key
+                and isinstance(data.get("entries"), dict)
+            ):
+                for plain_id, entry in data["entries"].items():
+                    parsed = _normalize_index_entry(entry)
+                    if parsed is not None:
+                        migrated.append((str(plain_id), parsed[0], parsed[1], parsed[2]))
+        except (OSError, ValueError, TypeError):
+            migrated = []
+        try:
+            self.db_path.unlink()
+        except OSError:
+            pass
+        return migrated
+
+    def __getitem__(self, key: str) -> Tuple[str, str, str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT wire_id, store_id, codec FROM ost_index WHERE plain_id = ?",
+                (str(key),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(key)
+        return (str(row[0]), str(row[1]), str(row[2]))
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        parsed = _normalize_index_entry(value)
+        if parsed is None:
+            raise ValueError(f"Invalid index entry: {value!r}")
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO ost_index (plain_id, wire_id, store_id, codec) "
+                "VALUES (?, ?, ?, ?)",
+                (str(key), parsed[0], parsed[1], parsed[2]),
+            )
+
+    def __delitem__(self, key: str) -> None:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM ost_index WHERE plain_id = ?", (str(key),)
+            )
+            if cur.rowcount == 0:
+                raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT plain_id FROM ost_index").fetchall()
+        for row in rows:
+            yield str(row[0])
+
+    def __len__(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM ost_index").fetchone()
+        return int(row[0]) if row else 0
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
 
 
 class SilentDropDetectedError(Exception):
@@ -170,41 +330,23 @@ class MerkleTreeBuilder:
         # 書き込み後にチャンクを複製する読み取り専用 OST。
         self.replicas: List[OSTClient] = list(replicas or [])
         self._last_wire_ids: set[str] = set()
-        # (plain_id -> (wire_id, store_id)) の書き手側索引。古い形式（str）も読める。
-        self.index: Dict[str, Any] = dict(index or {})
+        # (plain_id -> (wire_id, store_id, codec)) の書き手側索引。
+        self.index: MutableMapping[str, Any] = dict(index or {})
         self.index_file = Path(index_file).expanduser() if index_file else None
         self.index_key = sha256_hex(self.crypto.address_secret)
         self.compression = normalize_policy(compression)
         if self.index_file is not None and index is None:
-            self.index = self._load_index_file()
-
-    def _load_index_file(self) -> Dict[str, Any]:
-        if self.index_file is None or not self.index_file.is_file():
-            return {}
-        try:
-            data = json.loads(self.index_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            return {}
-        if not isinstance(data, dict) or data.get("schema") != "dfs-ost-index-v1":
-            return {}
-        if data.get("address_key") != self.index_key:
-            return {}
-        entries = data.get("entries")
-        if not isinstance(entries, dict):
-            return {}
-        result: Dict[str, Any] = {}
-        for plain_id, entry in entries.items():
-            parsed = self._index_get(entry)
-            if parsed is not None:
-                result[str(plain_id)] = parsed
-        return result
+            self.index = SQLiteChunkIndex(self.index_file, self.index_key)
 
     def _save_index_file(self) -> None:
+        if isinstance(self.index, SQLiteChunkIndex):
+            self.index.commit()
+            return
         if self.index_file is None:
             return
         entries: Dict[str, Any] = {}
         for plain_id, entry in self.index.items():
-            parsed = self._index_get(entry)
+            parsed = _normalize_index_entry(entry)
             if parsed is not None:
                 entries[str(plain_id)] = [parsed[0], parsed[1], parsed[2]]
         write_private_json(
@@ -514,7 +656,7 @@ class MerkleTreeBuilder:
                 prev[wire_id] = hint
 
         chunk_cap = _env_positive_int("DFS_BATCH_CHUNKS", self.DEFAULT_BATCH_CHUNKS)
-        byte_cap = _env_positive_int("DFS_BATCH_BYTES", self.DEFAULT_BATCH_BYTES)
+        byte_cap = _dynamic_batch_bytes(self.DEFAULT_BATCH_BYTES)
 
         for store_id, id_to_hint in by_store.items():
             client = self._client(store_id)
@@ -638,12 +780,96 @@ class MerkleTreeBuilder:
         dest_dir.mkdir(parents=True, exist_ok=True)
         root_store_id = root_store or self.default_store
 
-        # 1) ディレクトリ塊を幅優先で一括取得し、あわせてファイルの一覧を作る。
+        # 1) ディレクトリ塊を幅優先で辿り、溜まったファイルが閾値に達するたびに順次取得・解放する。
         level: List[Tuple[str, str, str, Path]] = [
             (root_plain_id, root_wire_id, root_store_id, dest_dir)
         ]
         files: List[Dict[str, Any]] = []
+        queued_chunks = 0
+        queued_bytes = 0
+        flush_chunk_cap = _env_positive_int("DFS_BATCH_CHUNKS", self.DEFAULT_BATCH_CHUNKS)
+        flush_byte_cap = _dynamic_batch_bytes(self.DEFAULT_BATCH_BYTES)
         directory_metadata: List[Tuple[Path, Any]] = []
+
+        def _flush_files() -> None:
+            nonlocal queued_chunks, queued_bytes
+            if not files:
+                return
+            wanted: List[Tuple[str, str, Optional[int]]] = []
+            refs_by_wire: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+            written: Dict[Path, int] = {file_entry["target"]: 0 for file_entry in files}
+            received_refs: set[Tuple[Path, int]] = set()
+            for file_entry in files:
+                target = file_entry["target"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                fd = _open_no_follow(target, os.O_RDWR | os.O_CREAT)
+                with os.fdopen(fd, "r+b") as existing_fh:
+                    existing_fh.seek(0, os.SEEK_END)
+                    existing_len = existing_fh.tell()
+                    if file_entry["size"] is not None and existing_len > int(file_entry["size"]):
+                        existing_fh.truncate(int(file_entry["size"]))
+                        existing_len = int(file_entry["size"])
+                    for chunk in file_entry["chunks"]:
+                        wire_id = chunk["wire_id"]
+                        if not wire_id or not chunk["plain_id"]:
+                            raise ChunkIntegrityError(f"Invalid chunk reference for {target.name}")
+                        offset = int(chunk.get("offset", 0))
+                        csize = chunk.get("size")
+                        resumed = False
+                        if csize is not None and offset + int(csize) <= existing_len:
+                            existing_fh.seek(offset)
+                            local_slice = existing_fh.read(int(csize))
+                            if (
+                                len(local_slice) == int(csize)
+                                and self.crypto.compute_plain_id(local_slice).hex() == chunk["plain_id"]
+                            ):
+                                written[target] += len(local_slice)
+                                received_refs.add((target, offset))
+                                resumed = True
+                        if not resumed:
+                            wanted.append((chunk["store"] or self.default_store, wire_id, csize))
+                            refs_by_wire.setdefault(wire_id, []).append((file_entry, chunk))
+                    if file_entry["size"] is not None and existing_len < int(file_entry["size"]):
+                        existing_fh.truncate(int(file_entry["size"]))
+
+            for got in self._iter_fetch_groups(wanted):
+                for wire_id, blob in got.items():
+                    for file_entry, chunk in refs_by_wire.get(wire_id, []):
+                        target = file_entry["target"]
+                        data = self.crypto.unpack_chunk(
+                            chunk["plain_id"], wire_id, blob
+                        )
+                        if chunk.get("size") is not None and len(data) != int(chunk["size"]):
+                            raise ChunkIntegrityError(
+                                f"File chunk size mismatch for {target.name}"
+                            )
+                        offset = int(chunk.get("offset", 0))
+                        fd = _open_no_follow(target, os.O_RDWR)
+                        with os.fdopen(fd, "r+b") as output:
+                            output.seek(offset)
+                            output.write(data)
+                        written[target] += len(data)
+                        received_refs.add((target, offset))
+
+            for file_entry in files:
+                target = file_entry["target"]
+                missing = [
+                    chunk for chunk in file_entry["chunks"]
+                    if (target, int(chunk.get("offset", 0))) not in received_refs
+                ]
+                if missing:
+                    raise ChunkIntegrityError(
+                        f"Missing file chunk during download: {target.name}"
+                    )
+                expected_size = file_entry["size"]
+                if expected_size is not None and written[target] != int(expected_size):
+                    raise ChunkIntegrityError(f"File size mismatch for {target.name}")
+                set_xattr(target, file_entry["compression"])
+                self._apply_metadata(target, file_entry["metadata"])
+            files.clear()
+            queued_chunks = 0
+            queued_bytes = 0
+
         depth = 0
         while level:
             depth += 1
@@ -688,13 +914,25 @@ class MerkleTreeBuilder:
                     entry_store = entry.get("store") or self.default_store
 
                     if etype == "file":
+                        f_chunks = self._entry_chunks(entry)
                         files.append({
-                            "chunks": self._entry_chunks(entry),
+                            "chunks": f_chunks,
                             "compression": entry.get("compression", "none"),
                             "metadata": entry.get("metadata"),
                             "size": entry.get("size"),
                             "target": child,
                         })
+                        queued_chunks += len(f_chunks)
+                        queued_bytes += sum(
+                            int(c.get("size") or self.UNKNOWN_CHUNK_ESTIMATE)
+                            for c in f_chunks
+                        )
+                        if (
+                            len(files) >= 512
+                            or queued_chunks >= flush_chunk_cap
+                            or queued_bytes >= flush_byte_cap
+                        ):
+                            _flush_files()
                     elif etype == "dir":
                         # 空のディレクトリも含めて、ここで実体を作る
                         child.mkdir(parents=True, exist_ok=True)
@@ -708,59 +946,7 @@ class MerkleTreeBuilder:
                         raise ChunkIntegrityError(f"Unknown directory entry type: {etype!r}")
             level = next_level
 
-        # 2) ファイル塊を store ごと・上限ごとに取得し、各 chunk の offset へ書く。
-        wanted: List[Tuple[str, str, Optional[int]]] = []
-        refs_by_wire: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
-        for file_entry in files:
-            target = file_entry["target"]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            fd = _open_no_follow(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-            with os.fdopen(fd, "wb") as output:
-                if file_entry["size"] is not None:
-                    output.truncate(int(file_entry["size"]))
-            for chunk in file_entry["chunks"]:
-                wire_id = chunk["wire_id"]
-                if not wire_id or not chunk["plain_id"]:
-                    raise ChunkIntegrityError(f"Invalid chunk reference for {target.name}")
-                wanted.append((chunk["store"] or self.default_store, wire_id, chunk.get("size")))
-                refs_by_wire.setdefault(wire_id, []).append((file_entry, chunk))
-
-        written: Dict[Path, int] = {file_entry["target"]: 0 for file_entry in files}
-        received_refs: set[Tuple[Path, int]] = set()
-        for got in self._iter_fetch_groups(wanted):
-            for wire_id, blob in got.items():
-                for file_entry, chunk in refs_by_wire.get(wire_id, []):
-                    target = file_entry["target"]
-                    data = self.crypto.unpack_chunk(
-                        chunk["plain_id"], wire_id, blob
-                    )
-                    if chunk.get("size") is not None and len(data) != int(chunk["size"]):
-                        raise ChunkIntegrityError(
-                            f"File chunk size mismatch for {target.name}"
-                        )
-                    offset = int(chunk.get("offset", 0))
-                    fd = _open_no_follow(target, os.O_RDWR)
-                    with os.fdopen(fd, "r+b") as output:
-                        output.seek(offset)
-                        output.write(data)
-                    written[target] += len(data)
-                    received_refs.add((target, offset))
-
-        for file_entry in files:
-            target = file_entry["target"]
-            missing = [
-                chunk for chunk in file_entry["chunks"]
-                if (target, int(chunk.get("offset", 0))) not in received_refs
-            ]
-            if missing:
-                raise ChunkIntegrityError(
-                    f"Missing file chunk during download: {target.name}"
-                )
-            expected_size = file_entry["size"]
-            if expected_size is not None and written[target] != int(expected_size):
-                raise ChunkIntegrityError(f"File size mismatch for {target.name}")
-            set_xattr(target, file_entry["compression"])
-            self._apply_metadata(target, file_entry["metadata"])
+        _flush_files()
 
         # 子の作成で親の時刻が変わるため、ディレクトリのメタデータは最後に戻す。
         for target, metadata in sorted(
@@ -840,18 +1026,15 @@ class MerkleTreeBuilder:
         results.sort(key=lambda r: r["path"])
         return results
 
-    def read_remote_file(
+    def iter_remote_file(
         self,
         root_plain_id: str,
         root_wire_id: str,
         rel_path: str,
         root_store: Optional[str] = None,
-    ) -> bytes:
-        """``rel_path`` のファイル 1 つだけを取得・検証して返す。
-
-        ディレクトリ塊をパスの深さぶん（= 1 段 1 往復）だけ辿る。ファイル塊は 1 往復。
-        ツリー全体を落とさずに 1 ファイルを読める（rclone の ``cat`` 用）。
-        """
+        batch_chunks: Optional[int] = None,
+    ) -> Iterator[bytes]:
+        """``rel_path`` のファイルをチャンク単位で取得・検証して順次 yield する。"""
         parts = [p for p in rel_path.replace("\\", "/").split("/") if p not in ("", ".")]
         if not parts:
             raise IsADirectoryError(f"{rel_path!r} is a directory, not a file")
@@ -871,38 +1054,88 @@ class MerkleTreeBuilder:
                 if entry["type"] != "file":
                     raise IsADirectoryError(f"{rel_path!r} is a directory, not a file")
                 chunks = self._entry_chunks(entry)
-                blobs = self._fetch_grouped(
-                    [
-                        (
-                            chunk["store"] or self.default_store,
-                            chunk["wire_id"],
-                            chunk.get("size"),
-                        )
-                        for chunk in chunks
-                    ]
-                )
-                data = bytearray()
-                for chunk in chunks:
-                    blob = blobs.get(chunk["wire_id"])
-                    if blob is None:
-                        raise ChunkIntegrityError(
-                            f"Missing file chunk: {chunk['wire_id']}"
-                        )
-                    part = self.crypto.unpack_chunk(
-                        chunk["plain_id"], chunk["wire_id"], blob
+                received = 0
+                if batch_chunks is not None:
+                    step = max(1, int(batch_chunks))
+                    groups = [chunks[s : s + step] for s in range(0, len(chunks), step)]
+                else:
+                    chunk_cap = _env_positive_int("DFS_BATCH_CHUNKS", self.DEFAULT_BATCH_CHUNKS)
+                    byte_cap = _dynamic_batch_bytes(self.DEFAULT_BATCH_BYTES)
+                    groups = []
+                    idx = 0
+                    while idx < len(chunks):
+                        group: List[Dict[str, Any]] = []
+                        est = 0
+                        while idx < len(chunks) and len(group) < chunk_cap:
+                            c = chunks[idx]
+                            csize = c.get("size")
+                            size = int(csize) if csize is not None else self.UNKNOWN_CHUNK_ESTIMATE
+                            if group and est + size > byte_cap:
+                                break
+                            group.append(c)
+                            est += size
+                            idx += 1
+                        groups.append(group)
+                for group in groups:
+                    blobs = self._fetch_grouped(
+                        [
+                            (
+                                chunk["store"] or self.default_store,
+                                chunk["wire_id"],
+                                chunk.get("size"),
+                            )
+                            for chunk in group
+                        ]
                     )
-                    if int(chunk.get("offset", 0)) != len(data):
-                        raise ChunkIntegrityError("File chunks are not contiguous")
-                    data.extend(part)
-                if len(data) != int(entry.get("size", len(data))):
+                    for chunk in group:
+                        blob = blobs.get(chunk["wire_id"])
+                        if blob is None:
+                            raise ChunkIntegrityError(
+                                f"Missing file chunk: {chunk['wire_id']}"
+                            )
+                        part_bytes = self.crypto.unpack_chunk(
+                            chunk["plain_id"], chunk["wire_id"], blob
+                        )
+                        if int(chunk.get("offset", 0)) != received:
+                            raise ChunkIntegrityError("File chunks are not contiguous")
+                        received += len(part_bytes)
+                        yield part_bytes
+                if received != int(entry.get("size", received)):
                     raise ChunkIntegrityError(f"File size mismatch for {rel_path}")
-                return bytes(data)
+                return
             if entry["type"] != "dir":
                 raise NotADirectoryError(f"{'/'.join(parts[: i + 1])!r} is not a directory")
             plain_id = entry["plain_id"]
             wire_id = entry["wire_id"]
             store_id = entry.get("store") or self.default_store
         raise FileNotFoundError(rel_path)
+
+    def read_remote_file(
+        self,
+        root_plain_id: str,
+        root_wire_id: str,
+        rel_path: str,
+        root_store: Optional[str] = None,
+    ) -> bytes:
+        """``rel_path`` のファイル 1 つだけを取得・検証して返す。
+
+        空きメモリを超える巨大ファイルで OOM Kill されるのを防ぐため、
+        空きメモリの 75% を超える場合は ``MemoryError`` を送出する
+        （ストリーム読み込みには ``iter_remote_file`` を使用）。
+        """
+        avail = _get_available_memory_bytes()
+        max_bytes = int(avail * 0.75) if (avail is not None and avail > 0) else None
+        buf = bytearray()
+        for chunk in self.iter_remote_file(
+            root_plain_id, root_wire_id, rel_path, root_store=root_store
+        ):
+            if max_bytes is not None and len(buf) + len(chunk) > max_bytes:
+                raise MemoryError(
+                    f"read_remote_file: {rel_path!r} exceeds safe memory budget "
+                    f"({max_bytes} bytes); use iter_remote_file() for streaming"
+                )
+            buf.extend(chunk)
+        return bytes(buf)
 
 
 class L4LogClient:
