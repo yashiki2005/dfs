@@ -1732,7 +1732,7 @@ def sync_from_peers(
                 )
                 for w in new_missing:
                     remaining.setdefault(w, None)
-            elif remaining:
+            if remaining:
                 # Re-sort remaining with updated rarest-first counts
                 cur_rem = list(remaining)
                 cur_rem.sort(
