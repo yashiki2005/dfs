@@ -551,7 +551,7 @@ def _normalize_hub_url(raw: str) -> str:
         return ""
     if "://" in value:
         return value
-    # ポート番号付き (例: 172.16.1.254:19440) は http://、ドメインのみ (例: dfs.yashiki.top) は https://
+    # ポート番号付き (例: 192.0.2.254:19440) は http://、ドメインのみ (例: dfs.example.com) は https://
     if ":" in value and not value.startswith("["):
         return f"http://{value}"
     return f"https://{value}"
@@ -1211,7 +1211,7 @@ def cmd_env(args: argparse.Namespace) -> int:
 
 
 def _domain_from_root_anchor(root_anchor: str) -> str:
-    """``/yashiki.top`` から ``yashiki.top`` を取り出す。"""
+    """``/example.com`` から ``example.com`` を取り出す。"""
     value = str(root_anchor or "").strip().strip("/")
     if not value:
         raise ServiceError("root_anchor が空です。--domain を指定してください")
@@ -1313,11 +1313,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--hub",
         nargs="?",
         const="auto",
-        help="root / リレーハブとして公開起動する（例: --hub dfs.yashiki.top）",
+        help="root / リレーハブとして公開起動する（例: --hub dfs.example.com）",
     )
     p.add_argument(
         "--join",
-        help="指定した root ハブへ参加する（例: --join https://dfs.yashiki.top）",
+        help="指定した root ハブへ参加する（例: --join https://dfs.example.com）",
     )
     p.add_argument(
         "--subscribe",

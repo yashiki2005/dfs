@@ -1,12 +1,18 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dfs"
 dynamic = ["version"]
 description = "Layered single-writer distributed file system"
-requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [
+    { name = "yashiki2005" },
+]
 dependencies = [
     "cryptography>=41",
     "dnspython>=2.6",
@@ -27,8 +33,17 @@ dfssvc = "dfs.svc:main"
 [tool.setuptools.packages.find]
 include = ["dfs*"]
 
+[tool.setuptools.package-data]
+"dfs.i18n" = ["catalogs.json"]
+
 [tool.setuptools.dynamic]
 version = {attr = "dfs.__version__"}
+
+[project.urls]
+Homepage = "https://github.com/yashiki2005/dfs"
+Repository = "https://github.com/yashiki2005/dfs.git"
+Issues = "https://github.com/yashiki2005/dfs/issues"
+Security = "https://github.com/yashiki2005/dfs/security/policy"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

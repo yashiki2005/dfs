@@ -1993,7 +1993,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--relay",
         action="append",
         default=[],
-        help="NAT 裏からアウトバウンド接続するパブリックリレー URL（複数指定可。例: https://dfs.yashiki.top）",
+        help="NAT 裏からアウトバウンド接続するパブリックリレー URL（複数指定可。例: https://dfs.example.com）",
     )
     p_serve.add_argument(
         "--relay-node",

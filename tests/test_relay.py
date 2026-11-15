@@ -325,7 +325,7 @@ def test_ice_candidates_via_relay_agent(tmp_path: Path) -> None:
         local_port=httpd.server_port,
         workers=1,
         pull_timeout=2.0,
-        direct_endpoints=["http://192.168.1.50:9000", "http://100.64.0.2:9000"],
+        direct_endpoints=["http://198.51.100.50:9000", "http://198.51.100.2:9000"],
     )
     agent.start()
     try:
@@ -346,8 +346,8 @@ def test_ice_candidates_via_relay_agent(tmp_path: Path) -> None:
         cands = payload["candidates"]
         types = [c["type"] for c in cands]
         assert types == ["host", "host", "srflx", "relay"]
-        assert cands[0] == {"type": "host", "endpoint": "http://192.168.1.50:9000", "priority": 100}
-        assert cands[1] == {"type": "host", "endpoint": "http://100.64.0.2:9000", "priority": 100}
+        assert cands[0] == {"type": "host", "endpoint": "http://198.51.100.50:9000", "priority": 100}
+        assert cands[1] == {"type": "host", "endpoint": "http://198.51.100.2:9000", "priority": 100}
         assert cands[2] == {"type": "srflx", "endpoint": "http://127.0.0.1:9000", "priority": 50}
         assert cands[3] == {"type": "relay", "endpoint": "/relay/mac1", "priority": 10}
     finally:
@@ -590,13 +590,13 @@ def test_dfssvc_simple_flags_and_dfscli_join(tmp_path: Path, monkeypatch: pytest
     assert ns_local.hub is None
     assert ns_local.join is None
 
-    ns_hub = parser.parse_args(["start", "--hub", "dfs.yashiki.top"])
-    assert ns_hub.hub == "dfs.yashiki.top"
-    assert _normalize_hub_url("dfs.yashiki.top") == "https://dfs.yashiki.top"
-    assert _normalize_hub_url("172.16.1.254:19100") == "http://172.16.1.254:19100"
+    ns_hub = parser.parse_args(["start", "--hub", "dfs.example.com"])
+    assert ns_hub.hub == "dfs.example.com"
+    assert _normalize_hub_url("dfs.example.com") == "https://dfs.example.com"
+    assert _normalize_hub_url("192.0.2.254:19100") == "http://192.0.2.254:19100"
 
-    ns_join = parser.parse_args(["start", "--join", "https://dfs.yashiki.top"])
-    assert ns_join.join == "https://dfs.yashiki.top"
+    ns_join = parser.parse_args(["start", "--join", "https://dfs.example.com"])
+    assert ns_join.join == "https://dfs.example.com"
 
     # dfscli join で既存ローカルサービス設定と RemoteStore が更新されること
     hub = RelayHub()
@@ -618,7 +618,7 @@ def test_dfssvc_simple_flags_and_dfscli_join(tmp_path: Path, monkeypatch: pytest
         rc = cli_main([
             "join",
             root_url,
-            "--name", "yashiki",
+            "--name", "workstation",
             "--path", "/example.com/shared",
             "--secret", "sec-123",
         ])
@@ -627,7 +627,7 @@ def test_dfssvc_simple_flags_and_dfscli_join(tmp_path: Path, monkeypatch: pytest
         cfg = json.loads((svc_dir / "dfssvc.json").read_text(encoding="utf-8"))
         assert cfg["join"] == root_url
 
-        remote = RemoteStore().get("yashiki")
+        remote = RemoteStore().get("workstation")
         assert remote.registry == root_url
         assert remote.ost == peer_url
     finally:

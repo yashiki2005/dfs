@@ -6,6 +6,9 @@
 
 ストレージサーバーやリレーサーバーに平文を見せることなく、PC・自宅サーバー・クラウド GPU ワーカー間でファイルツリーを安全に保存・同期・マウント・共有できます。
 
+> **プロジェクト状態:** `0.1.x` は初期リリース系列です。独立したセキュリティ監査は
+> 受けていません。重要なデータへ適用する前に脅威モデルを確認してください。
+
 ---
 
 ## 主な特徴
@@ -25,7 +28,7 @@
 
 ## 動作要件
 
-- Python `3.10` 以上
+- Python `3.11` 以上
 - [OpenSSH](https://www.openssh.com/)（`ssh-keygen`）— Ed25519 鍵の生成および署名に使用
 - [OpenSSL](https://github.com/openssl/openssl)（`openssl`）— TLS 証明書の生成に使用
 - 主要 Python ライブラリ:
@@ -47,7 +50,7 @@
 [`uv`](https://docs.astral.sh/uv/) を使う場合（推奨）:
 
 ```bash
-git clone <repo-url> dfs
+git clone https://github.com/yashiki2005/dfs.git dfs
 cd dfs
 uv sync
 ```
@@ -179,3 +182,15 @@ dfscli pull local:dataset ./restored-dataset
 ```bash
 uv run --extra test pytest -q
 ```
+
+---
+
+## プロジェクト方針
+
+- [セキュリティポリシー](SECURITY.md)
+- [コントリビューション](CONTRIBUTING.md)
+- [変更履歴](CHANGELOG.md)
+
+## ライセンス
+
+[MIT License](LICENSE) で公開します。

@@ -5,7 +5,7 @@
     "platform": "macOS-27.3-arm64-arm-64bit",
     "python": "3.12.16"
   },
-  "domain": "yashiki.top",
+  "domain": "example.com",
   "zone_cache": "in-process, TTL bounded",
   "n": 20,
   "samples_ms": [

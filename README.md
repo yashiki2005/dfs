@@ -6,6 +6,10 @@
 
 It lets you store, sync, mount, and share encrypted file trees across laptops, home servers, and cloud GPU workers—without trusting storage servers or relay nodes with your plaintext data.
 
+> **Project status:** `0.1.x` is an experimental initial-release series. It has not
+> undergone an independent security audit. Review the threat model before using
+> it with valuable data.
+
 ---
 
 ## Key Features
@@ -25,7 +29,7 @@ It lets you store, sync, mount, and share encrypted file trees across laptops, h
 
 ## Requirements
 
-- Python `3.10+`
+- Python `3.11+`
 - [OpenSSH](https://www.openssh.com/) (`ssh-keygen`) for Ed25519 key generation and signing
 - [OpenSSL](https://github.com/openssl/openssl) (`openssl`) for TLS certificate generation
 - Core Python libraries:
@@ -47,7 +51,7 @@ It lets you store, sync, mount, and share encrypted file trees across laptops, h
 Using [`uv`](https://docs.astral.sh/uv/) (recommended):
 
 ```bash
-git clone <repo-url> dfs
+git clone https://github.com/yashiki2005/dfs.git dfs
 cd dfs
 uv sync
 ```
@@ -179,3 +183,15 @@ Additional component-level specifications are available in [`specs/`](specs/).
 ```bash
 uv run --extra test pytest -q
 ```
+
+---
+
+## Project Policies
+
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
+
+## License
+
+Released under the [MIT License](LICENSE).

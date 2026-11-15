@@ -67,14 +67,19 @@ jobs:
       - name: Build standalone binaries
         shell: bash
         run: |
-          uv run pyinstaller --onefile --clean --name dfscli scripts/pyinstaller_cli.py
-          uv run pyinstaller --onefile --clean --name dfssvc scripts/pyinstaller_svc.py
+          if [ "${{ runner.os }}" = "Windows" ]; then DATA_SEP=";"; else DATA_SEP=":"; fi
+          uv run pyinstaller --onefile --clean --name dfscli \
+            --add-data "dfs/i18n/catalogs.json${DATA_SEP}dfs/i18n" \
+            scripts/pyinstaller_cli.py
+          uv run pyinstaller --onefile --clean --name dfssvc \
+            --add-data "dfs/i18n/catalogs.json${DATA_SEP}dfs/i18n" \
+            scripts/pyinstaller_svc.py
           "./dist/dfscli${{ matrix.ext }}" --help >/dev/null
           "./dist/dfssvc${{ matrix.ext }}" --help >/dev/null
           mkdir -p stage
           cp "dist/dfscli${{ matrix.ext }}" "stage/dfscli${{ matrix.ext }}"
           cp "dist/dfssvc${{ matrix.ext }}" "stage/dfssvc${{ matrix.ext }}"
-          cp README.md LICENSE stage/ 2>/dev/null || true
+          cp README.md LICENSE stage/
 
       - name: Package archive (tar.gz)
         if: matrix.archive == 'tar.gz'

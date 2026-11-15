@@ -4,7 +4,7 @@
   "environment": {
     "platform": "macOS-27.3-arm64-arm-64bit",
     "python": "3.12.16",
-    "hostname": "MacBook-Neo.local"
+    "hostname": "workstation.local"
   },
   "directory": {
     "method": "directory",

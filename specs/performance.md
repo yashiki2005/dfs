@@ -4,7 +4,7 @@
 
 | 項目 | 値 |
 |---|---|
-| マシン | MacBook-Neo（Apple A18 Pro） |
+| マシン | workstation（Apple A18 Pro） |
 | OS | macOS 27.3 arm64 |
 | Python | 3.12.16（`~/dfs-venv`） |
 | 計測 | ローカル / loopback |
@@ -49,7 +49,7 @@ pull は L3 の転送が支配的で、署名検証の最適化ではほとん�
 
 ## DNSSEC
 
-`discover_domain("yashiki.top")` を同一プロセスで 20 回実行した結果。
+`discover_domain("example.com")` を同一プロセスで 20 回実行した結果。
 
 | 項目 | 最適化前 | ゾーン鍵キャッシュ後 |
 |---|---:|---:|

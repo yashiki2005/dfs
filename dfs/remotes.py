@@ -45,7 +45,7 @@ class Remote:
     """1 つのリモート（= 1 つの書き込み境界）の定義。"""
 
     name: str
-    registry: str                       # L2 名簿 URL（例: http://172.16.1.60:19440）
+    registry: str                       # L2 名簿 URL（例: http://192.0.2.60:19440）
     key: str                            # 書き手の OpenSSH Ed25519 秘密鍵
     registry_alternates: List[str] = field(default_factory=list)  # 読み取り用の代替名簿
     ost: str = ""                       # L3 OST の host:port。空ならロケータから解決する

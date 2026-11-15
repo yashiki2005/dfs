@@ -18,7 +18,7 @@ LAN（RTT 2ms）では動いていた dfs が、WAN（RTT 20〜285ms）でも動
 ## 1. 構成
 
 ```text
-[Mac]                [Sakura (172.16.1.254)]                 [Scaleway (172.16.1.60)]
+[Mac]                [Sakura (192.0.2.254)]                 [Scaleway (192.0.2.60)]
 clayfs (L5)          dfs serve （比較用サーバ）              dfs serve
   └ tree/ ──push──▶  L3 ChunkStore (TLS 19443) ─┐             L3 ChunkStore (TLS 19443)
   .clayfs/                                       │             L2 名簿 (HTTP 19440)
@@ -28,8 +28,8 @@ clayfs (L5)          dfs serve （比較用サーバ）              dfs serve
 | 拠点 | 接続 | RTT（実測平均） | 環境 |
 |---|---|---|---|
 | Mac | 起点 | — | macOS arm64、Python 3.12 |
-| Scaleway | `ubuntu@172.16.1.60` | **278.5ms** | x86_64、1vCPU/950MB |
-| Sakura | `ubuntu@yashiki.top`（172.16.1.254） | **22.4ms** | x86_64、2core/960MB |
+| Scaleway | `deploy@192.0.2.60` | **278.5ms** | x86_64、1vCPU/950MB |
+| Sakura | `deploy@example.com`（192.0.2.254） | **22.4ms** | x86_64、2core/960MB |
 
 | 項目 | 値 |
 |---|---|
@@ -183,14 +183,14 @@ nohup python3 -m dfs.cli serve --bind 0.0.0.0   --registry-port 19440 --ost-port
 
 # Mac → Scaleway（ハーネスが配置・委譲・計測まで行う）
 python bench/e2e_wan.py --mode wan --label mac-to-scaleway \
-  --server-host 172.16.1.60 --server-ssh ubuntu@172.16.1.60 \
+  --server-host 192.0.2.60 --server-ssh deploy@192.0.2.60 \
   --server-key ~/.ssh/pi-mock-test --reset
 
 # Sakura → Scaleway（クライアントを ssh 先で実行）
 python bench/e2e_wan.py --mode wan --label sakura-to-scaleway \
-  --server-host 172.16.1.60 --server-ssh ubuntu@172.16.1.60 \
+  --server-host 192.0.2.60 --server-ssh deploy@192.0.2.60 \
   --server-key ~/.ssh/pi-mock-test \
-  --client-ssh ubuntu@yashiki.top --client-key ~/.ssh/id_ed25519_sakura --reset
+  --client-ssh deploy@example.com --client-key ~/.ssh/id_ed25519_sakura --reset
 
 # ハーネス自体の自己検証（Mac 内で完結）
 python bench/e2e_wan.py --mode loopback --label selfcheck --server-host 127.0.0.1

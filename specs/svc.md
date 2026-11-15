@@ -154,9 +154,9 @@ dfssvc dnssec dev
 
 ```bash
 dfssvc dnssec dev \
-  --domain yashiki.top \
-  --primary-url https://l2.yashiki.top \
-  --secondary-url https://l2-b.yashiki.top \
+  --domain example.com \
+  --primary-url https://l2.example.com \
+  --secondary-url https://l2-b.example.com \
   --ttl 300 \
   --epoch 2
 ```

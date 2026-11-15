@@ -6,12 +6,12 @@ set -euo pipefail
 # トークンは HTTP URL クエリに乗せず、引数または環境変数 DFS_INVITE_TOKEN で渡す。
 #
 # 使い方:
-#   curl -sSL https://dfs.yashiki.top/bootstrap.sh | bash -s -- <TOKEN>
-#   DFS_DEST=/workspace/data DFS_SYNC_ONLY=1 curl -sSL https://dfs.yashiki.top/bootstrap.sh | bash -s -- <TOKEN>
+#   curl -sSL https://dfs.example.com/bootstrap.sh | bash -s -- <TOKEN>
+#   DFS_DEST=/workspace/data DFS_SYNC_ONLY=1 curl -sSL https://dfs.example.com/bootstrap.sh | bash -s -- <TOKEN>
 
 TOKEN="${1:-${DFS_INVITE_TOKEN:-}}"
 if [ -z "$TOKEN" ]; then
-  echo "Usage: curl -sSL https://dfs.yashiki.top/bootstrap.sh | bash -s -- <dfs-ro-v1:...|dfs-rw-v1:...>" >&2
+  echo "Usage: curl -sSL https://dfs.example.com/bootstrap.sh | bash -s -- <dfs-ro-v1:...|dfs-rw-v1:...>" >&2
   exit 2
 fi
 

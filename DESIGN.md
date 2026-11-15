@@ -214,7 +214,7 @@ domain + user が魅力的に見える理由は正当。メールと SSH が実�
 **しかし両実装とも、既に別の層を持っていた。**
 
 - mini_lustre: `/example.com/someone` を解決した後、データの在り処は MDS が返す
-  `StripeLayout`。MDS 自体は mDNS と `yashiki.top:9005` のグローバル名簿で探す。
+  `StripeLayout`。MDS 自体は mDNS と `example.com:9005` のグローバル名簿で探す。
 - dfs: `/domain/user` を解決した後、保管庫は「設定した保管ノードの URL」にあった。
   ノードは名簿（rendezvous）と mDNS で探す。鍵は `.pubkey`（TOFU）で、鍵の権威は未定義。
 

@@ -5,7 +5,7 @@
     "platform": "macOS-27.3-arm64-arm-64bit",
     "python": "3.12.16"
   },
-  "domain": "yashiki.top",
+  "domain": "example.com",
   "samples_ms": [
     52.429,
     53.909,

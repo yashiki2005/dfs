@@ -280,11 +280,11 @@ class ReadOnlyInviteTests(unittest.TestCase):
                 "share", "work",
                 "--write-path", "/example.com/runpod-share",
                 "--root-key", str(self.root_key),
-                "--bootstrap-url", "https://dfs.yashiki.top/bootstrap.sh",
+                "--bootstrap-url", "https://dfs.example.com/bootstrap.sh",
             ])
         self.assertEqual(rc_rw, 0)
         line_rw = out_rw.getvalue().strip()
-        self.assertTrue(line_rw.startswith("curl -sSL https://dfs.yashiki.top/bootstrap.sh | bash -s -- dfs-rw-v1:"))
+        self.assertTrue(line_rw.startswith("curl -sSL https://dfs.example.com/bootstrap.sh | bash -s -- dfs-rw-v1:"))
 
 
 if __name__ == "__main__":

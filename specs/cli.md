@@ -64,9 +64,9 @@ rclone のリモートはこれに対応させた。**ホスト名ではない�
 
 | 項目 | 例 | 省略したとき |
 |---|---|---|
-| L2 名簿 | `172.16.1.60` | **必須**（出発点。ホスト名だけでよい） |
+| L2 名簿 | `192.0.2.60` | **必須**（出発点。ホスト名だけでよい） |
 | 書き手の OpenSSH Ed25519 秘密鍵 | `~/.ssh/alice` | その場で作る（`~/.config/dfs/keys/<名前>_ed25519`） |
-| L3 OST の host:port | `172.16.1.60:19443` | L2 のロケータ（`endpoints`）から解決する |
+| L3 OST の host:port | `192.0.2.60:19443` | L2 のロケータ（`endpoints`）から解決する |
 | サブツリーのパス | `/example.com/alice/notes` | L2 で書き手公開鍵から探す |
 | `tree_secret`（共有秘密） | — | 端末からエコーなしで読む |
 | 作業ディレクトリ | `~/.cache/dfs/<名前>` | 既定（`--workdir` で変更） |
@@ -75,17 +75,17 @@ rclone のリモートはこれに対応させた。**ホスト名ではない�
 
 ```bash
 # ホスト名だけ。鍵は作り、secret は端末から読む
-dfscli config create scw --registry 172.16.1.60
+dfscli config create scw --registry 192.0.2.60
 ```
 
 #### レジストリはホスト名だけでよい
 
-L2 の既定ポートは **9440**。`--registry` に `172.16.1.60` のようにホスト名（または IP）だけ
+L2 の既定ポートは **9440**。`--registry` に `192.0.2.60` のようにホスト名（または IP）だけ
 を渡すと、`http://` と `:9440` を補う。別のポートなら `--registry-port` で変えるか、
 `host:port` をそのまま書く。
 
 ```
-172.16.1.60                -> http://172.16.1.60:9440
+192.0.2.60                -> http://192.0.2.60:9440
 http://host:1234           -> http://host:1234        （そのまま）
 host --registry-port 19440 -> http://host:19440
 ```
@@ -98,11 +98,11 @@ host --registry-port 19440 -> http://host:19440
 書き込み（`announce` / `delegate`）は常に `--registry` の主名簿だけに送る。
 
 ```bash
-dfscli create scw --registry 172.16.1.60 \
-  --registry-alternate 172.16.1.61
+dfscli create scw --registry 192.0.2.60 \
+  --registry-alternate 192.0.2.61
 ```
 
-主名簿は `dfs serve --replica http://172.16.1.61:9440` のように起動すると、
+主名簿は `dfs serve --replica http://192.0.2.61:9440` のように起動すると、
 署名済みの委譲チェーン・L4 ログ・ロケータを代替名簿へ複製する。代替名簿は
 root アンカーから再検証し、古いバンドルで巻き戻さない。
 
@@ -195,7 +195,7 @@ dfscli create scw \
 詳細は `specs/libp2p.md`。
 
 **L2 が OST の場所とパスを知っている理由**: L2 のロケータ（`dfs-l2-locator-v1`）は
-`endpoints` を持ち、そこに L3 の場所（`tls://172.16.1.60:19443`）が入る。これは版を
+`endpoints` を持ち、そこに L3 の場所（`tls://192.0.2.60:19443`）が入る。これは版を
 書くたびに更新される。委譲レコードは書き手の公開鍵（`writer`）を持つので、「この鍵が
 書くのはどのサブツリーか」を L2 に聞ける。最初の版を書く前はロケータがまだ無いため、
 L2 は `--advertise`（または bind から推定したホスト）で自分の L3 の場所を広告する。
@@ -216,11 +216,11 @@ L2 は `--advertise`（または bind から推定したホスト）で自分の
 ものだけ採る。
 
 ```
-$ dfscli create scw --registry 172.16.1.60
+$ dfscli create scw --registry 192.0.2.60
 scw の tree_secret:                       ← 入力は画面に出ない
 scw の tree_secret（確認のためもう一度）:  ← 同じものを打つ
 [dfscli] リモート 'scw' を保存しました: ~/.config/dfs/remotes.json
-  registry    : http://172.16.1.60:9440
+  registry    : http://192.0.2.60:9440
   書き手の鍵  : ~/.config/dfs/keys/scw_ed25519（作った。OpenSSH 形式の Ed25519）
   tree_secret : *** （端末から読みました）
 ```
@@ -239,7 +239,7 @@ scw の tree_secret（確認のためもう一度）:  ← 同じものを打つ
 登録は一番よく打つので、`config` を省いた入口を用意した。中身は同じ関数。
 
 ```bash
-dfscli create scw --registry 172.16.1.60       # = dfscli config create scw ...
+dfscli create scw --registry 192.0.2.60       # = dfscli config create scw ...
 dfscli config show scw                         # 表示・削除・一覧は config の下
 dfscli config delete scw
 dfscli listremotes                             # config list と同じ

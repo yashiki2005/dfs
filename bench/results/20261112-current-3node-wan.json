@@ -2,9 +2,9 @@
   "schema": "dfs-3node-perf-v1",
   "measured_at_utc": "2026-11-12T10:23:47+00:00",
   "nodes": [
-    "Mac 172.16.1.30",
-    "Sakura 172.16.1.254",
-    "Scaleway 172.16.1.60"
+    "Mac 192.0.2.30",
+    "Sakura 192.0.2.254",
+    "Scaleway 192.0.2.60"
   ],
   "payload": {
     "files": 20,

@@ -7,7 +7,7 @@
 - ハーネス: `bench/e2e_lan.py`
 - 生データ: `bench/results/20261111-200812-e2e-lan.json`
 - 実行日: 2026-11-11
-- 接続: `ssh -i ~/.ssh/pi-mock-test yy@192.168.0.7`
+- 接続: `ssh -i ~/.ssh/pi-mock-test operator@198.51.100.7`
 
 ---
 
@@ -27,8 +27,8 @@ clayfs (L5)                                     dfs serve
 | Mac | macOS 27.3 arm64、Python 3.12 |
 | Pi5 | Ubuntu 24.04（Linux 7.0）、Python 3.14.4、`cryptography` 入り、pytest なし |
 | LAN RTT（ping 10 回） | **平均 2.25ms**（min 0.57 / max 6.04） |
-| L2 | `http://192.168.0.7:9440`（Symbolic Registry, HTTP） |
-| L3 | `tls://192.168.0.7:9443`（TLS 1.3） |
+| L2 | `http://198.51.100.7:9440`（Symbolic Registry, HTTP） |
+| L3 | `tls://198.51.100.7:9443`（TLS 1.3） |
 | 部屋の既存サービス | mini_lustre が 9001/9002 を使用中。**別ポートで試験し、止めていない** |
 
 ---
@@ -103,7 +103,7 @@ OK   衝突コピー 0 件
 
 ```bash
 # Pi5 側
-ssh -i ~/.ssh/pi-mock-test yy@192.168.0.7
+ssh -i ~/.ssh/pi-mock-test operator@198.51.100.7
 cd ~/src/dfs
 python3 -m dfs.cli serve --bind 0.0.0.0 \
   --registry-port 9440 --ost-port 9443 \

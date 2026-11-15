@@ -176,7 +176,7 @@ class RcloneCase(unittest.TestCase):
 
     def test_registry_host_only_gets_default_port(self) -> None:
         """--registry はホスト名だけでよい（ポートを補う）。"""
-        self.assertEqual(normalize_registry("172.16.1.60"), "http://172.16.1.60:9440")
+        self.assertEqual(normalize_registry("192.0.2.60"), "http://192.0.2.60:9440")
         self.assertEqual(normalize_registry("http://host:1234"), "http://host:1234")
         self.assertEqual(normalize_registry("host", 19440), "http://host:19440")
         self.assertEqual(normalize_registry("https://host/"), "https://host:9440")

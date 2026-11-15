@@ -71,24 +71,24 @@ def _start_http_ost_server(tmp_path: Path):
 
 def test_parse_and_normalize_ost_endpoints() -> None:
     assert parse_ost_endpoint("127.0.0.1:19441") == ("127.0.0.1", 19441, "tls://127.0.0.1:19441")
-    assert parse_ost_endpoint("tls://ost.dfs.yashiki.top:443") == (
-        "ost.dfs.yashiki.top",
+    assert parse_ost_endpoint("tls://ost.dfs.example.com:443") == (
+        "ost.dfs.example.com",
         443,
-        "tls://ost.dfs.yashiki.top:443",
+        "tls://ost.dfs.example.com:443",
     )
-    assert parse_ost_endpoint("https://dfs.yashiki.top/") == (
-        "dfs.yashiki.top",
+    assert parse_ost_endpoint("https://dfs.example.com/") == (
+        "dfs.example.com",
         443,
-        "https://dfs.yashiki.top",
+        "https://dfs.example.com",
     )
     assert parse_ost_endpoint("http://127.0.0.1:19440/sub/") == (
         "127.0.0.1",
         19440,
         "http://127.0.0.1:19440/sub",
     )
-    assert isinstance(make_ost_client("https://dfs.yashiki.top"), HttpOSTClient)
-    assert isinstance(make_ost_client("tls://dfs.yashiki.top:443"), OSTClient)
-    assert Remote.normalize_ost("https://dfs.yashiki.top/") == "https://dfs.yashiki.top"
+    assert isinstance(make_ost_client("https://dfs.example.com"), HttpOSTClient)
+    assert isinstance(make_ost_client("tls://dfs.example.com:443"), OSTClient)
+    assert Remote.normalize_ost("https://dfs.example.com/") == "https://dfs.example.com"
     assert Remote.normalize_ost("tls://127.0.0.1:19441") == "127.0.0.1:19441"
 
 

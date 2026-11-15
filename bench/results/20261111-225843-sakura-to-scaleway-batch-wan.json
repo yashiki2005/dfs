@@ -6,9 +6,9 @@
   "environment": {
     "control_host": "macOS-27.3-arm64-arm-64bit",
     "control_python": "3.12.16",
-    "server_host": "172.16.1.60",
-    "server_ssh": "ubuntu@172.16.1.60",
-    "client_ssh": "ubuntu@yashiki.top",
+    "server_host": "192.0.2.60",
+    "server_ssh": "deploy@192.0.2.60",
+    "client_ssh": "deploy@example.com",
     "l2_port": 19440,
     "l3_port": 19443,
     "files": 20,
@@ -20,7 +20,7 @@
   },
   "steps": [
     {
-      "step": "RTT 計測（172.16.1.60）",
+      "step": "RTT 計測（192.0.2.60）",
       "ok": true,
       "detail": "avg=275.112 ms"
     },
@@ -88,7 +88,7 @@
     {
       "step": "L1 委譲登録（サーバの L2）",
       "ok": true,
-      "detail": "[dfs delegate] Registered on http://172.16.1.60:19440: path=/example.com/alice/notes epoch=1 base_version=0",
+      "detail": "[dfs delegate] Registered on http://192.0.2.60:19440: path=/example.com/alice/notes epoch=1 base_version=0",
       "elapsed_ms": 4587.4
     },
     {
@@ -168,7 +168,7 @@
     {
       "step": "通信断を失敗として返す（ハングしない）",
       "ok": true,
-      "detail": "rc=1 elapsed=936ms [UNAVAILABLE: L2/L3 Unreachable] Cannot reach L3 OST at 172.16.1.60:19443: [Errno 111] Connection refused",
+      "detail": "rc=1 elapsed=936ms [UNAVAILABLE: L2/L3 Unreachable] Cannot reach L3 OST at 192.0.2.60:19443: [Errno 111] Connection refused",
       "elapsed_ms": 936.0
     },
     {

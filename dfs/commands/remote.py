@@ -49,7 +49,7 @@ def _remote_domain_candidate(remote: _cm.Remote) -> str:
     name = (remote.name or "").strip().rstrip(".")
     host = (urlsplit(remote.registry).hostname or "").strip().rstrip(".")
     if _is_domain(host):
-        # 例: name="yashiki.top", registry="https://l2.yashiki.top" は親ドメイン名を優先。
+        # 例: name="example.com", registry="https://l2.example.com" は親ドメイン名を優先。
         # 例: name="backup.v1", registry="https://dfs.example.com" は registry ホストを優先。
         if _is_domain(name) and (host == name or host.endswith(f".{name}")):
             return name
@@ -122,7 +122,7 @@ def _probe_remote_status(remote: _cm.Remote) -> Dict[str, Any]:
     return status
 
 
-DEFAULT_ROOT_DFS_DOMAINS = ("yashiki.top",)
+DEFAULT_ROOT_DFS_DOMAINS = ("example.com",)
 
 
 def _probe_root_dfs_domain(domain: str) -> Dict[str, Any]:

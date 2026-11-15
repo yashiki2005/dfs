@@ -7,8 +7,8 @@ rclone ライクな dfs の CLI。
 「リモート名で場所を指す」操作体系を被せる。
 
     dfscli listremotes
-    dfscli config create scaleway --registry http://172.16.1.60:19440 \\
-        --ost 172.16.1.60:19443 --path /example.com/alice/notes \\
+    dfscli config create scaleway --registry http://192.0.2.60:19440 \\
+        --ost 192.0.2.60:19443 --path /example.com/alice/notes \\
         --key ~/.ssh/alice --secret <共有秘密>
     dfscli ls    scaleway:
     dfscli ls    scaleway:docs
@@ -80,7 +80,7 @@ from .discovery import (
 from .dnssec import Discovery, DiscoveryError, discover_domain
 from .invite import InviteError, decode_invite, encode_ro_invite, encode_rw_invite
 
-# L2 名簿の既定ポート。ホスト名だけで済むようにする（例: --registry 172.16.1.60）。
+# L2 名簿の既定ポート。ホスト名だけで済むようにする（例: --registry 192.0.2.60）。
 DEFAULT_REGISTRY_PORT = 9440
 # dfssvc が立てるサーバの既定。こちらは連続した空きを選ぶので 19440 から。
 DEFAULT_LOCAL_REGISTRY_PORT = 19440
@@ -1038,7 +1038,7 @@ from .commands.remote import (  # noqa: E402
 def normalize_registry(value: str, default_port: int = DEFAULT_REGISTRY_PORT) -> str:
     """``--registry`` を URL に正規化する。
 
-    ``172.16.1.60`` のようにホスト名（または IP）だけでも受け、足りない部分を補う。
+    ``192.0.2.60`` のようにホスト名（または IP）だけでも受け、足りない部分を補う。
 
     - スキームが無ければ ``http://`` を付ける
     - ポートが無ければ ``default_port`` を付ける
@@ -1378,7 +1378,7 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
     """``create`` と ``config create`` で共有する引数。"""
     p.add_argument(
         "--registry",
-        help=f"L2 名簿。ホスト名だけでよい（例: 172.16.1.60）。"
+        help=f"L2 名簿。ホスト名だけでよい（例: 192.0.2.60）。"
              f"ポートを省くと {DEFAULT_REGISTRY_PORT} を補う",
     )
     p.add_argument(
@@ -1389,7 +1389,7 @@ def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> No
         "--registry-alternate", action="append", default=[],
         help="読み取り用の代替 L2 名簿（複数指定可。書き込みは --registry のみ）",
     )
-    p.add_argument("--ost", help="L3 OST の host:port（例: 172.16.1.60:19443）")
+    p.add_argument("--ost", help="L3 OST の host:port（例: 192.0.2.60:19443）")
     p.add_argument(
         "--ost-cert-sha256",
         help="L3 OST の TLS 証明書 SHA-256 ピン（ローテーション時や厳格ピン留め用）",
@@ -1929,7 +1929,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument(
         "--public-url",
         default="",
-        help="案内表示用の公開 URL（例: https://yashiki.top/dfs）",
+        help="案内表示用の公開 URL（例: https://example.com/dfs）",
     )
     p_web.add_argument(
         "--secure-cookie",
@@ -1957,7 +1957,7 @@ def _lan_ip() -> str:
 
 
 def _resolve_self_claimed_domain_remote(name: str) -> Optional[Remote]:
-    """未登録のドメイン名（例: yashiki.top）を解決する。
+    """未登録のドメイン名（例: example.com）を解決する。
 
     実在する公開 root の偽装を防ぐため、先に ``_dfs.<domain>`` の TXT レコード有無を確認し、
     存在する場合は DNSSEC 検証済みレコードのみを受け入れる。TXT が無い場合のみ自称ドメインを許可する。

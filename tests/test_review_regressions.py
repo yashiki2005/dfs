@@ -681,16 +681,16 @@ class TestReviewRegressions(unittest.TestCase):
                 self.assertNotIn("stale", reloaded.remotes)
 
                 fake_reg = SimpleNamespace(
-                    root_anchor_info=lambda: {"root_pubkey": pub, "root_anchor": "/yashiki.top"}
+                    root_anchor_info=lambda: {"root_pubkey": pub, "root_anchor": "/example.com"}
                 )
                 with patch("dfs.dnssec.has_txt_record", return_value=False), patch.object(
                     cli_main, "_probe_registry_tcp", return_value=True
                 ), patch.object(
                     cli_mod, "RemoteRegistryClient", return_value=fake_reg
                 ):
-                    resolved = cli_main._resolve_remote(reloaded, "yashiki.top")
-                self.assertEqual(resolved.name, "yashiki.top")
-                self.assertEqual(resolved.path, "/yashiki.top")
+                    resolved = cli_main._resolve_remote(reloaded, "example.com")
+                self.assertEqual(resolved.name, "example.com")
+                self.assertEqual(resolved.path, "/example.com")
                 self.assertTrue(resolved.read_only)
 
                 # When _dfs.<domain> TXT exists, self-claimed TOFU fallback must NOT be allowed
@@ -700,7 +700,7 @@ class TestReviewRegressions(unittest.TestCase):
                     side_effect=cli_main.DiscoveryError("bad dnssec"),
                 ):
                     with self.assertRaises(cli_main.UsageError):
-                        cli_main._resolve_remote(reloaded, "yashiki.top")
+                        cli_main._resolve_remote(reloaded, "example.com")
 
     def test_join_dfs_domain_uses_dnssec_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -710,13 +710,13 @@ class TestReviewRegressions(unittest.TestCase):
             _, pub = _keypair(root, "w")
             cfg_file = home / "remotes.json"
             discovered = SimpleNamespace(
-                domain="yashiki.top",
-                primary_url="https://l2.yashiki.top",
+                domain="example.com",
+                primary_url="https://l2.example.com",
                 alternate_urls=[],
                 root_pubkey=pub,
-                root_fingerprint="fp-yashiki",
+                root_fingerprint="fp-example",
                 epoch=1,
-                root_anchor="/yashiki.top",
+                root_anchor="/example.com",
                 dnssec_validated=True,
             )
             class FailReg:
@@ -731,7 +731,7 @@ class TestReviewRegressions(unittest.TestCase):
                     pass
 
                 def list_paths(self):
-                    return {"root_anchor": "/yashiki.top", "root_pubkey": pub, "paths": {}}
+                    return {"root_anchor": "/example.com", "root_pubkey": pub, "paths": {}}
 
             with patch.dict(
                 os.environ,
@@ -744,9 +744,9 @@ class TestReviewRegressions(unittest.TestCase):
                 ), patch(
                     "dfs.relay.discover_ice_candidates", return_value=[]
                 ):
-                    rc_fail = cli_main.main(["join", "dfs://yashiki.top"])
+                    rc_fail = cli_main.main(["join", "dfs://example.com"])
                 self.assertNotEqual(rc_fail, 0)
-                self.assertNotIn("yashiki.top", RemoteStore(cfg_file).remotes)
+                self.assertNotIn("example.com", RemoteStore(cfg_file).remotes)
 
                 with patch("dfs.dnssec.has_txt_record", return_value=True), patch.object(
                     cli_main, "discover_domain", return_value=discovered
@@ -755,14 +755,14 @@ class TestReviewRegressions(unittest.TestCase):
                 ), patch(
                     "dfs.relay.discover_ice_candidates", return_value=[]
                 ):
-                    rc = cli_main.main(["join", "dfs://yashiki.top"])
+                    rc = cli_main.main(["join", "dfs://example.com"])
                 self.assertEqual(rc, 0)
                 mock_discover.assert_called_once()
                 reloaded = RemoteStore(cfg_file)
-                remote = reloaded.get("yashiki.top")
+                remote = reloaded.get("example.com")
                 self.assertIsNotNone(remote)
-                self.assertEqual(remote.registry, "https://l2.yashiki.top")
-                self.assertEqual(remote.path, "/yashiki.top")
+                self.assertEqual(remote.registry, "https://l2.example.com")
+                self.assertEqual(remote.path, "/example.com")
                 self.assertEqual(remote.root_pubkey, pub)
                 self.assertTrue(remote.read_only)
 
@@ -774,10 +774,10 @@ class TestReviewRegressions(unittest.TestCase):
             cfg_file = home / "remotes.json"
             store = RemoteStore(cfg_file)
             remote = Remote(
-                name="yashiki.top",
-                registry="https://l2.yashiki.top",
+                name="example.com",
+                registry="https://l2.example.com",
                 key="",
-                path="/yashiki.top",
+                path="/example.com",
                 secret="",
                 read_only=True,
             )
@@ -785,18 +785,18 @@ class TestReviewRegressions(unittest.TestCase):
             with patch.dict(os.environ, {"DFS_HOME": str(home), "DFS_CONFIG": str(cfg_file)}):
                 with patch.object(cli_main, "prompt_secret", return_value="") as mock_empty:
                     with self.assertRaises(cli_main.UsageError):
-                        cli_main._ensure_remote_secret(RemoteStore(cfg_file).get("yashiki.top"))
+                        cli_main._ensure_remote_secret(RemoteStore(cfg_file).get("example.com"))
                 mock_empty.assert_called_once()
 
                 with patch.object(
                     cli_main, "prompt_secret", return_value="my-shared-secret"
                 ) as mock_prompt:
                     updated = cli_main._ensure_remote_secret(
-                        RemoteStore(cfg_file).get("yashiki.top")
+                        RemoteStore(cfg_file).get("example.com")
                     )
                 mock_prompt.assert_called_once()
                 self.assertEqual(updated.secret, "my-shared-secret")
-                self.assertEqual(RemoteStore(cfg_file).get("yashiki.top").secret, "my-shared-secret")
+                self.assertEqual(RemoteStore(cfg_file).get("example.com").secret, "my-shared-secret")
 
     def test_listremotes_queries_l2_and_dnssec_status(self) -> None:
         import io
@@ -821,10 +821,10 @@ class TestReviewRegressions(unittest.TestCase):
             )
             store.set(
                 Remote(
-                    name="yashiki.top",
-                    registry="https://l2.yashiki.top",
+                    name="example.com",
+                    registry="https://l2.example.com",
                     key="",
-                    path="/yashiki.top",
+                    path="/example.com",
                     root_pubkey=pub,
                     read_only=True,
                 )
@@ -838,18 +838,18 @@ class TestReviewRegressions(unittest.TestCase):
                     if "root.example.net" in self.url:
                         return {"root_anchor": "/", "root_pubkey": pub, "paths": {"/a": {}}}
                     return {
-                        "root_anchor": "/yashiki.top",
+                        "root_anchor": "/example.com",
                         "root_pubkey": pub,
-                        "paths": {"/yashiki.top/d1": {}, "/yashiki.top/d2": {}},
+                        "paths": {"/example.com/d1": {}, "/example.com/d2": {}},
                     }
 
             discovered = SimpleNamespace(
-                domain="yashiki.top",
-                primary_url="https://l2.yashiki.top",
+                domain="example.com",
+                primary_url="https://l2.example.com",
                 alternate_urls=[],
                 root_pubkey=pub,
                 epoch=1,
-                root_anchor="/yashiki.top",
+                root_anchor="/example.com",
                 dnssec_validated=True,
             )
 
@@ -859,7 +859,7 @@ class TestReviewRegressions(unittest.TestCase):
                 cli_mod, "RemoteRegistryClient", FakeReg
             ), patch(
                 "dfs.dnssec.has_txt_record",
-                side_effect=lambda rec: rec == "_dfs.yashiki.top",
+                side_effect=lambda rec: rec == "_dfs.example.com",
             ), patch.object(
                 cli_main, "discover_domain", return_value=discovered
             ):
@@ -869,7 +869,7 @@ class TestReviewRegressions(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 out = buf.getvalue()
                 self.assertIn("root dfs (anchor=/, paths=1)", out)
-                self.assertIn("root dfs (anchor=/yashiki.top, paths=2), DNSSEC: verified (_dfs.yashiki.top)", out)
+                self.assertIn("root dfs (anchor=/example.com, paths=2), DNSSEC: verified (_dfs.example.com)", out)
 
                 buf_json = io.StringIO()
                 with redirect_stdout(buf_json):
@@ -879,12 +879,12 @@ class TestReviewRegressions(unittest.TestCase):
                 self.assertEqual(rows["root"]["role"], "root")
                 self.assertEqual(rows["root"]["paths_count"], 1)
                 self.assertIsNone(rows["root"]["dnssec"])
-                self.assertEqual(rows["yashiki.top"]["role"], "root")
-                self.assertEqual(rows["yashiki.top"]["paths_count"], 2)
-                self.assertEqual(rows["yashiki.top"]["dnssec"], "verified")
-                self.assertEqual(rows["yashiki.top"]["dnssec_record"], "_dfs.yashiki.top")
+                self.assertEqual(rows["example.com"]["role"], "root")
+                self.assertEqual(rows["example.com"]["paths_count"], 2)
+                self.assertEqual(rows["example.com"]["dnssec"], "verified")
+                self.assertEqual(rows["example.com"]["dnssec_record"], "_dfs.example.com")
 
-    def test_listremotes_empty_probes_builtin_root_yashiki_top(self) -> None:
+    def test_listremotes_empty_probes_builtin_root_example_com(self) -> None:
         import io
         from contextlib import redirect_stdout
 
@@ -900,15 +900,15 @@ class TestReviewRegressions(unittest.TestCase):
                     self.urls = urls
 
                 def list_paths(self):
-                    return {"root_anchor": "/yashiki.top", "root_pubkey": pub, "paths": {"/yashiki.top/a": {}}}
+                    return {"root_anchor": "/example.com", "root_pubkey": pub, "paths": {"/example.com/a": {}}}
 
             discovered = SimpleNamespace(
-                domain="yashiki.top",
-                primary_url="https://l2.yashiki.top",
+                domain="example.com",
+                primary_url="https://l2.example.com",
                 alternate_urls=[],
                 root_pubkey=pub,
                 epoch=1,
-                root_anchor="/yashiki.top",
+                root_anchor="/example.com",
                 dnssec_validated=True,
             )
 
@@ -918,7 +918,7 @@ class TestReviewRegressions(unittest.TestCase):
                 cli_mod, "RemoteRegistryClient", FakeReg
             ), patch(
                 "dfs.dnssec.has_txt_record",
-                side_effect=lambda rec: rec == "_dfs.yashiki.top",
+                side_effect=lambda rec: rec == "_dfs.example.com",
             ), patch.object(
                 cli_main, "discover_domain", return_value=discovered
             ):
@@ -928,8 +928,8 @@ class TestReviewRegressions(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 out = buf.getvalue()
                 self.assertIn("既定の root dfs:", out)
-                self.assertIn("dfs://yashiki.top/ -> https://l2.yashiki.top /yashiki.top [online, unregistered]", out)
-                self.assertIn("root dfs (anchor=/yashiki.top, paths=1), DNSSEC: verified (_dfs.yashiki.top)", out)
+                self.assertIn("dfs://example.com/ -> https://l2.example.com /example.com [online, unregistered]", out)
+                self.assertIn("root dfs (anchor=/example.com, paths=1), DNSSEC: verified (_dfs.example.com)", out)
 
     def test_serve_accepts_relay_hub_flag(self) -> None:
         args = cli_mod.build_parser().parse_args(["serve", "--root-pubkey", "dummy.pub", "--relay-hub"])
@@ -951,15 +951,15 @@ class TestReviewRegressions(unittest.TestCase):
                     pass
 
                 def list_paths(self):
-                    return {"root_anchor": "/yashiki.top", "root_pubkey": pub, "paths": {}}
+                    return {"root_anchor": "/example.com", "root_pubkey": pub, "paths": {}}
 
             discovered = SimpleNamespace(
-                domain="yashiki.top",
-                primary_url="https://l2.yashiki.top",
+                domain="example.com",
+                primary_url="https://l2.example.com",
                 alternate_urls=[],
                 root_pubkey=pub,
                 epoch=1,
-                root_anchor="/yashiki.top",
+                root_anchor="/example.com",
                 dnssec_validated=True,
             )
 
@@ -994,7 +994,7 @@ class TestReviewRegressions(unittest.TestCase):
                 ), patch.object(
                     svc_mod, "main", return_value=0
                 ) as mock_svc_main:
-                    rc = cli_main.main(["join", "--name", "local", "dfs://yashiki.top"])
+                    rc = cli_main.main(["join", "--name", "local", "dfs://example.com"])
                 self.assertEqual(rc, 0)
                 mock_svc_main.assert_called_once_with(["start", "--name", "local", "--force"])
 
@@ -1014,15 +1014,15 @@ class TestReviewRegressions(unittest.TestCase):
                     pass
 
                 def list_paths(self):
-                    return {"root_anchor": "/yashiki.top", "root_pubkey": pub, "paths": {}}
+                    return {"root_anchor": "/example.com", "root_pubkey": pub, "paths": {}}
 
             discovered = SimpleNamespace(
-                domain="yashiki.top",
-                primary_url="https://l2.yashiki.top",
+                domain="example.com",
+                primary_url="https://l2.example.com",
                 alternate_urls=[],
                 root_pubkey=pub,
                 epoch=1,
-                root_anchor="/yashiki.top",
+                root_anchor="/example.com",
                 dnssec_validated=True,
             )
 
@@ -1041,7 +1041,7 @@ class TestReviewRegressions(unittest.TestCase):
                 ), patch(
                     "socket.gethostname", return_value="mac-test"
                 ):
-                    rc = cli_main.main(["join", "--name", "local", "dfs://yashiki.top"])
+                    rc = cli_main.main(["join", "--name", "local", "dfs://example.com"])
                 self.assertEqual(rc, 0)
                 expected_id = cli_main.default_subtree_name("203.0.113.10", "mac-test")
                 self.assertEqual(
@@ -1054,7 +1054,7 @@ class TestReviewRegressions(unittest.TestCase):
                 )
                 remote = RemoteStore(cfg_file).get("local")
                 self.assertEqual(remote.key, str(writer_priv))
-                self.assertEqual(remote.path, f"/yashiki.top/{expected_id}")
+                self.assertEqual(remote.path, f"/example.com/{expected_id}")
                 self.assertFalse(remote.read_only)
 
     def test_open_remote_resets_pin_when_subtree_changes(self) -> None:
@@ -1087,10 +1087,10 @@ class TestReviewRegressions(unittest.TestCase):
             )
             remote = Remote(
                 name="local",
-                registry="https://l2.yashiki.top",
+                registry="https://l2.example.com",
                 key=str(priv),
                 ost="127.0.0.1:19441",
-                path="/yashiki.top/new_node",
+                path="/example.com/new_node",
                 secret="s",
                 workdir=str(workdir),
                 root_pubkey=pub,
@@ -1113,7 +1113,7 @@ class TestReviewRegressions(unittest.TestCase):
             ost_dir = root / "ost"
             ost_dir.mkdir()
             pstate = cli_mod.PersistentRegistryState(
-                state_dir, "/yashiki.top", root_pub, chunks_dir=ost_dir
+                state_dir, "/example.com", root_pub, chunks_dir=ost_dir
             )
             pstate.auto_delegate_key = root_priv
             handler = cli_mod.make_registry_http_handler(pstate, None)  # type: ignore[arg-type]
@@ -1122,23 +1122,23 @@ class TestReviewRegressions(unittest.TestCase):
             t.start()
             try:
                 client = cli_mod.RemoteRegistryClient(f"http://127.0.0.1:{httpd.server_port}")
-                res_a = client.auto_delegate("/yashiki.top/nodeA", pub_a)
+                res_a = client.auto_delegate("/example.com/nodeA", pub_a)
                 self.assertTrue(res_a["ok"])
 
                 # 同一書き手なら冪等に成功
-                res_a2 = client.auto_delegate("/yashiki.top/nodeA", pub_a)
+                res_a2 = client.auto_delegate("/example.com/nodeA", pub_a)
                 self.assertTrue(res_a2.get("already_registered"))
 
                 # 別の書き手による既存パスの乗っ取りは拒否
                 with self.assertRaises(cli_mod.ConflictError):
-                    client.auto_delegate("/yashiki.top/nodeA", pub_b)
+                    client.auto_delegate("/example.com/nodeA", pub_b)
 
                 # 多段パスは拒否
                 with self.assertRaises(cli_mod.RegistryError):
-                    client.auto_delegate("/yashiki.top/nodeA/sub", pub_b)
+                    client.auto_delegate("/example.com/nodeA/sub", pub_b)
 
                 # 未使用の直下パスなら別の書き手も参加可能
-                res_b = client.auto_delegate("/yashiki.top/nodeB", pub_b)
+                res_b = client.auto_delegate("/example.com/nodeB", pub_b)
                 self.assertTrue(res_b["ok"])
             finally:
                 httpd.shutdown()
@@ -1155,9 +1155,9 @@ class TestReviewRegressions(unittest.TestCase):
         )
         self.assertEqual(
             cli_main._remote_domain_candidate(
-                Remote(name="yashiki.top", registry="https://l2.yashiki.top", key="")
+                Remote(name="example.com", registry="https://l2.example.com", key="")
             ),
-            "yashiki.top",
+            "example.com",
         )
         self.assertEqual(
             cli_main._remote_domain_candidate(

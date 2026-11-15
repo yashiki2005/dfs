@@ -12,7 +12,7 @@ PLAN.md 段階 5: Mac と Pi5 の実機で 1 つのツリーを共有する。
 数値と結果を JSON で残す（環境・RTT・各版の所要時間）。
 
 使い方:
-    python bench/e2e_lan.py --pi5 yy@192.168.0.7 --key ~/.ssh/pi-mock-test
+    python bench/e2e_lan.py --pi5 operator@198.51.100.7 --key ~/.ssh/pi-mock-test
 """
 
 from __future__ import annotations
@@ -47,8 +47,8 @@ def rtt_ms(host: str, count: int = 10) -> float | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pi5", default="yy@192.168.0.7")
-    ap.add_argument("--pi5-host", default="192.168.0.7")
+    ap.add_argument("--pi5", default="operator@198.51.100.7")
+    ap.add_argument("--pi5-host", default="198.51.100.7")
     ap.add_argument("--key", default="~/.ssh/pi-mock-test")
     ap.add_argument("--work", default="/tmp/dfs_e2e")
     ap.add_argument("--py", default=str(Path.home() / "dfs-venv" / "bin" / "python"))

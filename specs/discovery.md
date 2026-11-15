@@ -39,8 +39,8 @@ SSH 署名 namespace は `dfs-candidacy-v1`、identity は `root_anchor` とす�
     "expires_at": 1738281600,
     "issued_at": 1735689600,
     "registries": [
-      {"role": "primary", "url": "http://172.16.1.60:9440"},
-      {"role": "secondary", "url": "http://172.16.1.61:9440"}
+      {"role": "primary", "url": "http://192.0.2.60:9440"},
+      {"role": "secondary", "url": "http://192.0.2.61:9440"}
     ],
     "root_anchor": "/example.com",
     "root_pubkey": "ssh-ed25519 AAAA...",

@@ -156,10 +156,10 @@ class TestCliAndSvcE2E(unittest.TestCase):
         self.assertIn("e2e", out)
 
         with patch.object(cli_main, "_probe_root_dfs_domain", return_value={
-            "name": "yashiki.top",
+            "name": "example.com",
             "registered": False,
             "registry": "",
-            "path": "/yashiki.top",
+            "path": "/example.com",
             "online": False,
             "l2_ok": None,
             "l2_error": "",
@@ -167,7 +167,7 @@ class TestCliAndSvcE2E(unittest.TestCase):
             "root_anchor": "",
             "paths_count": None,
             "dnssec": "none",
-            "dnssec_record": "_dfs.yashiki.top",
+            "dnssec_record": "_dfs.example.com",
             "dnssec_error": "",
         }):
             rc, out, err = _run_cli(["listremotes"])

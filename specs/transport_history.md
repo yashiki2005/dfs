@@ -11,7 +11,7 @@
 3. **BitTorrent アーカイブ ([dfs/archive.py](../dfs/archive.py))**
    - 固定バージョンの巨大データセット配布には有効だが、UDP/DHT/着信ポート待ちが制限環境と相性が悪く、小刻みな差分更新にも向かない。
 4. **HTTPS OST + Direct-first HTTP リレー ([dfs/l3_ost_adapter.py](../dfs/l3_ost_adapter.py), [dfs/relay.py](../dfs/relay.py))**
-   - Python 標準ライブラリのみで `443/tcp` を確実に貫通し、直接通信できる場合はリレー (`dfs.yashiki.top`) を使わない。
+   - Python 標準ライブラリのみで `443/tcp` を確実に貫通し、直接通信できる場合はリレー (`dfs.example.com`) を使わない。
 
 ---
 
@@ -26,4 +26,4 @@
   - `dfs[libp2p]` が入っている環境では `Libp2pChunkClient` もそのまま Swarm プールに参加させられる。
 - **HTTPS / HTTP リレーの良いところ（確実な最後の砦）**:
   - `/relay/` エンドポイントは **フォールバック層（Relay Tier）** に分離し、直接ピア／複製ピア／QUIC ピアのいずれでも取れなかったチャンクだけをリレー経由で取得する。
-  - これにより、パブリックリレー (`dfs.yashiki.top`) の負荷を抑えつつ、制限環境でも必ず完了する。
+  - これにより、パブリックリレー (`dfs.example.com`) の負荷を抑えつつ、制限環境でも必ず完了する。

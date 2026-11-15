@@ -25,7 +25,7 @@ L2 がどのバックエンド（名簿 / DHT / DNS）で実装されていて�
 キーを辞書順にソートし、余白を含まない 1 行の UTF-8 JSON（`dfs.crypto.canonical_json()`、末尾 LF 1 バイト）とする。
 
 ```json
-{"delegation_epoch":1,"endpoints":["tls://192.168.1.50:9443"],"expires_at":1763086400,"head_hash":"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9","head_version":2,"path":"/example.com/alice","ttl":300}
+{"delegation_epoch":1,"endpoints":["tls://198.51.100.50:9443"],"expires_at":1763086400,"head_hash":"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9","head_version":2,"path":"/example.com/alice","ttl":300}
 ```
 
 | フィールド | 意味 |

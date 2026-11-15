@@ -3,7 +3,7 @@
   "measured_at_utc": "2026-11-11T11:08:00+00:00",
   "environment": {
     "mac_platform": "macOS-27.3-arm64-arm-64bit",
-    "pi5_target": "yy@192.168.0.7",
+    "pi5_target": "operator@198.51.100.7",
     "rtt_avg_ms": 1.452
   },
   "steps": [

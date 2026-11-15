@@ -357,14 +357,14 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
             role="primary",
             addrs=["/ip4/127.0.0.1/tcp/1234/p2p/12D3KooWTestPeer"],
             sync_id="HxsWZRX7hQIUmdBA",
-            sub_path="/yashiki.top/HxsWZRX7hQIUmdBA",
+            sub_path="/example.com/HxsWZRX7hQIUmdBA",
         )
         info = hub.get_allowed_peers()
         self.assertEqual(info["peers"][0]["sync_id"], "HxsWZRX7hQIUmdBA")
-        self.assertEqual(info["peers"][0]["sub_path"], "/yashiki.top/HxsWZRX7hQIUmdBA")
+        self.assertEqual(info["peers"][0]["sub_path"], "/example.com/HxsWZRX7hQIUmdBA")
 
         ns = build_parser().parse_args([
-            "start", "--join", "https://l2.yashiki.top",
+            "start", "--join", "https://l2.example.com",
             "--subscribe", "ID1", "--subscribe", "ID2",
         ])
         self.assertEqual(ns.subscribe, ["ID1", "ID2"])

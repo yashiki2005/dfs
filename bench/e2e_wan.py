@@ -17,14 +17,14 @@ dfs サーバへ push/pull し、高遅延・往復回数・耐障害性を測�
 
 使い方（WAN, Mac → Scaleway）:
     python bench/e2e_wan.py --mode wan --label mac-to-scaleway \
-        --server-host 172.16.1.60 --server-ssh ubuntu@172.16.1.60 \
+        --server-host 192.0.2.60 --server-ssh deploy@192.0.2.60 \
         --server-key ~/.ssh/pi-mock-test
 
 使い方（WAN, Pi5 → Scaleway。クライアントは ssh 先）:
     python bench/e2e_wan.py --mode wan --label pi5-to-scaleway \
-        --server-host 172.16.1.60 --server-ssh ubuntu@172.16.1.60 \
+        --server-host 192.0.2.60 --server-ssh deploy@192.0.2.60 \
         --server-key ~/.ssh/pi-mock-test \
-        --client-ssh yy@192.168.0.7 --client-key ~/.ssh/pi-mock-test
+        --client-ssh operator@198.51.100.7 --client-key ~/.ssh/pi-mock-test
 """
 
 from __future__ import annotations

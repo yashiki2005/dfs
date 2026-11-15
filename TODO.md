@@ -298,9 +298,9 @@ cd ~/src/dfs
 
 | 拠点 | 接続 | 備考 |
 |---|---|---|
-| Scaleway | `ubuntu@172.16.1.60`（公開 `51.15.35.162`） | RTT 約 285ms。`ListenPort` 固定済み |
-| Sakura | `ubuntu@yashiki.top`（172.16.1.254） | ハブ。RTT 約 21ms。keepalive 対称 |
-| Pi5 | `yy@192.168.0.7` | RTT 約 0.5ms |
+| Scaleway | `deploy@192.0.2.60`（公開 `203.0.113.162`） | RTT 約 285ms。`ListenPort` 固定済み |
+| Sakura | `deploy@example.com`（192.0.2.254） | ハブ。RTT 約 21ms。keepalive 対称 |
+| Pi5 | `operator@198.51.100.7` | RTT 約 0.5ms |
 
 **注意**: WireGuard の経路は不安定なときがある。テスト中に Mac → Scaleway が数分不通に
 なった（公開 IP と Sakura 経由では到達できた）。断が起きたら時刻を控えると追いやすい。
