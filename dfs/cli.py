@@ -1316,6 +1316,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
             ],
             check=True,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=60,
         )
 
     ost = ChunkStoreServer(
@@ -1446,12 +1448,20 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     # L2 の受付を libp2p 初期化から分離する。P2P/DHT の起動や DNS
     # 公開が遅い環境でも、dfssvc の起動確認と HTTP API は先に利用可能にする。
+    http_started = threading.Event()
+
+    def _serve_http() -> None:
+        http_started.set()
+        httpd.serve_forever()
+
     httpd_thread = threading.Thread(
-        target=httpd.serve_forever,
+        target=_serve_http,
         name="dfs-l2-http",
         daemon=True,
     )
     httpd_thread.start()
+    if not http_started.wait(timeout=5.0):
+        raise RuntimeError("L2 HTTP server did not start")
     threading.Thread(target=_watch_stop, daemon=True).start()
 
     p2p_manager = None

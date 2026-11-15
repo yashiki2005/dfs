@@ -352,7 +352,10 @@ def ensure_root_key(path: Path) -> Path:
     res = subprocess.run(
         ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"dfssvc-root@{socket.gethostname()}",
          "-f", str(path)],
-        capture_output=True, text=True,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if res.returncode != 0:
         raise ServiceError(f"root 鍵を作れませんでした: {res.stderr.strip()}")
@@ -368,7 +371,10 @@ def ensure_writer_key(path: Path) -> Path:
     res = subprocess.run(
         ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"dfssvc-writer@{socket.gethostname()}",
          "-f", str(path)],
-        capture_output=True, text=True,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if res.returncode != 0:
         raise ServiceError(f"書き手の鍵を作れませんでした: {res.stderr.strip()}")
@@ -419,7 +425,14 @@ def register_delegation(
         "--registry", registry_url,
         "--ttl-days", str(int(ttl_days)),
     ]
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+    res = subprocess.run(
+        cmd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
     if res.returncode != 0:
         raise ServiceError(
             "委譲の登録に失敗しました: " + (res.stderr.strip() or res.stdout.strip())
@@ -485,7 +498,14 @@ def register_delegation_chain_step(
         "--registry", registry_url,
         "--ttl-days", str(int(ttl_days)),
     ]
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+    res = subprocess.run(
+        cmd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
     if res.returncode != 0:
         raise ServiceError(
             f"中間の委譲 ({child}) の登録に失敗しました: "
@@ -720,11 +740,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         if args.writer_key
         else (Path(existing.writer_key).expanduser() if existing and existing.writer_key else base / "keys" / "writer")
     )
-    log_path = (
-        Path(existing.log_path).expanduser()
-        if existing and existing.log_path
-        else base / "serve.log"
-    )
+    # サービス状態と一緒に消えないよう、ログはdfsのトップレベルへ固定する。
+    log_path = _repo_root() / "serve.log"
 
     ensure_private_dir(base)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -834,7 +851,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     if args.foreground:
         print("[dfssvc] 前面で起動します（Ctrl-C で停止）")
-        proc = subprocess.Popen(cmd, env=env)
+        proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL)
     else:
         with open(log_path, "ab") as log:
             proc = subprocess.Popen(
@@ -843,13 +860,20 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
 
     if not wait_for_l2(registry_url, timeout=args.wait):
+        tail = ""
+        if not args.foreground and log_path.is_file():
+            tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
         if proc.poll() is not None:
-            if not args.foreground and log_path.is_file():
-                tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
-                raise ServiceError(f"サーバが起動しませんでした（終了コード {proc.returncode}）:\n{tail}")
-            raise ServiceError(f"サーバが起動しませんでした（終了コード {proc.returncode}）")
+            detail = f"\n{tail}" if tail else ""
+            raise ServiceError(
+                f"サーバが起動しませんでした（終了コード {proc.returncode}）:{detail}"
+            )
         _terminate(proc)
-        raise ServiceError(f"L2 ({registry_url}) が {args.wait:.0f} 秒以内に応答しませんでした")
+        detail = f"\n{tail}" if tail else ""
+        raise ServiceError(
+            f"L2 ({registry_url}) が {args.wait:.0f} 秒以内に応答しませんでした"
+            f"（ログ: {log_path}）:{detail}"
+        )
 
     # サーバ本体の PID を state_dir/serve.pid から取る（Windows の venv 版
     # python.exe は本体を子プロセスで起動するので proc.pid は当てにならない）。

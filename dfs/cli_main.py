@@ -2154,6 +2154,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     norm_argv = _normalize_intermixed_archive_argv(raw_argv)
     parser = translate_parser(build_parser(), _)
     args = parser.parse_args(norm_argv)
+    if hasattr(args, "no_prompt") and not sys.stdin.isatty():
+        # PTYが無いCI・パイプ実行では、明示指定がなくても端末入力を待たない。
+        args.no_prompt = True
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:
