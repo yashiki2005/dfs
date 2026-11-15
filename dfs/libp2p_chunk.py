@@ -1544,9 +1544,47 @@ def sync_from_peers(
     fetched = 0
     fetched_bytes = 0
     per_peer: Dict[str, int] = {}
+    write_sem = threading.Semaphore(8)
+    write_futs: List[Any] = []
+    writer_pool = ThreadPoolExecutor(max_workers=2)
+
+    def _persist_batch(
+        pid: str,
+        batch: List[str],
+        blobs: Dict[str, bytes],
+        is_endgame: bool,
+    ) -> None:
+        nonlocal fetched, fetched_bytes
+        try:
+            newly_put: List[Tuple[str, int]] = []
+            for wid, blob in blobs.items():
+                with lock:
+                    already = wid in completed
+                if already:
+                    continue
+                if _store_put(store, wid, blob):
+                    newly_put.append((wid, len(blob)))
+            with lock:
+                for wid in batch:
+                    cnt = inflight.get(wid, 0)
+                    if cnt <= 1:
+                        inflight.pop(wid, None)
+                    else:
+                        inflight[wid] = cnt - 1
+                for wid, blen in newly_put:
+                    if wid not in completed:
+                        completed.add(wid)
+                        fetched += 1
+                        fetched_bytes += blen
+                        per_peer[pid] = per_peer.get(pid, 0) + 1
+                for wid in batch:
+                    if wid not in completed and not _store_contains(store, wid):
+                        if not is_endgame:
+                            remaining.setdefault(wid, None)
+        finally:
+            write_sem.release()
 
     def _worker(pid: str) -> None:
-        nonlocal fetched, fetched_bytes
         with lock:
             entry = active_peers_map.get(pid)
         if entry is None:
@@ -1605,31 +1643,10 @@ def sync_from_peers(
             if adaptive_batch:
                 cur_step = _adapt_batch_size(cur_step, time.monotonic() - t_req, failed=False)
             consec_err = 0
-            newly_put: List[Tuple[str, int]] = []
-            for wid, blob in blobs.items():
-                with lock:
-                    already = wid in completed
-                if already:
-                    continue
-                if _store_put(store, wid, blob):
-                    newly_put.append((wid, len(blob)))
+            write_sem.acquire()
+            wf = writer_pool.submit(_persist_batch, pid, batch, blobs, is_endgame)
             with lock:
-                for wid in batch:
-                    cnt = inflight.get(wid, 0)
-                    if cnt <= 1:
-                        inflight.pop(wid, None)
-                    else:
-                        inflight[wid] = cnt - 1
-                for wid, blen in newly_put:
-                    if wid not in completed:
-                        completed.add(wid)
-                        fetched += 1
-                        fetched_bytes += blen
-                        per_peer[pid] = per_peer.get(pid, 0) + 1
-                for wid in batch:
-                    if wid not in completed and not _store_contains(store, wid):
-                        if not is_endgame:
-                            remaining.setdefault(wid, None)
+                write_futs.append(wf)
 
     with ThreadPoolExecutor(max_workers=16) as pool:
         futs = [
@@ -1668,6 +1685,9 @@ def sync_from_peers(
                                 futs.append(pool.submit(_worker, npid))
         for f in futs:
             f.result()
+    for wf in write_futs:
+        wf.result()
+    writer_pool.shutdown(wait=True)
 
     return {
         "remote_total": len(all_wids_ordered),
