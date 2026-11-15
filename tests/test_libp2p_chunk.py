@@ -763,6 +763,26 @@ class TestLibp2pHostManagerAndDHT(unittest.TestCase):
 
         self.assertEqual(soap_calls, ["AddPortMapping", "GetExternalIPAddress", "DeletePortMapping"])
 
+    def test_connection_summary_reports_direct_and_ipv6(self) -> None:
+        from dfs.libp2p_chunk import Libp2pHostManager, sync_from_peers
+
+        s_store = {hashlib.sha256(b"dcutr-vis").hexdigest(): b"dcutr-vis"}
+        d_store: dict[str, bytes] = {}
+        s_mgr = Libp2pHostManager(
+            store=s_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        d_mgr = Libp2pHostManager(
+            store=d_store, listen=["/ip4/127.0.0.1/udp/0/quic-v1"], enable_dht=False
+        ).start()
+        self.addCleanup(s_mgr.close)
+        self.addCleanup(d_mgr.close)
+
+        sync_from_peers(d_mgr, d_store, [(s_mgr.peer_id, s_mgr.addrs)])
+        summary = d_mgr.connection_summary()
+        self.assertGreaterEqual(summary["total"], 1)
+        self.assertGreaterEqual(summary["direct"], 1)
+        self.assertEqual(summary["relayed"], 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

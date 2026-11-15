@@ -1130,6 +1130,78 @@ class Libp2pHostManager:
         except Exception:
             return []
 
+    def connection_summary(self) -> Dict[str, Any]:
+        """Return live peer connection transport breakdown (direct / relayed / ipv6)."""
+        if self._host is None or self._trio_token is None:
+            return {
+                "total": 0,
+                "direct": 0,
+                "relayed": 0,
+                "ipv6": 0,
+                "dcutr_active": self.dcutr_active,
+                "peers": {},
+            }
+
+        async def _go() -> Dict[str, Any]:
+            assert self._host is not None
+            conns = getattr(self._host.get_network(), "connections", {}) or {}
+            direct = 0
+            relayed = 0
+            ipv6 = 0
+            peers_map: Dict[str, List[str]] = {}
+            for pid, conn_list in conns.items():
+                items = conn_list if isinstance(conn_list, (list, tuple, set)) else [conn_list]
+                addrs: List[str] = []
+                has_direct = False
+                has_relay = False
+                has_ipv6 = False
+                for c in items:
+                    raddr = ""
+                    try:
+                        if hasattr(c, "get_remote_address"):
+                            raddr = str(c.get_remote_address() or "")
+                        elif hasattr(c, "muxed_conn") and hasattr(c.muxed_conn, "peer_address"):
+                            raddr = str(c.muxed_conn.peer_address or "")
+                    except Exception:
+                        raddr = ""
+                    if raddr:
+                        addrs.append(raddr)
+                        if "/p2p-circuit" in raddr:
+                            has_relay = True
+                        else:
+                            has_direct = True
+                        if "/ip6/" in raddr:
+                            has_ipv6 = True
+                if not addrs:
+                    has_direct = True
+                if has_direct:
+                    direct += 1
+                elif has_relay:
+                    relayed += 1
+                if has_ipv6:
+                    ipv6 += 1
+                peers_map[str(pid)] = addrs
+            return {
+                "total": len(conns),
+                "direct": direct,
+                "relayed": relayed,
+                "ipv6": ipv6,
+                "dcutr_active": self.dcutr_active,
+                "peers": peers_map,
+            }
+
+        try:
+            return self._run_sync(_go)
+        except Exception:
+            return {
+                "total": 0,
+                "direct": 0,
+                "relayed": 0,
+                "ipv6": 0,
+                "dcutr_active": self.dcutr_active,
+                "peers": {},
+            }
+
     def close(self) -> None:
         token = self._trio_token
         stop_ev = self._stop_event

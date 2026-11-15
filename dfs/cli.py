@@ -1497,6 +1497,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                         f"({stats['bytes']} B) [{peer_summary}]",
                                         flush=True,
                                     )
+                                    csum = p2p_manager.connection_summary()
+                                    print(
+                                        f"[dfs p2p] paths: total={csum['total']} direct={csum['direct']} "
+                                        f"relayed={csum['relayed']} ipv6={csum['ipv6']} dcutr={csum['dcutr_active']}",
+                                        flush=True,
+                                    )
                             except Exception:
                                 pass
                 except Exception:
