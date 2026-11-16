@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import subprocess
+import socket
 import threading
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -90,6 +92,19 @@ def test_parse_and_normalize_ost_endpoints() -> None:
     assert isinstance(make_ost_client("tls://dfs.example.com:443"), OSTClient)
     assert Remote.normalize_ost("https://dfs.example.com/") == "https://dfs.example.com"
     assert Remote.normalize_ost("tls://127.0.0.1:19441") == "127.0.0.1:19441"
+
+
+def test_bounded_http_server_does_not_reverse_resolve(monkeypatch) -> None:
+    def fail_getfqdn(_host):
+        raise AssertionError("server_bind must not call socket.getfqdn")
+
+    monkeypatch.setattr(socket, "getfqdn", fail_getfqdn)
+    httpd = BoundedThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    try:
+        assert httpd.server_name == "127.0.0.1"
+        assert httpd.server_port > 0
+    finally:
+        httpd.server_close()
 
 
 def test_http_ost_roundtrip_and_session(tmp_path: Path) -> None:

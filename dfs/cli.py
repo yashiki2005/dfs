@@ -28,6 +28,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 if __package__ in (None, ""):
@@ -387,6 +388,15 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             raise ValueError("max_workers must be >= 1")
         self._worker_slots = threading.BoundedSemaphore(max_workers)
         super().__init__(server_address, handler)
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind() は socket.getfqdn() で逆引きする。
+        # 分離ネットワークのCIランナーではこれが長時間止まることがあるため、
+        # 待受アドレスをそのままサーバー名として使う。
+        TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
     def process_request(self, request, client_address) -> None:
         if not self._worker_slots.acquire(blocking=False):
