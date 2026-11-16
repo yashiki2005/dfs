@@ -9,10 +9,6 @@ on:
 jobs:
   test:
     timeout-minutes: 30
-    env:
-      # macOS/Windowsではlibp2p常駐処理をサービス起動テストから分離する。
-      # Linuxでは従来どおり有効にしてP2P経路も検証する。
-      DFS_LIBP2P: ${{ runner.os == 'Linux' && '1' || '0' }}
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +29,10 @@ jobs:
         run: uv sync --extra test
 
       - name: Run pytest
+        env:
+          # macOS/Windowsではlibp2p常駐処理をサービス起動テストから分離する。
+          # Linuxでは従来どおり有効にしてP2P経路も検証する。
+          DFS_LIBP2P: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: uv run --extra test pytest -q --timeout=120 tests
 
   package:
