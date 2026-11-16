@@ -206,6 +206,108 @@ libp2p を OST の追加 ChunkSource として実装した。最初の TCP 試�
 | 名簿のキャッシュ | 実装済み（`.clayfs/l2_cache.json`、全 registry 停止時の読み取りフォールバック） |
 | 過去の版の取り出し（ロールバック） | 実装済み。`/v1/history` / `/v1/resolve?version` / `dfscli history` / `archive create --version` |
 
+### 2.8 2026-11-16 コードレビュー指摘
+
+基準コミットは `d0700d1`。既存の全テストは
+`.venv/bin/pytest -q` で **319 passed, 10 skipped**（Python 3.13 / macOS）。
+以下は動的テストでは検出されなかった項目を含む。
+
+#### 高優先度
+
+- [ ] **libp2pの応答を一括メモリ展開せず、累積サイズを制限する**
+  - 対象: `dfs/libp2p_chunk.py` の `Libp2pChunkServer._handle_stream()` と
+    `Libp2pHostManager._handle_stream()`。
+  - 現状: `G` 応答は最大65,536塊を `b"".join(parts)` で一つのbytesにしている。
+    各塊の上限は256MiBで、応答全体の上限は送信前に検査していない。
+  - 助長要因: 許可リスト未設定時は全Peerを許可し、`libp2p-serve` の既定起動も
+    allowlist / PSKなし。
+  - 修正: 応答全体を `MAX_FRAME_BYTES` 以下に制限する。大量応答はストリーミングする。
+    読み込みタイムアウトを追加する。public bind時の既定をallowlistまたはPSK必須にする。
+  - 回帰試験: 大量の `G` 要求で応答構築前に拒否されること、未許可Peerが拒否されること、
+    応答途中で閉じてもメモリ使用量が上限を超えないこと。
+
+- [ ] **信頼しないL2から読み込むHTTP応答にサイズ上限を設ける**
+  - 対象: `dfs/cli.py` の `RemoteRegistryClient._post_one()`。
+  - 現状: 正常応答とエラー応答の双方で `read()` がサイズ無制限。
+    サーバ側には8MiBの上限があるが、クライアント側にはない。
+  - 影響: L2が侵害または停止しているという脅威モデルにおいて、巨大応答で
+    クライアントをOOMさせられる。
+  - 修正: `Content-Length` を検査し、本文は `MAX_REGISTRY_BODY_BYTES + 1` バイトまで
+    ストリーム読み込みする。`discovery.fetch_candidacy()` など、同じ無制限 `read()` を
+    使う経路もまとめて修正する。
+  - 回帰試験: 上限超過の正常応答とエラー応答をローカルHTTPサーバから返し、
+    `RegistryError` または `ServiceUnavailableError` として拒否されること。
+
+#### 中優先度
+
+- [ ] **複数OSTストライピング時も全chunkを正しい取得元から複製する**
+  - 対象: `dfs/l4_log.py` の `MerkleTreeBuilder._replicate_chunks()`。
+  - 現状: 全 `wire_id` を既定OSTの `self.ost.batch_get()` から取得している。
+    他のOSTにだけ存在する塊は取得結果から静かに欠落し、警告も出ない。
+  - 再現結果: 2 OSTに3塊を分散したところ
+    `ost1=2`, `ost2=1`, `replica=2`, `missing_on_replica=1`, `warnings=`。
+  - 修正: `wire_id -> store_id` の対応を今回の版から保持し、取得元OSTごとに
+    `batch_get()` する。取得結果が要求IDを満たさない場合は警告または例外にする。
+  - 回帰試験: 2 OSTへのストライピングと複製OSTを同時に有効化し、
+    主OSTの全塊が複製先に存在すること。
+
+- [ ] **`dfscli listremotes --no-check` の `NameError` を修正する**
+  - 対象: `dfs/commands/remote.py` の `cmd_listremotes()`。
+  - 現状: 16文字の共有ID形式の部分木名で `re.fullmatch()` を呼ぶが、`re` がない。
+  - 再現結果: `[dfscli] 予期しないエラー: NameError: name 're' is not defined`。
+  - 修正: `import re` を追加する。
+  - 回帰試験: `/example.com/AbCdEfGhIjKlMnOp` のようなパスを登録し、
+    `listremotes --no-check` が正常終了すること。
+
+- [ ] **Webサーバの接続数、読み込み時間、アップロードメモリを制限する**
+  - 対象: `dfs/web.py` の `make_web_handler()` / `start_web_server()`。
+  - 現状: 無制限の `ThreadingHTTPServer` を使い、ヘッダーと本文の読み込みに
+    ソケットタイムアウトがない。アップロード本文も最大256MiBを一度にメモリへ読む。
+  - 影響: `--bind 0.0.0.0` でslowloris、過剰な同時接続、並列大容量アップロードにより
+    プロセスを枯渇させられる。
+  - 修正: 接続数制限付きHTTPサーバを使い、`setup()` で読み込みタイムアウトを設定する。
+    アップロードは一時ファイルへストリーミングし、同時アップロード数も制限する。
+  - 回帰試験: 接続数超過時の503、部分ヘッダーで停止した接続のタイムアウト、
+    上限サイズのアップロード時にメモリへ全量を保持しないこと。
+
+- [ ] **tar/archive展開に展開量の上限を設ける**
+  - 対象: `dfs/cli_main.py` の `_extract_tar_safely()`。
+  - 現状: パストラバーサル、symlink、hardlink、特殊ファイルは拒否するが、
+    合計展開サイズ、エントリ数、1ファイルのサイズ、圧縮率に上限がない。
+  - 影響: 信頼しないtarのimportでディスクや時間を枯渇させられる。
+  - 修正: 最大エントリ数、最大合計展開バイト数、最大単体サイズ、圧縮率上限を設ける。
+    展開前に空き容量も確認する。
+  - 回帰試験: 多数の小ファイル、単一巨大ファイル、高圧縮率のtarを作成し、
+    出力先へ展開する前に拒否されること。
+
+#### 低優先度・保守性
+
+- [ ] **秘密情報を含む設定を `write_private_json()` に統一する**
+  - 対象: `dfs/remotes.py` の `RemoteStore.save()` など。
+  - 現状: 予測可能な `*.tmp` に `tree_secret` を含むJSONを書いてから `chmod 0600` する。
+    クラッシュや差し替えの競合時に秘密が残る、または別ファイルへ書く余地がある。
+  - 修正: 既存の `dfs/private_io.py` を使い、`mkstemp`、0600、`fsync`、
+    `os.replace` に統一する。
+  - 回帰試験: 新規設定と既存設定の更新後、ファイルmodeが0600であること。
+    一時ファイルが予測可能な名前で作成されないこと。
+
+- [ ] **bootstrapでインストールするパッケージとダウンローダを固定・検証する**
+  - 対象: `scripts/bootstrap.sh` と `scripts/bootstrap_ro.sh`。
+  - 現状: `uv tool install --force dfs` はバージョンやハッシュを固定していない。
+    `uv` がない場合は `curl ... | sh` でインストーラを直接実行する。
+  - 修正: リリース版をバージョン固定し、配布物のSHA256を検証する。
+    必要なら署名検証も追加する。
+  - 回帰試験: 固定バージョンとハッシュが一致する場合だけインストールが進むこと。
+    改ざんされた配布物を拒否すること。
+
+- [ ] **静的解析と型検査をCIへ追加し、検出済みの診断を整理する**
+  - 現状: RuffのF系だけで未使用importが多数あり、未定義名も検出される。
+    `dfs/cli.py` の `Callable` / `Set`、`dfs/svc.py` の `Any` は
+    `from __future__ import annotations` により実行時エラーにはなっていない。
+  - 修正: Ruffの最小ルールとmypyまたはpyrightをCIへ追加する。
+    まず `F401`, `F821`, `F811`, `F841` を通し、その後に段階的にルールを増やす。
+  - 受入条件: 既存のpytest全件と静的解析がCIで成功すること。
+
 ---
 
 ## 3. 設計の要点（再開時に効く知識）
