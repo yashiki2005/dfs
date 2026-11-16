@@ -559,6 +559,7 @@ class TestReviewRegressions(unittest.TestCase):
         env["PYTHONPATH"] = str(repo) + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
+        env["PYTHONIOENCODING"] = "cp1252"
         for script in ("scripts/pyinstaller_cli.py", "scripts/pyinstaller_svc.py"):
             res = subprocess.run(
                 [sys.executable, str(repo / script), "--help"],
@@ -2156,8 +2157,8 @@ class TestReviewRegressions(unittest.TestCase):
             proc = subprocess.Popen(
                 [sys.executable, "-m", "dfs.svc", "start", "fgsvc", "--foreground", "--port", "31300"],
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             try:
                 deadline = time.time() + 15.0

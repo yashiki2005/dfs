@@ -2148,8 +2148,9 @@ def _normalize_intermixed_archive_argv(argv: List[str]) -> List[str]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    from .i18n import _, translate_parser
+    from .i18n import _, configure_stdio, translate_parser
 
+    configure_stdio()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     norm_argv = _normalize_intermixed_archive_argv(raw_argv)
     parser = translate_parser(build_parser(), _)

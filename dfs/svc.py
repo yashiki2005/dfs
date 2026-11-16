@@ -603,36 +603,39 @@ def cmd_start(args: argparse.Namespace) -> int:
     store = ServiceStore()
     name = _resolve_service_name(args)
     existing = store.services.get(name)
+    start_port_arg = getattr(args, "port", None)
+    registry_port_arg = getattr(args, "registry_port", None)
+    ost_port_arg = getattr(args, "ost_port", None)
 
-    if args.port is not None and (
-        args.registry_port is not None or args.ost_port is not None
+    if start_port_arg is not None and (
+        registry_port_arg is not None or ost_port_arg is not None
     ):
         raise ServiceError("--port と --registry-port/--ost-port は同時に指定できません")
-    if (args.registry_port is None) != (args.ost_port is None):
+    if (registry_port_arg is None) != (ost_port_arg is None):
         raise ServiceError("--registry-port と --ost-port は両方指定してください")
     if (
-        args.registry_port is not None
-        and args.registry_port == args.ost_port
+        registry_port_arg is not None
+        and registry_port_arg == ost_port_arg
     ):
         raise ServiceError("--registry-port と --ost-port には別のポートを指定してください")
 
     is_alive = existing is not None and (
         existing.is_running() or _recorded_server_is_alive(existing)
     )
-    if is_alive and not args.force:
+    if is_alive and not getattr(args, "force", False):
         raise ServiceError(
             f"サービス {name!r} は既に起動しています。"
             f"止めるなら 'dfssvc stop {name}'、再起動するなら --force を付けてください"
         )
-    if is_alive and args.force:
+    if is_alive and getattr(args, "force", False):
         if not _stop_process(existing):
             raise ServiceError(f"既存のサービス {name!r} を停止できませんでした")
 
     host_arg = getattr(args, "host", None)
     host = host_arg if host_arg is not None else (existing.bind if existing and existing.bind else "127.0.0.1")
     start_port = (
-        args.port
-        if args.port is not None
+        start_port_arg
+        if start_port_arg is not None
         else (existing.registry_port if existing and existing.registry_port else DEFAULT_START_PORT)
     )
     # 停止済みの古い記録はポートを予約しない。実際に稼働中のサービスだけを避ける。
@@ -645,8 +648,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         port_owners[service.registry_port] = service.name
         port_owners[service.ost_port] = service.name
     used = set(port_owners)
-    if args.registry_port is not None and args.ost_port is not None:
-        registry_port, ost_port = args.registry_port, args.ost_port
+    if registry_port_arg is not None and ost_port_arg is not None:
+        registry_port, ost_port = registry_port_arg, ost_port_arg
         owners = sorted({
             port_owners[port] for port in (registry_port, ost_port) if port in port_owners
         })
@@ -660,7 +663,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             if not is_port_free(port, host, allow_reuse=True):
                 raise ServiceError(f"{label} ポートは使用中です: {port}")
     elif (
-        args.port is None
+        start_port_arg is None
         and existing is not None
         and existing.registry_port
         and existing.ost_port
@@ -675,7 +678,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             while start_port in used:
                 start_port += 1
             registry_port, ost_port = find_consecutive_free_ports(
-                start_port, 2, host, allow_reuse=(args.port is not None)
+                start_port, 2, host, allow_reuse=(start_port_arg is not None)
             )
             if registry_port not in used and ost_port not in used:
                 break
@@ -1658,8 +1661,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    from .i18n import _, translate_parser
+    from .i18n import _, configure_stdio, translate_parser
 
+    configure_stdio()
     parser = translate_parser(build_parser(), _)
     args = parser.parse_args(argv)
     try:
