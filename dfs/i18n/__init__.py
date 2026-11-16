@@ -163,16 +163,13 @@ def _(text: str) -> str:
 
 
 def configure_stdio() -> None:
-    """CLI出力をUTF-8へ寄せ、WindowsのCP1252等でもヘルプ表示を落とさない。"""
+    """CLI出力の文字コードを保ち、WindowsのCP1252等でもヘルプ表示を落とさない。"""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if not callable(reconfigure):
             continue
-        encoding = str(getattr(stream, "encoding", "") or "").lower().replace("-", "")
-        if encoding == "utf8":
-            continue
         try:
-            reconfigure(encoding="utf-8", errors="backslashreplace")
+            reconfigure(errors="backslashreplace")
         except (AttributeError, OSError, ValueError):
             # テストの文字列ストリームや特殊なコンソールでは元の設定を使う。
             pass

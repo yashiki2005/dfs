@@ -1305,6 +1305,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     root_pub_path = Path(args.root_pubkey).expanduser().resolve()
     root_pubkey = root_pub_path.read_text(encoding="utf-8").strip()
 
+    print("[dfs serve] startup: preparing OST credentials", file=sys.stderr, flush=True)
     cert = state_dir / "ost_cert.pem"
     key = state_dir / "ost_key.pem"
     if not cert.exists() or not key.exists():
@@ -1320,9 +1321,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
             timeout=60,
         )
 
+    print("[dfs serve] startup: opening L3 OST", file=sys.stderr, flush=True)
     ost = ChunkStoreServer(
         cert, key, host=args.bind, port=args.ost_port, chunks_dir=chunks_dir
     )
+    print("[dfs serve] startup: loading registry state", file=sys.stderr, flush=True)
     pstate = PersistentRegistryState(
         state_dir, args.root_anchor, root_pubkey, chunks_dir=chunks_dir
     )
@@ -1408,6 +1411,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     handler = make_registry_http_handler(
         pstate, ost, relay_hub=relay_hub, status_provider=_get_p2p_status
     )
+    print("[dfs serve] startup: binding L2 HTTP", file=sys.stderr, flush=True)
     httpd = BoundedThreadingHTTPServer((args.bind, args.registry_port), handler)
 
     relay_agents: List[RelayAgent] = []
@@ -1462,6 +1466,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     httpd_thread.start()
     if not http_started.wait(timeout=5.0):
         raise RuntimeError("L2 HTTP server did not start")
+    print("[dfs serve] startup: L2 HTTP accepting requests", file=sys.stderr, flush=True)
     threading.Thread(target=_watch_stop, daemon=True).start()
 
     p2p_manager = None
