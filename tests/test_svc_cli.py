@@ -273,6 +273,27 @@ class StartStopTests(unittest.TestCase):
         self.assertEqual(service.registry_port, l2_port)
         self.assertEqual(service.ost_port, l3_port)
 
+    def test_stopped_service_record_does_not_reserve_ports(self) -> None:
+        l2_port, l3_port = find_consecutive_free_ports(29600, 2, "127.0.0.1")
+        self.assertEqual(
+            svc_main([
+                "start", "--name", "old",
+                "--registry-port", str(l2_port),
+                "--ost-port", str(l3_port),
+            ]),
+            0,
+        )
+        self.assertEqual(svc_main(["stop", "old"]), 0)
+        self.assertEqual(
+            svc_main([
+                "start", "--name", "new",
+                "--registry-port", str(l2_port),
+                "--ost-port", str(l3_port),
+            ]),
+            0,
+        )
+        self.service = ServiceStore().get("new")
+
     def test_start_help_documents_l2_and_l3_ports(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output), self.assertRaises(SystemExit) as ctx:
@@ -283,6 +304,60 @@ class StartStopTests(unittest.TestCase):
         self.assertIn("L2 Registry", help_text)
         self.assertIn("--ost-port", help_text)
         self.assertIn("L3 OST", help_text)
+
+    def test_forget_removes_only_stopped_service_record(self) -> None:
+        l2_port, _ = find_consecutive_free_ports(29700, 2, "127.0.0.1")
+        self.assertEqual(svc_main(["start", "--name", "forget", "--port", str(l2_port)]), 0)
+        self.assertEqual(svc_main(["stop", "forget"]), 0)
+        state_dir = Path(ServiceStore().get("forget").state_dir)
+        self.assertEqual(svc_main(["forget", "forget"]), 0)
+        with self.assertRaises(ServiceError):
+            ServiceStore().get("forget")
+        self.assertTrue(state_dir.exists(), "forgetで状態ディレクトリまで消している")
+
+    def test_prune_is_dry_run_by_default(self) -> None:
+        l2_port, _ = find_consecutive_free_ports(29800, 2, "127.0.0.1")
+        self.assertEqual(svc_main(["start", "--name", "prune", "--port", str(l2_port)]), 0)
+        self.assertEqual(svc_main(["stop", "prune"]), 0)
+        self.assertEqual(svc_main(["prune"]), 0)
+        self.assertIn("prune", ServiceStore().services)
+        self.assertEqual(svc_main(["prune", "--apply"]), 0)
+        self.assertNotIn("prune", ServiceStore().services)
+
+    def test_purge_requires_confirmation_and_removes_state(self) -> None:
+        l2_port, _ = find_consecutive_free_ports(29900, 2, "127.0.0.1")
+        self.assertEqual(svc_main(["start", "--name", "purge", "--port", str(l2_port)]), 0)
+        service = ServiceStore().get("purge")
+        self.service = service
+        self.assertEqual(svc_main(["purge", "purge"]), 0)
+        self.assertTrue(service.is_running(), "--yesなしで停止している")
+        self.assertEqual(svc_main(["purge", "purge", "--yes"]), 0)
+        self.service = None
+        self.assertFalse(Path(service.state_dir).exists())
+        with self.assertRaises(ServiceError):
+            ServiceStore().get("purge")
+
+    def test_prune_cache_removes_only_expired_locators(self) -> None:
+        l2_port, _ = find_consecutive_free_ports(30000, 2, "127.0.0.1")
+        self.assertEqual(svc_main(["start", "--name", "cache", "--port", str(l2_port)]), 0)
+        self.assertEqual(svc_main(["stop", "cache"]), 0)
+        service = ServiceStore().get("cache")
+        state_file = Path(service.state_dir) / "registry_state.json"
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        data.setdefault("locators", {})["/expired"] = {
+            "payload": {"expires_at": int(time.time()) - 1}
+        }
+        data["locators"]["/current"] = {
+            "payload": {"expires_at": int(time.time()) + 3600}
+        }
+        state_file.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(svc_main(["prune-cache", "cache"]), 0)
+        dry = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertIn("/expired", dry["locators"])
+        self.assertEqual(svc_main(["prune-cache", "cache", "--apply"]), 0)
+        applied = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("/expired", applied["locators"])
+        self.assertIn("/current", applied["locators"])
 
     def test_start_registers_delegation(self) -> None:
         """start は書き手の鍵と委譲まで用意する（dfscli がそのまま使える）。"""

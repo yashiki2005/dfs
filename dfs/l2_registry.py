@@ -8,6 +8,7 @@ specs/l2_comparison.md に基づく署名付きロケータ (`dfs-l2-locator-v1`
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -581,7 +582,10 @@ class DirectoryRegistryService:
             self.delegations[normalize_path(p["path"])] = env
 
     def resolve(
-        self, path: str, version: Optional[int] = None
+        self,
+        path: str,
+        version: Optional[int] = None,
+        now: Optional[int] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """
         (delegation_envelope, locator_envelope, head_log_envelope) を 1 RTT で返す。
@@ -655,6 +659,18 @@ class DirectoryRegistryService:
                 return del_env, loc_env, None
             # ロケータは現在の先頭版にしか対応しない。過去版では返さない。
             selected_locator = loc_env if selected is log_list[-1] else None
+            if selected_locator is not None:
+                try:
+                    expires_at = int(
+                        selected_locator.get("payload", {}).get("expires_at", 0)
+                    )
+                except (TypeError, ValueError):
+                    expires_at = 0
+                check_now = int(time.time()) if now is None else int(now)
+                if check_now >= expires_at:
+                    # endpointはL2の/v1/ostから再解決できる。期限切れの署名済み
+                    # locatorをクライアントへ返して読み取り全体を止めない。
+                    selected_locator = None
             return del_env, selected_locator, selected
 
     def history(self, path: str, limit: int = 50) -> List[Dict[str, Any]]:

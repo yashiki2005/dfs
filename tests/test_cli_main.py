@@ -531,6 +531,13 @@ class RcloneCase(unittest.TestCase):
         with self.assertRaises(Exception):
             node.read_remote("a.txt")
 
+    def test_expired_registry_locator_falls_back_to_advertised_ost(self) -> None:
+        """期限切れlocatorでもL2広告のOSTから現在headを読める。"""
+        self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
+        locator = self.server.pstate.service.locators["/example.com/alice/notes"]
+        locator["payload"]["expires_at"] = int(time.time()) - 1
+        self.assertEqual(self.run_cli("cat", "t:a.txt"), 0)
+
     def test_copyto_and_checksum(self) -> None:
         one = self.base / "one.txt"
         one.write_text("one file\n", encoding="utf-8")

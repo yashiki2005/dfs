@@ -39,6 +39,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -51,7 +52,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .dnssec import DEFAULT_RECORD_PREFIX, parse_discovery_text
 from .paths import config_dir, dfs_home, restrict_to_owner
-from .private_io import ensure_private_dir
+from .private_io import ensure_private_dir, write_private_json
 
 CONFIG_FILENAME = "services.json"
 DEFAULT_START_PORT = 19440
@@ -634,14 +635,25 @@ def cmd_start(args: argparse.Namespace) -> int:
         if args.port is not None
         else (existing.registry_port if existing and existing.registry_port else DEFAULT_START_PORT)
     )
-    # 記録済みのサービスが使っているポートは避ける
-    used = {
-        s.registry_port for s in store.services.values() if s.name != name
-    } | {s.ost_port for s in store.services.values() if s.name != name}
+    # 停止済みの古い記録はポートを予約しない。実際に稼働中のサービスだけを避ける。
+    port_owners: Dict[int, str] = {}
+    for service in store.services.values():
+        if service.name == name or not (
+            service.is_running() or _recorded_server_is_alive(service)
+        ):
+            continue
+        port_owners[service.registry_port] = service.name
+        port_owners[service.ost_port] = service.name
+    used = set(port_owners)
     if args.registry_port is not None and args.ost_port is not None:
         registry_port, ost_port = args.registry_port, args.ost_port
-        if registry_port in used or ost_port in used:
-            raise ServiceError("指定したポートは別の登録済みサービスが使用しています")
+        owners = sorted({
+            port_owners[port] for port in (registry_port, ost_port) if port in port_owners
+        })
+        if owners:
+            raise ServiceError(
+                f"指定したポートは起動中のサービス {', '.join(owners)} が使用しています"
+            )
         for label, port in (("L2", registry_port), ("L3", ost_port)):
             if not 1 <= port <= 65535:
                 raise ServiceError(f"{label} ポートが範囲外です: {port}")
@@ -1115,6 +1127,156 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_forget(args: argparse.Namespace) -> int:
+    """停止済みサービスの記録だけを削除し、状態・鍵・チャンクは残す。"""
+    store = ServiceStore()
+    name = _resolve_service_name(args)
+    service = store.get(name)
+    if service.is_running() or _recorded_server_is_alive(service):
+        raise ServiceError(
+            f"サービス {name!r} は稼働中です。先に 'dfssvc stop {name}' を実行してください"
+        )
+    store.services.pop(name, None)
+    store.save()
+    print(f"[dfssvc] 記録だけ削除しました（状態は保持）: {name}")
+    return 0
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    """停止済みかつプロセスが存在しないサービス記録を整理する。"""
+    store = ServiceStore()
+    stale = [
+        service
+        for service in store.services.values()
+        if not service.is_running() and not _recorded_server_is_alive(service)
+    ]
+    if not stale:
+        print("[dfssvc] 削除対象の停止済み記録はありません")
+        return 0
+    for service in sorted(stale, key=lambda item: item.name):
+        print(f"[dfssvc] 停止済み記録: {service.name}")
+    if not args.apply:
+        print(f"[dfssvc] dry-run: {len(stale)}件。削除するには --apply を指定してください")
+        return 0
+    for service in stale:
+        store.services.pop(service.name, None)
+    store.save()
+    print(f"[dfssvc] 停止済み記録を{len(stale)}件削除しました（状態は保持）")
+    return 0
+
+
+def _purge_targets(service: Service) -> List[Path]:
+    raw = [
+        service.state_dir,
+        service.ost_dir,
+        service.root_key,
+        f"{service.root_key}.pub",
+        service.writer_key,
+        f"{service.writer_key}.pub",
+    ]
+    targets: List[Path] = []
+    seen: set[Path] = set()
+    for value in raw:
+        if not value:
+            continue
+        path = Path(value).expanduser().resolve(strict=False)
+        if path not in seen:
+            seen.add(path)
+            targets.append(path)
+    base = _base_dir(service.name).resolve(strict=False)
+    if base not in seen:
+        targets.append(base)
+    return targets
+
+
+def _remove_path(path: Path) -> None:
+    forbidden = {
+        Path("/").resolve(),
+        Path.home().resolve(),
+        dfs_home().resolve(strict=False),
+        config_dir().resolve(strict=False),
+        _repo_root().resolve(),
+    }
+    if path in forbidden:
+        raise ServiceError(f"安全のため削除できません: {path}")
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def cmd_purge(args: argparse.Namespace) -> int:
+    """停止・記録・状態・鍵・OSTを明示的に削除する。"""
+    store = ServiceStore()
+    name = _resolve_service_name(args)
+    service = store.get(name)
+    targets = _purge_targets(service)
+    if not args.yes:
+        print(f"[dfssvc] purge対象: {name}")
+        for path in targets:
+            print(f"  {path}")
+        print("[dfssvc] 実行するには --yes を指定してください")
+        return 0
+    if not _stop_process(service) and (
+        service.is_running() or _recorded_server_is_alive(service)
+    ):
+        raise ServiceError(f"サービス {name!r} を停止できませんでした")
+    for path in targets:
+        _remove_path(path)
+    store.services.pop(name, None)
+    store.save()
+    print(f"[dfssvc] サービスをpurgeしました: {name}")
+    return 0
+
+
+def cmd_prune_cache(args: argparse.Namespace) -> int:
+    """停止中サービスの期限切れL2 locatorだけを削除する。"""
+    store = ServiceStore()
+    name = _resolve_service_name(args)
+    service = store.get(name)
+    if service.is_running() or _recorded_server_is_alive(service):
+        raise ServiceError(
+            f"サービス {name!r} は稼働中です。先に 'dfssvc stop {name}' を実行してください"
+        )
+    state_file = Path(service.state_dir).expanduser() / "registry_state.json"
+    if not state_file.is_file():
+        print(f"[dfssvc] registry_state.json がありません: {state_file}")
+        return 0
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ServiceError(f"registry state を読めません: {e}") from e
+    locators = data.get("locators")
+    if not isinstance(locators, dict):
+        print("[dfssvc] locatorキャッシュはありません")
+        return 0
+    now = int(time.time())
+    expired: List[str] = []
+    for path, envelope in locators.items():
+        try:
+            expires_at = int((envelope.get("payload") or {}).get("expires_at", 0))
+        except (AttributeError, TypeError, ValueError):
+            expires_at = 0
+        if now >= expires_at:
+            expired.append(str(path))
+    if not expired:
+        print("[dfssvc] 期限切れlocatorはありません")
+        return 0
+    for path in sorted(expired):
+        print(f"[dfssvc] 期限切れlocator: {path}")
+    if not args.apply:
+        print(
+            f"[dfssvc] dry-run: {len(expired)}件。"
+            "削除するには --apply を指定してください"
+        )
+        return 0
+    for path in expired:
+        locators.pop(path, None)
+    write_private_json(state_file, data)
+    print(f"[dfssvc] 期限切れlocatorを{len(expired)}件削除しました")
+    return 0
+
+
 def _terminate(proc: subprocess.Popen, timeout: float = 10.0) -> None:
     """起動したばかりのサーバを確実に止める（記録に載せる前の後始末）。"""
     if proc.poll() is not None:
@@ -1433,6 +1595,36 @@ def build_parser() -> argparse.ArgumentParser:
     _add_service_name_args(p)
     p.add_argument("--forget", action="store_true", help="記録からも消す")
     p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("forget", help="停止済みサービスの記録だけを消す")
+    _add_service_name_args(p)
+    p.set_defaults(func=cmd_forget)
+
+    p = sub.add_parser("prune", help="停止済みサービス記録を整理する")
+    p.add_argument(
+        "--apply",
+        action="store_true",
+        help="実際に削除する（省略時はdry-run）",
+    )
+    p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser("purge", help="サービスを停止して状態・鍵・OSTを削除する")
+    _add_service_name_args(p)
+    p.add_argument(
+        "--yes",
+        action="store_true",
+        help="破壊的な削除を確認して実行する",
+    )
+    p.set_defaults(func=cmd_purge)
+
+    p = sub.add_parser("prune-cache", help="停止中サービスの期限切れlocatorを掃除する")
+    _add_service_name_args(p)
+    p.add_argument(
+        "--apply",
+        action="store_true",
+        help="実際に削除する（省略時はdry-run）",
+    )
+    p.set_defaults(func=cmd_prune_cache)
 
     p = sub.add_parser("env", help="dfscli の設定行を出す")
     _add_service_name_args(p)
