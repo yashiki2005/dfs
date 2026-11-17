@@ -16,9 +16,10 @@ def _archive_registry_context(
     version: Optional[int],
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """ローカル設定を起点に、L2公開descriptorと対応L4 headを検証して返す。"""
-    from dfs import cli_main as _cm
+    from dfs import cli_core as _cm
+    from dfs import cli as cli_mod
 
-    registry = _cm.cli_mod.RemoteRegistryClient(remote.registry_urls())
+    registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
     path = _cm.resolve_path(remote, registry)
     if not remote.root_pubkey:
         info = registry.root_anchor_info()
@@ -95,7 +96,8 @@ def _archive_registry_context(
 
 def cmd_archive(args: argparse.Namespace) -> int:
     """版単位の archive bundle / torrent を作成・公開・取得・復元する。"""
-    from dfs import cli_main as _cm
+    from dfs import cli_core as _cm
+    from dfs import cli as cli_mod
 
     if args.action == "create":
         store = _cm.RemoteStore()
@@ -162,7 +164,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
             f"&dn={result.bundle.name}"
         )
         if args.publish:
-            registry = _cm.cli_mod.RemoteRegistryClient(remote.registry_urls())
+            registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
             registry.publish_archive(
                 result.descriptor_envelope,
                 role_epoch=int(remote.role_epoch),
@@ -207,7 +209,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
             raise _cm.UsageError(
                 "この bundle には署名済みdescriptorがありません。作成し直してください"
             )
-        registry = _cm.cli_mod.RemoteRegistryClient(remote.registry_urls())
+        registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
         verified = registry.publish_archive(
             envelope, role_epoch=int(remote.role_epoch)
         )

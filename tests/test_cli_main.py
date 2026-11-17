@@ -792,7 +792,7 @@ class RcloneCase(unittest.TestCase):
         self.assertEqual(self.run_cli("copy", str(self.local), "t:"), 0)
         bundle_out = self.base / "nopar2_bundle"
         stderr_buf = io.StringIO()
-        with mock.patch("dfs.cli_main.find_par2_binary", return_value=None):
+        with mock.patch("dfs.cli_core.find_par2_binary", return_value=None):
             with mock.patch("sys.stderr", stderr_buf):
                 rc = self.run_cli("archive", "create", "t:", "--out", str(bundle_out))
         self.assertEqual(rc, 0)

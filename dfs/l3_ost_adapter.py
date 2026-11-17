@@ -24,11 +24,72 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
-from urllib.parse import urlsplit, urlunsplit
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union, Protocol
+from contextlib import contextmanager
 
 from .crypto import ChunkIntegrityError, sha256_hex
 from .l2_registry import ServiceUnavailableError
+
+
+class OSTClientProtocol(Protocol):
+    """L3 OST client protocol definition.
+    
+    Common interface implemented by OSTClient, HttpOSTClient, 
+    FailoverOSTClient, SwarmOSTClient.
+    """
+    
+    @property
+    def endpoint_uri(self) -> str: ...
+    
+    @property
+    def host(self) -> str: ...
+    
+    @property
+    def port(self) -> int: ...
+    
+    @property
+    def expected_cert_sha256(self) -> Optional[str]: ...
+    
+    @property
+    def bytes_sent(self) -> int: ...
+    
+    @property
+    def bytes_received(self) -> int: ...
+    
+    @property
+    def blob_bytes_sent(self) -> int: ...
+    
+    @property
+    def put_count(self) -> int: ...
+    
+    @property
+    def get_count(self) -> int: ...
+    
+    @property
+    def tls_handshakes(self) -> int: ...
+    
+    @property
+    def round_trips(self) -> int: ...
+    
+    @property
+    def last_overloaded(self) -> bool: ...
+    
+    def probe(self, timeout: Optional[float] = None) -> float: ...
+    
+    def reset_metrics(self) -> None: ...
+    
+    def batch_has(self, wire_ids: Sequence[str]) -> Dict[str, bool]: ...
+    
+    def batch_put_if_absent(self, chunks: Dict[str, bytes], assume_absent: bool = False) -> int: ...
+    
+    def batch_get(self, wire_ids: Sequence[str]) -> Dict[str, bytes]: ...
+    
+    def put_if_absent(self, wire_id: str, blob: bytes) -> bool: ...
+    
+    def close(self) -> None: ...
+    
+    @contextmanager
+    def session(self) -> Iterator["OSTClientProtocol"]: ...
 
 ZERO_WIRE_ID = b"0" * 64
 QUIT_FRAME = b"Q" + ZERO_WIRE_ID + struct.pack(">I", 0)
@@ -1627,16 +1688,16 @@ class FailoverOSTClient:
     ):
         if not clients:
             raise ValueError("At least one OST client is required")
-        self.clients: List[Union[OSTClient, HttpOSTClient]] = list(clients)
-        self.primary = self.clients[0]
-        self._active: Optional[Union[OSTClient, HttpOSTClient]] = None
+        self.clients: List[OSTClientProtocol] = list(clients)
+        self.primary = self.clients[0]  # type: OSTClientProtocol
+        self._active: Optional[OSTClientProtocol] = None
         self.allow_write_failover = bool(allow_write_failover)
         self.cache_file: Optional[Path] = Path(cache_file) if cache_file else None
         self.probe_ttl: float = float(probe_ttl)
         self._adapted: bool = False
 
     @staticmethod
-    def _client_uri(client: Any) -> str:
+    def _client_uri(client: OSTClientProtocol) -> str:
         uri = getattr(client, "endpoint_uri", None)
         if uri:
             return str(uri)
@@ -1650,7 +1711,7 @@ class FailoverOSTClient:
         return "/relay/" in uri
 
     @staticmethod
-    def _probe_one(client: Any, timeout: float) -> Tuple[bool, float]:
+    def _probe_one(client: OSTClientProtocol, timeout: float) -> Tuple[bool, float]:
         t0 = time.monotonic()
         probe_fn = getattr(client, "probe", None)
         try:
@@ -1728,7 +1789,7 @@ class FailoverOSTClient:
             if cached:
                 by_uri = {self._client_uri(c): c for c in self.clients}
                 reordered = [by_uri[u] for u in cached if u in by_uri]
-                for c in self.clients:
+                for c in self.clients:  # type: OSTClientProtocol
                     if c not in reordered:
                         reordered.append(c)
                 self.clients = reordered
@@ -1789,7 +1850,7 @@ class FailoverOSTClient:
         return self.primary.port
 
     def reset_metrics(self) -> None:
-        for client in self.clients:
+        for client in self.clients:  # type: OSTClientProtocol
             client.reset_metrics()
         self._active = None
 
@@ -1935,24 +1996,24 @@ class SwarmOSTClient(FailoverOSTClient):
         self.safe_mode = True
         self.safe_mode_reason = str(reason or "auto")
         # HTTP/HTTPS クライアントを優先しつつ、非リレー → リレーの順を維持する
-        http_direct = [
+        http_direct: List[OSTClientProtocol] = [
             c for c in self.clients
             if not self._is_relay_client(c)
             and str(getattr(c, "base_url", "")).startswith(("http://", "https://"))
         ]
-        other_direct = [
+        other_direct: List[OSTClientProtocol] = [
             c for c in self.clients
             if not self._is_relay_client(c) and c not in http_direct
         ]
-        relay = [c for c in self.clients if self._is_relay_client(c)]
+        relay: List[OSTClientProtocol] = [c for c in self.clients if self._is_relay_client(c)]
         self.clients = http_direct + other_direct + relay
 
     @staticmethod
-    def _is_relay_client(client: Any) -> bool:
+    def _is_relay_client(client: OSTClientProtocol) -> bool:
         return "/relay/" in str(getattr(client, "base_url", ""))
 
     @classmethod
-    def _is_libp2p_client(cls, client: Any) -> bool:
+    def _is_libp2p_client(cls, client: OSTClientProtocol) -> bool:
         return cls._client_uri(client).startswith("libp2p://")
 
     def disable_libp2p(self, reason: str) -> None:
@@ -1960,9 +2021,9 @@ class SwarmOSTClient(FailoverOSTClient):
         with self._peer_bps_lock:
             already = self._libp2p_disabled
             self._libp2p_disabled = True
-        removed = [c for c in self.clients if self._is_libp2p_client(c)]
+        removed: List[OSTClientProtocol] = [c for c in self.clients if self._is_libp2p_client(c)]
         if removed:
-            self.clients = [c for c in self.clients if not self._is_libp2p_client(c)]
+            self.clients = [c for c in self.clients if not self._is_libp2p_client(c)]  # type: List[OSTClientProtocol]
             if self._active in removed:
                 self._active = self.clients[0] if self.clients else None
             for c in removed:
@@ -1977,7 +2038,7 @@ class SwarmOSTClient(FailoverOSTClient):
                 flush=True,
             )
 
-    def _record_libp2p_outcome(self, client: Any, *, ok: bool, reason: str = "udp_receive_failures") -> None:
+    def _record_libp2p_outcome(self, client: OSTClientProtocol, *, ok: bool, reason: str = "udp_receive_failures") -> None:
         if not self._is_libp2p_client(client):
             return
         should_disable = False
@@ -1991,9 +2052,9 @@ class SwarmOSTClient(FailoverOSTClient):
         if should_disable:
             self.disable_libp2p(reason)
 
-    def _partition_tiers(self) -> Tuple[List[Any], List[Any]]:
-        direct = [c for c in self.clients if not self._is_relay_client(c)]
-        relay = [c for c in self.clients if self._is_relay_client(c)]
+    def _partition_tiers(self) -> Tuple[List[OSTClientProtocol], List[OSTClientProtocol]]:
+        direct: List[OSTClientProtocol] = [c for c in self.clients if not self._is_relay_client(c)]
+        relay: List[OSTClientProtocol] = [c for c in self.clients if self._is_relay_client(c)]
         return direct, relay
 
     @contextmanager
@@ -2001,7 +2062,7 @@ class SwarmOSTClient(FailoverOSTClient):
         with super().session():
             yield self
 
-    def _is_overloaded(self, client: Any, now: float) -> bool:
+    def _is_overloaded(self, client: OSTClientProtocol, now: float) -> bool:
         key = self._client_uri(client)
         until = self._overloaded_until.get(key, 0.0)
         if until > now:
@@ -2010,7 +2071,7 @@ class SwarmOSTClient(FailoverOSTClient):
             del self._overloaded_until[key]
         return False
 
-    def _mark_overloaded(self, client: Any) -> None:
+    def _mark_overloaded(self, client: OSTClientProtocol) -> None:
         self._overloaded_until[self._client_uri(client)] = (
             time.monotonic() + self.overload_cooldown
         )
@@ -2018,7 +2079,7 @@ class SwarmOSTClient(FailoverOSTClient):
     def _compute_peer_weights(
         self,
         active_indices: Sequence[int],
-        direct_tier: Sequence[Any],
+        direct_tier: Sequence[OSTClientProtocol],
         probe_rtt: Dict[int, float],
     ) -> Dict[int, float]:
         """実測スループット (EWMA) とプローブ RTT の逆数からピアごとの配分重みを決める。"""
@@ -2057,7 +2118,7 @@ class SwarmOSTClient(FailoverOSTClient):
                 weights[idx] = max(1e-6, est)
         return weights
 
-    def _record_peer_throughput(self, client: Any, got_bytes: int, dt: float) -> None:
+    def _record_peer_throughput(self, client: OSTClientProtocol, got_bytes: int, dt: float) -> None:
         """十分大きい応答からピアの実効帯域 (bytes/s) を EWMA 更新する。"""
         if got_bytes < 64 * 1024 or dt <= 0:
             return
@@ -2071,7 +2132,7 @@ class SwarmOSTClient(FailoverOSTClient):
         unique_ids = list(dict.fromkeys(wire_ids))
         if not unique_ids:
             return {}
-        direct_tier, relay_tier = self._partition_tiers()
+        direct_tier: List[OSTClientProtocol]; relay_tier: List[OSTClientProtocol]; direct_tier, relay_tier = self._partition_tiers()
         if (
             self.safe_mode
             or len(direct_tier) <= 1
@@ -2128,7 +2189,7 @@ class SwarmOSTClient(FailoverOSTClient):
             availability = {}
             probe_rtt: Dict[int, float] = {}
 
-            def _probe_has(idx: int, client: Any) -> Tuple[Dict[str, bool], float]:
+            def _probe_has(idx: int, client: OSTClientProtocol) -> Tuple[Dict[str, bool], float]:
                 t0 = time.perf_counter()
                 with client.session():
                     res = client.batch_has(remaining)

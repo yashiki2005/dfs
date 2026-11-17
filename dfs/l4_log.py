@@ -18,7 +18,8 @@ import time
 from collections.abc import MutableMapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Protocol
+from contextlib import contextmanager
 
 from .crypto import (
     EMPTY_SHA256,
@@ -46,7 +47,7 @@ from .l2_registry import (
     create_locator_envelope,
     verify_locator_envelope,
 )
-from .l3_ost_adapter import OSTClient, _get_available_memory_bytes
+from .l3_ost_adapter import OSTClientProtocol, _get_available_memory_bytes
 from .path_safety import UnsafePathError, _open_no_follow
 from .private_io import write_private_json
 
@@ -318,25 +319,25 @@ class MerkleTreeBuilder:
     def __init__(
         self,
         crypto: ContentAddressedCrypto,
-        ost: OSTClient,
-        stores: Optional[Dict[str, OSTClient]] = None,
+        ost: OSTClientProtocol,
+        stores: Optional[Dict[str, OSTClientProtocol]] = None,
         default_store: str = "ost0",
         index: Optional[Dict[str, Any]] = None,
-        replicas: Optional[List[OSTClient]] = None,
+        replicas: Optional[List[OSTClientProtocol]] = None,
         index_file: Optional[Path] = None,
         compression: str = "auto",
     ):
         self.crypto = crypto
         # 後方互換: ost は既定の OST を指す
         self.ost = ost
-        self.stores: Dict[str, OSTClient] = dict(stores) if stores else {default_store: ost}
+        self.stores: Dict[str, OSTClientProtocol] = dict(stores) if stores else {default_store: ost}
         self.default_store = default_store if default_store in self.stores else next(iter(self.stores))
         self.stripe_order: list[str] = list(self.stores.keys())
         self._next_stripe = 0
         # アップロード時に読み飛ばした項目（symlink など）を呼び出し側へ知らせる。
         self.warnings: List[str] = []
         # 書き込み後にチャンクを複製する読み取り専用 OST。
-        self.replicas: List[OSTClient] = list(replicas or [])
+        self.replicas: List[OSTClientProtocol] = list(replicas or [])
         self._last_wire_ids: set[str] = set()
         # (plain_id -> (wire_id, store_id, codec)) の書き手側索引。
         self.index: MutableMapping[str, Any] = dict(index or {})
@@ -399,7 +400,7 @@ class MerkleTreeBuilder:
         self._next_stripe += 1
         return sid
 
-    def _client(self, store_id: str) -> OSTClient:
+    def _client(self, store_id: str) -> OSTClientProtocol:
         return self.stores.get(store_id, self.ost)
 
     @staticmethod

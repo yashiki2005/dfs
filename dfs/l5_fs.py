@@ -18,7 +18,7 @@ from .crypto import KDF_DEFAULT, ContentAddressedCrypto
 from .l2_registry import DirectoryRegistryService, ServiceUnavailableError
 from .l3_ost_adapter import (
     FailoverOSTClient,
-    OSTClient,
+    OSTClientProtocol,
     SwarmOSTClient,
     make_ost_client,
     parse_ost_endpoint,
@@ -182,20 +182,20 @@ class DFSNode:
                 raw_endpoints.append(self._normalize_ost_endpoint(str(reg_u)))
         seen = set()
         self.ost_endpoints: List[str] = []
-        ost_clients: List[Any] = []
+        ost_clients: List[OSTClientProtocol] = []
         for idx, canonical in enumerate(raw_endpoints):
             if canonical in seen:
                 continue
             seen.add(canonical)
             pin = self.ost_cert_sha256 if (idx == 0 and not canonical.startswith("http://")) else None
-            ost_clients.append(make_ost_client(canonical, expected_cert_sha256=pin))
+            ost_clients.append(make_ost_client(canonical, expected_cert_sha256=pin))  # type: OSTClientProtocol
             self.ost_endpoints.append(canonical)
-        relay_write_fallbacks = [
+        relay_write_fallbacks: List[OSTClientProtocol] = [
             c
             for c, ep in zip(ost_clients[1:], self.ost_endpoints[1:])
             if "/relay/" in ep
         ]
-        self.replica_osts = [
+        self.replica_osts: List[OSTClientProtocol] = [
             c
             for c, ep in zip(ost_clients[1:], self.ost_endpoints[1:])
             if "/relay/" not in ep
@@ -262,10 +262,10 @@ class DFSNode:
                 )
                 self.libp2p_manager = None
                 self.libp2p_client = None
-        read_clients: List[Any] = list(ost_clients)
+        read_clients: List[OSTClientProtocol] = list(ost_clients)
         if self.libp2p_client is not None:
             read_clients.append(self.libp2p_client)
-        self.read_ost = SwarmOSTClient(read_clients, cache_file=transport_cache)
+        self.read_ost = SwarmOSTClient(read_clients, cache_file=transport_cache)  # type: ignore
         self.read_builder = MerkleTreeBuilder(self.crypto, self.read_ost)
         self.registry = registry
         self.role_epoch = int(role_epoch)
