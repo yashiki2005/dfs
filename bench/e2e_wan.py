@@ -102,12 +102,13 @@ def rtt_ms(host: str, count: int = 10) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def qpath(p: str) -> str:
+def qpath(p: str | Path) -> str:
     """シェル用にパスを引用する。先頭の ``~`` は ``"$HOME"`` に置き換える。
 
     ``shlex.quote("~/src")`` は ``'~/src'`` になり、チルダが展開されない。
     ローカル・ssh 先のどちらのシェルでも同じ文字列が使えるよう、ここで吸収する。
     """
+    p = str(p)
     if p == "~":
         return '"$HOME"'
     if p.startswith("~/"):

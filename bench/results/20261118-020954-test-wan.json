@@ -1,0 +1,146 @@
+{
+  "schema": "dfs-e2e-wan-v1",
+  "label": "test",
+  "mode": "loopback",
+  "measured_at_utc": "2026-11-17T17:09:49+00:00",
+  "environment": {
+    "control_host": "macOS-27.3-arm64-arm-64bit-Mach-O",
+    "control_python": "3.14.10",
+    "server_host": "127.0.0.1",
+    "server_ssh": null,
+    "client_ssh": null,
+    "l2_port": 19440,
+    "l3_port": 19443,
+    "files": 20,
+    "file_size": 131072,
+    "chunk_count": 0,
+    "rtt_avg_ms": null,
+    "payload_desc": "20 × 131072 B",
+    "payload_bytes": 2130050
+  },
+  "steps": [
+    {
+      "step": "鍵生成（root）",
+      "ok": true,
+      "detail": "ok"
+    },
+    {
+      "step": "鍵生成（alice）",
+      "ok": true,
+      "detail": "ok"
+    },
+    {
+      "step": "ローカルサーバ起動（loopback）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "step": "L2 疎通（HTTP）",
+      "ok": true,
+      "detail": "{\"delegation\": null, \"head_log\": null, \"locator\": null}",
+      "elapsed_ms": 32.9
+    },
+    {
+      "step": "L3 疎通（TLS）",
+      "ok": true,
+      "detail": "TLS TLSv1.3 6.8 ms",
+      "elapsed_ms": 60.1
+    },
+    {
+      "step": "L1 委譲登録",
+      "ok": true,
+      "detail": "[dfs delegate] Registered on http://127.0.0.1:19440: path=/example.com/alice/notes epoch=1 base_version=0",
+      "elapsed_ms": 147.8
+    },
+    {
+      "step": "クライアント init",
+      "ok": true,
+      "detail": "[dfs init] Initialized mount at /private/tmp/dfs_bench/client_mount\n  Working tree : /private/tmp/dfs_bench/client_mount/tree\n  Snapshots    : /private/tmp/dfs_bench/client_mount/.clayfs/snapshots",
+      "elapsed_ms": 74.7
+    },
+    {
+      "step": "試験データ生成（20 × 131072 B）",
+      "ok": true,
+      "detail": "20 × 131072 B",
+      "elapsed_ms": 199.4
+    },
+    {
+      "step": "クライアント push",
+      "ok": true,
+      "detail": "[dfs push] OK v1 (epoch=1) | root=6210ff173085... | sent=5697 B | 58.4 ms\n  Snapshot saved at: /private/tmp/dfs_bench/client_mount/.clayfs/snapshots/v1\n[dfs metrics] {\"blob_bytes_sent\": 4200, \"bytes_received\": 1, \"bytes_sent\": 5697, \"direction\": \"push\", \"elapsed_ms\": 58.404, \"get_count\": 0, \"payload_bytes\": 5697, \"put_count\": 21, \"round_trips\": 1, \"tls_handshakes\": 1, \"version\": 1}",
+      "elapsed_ms": 181.9
+    },
+    {
+      "step": "読取側 init",
+      "ok": true,
+      "detail": "[dfs init] Initialized mount at /private/tmp/dfs_bench/reader_mount\n  Working tree : /private/tmp/dfs_bench/reader_mount/tree\n  Snapshots    : /private/tmp/dfs_bench/reader_mount/.clayfs/snapshots",
+      "elapsed_ms": 69.8
+    },
+    {
+      "step": "読取側 pull",
+      "ok": false,
+      "detail": "rc=1 Traceback (most recent call last):\n  File \"<frozen runpy>\", line 203, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/Volumes/ExtSSD/src/dfs/dfs/cli.py\", line 2137, in <module>\n    main()\n    ~~~~^^\n  File \"/Volumes/ExtSSD/src/dfs/dfs/cli.py\", line 2127, in main\n    args.func(args)\n    ~~~~~~~~~^^^^^^\n  File \"/Volumes/ExtSSD/src/dfs/dfs/cli.py\", line 1938, in cmd_pull\n    snap_dir = node.pull()\n  File \"/Volumes/ExtSSD/src/dfs/dfs/l5_fs.py\", line 464, in pull\n    head_env = self.l4.sync_head(self.registry, expected_writer_pubkey=expected_writer_pubkey)\n  File \"/Volumes/ExtSSD/src/dfs/dfs/l4_log.py\", line 1283, in sync_head\n    writer_pub = self._verified_writer(del_env)\n  File \"/Volumes/ExtSSD/src/dfs/dfs/l4_log.py\", line 1241, in _verified_writer\n    rai",
+      "elapsed_ms": 115.3
+    },
+    {
+      "step": "内容一致（SHA-256）",
+      "ok": false,
+      "detail": "writer=20 件, reader=0 件"
+    },
+    {
+      "step": "競合試験の準備（reader 側の変更）",
+      "ok": true,
+      "detail": "TOUCH_OK"
+    },
+    {
+      "step": "競合試験: 先着 push",
+      "ok": false,
+      "detail": "rc=1 [REJECTED: Single-Writer Conflict] CAS conflict on '/example.com/alice/notes': expected version 2 (parent 1, e7e0f5d29a...), got version 1 (parent 0, e3b0c44298...)\nHint: Run 'dfs pull' first.",
+      "elapsed_ms": 117.8
+    },
+    {
+      "step": "競合試験の準備（client 側の変更）",
+      "ok": true,
+      "detail": "TOUCH2_OK"
+    },
+    {
+      "step": "同時書き込みを CAS で拒否（後着）",
+      "ok": false,
+      "detail": "先着=[REJECTED: Single-Writer Conflict] CAS conflict on '/example.com/alice/notes': e / 後着 rc=0: [dfs push] OK v2 (epoch=1) | root=9d0659e3a1a4... | sent=3946 B | 30.7 ms\n  Snapshot saved at: /private/tmp/dfs_bench/client_mount/.clayfs/snapshots/v2",
+      "elapsed_ms": 138.6
+    },
+    {
+      "step": "衝突コピー 0 件",
+      "ok": true,
+      "detail": "0 件"
+    }
+  ],
+  "metrics": [
+    {
+      "blob_bytes_sent": 4200,
+      "bytes_received": 1,
+      "bytes_sent": 5697,
+      "direction": "push",
+      "elapsed_ms": 58.404,
+      "get_count": 0,
+      "payload_bytes": 5697,
+      "put_count": 21,
+      "round_trips": 1,
+      "tls_handshakes": 1,
+      "version": 1
+    }
+  ],
+  "verdict": {
+    "server_started": true,
+    "l2_reachable": true,
+    "l3_reachable": true,
+    "delegation_registered": true,
+    "push_ok": true,
+    "pull_ok": false,
+    "content_matches": false,
+    "concurrent_cas": false,
+    "no_conflict_copies": true,
+    "outage_handled": null
+  },
+  "all_ok": false
+}

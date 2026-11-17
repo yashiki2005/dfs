@@ -1,0 +1,183 @@
+name: Benchmark
+
+on:
+  schedule:
+    # 毎週月曜 03:00 JST (UTC 18:00) に実行
+    - cron: '0 18 * * 1'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Benchmark mode'
+        required: true
+        default: 'loopback'
+        type: choice
+        options:
+          - loopback
+          - wan
+      label:
+        description: 'Result label'
+        required: false
+        default: 'scheduled'
+      files:
+        description: 'Number of test files'
+        required: false
+        default: '20'
+      file-size:
+        description: 'File size in bytes'
+        required: false
+        default: '131072'
+      chunk-count:
+        description: 'Chunk count for round-trip verification'
+        required: false
+        default: '0'
+
+jobs:
+  benchmark:
+    name: dfs Benchmark
+    runs-on: self-hosted
+    timeout-minutes: 120
+    env:
+      DFS_CONFIG: ~/.config/dfs/remotes.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[test]
+          pip install zstandard
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            par2 \
+            fuse3 \
+            libfuse3-dev \
+            iproute2 \
+            wireguard-tools
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install par2 fuse3 wireguard-tools
+
+      - name: Generate test keys
+        run: |
+          mkdir -p /tmp/dfs_bench/keys
+          for name in root alice; do
+            ssh-keygen -t ed25519 -N "" -C "bench-$name@example.com" -f /tmp/dfs_bench/keys/$name
+            chmod 600 /tmp/dfs_bench/keys/$name
+          done
+
+      - name: Run loopback benchmark
+        if: github.event.inputs.mode == 'loopback' || github.event_name == 'schedule'
+        run: |
+          cd ${{ github.workspace }}
+          python -m bench.e2e_lan \
+            --work /tmp/dfs_bench \
+            --py python \
+            --key /tmp/dfs_bench/keys/alice
+
+      - name: Run WAN benchmark (loopback mode for CI)
+        if: github.event.inputs.mode == 'wan'
+        run: |
+          cd ${{ github.workspace }}
+          python -m bench.e2e_wan \
+            --mode loopback \
+            --label ${{ github.event.inputs.label }} \
+            --server-host 127.0.0.1 \
+            --l2-port 19440 \
+            --l3-port 19443 \
+            --work /tmp/dfs_bench \
+            --local-py python \
+            --remote-py python \
+            --files ${{ github.event.inputs.files }} \
+            --file-size ${{ github.event.inputs.file-size }} \
+            --chunk-count ${{ github.event.inputs.chunk-count }} \
+            --reset
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: bench/results/*.json
+          retention-days: 30
+
+      - name: Parse and post metrics
+        if: always()
+        run: |
+          python -c "
+import json, glob, os
+results = glob.glob('bench/results/*.json')
+if results:
+    latest = max(results, key=os.path.getmtime)
+    with open(latest) as f:
+        data = json.load(f)
+    
+    # Extract key metrics
+    metrics = {}
+    if 'metrics' in data:
+        for m in data['metrics']:
+            if 'direction' in m:
+                key = f'{m[\"direction\"]}_v{m[\"version\"]}'
+                metrics[key] = m
+    
+    if 'steps' in data:
+        for s in data['steps']:
+            if s['ok'] and 'elapsed_ms' in s:
+                metrics[s['step']] = s['elapsed_ms']
+    
+    print('## Benchmark Metrics')
+    for k, v in metrics.items():
+        print(f'- {k}: {v}')
+    
+    # Output for GitHub Actions
+    if metrics:
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+            f.write('## Benchmark Results\\n')
+            for k, v in metrics.items():
+                f.write(f'- {k}: {v}\\n')
+"
+
+      - name: Check performance regression
+        if: always()
+        run: |
+          python -c "
+import json, glob, os, sys
+results = glob.glob('bench/results/*.json')
+if len(results) >= 2:
+    latest = max(results, key=os.path.getmtime)
+    previous = sorted(results, key=os.path.getmtime)[-2]
+    
+    with open(latest) as f:
+        new = json.load(f)
+    with open(previous) as f:
+        old = json.load(f)
+    
+    def get_avg_ms(data, step_name):
+        for s in data.get('steps', []):
+            if s['step'] == step_name and s['ok'] and 'elapsed_ms' in s:
+                return s['elapsed_ms']
+        return None
+    
+    # Compare key operations
+    for step in ['Mac push', 'Pi5 pull', 'クライアント push', '読取側 pull', '内容一致（SHA-256）']:
+        new_ms = get_avg_ms(new, step)
+        old_ms = get_avg_ms(old, step)
+        if new_ms and old_ms:
+            pct = (new_ms - old_ms) / old_ms * 100
+            print(f'{step}: {old_ms:.1f}ms -> {new_ms:.1f}ms ({pct:+.1f}%)')
+            if pct > 50:  # 50% 以上の劣化で警告
+                print(f'::warning::Performance regression detected in {step}: {pct:+.1f}%')
+"
+        continue-on-error: true
