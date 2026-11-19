@@ -31,19 +31,23 @@
 ## 60 秒で試す
 
 ```bash
-git clone https://github.com/yashiki2005/dfs.git dfs && cd dfs
-uv sync
+# 0. 1 行インストール（macOS / Linux）
+curl -sSL https://raw.githubusercontent.com/yashiki2005/dfs/main/scripts/install.sh | bash
+```
 
-# 1. ローカルに名簿 + 暗号化チャンク保管庫を起動
-uv run dfssvc start
+```powershell
+# 0. 1 行インストール（Windows PowerShell）
+irm https://raw.githubusercontent.com/yashiki2005/dfs/main/scripts/install.ps1 | iex
+```
 
-# 2. 接続設定コマンドを表示し、そのまま実行してリモートを登録
-uv run dfssvc env
+```bash
+# 1. ローカルサーバー起動＆初期設定（リポジトリ内からは ./cli でも可）
+dfs start
 
-# 3. 同期・一覧・復元
-uv run dfscli sync ./dataset local:dataset
-uv run dfscli ls local:dataset
-uv run dfscli pull local:dataset ./restored
+# 2. 同期・一覧・復元
+dfs push ./dataset
+dfs ls
+dfs pull ./restored
 ```
 
 ---

@@ -32,6 +32,7 @@ test = [
 ]
 
 [project.scripts]
+dfs = "dfs.simple_cli:main"
 dfscli = "dfs.cli_main:main"
 dfssvc = "dfs.svc:main"
 

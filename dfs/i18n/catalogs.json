@@ -216,7 +216,8 @@
     "dfscli につなぐには": "To connect via dfscli",
     "記録からも消しました": "Also removed from service registry",
     "停止しました": "Stopped",
-    "もともと動いていません": "Not running"
+    "もともと動いていません": "Not running",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "Using yashiki.top for NAT traversal (pass --no-hub to disable)."
   },
   "zh-Hans": {
     "--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）": "Where to store keys when --key is omitted (default: ~/.config/dfs/keys)",
@@ -435,7 +436,8 @@
     "dfscli につなぐには": "连接 dfscli 方法",
     "記録からも消しました": "已从记录中删除",
     "停止しました": "已停止",
-    "もともと動いていません": "原本未运行"
+    "もともと動いていません": "原本未运行",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "将使用 yashiki.top 进行 NAT 穿透（传入 --no-hub 可禁用）。"
   },
   "zh-Hant": {
     "--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）": "Where to store keys when --key is omitted (default: ~/.config/dfs/keys)",
@@ -654,7 +656,8 @@
     "dfscli につなぐには": "連接 dfscli 方法",
     "記録からも消しました": "已從記錄中刪除",
     "停止しました": "已停止",
-    "もともと動いていません": "原本未執行"
+    "もともと動いていません": "原本未執行",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "將使用 yashiki.top 進行 NAT 穿透（傳入 --no-hub 可停用）。"
   },
   "fr": {
     "--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）": "Where to store keys when --key is omitted (default: ~/.config/dfs/keys)",
@@ -873,7 +876,8 @@
     "dfscli につなぐには": "Pour se connecter via dfscli",
     "記録からも消しました": "Également supprimé du registre",
     "停止しました": "Arrêté",
-    "もともと動いていません": "N'était pas en cours d'exécution"
+    "もともと動いていません": "N'était pas en cours d'exécution",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "Utilisation de yashiki.top pour la traversée NAT (passez --no-hub pour désactiver)."
   },
   "de": {
     "--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）": "Where to store keys when --key is omitted (default: ~/.config/dfs/keys)",
@@ -1092,7 +1096,8 @@
     "dfscli につなぐには": "Verbindung über dfscli herstellen",
     "記録からも消しました": "Auch aus der Registrierung entfernt",
     "停止しました": "Gestoppt",
-    "もともと動いていません": "Lief zuvor nicht"
+    "もともと動いていません": "Lief zuvor nicht",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "Verwende yashiki.top für NAT-Traversal (--no-hub zum Deaktivieren)."
   },
   "es": {
     "--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）": "Where to store keys when --key is omitted (default: ~/.config/dfs/keys)",
@@ -1311,7 +1316,8 @@
     "dfscli につなぐには": "Para conectar con dfscli",
     "記録からも消しました": "También eliminado del registro",
     "停止しました": "Detenido",
-    "もともと動いていません": "No estaba en ejecución"
+    "もともと動いていません": "No estaba en ejecución",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "Usando yashiki.top para atravesar NAT (pasa --no-hub para desactivar)."
   },
   "ko": {
     "--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）": "Where to store keys when --key is omitted (default: ~/.config/dfs/keys)",
@@ -1530,7 +1536,8 @@
     "dfscli につなぐには": "dfscli에 연결하려면",
     "記録からも消しました": "기록에서도 삭제했습니다",
     "停止しました": "중지되었습니다",
-    "もともと動いていません": "원래 실행 중이지 않았습니다"
+    "もともと動いていません": "원래 실행 중이지 않았습니다",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "NAT 통과를 위해 yashiki.top을 사용합니다(--no-hub로 비활성화 가능)."
   },
   "it": {
     "--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）": "Where to store keys when --key is omitted (default: ~/.config/dfs/keys)",
@@ -1743,7 +1750,8 @@
     "ログ": "Registro",
     "前面で起動します（Ctrl-C で停止）": "Avvio in primo piano (Ctrl-C per arrestare)",
     "起動しました": "Avviato",
-    "停止しました": "Arrestato"
+    "停止しました": "Arrestato",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "Utilizzo di yashiki.top per l'attraversamento NAT (passa --no-hub per disabilitare)."
   },
   "pt-BR": {
     "--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）": "Where to store keys when --key is omitted (default: ~/.config/dfs/keys)",
@@ -1956,7 +1964,8 @@
     "ログ": "Log",
     "前面で起動します（Ctrl-C で停止）": "Iniciando em primeiro plano (Ctrl-C para parar)",
     "起動しました": "Iniciado",
-    "停止しました": "Parado"
+    "停止しました": "Parado",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "Usando yashiki.top para travessia de NAT (passe --no-hub para desativar)."
   },
   "ru": {
     "--key を省いたときに鍵を置く場所（既定 ~/.config/dfs/keys）": "Where to store keys when --key is omitted (default: ~/.config/dfs/keys)",
@@ -2169,6 +2178,7 @@
     "ログ": "Журнал",
     "前面で起動します（Ctrl-C で停止）": "Запуск на переднем плане (Ctrl-C для остановки)",
     "起動しました": "Запущено",
-    "停止しました": "Остановлено"
+    "停止しました": "Остановлено",
+    "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）": "Используется yashiki.top для обхода NAT (передайте --no-hub для отключения)."
   }
 }

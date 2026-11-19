@@ -32,19 +32,23 @@
 ## Try It in 60 Seconds
 
 ```bash
-git clone https://github.com/yashiki2005/dfs.git dfs && cd dfs
-uv sync
+# 0. One-line install (macOS / Linux)
+curl -sSL https://raw.githubusercontent.com/yashiki2005/dfs/main/scripts/install.sh | bash
+```
 
-# 1. Start a local registry + encrypted chunk store
-uv run dfssvc start
+```powershell
+# 0. One-line install (Windows PowerShell)
+irm https://raw.githubusercontent.com/yashiki2005/dfs/main/scripts/install.ps1 | iex
+```
 
-# 2. Print the ready-to-run dfscli config command and register your remote
-uv run dfssvc env
+```bash
+# 1. Start a local server and auto-configure 'local' (or use ./cli from repo)
+dfs start
 
-# 3. Push, list, and pull back
-uv run dfscli sync ./dataset local:dataset
-uv run dfscli ls local:dataset
-uv run dfscli pull local:dataset ./restored
+# 2. Push, list, and pull back
+dfs push ./dataset
+dfs ls
+dfs pull ./restored
 ```
 
 ---

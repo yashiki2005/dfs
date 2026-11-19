@@ -1,0 +1,27 @@
+#!/bin/sh
+# cli: unified beginner-friendly CLI wrapper for dfs (wraps dfscli + dfssvc).
+set -eu
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ -n "${DFSCLI_PYTHON:-}" ]; then
+    cd "$SELF_DIR"
+    exec "$DFSCLI_PYTHON" -m dfs.simple_cli "$@"
+fi
+
+for candidate in \
+    "$HOME/dfs-venv/bin/python" \
+    "$SELF_DIR/.venv/bin/python" \
+    "$SELF_DIR/../.venv/bin/python" \
+    "$(command -v python3 2>/dev/null || true)"
+do
+    [ -n "$candidate" ] || continue
+    [ -x "$candidate" ] || continue
+    if "$candidate" -c 'import cryptography' >/dev/null 2>&1; then
+        cd "$SELF_DIR"
+        exec "$candidate" -m dfs.simple_cli "$@"
+    fi
+done
+
+echo "cli: Python with 'cryptography' not found. Set DFSCLI_PYTHON=/path/to/python or run uv sync." >&2
+exit 127
