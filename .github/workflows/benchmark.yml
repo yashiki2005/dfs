@@ -116,68 +116,68 @@ jobs:
       - name: Parse and post metrics
         if: always()
         run: |
-          python -c "
-import json, glob, os
-results = glob.glob('bench/results/*.json')
-if results:
-    latest = max(results, key=os.path.getmtime)
-    with open(latest) as f:
-        data = json.load(f)
-    
-    # Extract key metrics
-    metrics = {}
-    if 'metrics' in data:
-        for m in data['metrics']:
-            if 'direction' in m:
-                key = f'{m[\"direction\"]}_v{m[\"version\"]}'
-                metrics[key] = m
-    
-    if 'steps' in data:
-        for s in data['steps']:
-            if s['ok'] and 'elapsed_ms' in s:
-                metrics[s['step']] = s['elapsed_ms']
-    
-    print('## Benchmark Metrics')
-    for k, v in metrics.items():
-        print(f'- {k}: {v}')
-    
-    # Output for GitHub Actions
-    if metrics:
-        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-            f.write('## Benchmark Results\\n')
-            for k, v in metrics.items():
-                f.write(f'- {k}: {v}\\n')
-"
+          python - <<'EOF'
+          import json, glob, os
+          results = glob.glob('bench/results/*.json')
+          if results:
+              latest = max(results, key=os.path.getmtime)
+              with open(latest) as f:
+                  data = json.load(f)
+
+              # Extract key metrics
+              metrics = {}
+              if 'metrics' in data:
+                  for m in data['metrics']:
+                      if 'direction' in m:
+                          key = f"{m['direction']}_v{m['version']}"
+                          metrics[key] = m
+
+              if 'steps' in data:
+                  for s in data['steps']:
+                      if s['ok'] and 'elapsed_ms' in s:
+                          metrics[s['step']] = s['elapsed_ms']
+
+              print('## Benchmark Metrics')
+              for k, v in metrics.items():
+                  print(f'- {k}: {v}')
+
+              # Output for GitHub Actions
+              if metrics and 'GITHUB_STEP_SUMMARY' in os.environ:
+                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                      f.write('## Benchmark Results\n')
+                      for k, v in metrics.items():
+                          f.write(f'- {k}: {v}\n')
+          EOF
 
       - name: Check performance regression
         if: always()
-        run: |
-          python -c "
-import json, glob, os, sys
-results = glob.glob('bench/results/*.json')
-if len(results) >= 2:
-    latest = max(results, key=os.path.getmtime)
-    previous = sorted(results, key=os.path.getmtime)[-2]
-    
-    with open(latest) as f:
-        new = json.load(f)
-    with open(previous) as f:
-        old = json.load(f)
-    
-    def get_avg_ms(data, step_name):
-        for s in data.get('steps', []):
-            if s['step'] == step_name and s['ok'] and 'elapsed_ms' in s:
-                return s['elapsed_ms']
-        return None
-    
-    # Compare key operations
-    for step in ['Mac push', 'Pi5 pull', 'クライアント push', '読取側 pull', '内容一致（SHA-256）']:
-        new_ms = get_avg_ms(new, step)
-        old_ms = get_avg_ms(old, step)
-        if new_ms and old_ms:
-            pct = (new_ms - old_ms) / old_ms * 100
-            print(f'{step}: {old_ms:.1f}ms -> {new_ms:.1f}ms ({pct:+.1f}%)')
-            if pct > 50:  # 50% 以上の劣化で警告
-                print(f'::warning::Performance regression detected in {step}: {pct:+.1f}%')
-"
         continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import json, glob, os
+          results = glob.glob('bench/results/*.json')
+          if len(results) >= 2:
+              latest = max(results, key=os.path.getmtime)
+              previous = sorted(results, key=os.path.getmtime)[-2]
+
+              with open(latest) as f:
+                  new = json.load(f)
+              with open(previous) as f:
+                  old = json.load(f)
+
+              def get_avg_ms(data, step_name):
+                  for s in data.get('steps', []):
+                      if s['step'] == step_name and s['ok'] and 'elapsed_ms' in s:
+                          return s['elapsed_ms']
+                  return None
+
+              # Compare key operations
+              for step in ['Mac push', 'Pi5 pull', 'クライアント push', '読取側 pull', '内容一致（SHA-256）']:
+                  new_ms = get_avg_ms(new, step)
+                  old_ms = get_avg_ms(old, step)
+                  if new_ms and old_ms:
+                      pct = (new_ms - old_ms) / old_ms * 100
+                      print(f'{step}: {old_ms:.1f}ms -> {new_ms:.1f}ms ({pct:+.1f}%)')
+                      if pct > 50:  # 50% 以上の劣化で警告
+                          print(f'::warning::Performance regression detected in {step}: {pct:+.1f}%')
+          EOF
