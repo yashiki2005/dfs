@@ -16,16 +16,20 @@ authors = [
 dependencies = [
     "cryptography>=41",
     "dnspython>=2.6",
-    "fastecdsa==4.0.0; sys_platform != 'win32'",
-    "libp2p>=0.8",
     "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]
 compression = ["zstandard>=0.22"]
-libp2p = ["libp2p>=0.8"]
+libp2p = ["libp2p>=0.8", "fastecdsa==4.0.0; sys_platform != 'win32'"]
 fuse = ["fusepy>=3"]
-test = ["pytest>=8", "pytest-timeout>=2.3", "zstandard>=0.22"]
+test = [
+    "pytest>=8",
+    "pytest-timeout>=2.3",
+    "zstandard>=0.22",
+    "libp2p>=0.8",
+    "fastecdsa==4.0.0; sys_platform != 'win32'",
+]
 
 [project.scripts]
 dfscli = "dfs.cli_main:main"

@@ -37,7 +37,7 @@ if ! command -v dfscli >/dev/null 2>&1; then
     mkdir -p "$(dirname "$INSTALL_DIR")"
     git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
   fi
-  uv sync --project "$INSTALL_DIR"
+  uv sync --project "$INSTALL_DIR" --extra libp2p
   mkdir -p "$BIN_DIR"
   ln -sf "$INSTALL_DIR/.venv/bin/dfscli" "$BIN_DIR/dfscli"
   ln -sf "$INSTALL_DIR/.venv/bin/dfssvc" "$BIN_DIR/dfssvc"
