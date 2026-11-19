@@ -712,10 +712,18 @@ def extract_zstd_chunked_member(archive_path: Path | str, member_name: str) -> b
     clen = int(matched_entry["compressed_size"])
     poff = int(matched_entry["payload_offset_in_frame"])
     psize = int(matched_entry["size"])
+    if off < 0 or clen <= 0 or poff < 0 or psize < 0:
+        raise ArchiveError(f"Invalid zstd:chunked TOC offsets for {member_name}")
+    file_size = path.stat().st_size
+    if off + clen > file_size:
+        raise ArchiveError(f"zstd:chunked TOC entry out of bounds for {member_name}")
     with path.open("rb") as fh:
         fh.seek(off)
         compressed = fh.read(clen)
-    raw_frame = zstd.ZstdDecompressor().decompress(compressed)
+    max_frame_bytes = max(poff + psize, 64 * 1024 * 1024)
+    raw_frame = zstd.ZstdDecompressor().decompress(compressed, max_output_size=max_frame_bytes)
+    if len(raw_frame) < poff + psize:
+        raise ArchiveError(f"Truncated zstd:chunked frame for {member_name}")
     return raw_frame[poff : poff + psize]
 
 

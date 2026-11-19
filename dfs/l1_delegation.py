@@ -78,13 +78,23 @@ def verify_single_delegation(
     単一の委譲レコードに対して specs/delegation.md の不変条件 1〜4 および §3.2 を検証する。
     検証に成功した場合は payload 辞書を返す。
     """
-    if "payload" not in envelope or "signature" not in envelope:
+    if not isinstance(envelope, dict) or "payload" not in envelope or "signature" not in envelope:
         raise DelegationError("Malformed delegation envelope")
 
     p = envelope["payload"]
+    if not isinstance(p, dict):
+        raise DelegationError("Malformed delegation payload")
     required_keys = {"base_version", "epoch", "expires_at", "issued_at", "parent", "path", "writer"}
     if set(p.keys()) != required_keys:
         raise DelegationError(f"Invalid delegation payload keys: {set(p.keys())}")
+    for int_key in ("base_version", "epoch", "expires_at", "issued_at"):
+        if isinstance(p[int_key], bool) or not isinstance(p[int_key], int):
+            raise DelegationError(f"Invalid {int_key} type in delegation payload")
+    for str_key in ("parent", "path", "writer"):
+        if not isinstance(p[str_key], str) or not p[str_key].strip():
+            raise DelegationError(f"Invalid {str_key} in delegation payload")
+    if not isinstance(envelope["signature"], str) or not envelope["signature"].strip():
+        raise DelegationError("Invalid signature in delegation envelope")
 
     try:
         norm_parent = normalize_path(p["parent"])

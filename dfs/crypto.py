@@ -358,25 +358,28 @@ def ssh_verify(
         allowed_signers.write_text(f"{safe_identity} {clean_pub}\n", encoding="utf-8")
         sig_file.write_text(signature, encoding="utf-8")
 
-        res = subprocess.run(
-            [
-                "ssh-keygen",
-                "-Y",
-                "verify",
-                "-f",
-                str(allowed_signers),
-                "-I",
-                safe_identity,
-                "-n",
-                namespace,
-                "-s",
-                str(sig_file),
-            ],
-            input=payload,
-            capture_output=True,
-            timeout=SIGN_TIMEOUT_SECONDS,
-        )
-        return res.returncode == 0
+        try:
+            res = subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-Y",
+                    "verify",
+                    "-f",
+                    str(allowed_signers),
+                    "-I",
+                    safe_identity,
+                    "-n",
+                    namespace,
+                    "-s",
+                    str(sig_file),
+                ],
+                input=payload,
+                capture_output=True,
+                timeout=SIGN_TIMEOUT_SECONDS,
+            )
+            return res.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
 
 
 def require_ssh_verify(

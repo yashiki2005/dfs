@@ -305,10 +305,10 @@ def detect_cow_backend(root: Path) -> Optional[str]:
             src.write_bytes(b"dfs")
             try:
                 if is_macos():
-                    _macos_clonefile(str(src), str(dst))
+                    macos_clonefile(str(src), str(dst))
                     return "reflink"
                 if is_linux():
-                    _linux_ficlone(str(src), str(dst))
+                    linux_ficlone(str(src), str(dst))
                     return "reflink"
             except OSError:
                 pass
@@ -465,6 +465,8 @@ class ReflinkBackend(Backend):
         self.detail = detail
 
     def copy_file(self, src: Path, dst: Path) -> int:
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
         self._copier(str(src), str(dst))
         try:
             shutil.copystat(src, dst, follow_symlinks=False)

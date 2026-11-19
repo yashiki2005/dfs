@@ -202,7 +202,15 @@ class RemoteStore:
             "remotes": {name: r.to_dict() for name, r in sorted(self.remotes.items())},
         }
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        content = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            f = os.fdopen(fd, "wb")
+        except Exception:
+            os.close(fd)
+            raise
+        with f:
+            f.write(content)
         restrict_to_owner(tmp)
         tmp.replace(self.path)
 

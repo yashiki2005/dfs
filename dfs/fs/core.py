@@ -37,6 +37,9 @@ from dfs.fs.platform import (
     detect_cow_backend,
     is_windows,
     is_windows_junction,
+    is_windows_junction as _is_windows_junction,
+    _windows_cluster_size,
+    _windows_block_clone,
     is_winerror_1314,
     clear_readonly_and_retry,
     safe_target,
@@ -50,6 +53,36 @@ from dfs.fs.platform import (
     SNAPSHOT_ID_RE,
     _validate_snapshot_id,
 )
+
+
+def _probe_block_clone(path: Path) -> Optional[BackendInfo]:
+    """Windows の ReFS / Dev Drive block clone を実際に試す。"""
+    if not is_windows():
+        return None
+    import tempfile
+
+    # block clone はクラスタ単位。1 クラスタ未満だと常に ENOTSUP になるので、
+    # 1 MiB を書いて「本当に複製できたか」と「中身が一致するか」まで確かめる。
+    payload = b"\x00" * (1024 * 1024)
+    with tempfile.TemporaryDirectory(prefix="dfs_fs_clone_", dir=str(path)) as probe:
+        probe_dir = Path(probe)
+        src = probe_dir / "probe_src"
+        dst = probe_dir / "probe_dst"
+        src.write_bytes(payload)
+        try:
+            _windows_block_clone(str(src), str(dst))
+            if not dst.exists() or dst.stat().st_size != len(payload):
+                return None
+            if dst.read_bytes() != payload:
+                return None
+            return BackendInfo(
+                "fast_clone",
+                Capability.FAST_CLONE,
+                "Windows FSCTL_DUPLICATE_EXTENTS_TO_FILE",
+                True,
+            )
+        except Exception:  # noqa: BLE001 - 検出なので落とさない
+            return None
 
 
 @dataclass
@@ -170,33 +203,7 @@ class FileSystem:
 
     def _probe_block_clone(self, path: Path) -> Optional[BackendInfo]:
         """Windows の ReFS / Dev Drive block clone を実際に試す。"""
-        if not is_windows():
-            return None
-        import tempfile
-
-        # block clone はクラスタ単位。1 クラスタ未満だと常に ENOTSUP になるので、
-        # 1 MiB を書いて「本当に複製できたか」と「中身が一致するか」まで確かめる。
-        payload = b"\x00" * (1024 * 1024)
-        with tempfile.TemporaryDirectory(prefix="dfs_fs_clone_", dir=str(path)) as probe:
-            probe_dir = Path(probe)
-            src = probe_dir / "probe_src"
-            dst = probe_dir / "probe_dst"
-            src.write_bytes(payload)
-            try:
-                from dfs.fs.platform import _windows_block_clone
-                _windows_block_clone(str(src), str(dst))
-                if not dst.exists() or dst.stat().st_size != len(payload):
-                    return None
-                if dst.read_bytes() != payload:
-                    return None
-                return BackendInfo(
-                    "fast_clone",
-                    Capability.FAST_CLONE,
-                    "Windows FSCTL_DUPLICATE_EXTENTS_TO_FILE",
-                    True,
-                )
-            except Exception:  # noqa: BLE001 - 検出なので落とさない
-                return None
+        return _probe_block_clone(path)
 
     @property
     def backend(self) -> Backend:

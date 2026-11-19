@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union, Protocol
-from contextlib import contextmanager
+from urllib.parse import urlsplit, urlunsplit
 
 from .crypto import ChunkIntegrityError, sha256_hex
 from .l2_registry import ServiceUnavailableError
@@ -594,11 +594,18 @@ class ChunkStoreServer:
                     except Exception:
                         pass
                     continue
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.settimeout(ost_socket_timeout())
-                threading.Thread(
-                    target=self._handle_client_guarded, args=(conn,), daemon=True
-                ).start()
+                try:
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    conn.settimeout(ost_socket_timeout())
+                    threading.Thread(
+                        target=self._handle_client_guarded, args=(conn,), daemon=True
+                    ).start()
+                except Exception:
+                    try:
+                        conn.close()
+                    finally:
+                        self._conn_sem.release()
+                    raise
             except Exception:
                 break
 
@@ -1546,6 +1553,9 @@ class HttpOSTClient:
                     raise ServiceUnavailableError(
                         f"L3 HTTP OST connection failed at {self.base_url}: {e}"
                     ) from e
+                except ChunkIntegrityError:
+                    self._close_pooled_conn()
+                    raise
                 except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException) as e:
                     self._close_pooled_conn()
                     raise ServiceUnavailableError(

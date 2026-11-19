@@ -31,8 +31,13 @@ def write_private_json(path: Path, data: Any, mode: int = 0o600) -> None:
     )
     tmp = Path(tmp_name)
     try:
-        os.chmod(tmp, mode)
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        try:
+            os.chmod(tmp, mode)
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except Exception:
+            os.close(fd)
+            raise
+        with f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())

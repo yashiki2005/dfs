@@ -159,7 +159,11 @@ def _matching_dnskeys(zone: Any, keys: Any, ds_rrset: Any):
 
 
 def _validated_zone_keys(
-    resolver: Any, zone: Any, cache: Dict[Any, Any]
+    resolver: Any,
+    zone: Any,
+    cache: Dict[Any, Any],
+    *,
+    _in_progress: Optional[set] = None,
 ):
     """root から ``zone`` までの DNSKEY/DS チェーンを検証し、DNSKEY 集合を返す。"""
     import dns.dnssec
@@ -169,6 +173,11 @@ def _validated_zone_keys(
     zone = dns.name.from_text(str(zone))
     if zone in cache:
         return cache[zone]
+    if _in_progress is None:
+        _in_progress = set()
+    if zone in _in_progress:
+        raise DiscoveryError(f"DNSSEC signer cycle detected at {zone}")
+    _in_progress.add(zone)
     zone_key = zone.to_text()
     now = int(time.time())
     with _ZONE_KEY_CACHE_LOCK:
@@ -189,7 +198,13 @@ def _validated_zone_keys(
         if len(signers) != 1:
             raise DiscoveryError(f"DS for {zone} has ambiguous signers")
         parent = next(iter(signers))
-        parent_keys = _validated_zone_keys(resolver, parent, cache)
+        if parent == zone or not zone.is_subdomain(parent):
+            raise DiscoveryError(
+                f"DS signer {parent} is not an ancestor of {zone}"
+            )
+        parent_keys = _validated_zone_keys(
+            resolver, parent, cache, _in_progress=_in_progress
+        )
         try:
             dns.dnssec.validate(ds_rrset, ds_rrsig, {parent: parent_keys})
         except Exception as e:  # noqa: BLE001
@@ -220,6 +235,10 @@ def _validate_answer(resolver: Any, answer: Any, rrset: Any) -> None:
     import dns.dnssec
     import dns.rdatatype
 
+    if getattr(answer, "qname", None) is not None and answer.qname != answer.canonical_name:
+        raise DiscoveryError(
+            f"Refusing unvalidated CNAME redirection from {answer.qname} to {answer.canonical_name}"
+        )
     sigset = None
     for item in answer.response.answer:
         if item.name != answer.canonical_name:
@@ -235,6 +254,10 @@ def _validate_answer(resolver: Any, answer: Any, rrset: Any) -> None:
     if len(signers) != 1:
         raise DiscoveryError(f"TXT for {answer.canonical_name} has ambiguous signers")
     zone = next(iter(signers))
+    if not answer.canonical_name.is_subdomain(zone):
+        raise DiscoveryError(
+            f"TXT signer {zone} is not an ancestor of {answer.canonical_name}"
+        )
     keys = _validated_zone_keys(resolver, zone, {})
     try:
         dns.dnssec.validate(rrset, sigset, {zone: keys})

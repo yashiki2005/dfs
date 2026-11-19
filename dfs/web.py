@@ -154,6 +154,8 @@ class DFSWebBackend:
         norm = normalize_rel_path(rel_path)
         if not norm:
             return self.work_tree
+        if any(part == ".dfs" or part.startswith("._") for part in Path(norm).parts):
+            raise WebAppError(403, f"Reserved path: /{norm}")
         try:
             return safe_target(self.work_tree, norm)
         except UnsafePathError as e:
@@ -1248,6 +1250,14 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
 
     class DFSWebHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = 30.0
+
+        def setup(self) -> None:
+            super().setup()
+            try:
+                self.connection.settimeout(self.timeout)
+            except OSError:
+                pass
 
         def log_message(self, fmt: str, *args: Any) -> None:
             pass
@@ -1257,9 +1267,11 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
             return bool(config.secure_cookie or proto == "https")
 
         def _strip_base(self, path: str) -> str:
-            if base_prefix and path.startswith(base_prefix):
-                rest = path[len(base_prefix) :]
-                return rest if rest.startswith("/") else "/" + rest
+            if base_prefix:
+                if path == base_prefix:
+                    return "/"
+                if path.startswith(base_prefix + "/"):
+                    return path[len(base_prefix) :]
             return path
 
         def _set_common_headers(self, csp_nonce: Optional[str] = None) -> None:
@@ -1474,8 +1486,11 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                     rel = (qs.get("path") or [""])[0]
                     inline = (qs.get("inline") or ["0"])[0] == "1"
                     target, mime, size = backend.read_file_info(rel)
-                    # HTML/SVG 等をインラインで返すと XSS リスクがあるため安全側に倒す
-                    if mime in ("text/html", "image/svg+xml", "application/xhtml+xml"):
+                    # HTML/SVG/XML 等をインラインで返すと XSS リスクがあるため安全側に倒す
+                    if (
+                        mime in ("text/html", "image/svg+xml", "application/xhtml+xml", "application/xml", "text/xml")
+                        or mime.endswith("+xml")
+                    ):
                         inline = False
                         mime = "application/octet-stream"
                     disp = "inline" if inline else "attachment"
@@ -1484,6 +1499,7 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                     self.send_header("Content-Type", mime)
                     self.send_header("Content-Length", str(size))
                     self.send_header("Content-Disposition", f"{disp}; filename*=UTF-8''{fname}")
+                    self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
                     self._set_common_headers()
                     self.end_headers()
                     with target.open("rb") as f:

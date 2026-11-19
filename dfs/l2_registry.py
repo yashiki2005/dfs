@@ -557,13 +557,8 @@ class DirectoryRegistryService:
                 if old_env.get("entry_hash") != logs[i].get("entry_hash"):
                     raise ConflictError("Replication fork detected")
 
-            self._store_replica_chain(chain)
-            self.delegation_history.setdefault(norm_path, {}).update(verified_epoch_chains)
-            if logs:
-                self.logs[norm_path] = logs
-                self.locators[norm_path] = locator
             if archives:
-                current = self.archives.setdefault(norm_path, {})
+                current = self.archives.get(norm_path, {})
                 for version, envelope in archives.items():
                     existing_envelope = current.get(version)
                     if (
@@ -573,7 +568,14 @@ class DirectoryRegistryService:
                         raise ConflictError(
                             f"Archive descriptor fork detected for {norm_path!r} v{version}"
                         )
-                    current[version] = envelope
+
+            self._store_replica_chain(chain)
+            self.delegation_history.setdefault(norm_path, {}).update(verified_epoch_chains)
+            if logs:
+                self.logs[norm_path] = logs
+                self.locators[norm_path] = locator
+            if archives:
+                self.archives.setdefault(norm_path, {}).update(archives)
             return True
 
     def _store_replica_chain(self, chain: List[Dict[str, Any]]) -> None:

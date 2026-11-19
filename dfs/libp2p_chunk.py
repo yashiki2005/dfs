@@ -1545,13 +1545,14 @@ def sync_from_peer(
     remote_wids: List[str] = []
     offset = 0
     total = 0
+    max_list_chunks = 10_000_000
     while True:
         total, page = client.list_chunks(offset=offset, limit=4096)
         if not page:
             break
         remote_wids.extend(page)
         offset += len(page)
-        if offset >= total:
+        if offset >= total or len(remote_wids) >= max_list_chunks:
             break
     missing = [wid for wid in remote_wids if not _store_contains(store, wid)]
     fetched = 0
@@ -1674,7 +1675,7 @@ def sync_from_peers(
             if page:
                 wids.extend(page)
                 offset += len(page)
-            while offset < total:
+            while offset < total and len(wids) < 10_000_000:
                 total, page = client.list_chunks(offset=offset, limit=4096)
                 if not page:
                     break

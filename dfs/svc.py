@@ -1382,8 +1382,12 @@ def _stop_process(s: Service) -> bool:
             # Windowsではポートが閉じてもserve.logを書き終えるまで待つ。
             return not _process_alive(s.pid)
         # POSIXではdetached serverが親に回収されず、ゾンビの間は
-        # _process_alive()が真を返すため、待受終了を停止完了とする。
-        return not s.is_running()
+        # _process_alive()が真を返すため、待受終了かつポート解放を停止完了とする。
+        return (
+            not s.is_running()
+            and is_port_free(s.registry_port, allow_reuse=True)
+            and is_port_free(s.ost_port, allow_reuse=True)
+        )
 
     # まずは穏当に。サーバは stop.request を見て httpd.shutdown() し、
     # finally で状態とチャンクを保存してから終了する（データを落とさない）。

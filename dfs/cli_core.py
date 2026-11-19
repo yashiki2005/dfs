@@ -39,7 +39,15 @@ from .archive import (
     verify_bundle,
 )
 from .crypto import KDF_DEFAULT, KDF_LEGACY_SHA256, ssh_key_fingerprint
+from .discovery import (
+    CandidacyError,
+    create_candidacy_envelope,
+    fetch_candidacy,
+    verify_candidacy_envelope,
+)
+from .dnssec import Discovery, DiscoveryError, discover_domain
 from .fs.core import remove_tree
+from .invite import InviteError, decode_invite, encode_ro_invite, encode_rw_invite
 from .l2_registry import ConflictError, ServiceUnavailableError
 from .l1_delegation import DelegationError, create_delegation_envelope, verify_delegation_chain
 from .l4_log import (
@@ -176,14 +184,15 @@ def _ensure_remote_secret(
         return remote
     # tree_secret はサーバに置かない共有秘密なので、L2 からは引けない。
     # 対話端末ならその場で 2 度入力して remotes.json に保存する。
-    secret = prompt_secret(
+    prompt_fn = getattr(sys.modules.get("dfs.cli_main"), "prompt_secret", prompt_secret)
+    secret = prompt_fn(
         f"tree_secret ({remote.name}): ",
         f"tree_secret ({remote.name}, 確認): ",
     )
     if secret:
         remote.secret = secret
         target_store = store if store is not None else RemoteStore()
-        if target_store.get(remote.name) is not None:
+        if remote.name in target_store.remotes:
             target_store.set(remote)
             print(
                 f"[dfscli] 共有秘密鍵 (tree_secret) を保存しました: {target_store.path}",

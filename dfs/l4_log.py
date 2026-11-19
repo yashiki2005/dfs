@@ -229,7 +229,10 @@ class SQLiteChunkIndex(MutableMapping[str, Tuple[str, str, str]]):
             if self._closed:
                 return
             self._closed = True
-            self._conn.close()
+            try:
+                self._conn.commit()
+            finally:
+                self._conn.close()
 
 
 class SilentDropDetectedError(Exception):
@@ -1253,13 +1256,13 @@ class L4LogClient:
         L2/L4 から先頭版を取得し、署名検証および B6（巻き戻し・フォーク）チェックを行ってローカルピンを更新する。
         """
         del_env, loc_env, head_env = registry.resolve(self.sub_path)
-        self.last_delegation = del_env
-        self.last_locator = loc_env
         if head_env is None:
             if self.pin.version > 0:
                 raise RollbackDetectedError(
                     f"B6 Rollback detected: remote log is empty, but local pin is at v{self.pin.version}"
                 )
+            self.last_delegation = del_env
+            self.last_locator = loc_env
             return None
 
         p = head_env["payload"]
@@ -1311,6 +1314,8 @@ class L4LogClient:
             if int(loc_p.get("delegation_epoch", -1)) != int(p["delegation_epoch"]):
                 raise ChunkIntegrityError("Locator delegation_epoch does not match the head")
 
+        self.last_delegation = del_env
+        self.last_locator = loc_env
         self.pin = HeadPin(
             version=p["version"],
             entry_hash=head_env["entry_hash"],

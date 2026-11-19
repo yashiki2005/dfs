@@ -98,7 +98,12 @@ def write_bytes_no_follow(path: Path, data: bytes) -> None:
     """最終要素が symlink でないことを確認してファイルを書く。"""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     fd = _open_no_follow(path, flags)
-    with os.fdopen(fd, "wb") as f:
+    try:
+        f = os.fdopen(fd, "wb")
+    except Exception:
+        os.close(fd)
+        raise
+    with f:
         f.write(data)
 
 

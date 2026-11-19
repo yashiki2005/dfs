@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import sys
 import time
 from pathlib import Path
@@ -20,7 +21,11 @@ from . import cli as cli_mod
 from .cli_core import (
     safe_target,
     UnsafePathError,
+    _ensure_remote_secret,
+    _reset_workdir_pin,
     _resolve_remote,
+    public_key_of,
+    resolve_path,
     _resolve_self_claimed_domain_remote,
     _ensure_remote_from_service,
     _require_writable,
@@ -321,7 +326,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"dfscli {_version()}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # listremotes
     p = sub.add_parser("listremotes", help="定義済みのリモートと接続状態・権限を一覧する")
     p.add_argument("--no-check", action="store_true", help="接続確認を省略して高速表示する")
     p.add_argument("--prune", action="store_true", help="到達できないリモートを削除する（dfssvc 管理下は保護）")
@@ -330,51 +334,238 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="JSON で出力する")
     p.set_defaults(func=cmd_listremotes)
 
-    # create = config create
+    # `dfscli create NAME ...` は `dfscli config create NAME ...` と同じ。
+    # 登録は一番よく打つので短い入口を用意する。
     p = sub.add_parser("create", help="リモートを登録する（= config create）")
     _add_create_args(p, args_name_required=True)
     p.set_defaults(func=cmd_config, action="create")
 
-    # config group
-    p_conf = sub.add_parser("config", help="リモート定義を管理する")
-    conf_sub = p_conf.add_subparsers(dest="action", required=True)
-    p_create = conf_sub.add_parser("create", help="リモートを登録する")
-    _add_create_args(p_create, args_name_required=True)
-    p_create.set_defaults(func=cmd_config, action="create")
-    p_update = conf_sub.add_parser("update", help="既存リモートを更新する")
-    _add_create_args(p_update, args_name_required=True)
-    p_update.set_defaults(func=cmd_config, action="update")
-    p_remove = conf_sub.add_parser("remove", help="リモートを削除する")
-    p_remove.add_argument("name", help="削除するリモート名")
-    p_remove.set_defaults(func=cmd_config, action="remove")
-    p_show = conf_sub.add_parser("show", help="リモート定義を表示する")
-    p_show.add_argument("name", help="表示するリモート名")
-    p_show.set_defaults(func=cmd_config, action="show")
+    p_conf = sub.add_parser("config", help="リモート定義の作成・表示・削除")
+    p_conf.add_argument("action", choices=["create", "show", "delete", "list"])
+    p_conf.add_argument("name", nargs="?", default="")
+    _add_create_args(p_conf, args_name_required=False)
     p_conf.set_defaults(func=cmd_config)
 
-    # discover
-    p_disc = sub.add_parser("discover", help="ドメイン名から root 情報を DNSSEC 経由で取得する")
-    p_disc.add_argument("domain", help="調べるドメイン名（例: example.com）")
-    p_disc.add_argument("--name", help="登録するリモート名（省略時は自動）")
-    p_disc.add_argument("--key", help="書き手秘密鍵（登録時）")
-    p_disc.add_argument("--secret", help="tree_secret（登録時）")
-    p_disc.add_argument("--no-validate", action="store_true", help="DNSSEC 検証を省略する（診断用）")
-    p_disc.add_argument("--record", default="_dfs", help="TXT レコードのプレフィクス（既定 _dfs）")
+    p_disc = sub.add_parser("discover", help="DNSSEC から root/registry 情報を取得して表示する")
+    p_disc.add_argument("domain", help="例: example.com")
+    p_disc.add_argument("--dnssec-name", help="TXT レコード名（既定 _dfs.<domain>）")
+    p_disc.add_argument("--dnssec-no-ad", action="store_true", help="AD ビットを要求しない")
+    p_disc.add_argument(
+        "--dnssec-no-validate",
+        action="store_true",
+        help="クライアント側 DNSSEC 検証を省略する（診断用。本番では使わない）",
+    )
+    p_disc.add_argument("--json", action="store_true", help="レコード JSON をそのまま出す")
     p_disc.set_defaults(func=cmd_discover)
 
-    # candidacy
-    p_cand = sub.add_parser("candidacy", help="署名付き立候補名簿 (/v1/candidacy) を取得・検証する")
-    p_cand.add_argument("url", nargs="?", help="取得する /v1/candidacy の URL")
-    p_cand.add_argument("--file", help="ローカルの dfs-candidacy-v1 JSON ファイル")
-    p_cand.add_argument("--root-pubkey", help="root アンカー公開鍵（検証用）")
-    p_cand.add_argument("--root-anchor", help="期待する root_anchor パス")
-    p_cand.add_argument("--register", action="store_true", help="検証後にローカル dfssvc へ登録する")
-    p_cand.add_argument("--svc", default="local", help="登録するローカル dfssvc 名（既定 local）")
+    p_cand = sub.add_parser(
+        "candidacy",
+        help="小規模運用向けの署名付き立候補レコードを作成・取得する",
+    )
+    p_cand.add_argument("action", choices=["create", "discover"])
+    p_cand.add_argument("--root-key", help="root の OpenSSH 秘密鍵 (create 用)")
+    p_cand.add_argument("--root-anchor", default="/example.com", help="root アンカーパス")
+    p_cand.add_argument("--root-pubkey", required=True, help="root 公開鍵ファイルまたは文字列")
+    p_cand.add_argument("--primary", help="primary registry URL (create 用)")
+    p_cand.add_argument("--secondary", action="append", default=[], help="secondary registry URL (複数可)")
+    p_cand.add_argument("--epoch", type=int, default=1, help="立候補世代 / role_epoch (create 用)")
+    p_cand.add_argument("--ttl-days", type=int, default=30, help="有効期間（日）")
+    p_cand.add_argument("--out", help="出力 JSON ファイルパス (create 用)")
+    p_cand.add_argument("--announce", action="append", default=[], help="登録先の registry URL (create 用)")
+    p_cand.add_argument("--url", action="append", default=[], help="問い合わせる候補 registry URL (discover 用)")
+    p_cand.add_argument("--min-epoch", type=int, help="受け入れる最小 epoch (discover 用)")
+    p_cand.add_argument("--registry-port", type=int, default=DEFAULT_REGISTRY_PORT)
+    p_cand.add_argument("--json", action="store_true", help="JSON をそのまま出す")
     p_cand.set_defaults(func=cmd_candidacy)
 
-    # invite / share / join
-    p_inv = sub.add_parser("invite", help="読み取り専用 / 書き込み可の招待トークンを発行する")
-    p_inv.add_argument("remote", nargs="?", help="招待元リモート名（--name 指定時は省略可）")
+    p_arch = sub.add_parser(
+        "archive", help="版の archive bundle / BitTorrent を作成・公開・取得する"
+    )
+    p_arch.add_argument(
+        "action",
+        choices=["create", "publish", "verify", "extract", "catalog", "fetch"],
+    )
+    p_arch.add_argument(
+        "source",
+        help="create/fetch は remote:path、verify/extract は bundle ディレクトリ",
+    )
+    p_arch.add_argument("dest", nargs="?", help="extract/fetch の出力先")
+    p_arch.add_argument(
+        "--out",
+        help="create の bundle 出力先、または fetch のダウンロード先",
+    )
+    p_arch.add_argument(
+        "--format",
+        choices=["zstd:chunked", "tar.zst", "tar.gz"],
+        default="zstd:chunked",
+        help="create のアーカイブ形式（既定: zstd:chunked）",
+    )
+    p_arch.add_argument(
+        "--keep-dir",
+        action="store_true",
+        help="create 時に展開済み bundle ディレクトリも削除せず残す",
+    )
+    p_arch.add_argument(
+        "--recovery",
+        type=int,
+        default=None,
+        metavar="PERCENT",
+        help="PAR2 リカバリレコードの冗長率 %%（既定: par2 があれば 5、0 で無効）",
+    )
+    p_arch.add_argument("--announce", help="torrent の announce URL（省略可）")
+    p_arch.add_argument("--version", type=int, help="archive する版（省略時は先頭版）")
+    p_arch.add_argument("--secret", help="extract の tree_secret")
+    p_arch.add_argument("--no-prompt", action="store_true", help="secret を端末から読まない")
+    p_arch.add_argument(
+        "--publish",
+        action="store_true",
+        help="create 後、署名済みdescriptorをL2へ公開する",
+    )
+    p_arch.add_argument(
+        "--torrent-client",
+        help="fetchで使う外部BT CLI（既定: aria2c、次に transmission-cli）",
+    )
+    p_arch.add_argument(
+        "--torrent-timeout",
+        type=int,
+        default=7200,
+        help="fetchのダウンロードタイムアウト秒（既定 7200）",
+    )
+    p_arch.set_defaults(func=cmd_archive)
+
+    p_history = sub.add_parser("history", help="L4 の版履歴を表示する")
+    p_history.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
+    p_history.add_argument("--limit", type=int, default=50, help="表示件数（既定 50）")
+    p_history.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("ls", help="リモートの直下を一覧する（内容は取らない）")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
+    p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser("lsd", help="リモートの直下にあるディレクトリだけを一覧する")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
+    p.set_defaults(func=cmd_lsd)
+
+    p = sub.add_parser("mount", help="リモートを fuse-t / FUSE でマウントする")
+    p.add_argument("remote", help="remote:path")
+    p.add_argument("mountpoint", help="ローカルのマウントポイント")
+    p.add_argument("--read-only", action="store_true", help="読み取り専用でマウントする")
+    p.add_argument("--allow-other", action="store_true", help="allow_other を FUSE に渡す")
+    p.add_argument("--debug", action="store_true", help="FUSE のデバッグログを出す")
+    p.add_argument(
+        "--fuse-library",
+        help="fusepy が使う FUSE ライブラリ（macOS の fuse-t など）",
+    )
+    p.add_argument(
+        "--backend",
+        choices=["auto", "fskit", "fuse-t", "macfuse"],
+        default="auto",
+        help="FUSE マウントのバックエンド（既定: auto = macfuse-fskit -> fuse-t -> macfuse）",
+    )
+    p.set_defaults(func=cmd_mount)
+
+    p = sub.add_parser("lsl", help="リモートの直下を大きさ付きで一覧する")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
+    p.set_defaults(func=cmd_lsl)
+
+    p = sub.add_parser("lsjson", help="リモートの一覧を JSON で出す")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
+    p.set_defaults(func=cmd_lsjson)
+
+    p = sub.add_parser("size", help="リモートの合計と重複排除後の塊の数を出す")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
+    p.set_defaults(func=cmd_size)
+
+    p = sub.add_parser("cat", help="リモートの 1 ファイルを標準出力へ出す")
+    p.add_argument("remote")
+    p.set_defaults(func=cmd_cat)
+
+    p = sub.add_parser("copy", help="ローカルのファイルをリモートへ足す（残す）")
+    p.add_argument("src", help="ローカルのファイルまたはディレクトリ")
+    p.add_argument("dest", help="remote:path")
+    p.add_argument(
+        "--checksum", nargs="?", const="plain_id", default="size",
+        choices=CHECKSUM_MODES,
+        help="変更検出: size / crc32 / sha1 / plain_id（単独指定は plain_id）",
+    )
+    p.add_argument("--include", action="append", default=[], metavar="PATTERN",
+                   help="含める相対パターン（複数指定可）")
+    p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                   help="除外する相対パターン（複数指定可、include より優先）")
+    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
+    p.set_defaults(func=cmd_copy)
+
+    p = sub.add_parser("copyto", help="ローカルの 1 ファイルをリモートの指定パスへ置く")
+    p.add_argument("src")
+    p.add_argument("dest", help="remote:path/file")
+    p.add_argument(
+        "--checksum", nargs="?", const="plain_id", default="size",
+        choices=CHECKSUM_MODES,
+        help="変更検出: size / crc32 / sha1 / plain_id（単独指定は plain_id）",
+    )
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_copyto)
+
+    p = sub.add_parser(
+        "import",
+        aliases=["import-tar", "import_tar"],
+        help="tar / tar.gz や DFS archive bundle をリモートへインポートする",
+    )
+    p.add_argument("archive", help="ローカルの tar ファイルまたは DFS archive bundle")
+    p.add_argument("dest", help="remote:path")
+    p.add_argument(
+        "--strip-components", type=int, default=0, metavar="N",
+        help="tar member の先頭 N 要素を除く（既定 0）",
+    )
+    p.add_argument(
+        "--source-secret",
+        help="DFS archive bundle の復号に使う tree_secret（省略時は宛先リモートと同じ secret）",
+    )
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("mv", help="リモート内でファイルまたはディレクトリを移動する")
+    p.add_argument("src", help="移動元 remote:path")
+    p.add_argument("dst", help="移動先 remote:path")
+    p.add_argument("--overwrite", action="store_true",
+                   help="移動先のファイルを置換する（ディレクトリの merge はしない）")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_mv)
+
+    p = sub.add_parser("sync", help="リモートをローカルディレクトリと一致させる")
+    p.add_argument("src", help="ローカルのディレクトリ")
+    p.add_argument("dest", help="remote:path")
+    p.add_argument("--delete", action="store_true", help="リモートにしかないものを消す")
+    p.add_argument(
+        "--checksum", nargs="?", const="plain_id", default="size",
+        choices=CHECKSUM_MODES,
+        help="変更検出: size / crc32 / sha1 / plain_id（単独指定は plain_id）",
+    )
+    p.add_argument("--include", action="append", default=[], metavar="PATTERN",
+                   help="含める相対パターン（複数指定可）")
+    p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                   help="除外する相対パターン（複数指定可、include より優先）")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("pull", help="リモートをローカルディレクトリへ取り出す")
+    p.add_argument("src", help="remote:path")
+    p.add_argument("dest", help="ローカルのディレクトリ")
+    p.add_argument("--force", action="store_true", help="写しが同じ版でも取り直す")
+    p.add_argument("--watch", action="store_true", help="更新を監視して自動同期し続ける")
+    p.add_argument("--poll", type=int, default=30, help="--watch 時のポーリング間隔（秒）")
+    p.add_argument("--include", action="append", default=[], metavar="PATTERN",
+                   help="含める相対パターン（複数指定可）")
+    p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                   help="除外する相対パターン（複数指定可、include より優先）")
+    p.set_defaults(func=cmd_pull)
+
+    p_inv = sub.add_parser(
+        "invite",
+        help="RunPod 等向けの読み取り専用招待トークン (Base64) を作成・参加する",
+    )
+    p_inv.add_argument("action", choices=["create", "join"])
+    p_inv.add_argument("target", nargs="?", default="", help="create 時はリモート名、join 時はトークン")
     p_inv.add_argument("--name", help="作成先 / 参加先のリモート名")
     p_inv.add_argument("--bootstrap-url", help="create 時に curl | bash 用の 1 行コマンドを生成する URL")
     p_inv.add_argument("--write-path", help="create 時に RunPod 出力専用のサブパスを L1 委譲してトークンに含める")
@@ -390,10 +581,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_inv.add_argument("--poll", type=int, default=30, help="自動同期のポーリング間隔（秒）")
     p_inv.set_defaults(func=cmd_invite)
 
-    p_share = sub.add_parser("share", help="RunPod 等向けの 1 行ブートストラップコマンド (curl | bash) を発行する")
+    p_share = sub.add_parser(
+        "share",
+        help="RunPod 等向けの 1 行ブートストラップコマンド (curl | bash) を発行する",
+    )
     p_share.add_argument("remote", help="共有元のリモート名")
     p_share.add_argument("--name", help="参加先のリモート名")
-    p_share.add_argument("--bootstrap-url", help="bootstrap.sh の URL（省略時は DFS_BOOTSTRAP_URL または registry の /bootstrap.sh）")
+    p_share.add_argument(
+        "--bootstrap-url",
+        help="bootstrap.sh の URL（省略時は DFS_BOOTSTRAP_URL または registry の /bootstrap.sh）",
+    )
     p_share.add_argument("--token-only", action="store_true", help="curl コマンドではなくトークン文字列だけを出す")
     p_share.add_argument("--write-path", help="RunPod 出力専用のサブパスを L1 委譲してトークンに含める")
     p_share.add_argument("--write-name", help="参加先に登録する出力用リモート名（既定 <name>-out）")
@@ -404,7 +601,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_share.add_argument("--poll", type=int, default=30, help="自動同期のポーリング間隔（秒）")
     p_share.set_defaults(func=cmd_share)
 
-    p_join = sub.add_parser("join", help="後から別ドメイン / root ハブ / 招待 URI に参加する")
+    p_join = sub.add_parser(
+        "join",
+        help="後から別ドメイン / root ハブ / 招待 URI に参加する",
+    )
     p_join.add_argument("target", help="参加先ドメイン・URL または dfs-invite:// URI")
     p_join.add_argument("--name", help="登録するリモート名（既定: 接続先ホスト名）")
     p_join.add_argument("--path", help="サブツリーパス（例: /example.com/shared）")
@@ -413,197 +613,73 @@ def build_parser() -> argparse.ArgumentParser:
     p_join.add_argument("--svc", default="local", help="設定を更新するローカル dfssvc 名（既定: local）")
     p_join.add_argument("--workdir", help="作業ディレクトリ（招待 URI 利用時）")
     p_join.add_argument("--root-pubkey", help="root アンカーの公開鍵ファイル（信頼の根）")
-    p_join.add_argument("--allow-tofu", action="store_true", help="root 公開鍵を取得できない／未設定のリモートでも writer 検証を省略して TOFU を許可する")
+    p_join.add_argument(
+        "--allow-tofu", action="store_true",
+        help="root 公開鍵を取得できない／未設定のリモートでも writer 検証を省略して TOFU を許可する",
+    )
     p_join.add_argument("--sync", action="store_true", help="join 後に即時 pull する（招待 URI 利用時）")
     p_join.set_defaults(func=cmd_join)
 
-    p_quit = sub.add_parser("quit", help="参加中のドメインから離脱し、ローカル単独モードへ戻す")
+    p_quit = sub.add_parser(
+        "quit",
+        help="参加中のドメインから離脱し、ローカル単独モードへ戻す",
+    )
     p_quit.add_argument("name", nargs="?", help="削除するリモート名（省略時は dfssvc の参加設定のみ解除）")
     p_quit.add_argument("--svc", default="local", help="解除するローカル dfssvc 名（既定: local）")
     p_quit.add_argument("--all", action="store_true", help="同じドメインの登録済みリモートも一括削除する")
     p_quit.set_defaults(func=cmd_quit)
 
-    # fs
     p_fs = sub.add_parser("fs", help="ローカルの CoW 検出・スナップショット（リモート不要）")
     p_fs.add_argument("action", choices=["info", "snapshot", "materialize"])
     p_fs.add_argument("path", help="対象ディレクトリ")
     p_fs.add_argument("snap_id", nargs="?", help="snapshot の ID (例: v1)")
     p_fs.add_argument("dst", nargs="?", help="materialize の出力先")
-    p_fs.add_argument("--src", dest="src", help="materialize の入力 (省略時は path/.clayfs/snapshots/<snap_id>)")
-    p_fs.add_argument("--backend", default="auto", help="copy / reflink / fast_clone / auto (既定 auto)")
+    p_fs.add_argument(
+        "--src", dest="src",
+        help="materialize の入力 (省略時は path/.clayfs/snapshots/<snap_id>)",
+    )
+    p_fs.add_argument(
+        "--backend", default="auto",
+        help="copy / reflink / fast_clone / auto (既定 auto)",
+    )
     p_fs.set_defaults(func=cmd_fs)
-
-    # ls / lsd / lsl / lsjson / size / cat / history
-    p = sub.add_parser("ls", help="リモートのファイル・ディレクトリを一覧する")
-    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("-R", "--recursive", action="store_true", help="再帰的に一覧する")
-    p.add_argument("--include", action="append", default=[], help="含めるパターン（相対パス）")
-    p.add_argument("--exclude", action="append", default=[], help="除外するパターン（相対パス）")
-    p.add_argument("--json", action="store_true", help="JSON で出力する")
-    p.set_defaults(func=cmd_ls)
-
-    p = sub.add_parser("lsd", help="リモートのディレクトリだけを一覧する")
-    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.set_defaults(func=cmd_lsd)
-
-    p = sub.add_parser("lsl", help="リモートのファイルを詳細付きで一覧する")
-    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("-R", "--recursive", action="store_true", help="再帰的に一覧する")
-    p.set_defaults(func=cmd_lsl)
-
-    p = sub.add_parser("lsjson", help="リモートの一覧を JSON 配列で出力する")
-    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("-R", "--recursive", action="store_true", help="再帰的に一覧する")
-    p.add_argument("--include", action="append", default=[], help="含めるパターン（相対パス）")
-    p.add_argument("--exclude", action="append", default=[], help="除外するパターン（相対パス）")
-    p.set_defaults(func=cmd_lsjson)
-
-    p = sub.add_parser("size", help="リモートのファイル/ディレクトリの合計サイズを表示する")
-    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("-R", "--recursive", action="store_true", help="再帰的に計算する")
-    p.set_defaults(func=cmd_size)
-
-    p = sub.add_parser("cat", help="リモートのファイル内容を標準出力に出す")
-    p.add_argument("remote", help="remote:path")
-    p.set_defaults(func=cmd_cat)
-
-    p = sub.add_parser("history", help="リモートの版履歴を表示する")
-    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("--limit", type=int, default=50, help="表示件数（既定 50）")
-    p.set_defaults(func=cmd_history)
-
-    # copy / copyto / import / import_tar / mount / mv / sync / pull / check / rm / rmdir / purge / mkdir / touch / about
-    p = sub.add_parser("copy", help="ローカルからリモートへコピーする")
-    p.add_argument("src", help="ローカルのファイル/ディレクトリ")
-    p.add_argument("dest", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("-R", "--recursive", action="store_true", help="ディレクトリを再帰的にコピーする")
-    p.add_argument("--checksum", choices=CHECKSUM_MODES, default="size", help="同期判定モード（既定 size）")
-    p.add_argument("--include", action="append", default=[], help="含めるパターン（相対パス）")
-    p.add_argument("--exclude", action="append", default=[], help="除外するパターン（相対パス）")
-    p.add_argument("--no-traverse", action="store_true", help="リモートを走査せずローカルだけを送る（初回アップロード向け）")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_copy)
-
-    p = sub.add_parser("copyto", help="単一ファイルをリモートの指定パスへコピーする")
-    p.add_argument("src", help="ローカルのファイル")
-    p.add_argument("dest", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("--checksum", choices=CHECKSUM_MODES, default="size", help="同期判定モード（既定 size）")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_copyto)
-
-    p = sub.add_parser("import", aliases=["import-tar", "import_tar"], help="ローカルのディレクトリまたは tar / tar.zst をリモートへインポートする")
-    p.add_argument("archive", help="ローカルのディレクトリまたは tar / tar.zst ファイル")
-    p.add_argument("dest", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("--checksum", choices=CHECKSUM_MODES, default="size", help="同期判定モード（既定 size）")
-    p.add_argument("--strip-components", type=int, default=0, dest="strip_components", help="tar member の先頭 N 要素を除く（既定 0）")
-    p.add_argument("--source-secret", help="DFS archive bundle の復号に使う tree_secret（省略時は宛先リモートと同じ secret）")
-    p.add_argument("--include", action="append", default=[], help="含めるパターン（相対パス）")
-    p.add_argument("--exclude", action="append", default=[], help="除外するパターン（相対パス）")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_import)
-
-    p = sub.add_parser("mount", help="リモートを FUSE でマウントする（読み取り専用）")
-    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("mountpoint", help="マウントポイント")
-    p.add_argument("-o", "--options", default="", help="FUSE オプション（カンマ区切り）")
-    p.add_argument("--read-only", action="store_true", help="読み取り専用でマウントする（既定）")
-    p.add_argument("--allow-other", action="store_true", help="他ユーザーからのアクセスを許可する")
-    p.set_defaults(func=cmd_mount)
-
-    p = sub.add_parser("mv", help="リモート上でファイル/ディレクトリを移動/リネームする")
-    p.add_argument("src", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("dst", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("--overwrite", action="store_true", help="ファイル同士なら移動先を置換する")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_mv)
-
-    p = sub.add_parser("sync", help="リモートをローカルに合わせる（ローカルが基準）")
-    p.add_argument("src", help="ローカルのディレクトリ")
-    p.add_argument("dest", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("--checksum", choices=CHECKSUM_MODES, default="size", help="同期判定モード（既定 size）")
-    p.add_argument("--include", action="append", default=[], help="含めるパターン（相対パス）")
-    p.add_argument("--exclude", action="append", default=[], help="除外するパターン（相対パス）")
-    p.add_argument("--delete", action="store_true", help="リモートにしかないものを消す")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_sync)
-
-    p = sub.add_parser("pull", help="リモートをローカルへ取り出す")
-    p.add_argument("src", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("dest", help="ローカルのディレクトリ")
-    p.add_argument("--checksum", choices=CHECKSUM_MODES, default="size", help="同期判定モード（既定 size）")
-    p.add_argument("--include", action="append", default=[], help="含めるパターン（相対パス）")
-    p.add_argument("--exclude", action="append", default=[], help="除外するパターン（相対パス）")
-    p.add_argument("--force", action="store_true", help="キャッシュを無視して強制的に取得する")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_pull)
-
-    p = sub.add_parser("check", help="リモートとローカルを比べる")
-    p.add_argument("remote", help="remote:path")
-    p.add_argument("local", help="ローカルのディレクトリ")
-    p.add_argument("--checksum", choices=CHECKSUM_MODES, default="size", help="同期判定モード（既定 size）")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_check)
-
-    p = sub.add_parser("rm", help="リモートのファイル（または --recursive でディレクトリ）を消す")
-    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("-R", "--recursive", action="store_true", help="ディレクトリを中身ごと消す")
-    p.add_argument("--rmdirs", action="store_true", help="消した後に空になったディレクトリも片付ける")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_rm)
-
-    p = sub.add_parser("rmdir", help="空のディレクトリを消す（中身があれば断る）")
-    p.add_argument("remote", nargs="?", default="", help="remote:dir（--remote 指定時は省略可）")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_rmdir)
-
-    p = sub.add_parser("purge", help="指定パスの中身をすべて消す")
-    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.add_argument("-n", "--dry-run", action="store_true", help="何をするかだけ表示する")
-    p.set_defaults(func=cmd_purge)
 
     p = sub.add_parser("mkdir", help="リモートにディレクトリを作る")
     p.add_argument("remote", nargs="?", default="", help="remote:dir（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_mkdir)
 
-    p = sub.add_parser("touch", help="リモートの作業ディレクトリを初期化する")
+    p = sub.add_parser("rm", help="リモートのファイル（または --recursive でディレクトリ）を消す")
     p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
-    p.set_defaults(func=cmd_touch)
+    p.add_argument("-R", "--recursive", action="store_true", help="ディレクトリを中身ごと消す")
+    p.add_argument("--rmdirs", action="store_true",
+                   help="消した後に空になったディレクトリも片付ける")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("rmdir", help="空のディレクトリを消す（中身があれば断る）")
+    p.add_argument("remote", nargs="?", default="", help="remote:dir（--remote 指定時は省略可）")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_rmdir)
+
+    p = sub.add_parser("purge", help="指定パスの中身をすべて消す")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_purge)
+
+    p = sub.add_parser("check", help="リモートとローカルを比べる")
+    p.add_argument("remote", help="remote:path")
+    p.add_argument("local", help="ローカルのディレクトリ")
+    p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("about", help="リモートの設定と先頭版を表示する")
     p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_about)
 
-    # archive
-    p_arch = sub.add_parser("archive", help="archive descriptor の作成・検証・取得")
-    arch_sub = p_arch.add_subparsers(dest="action", required=True)
-    p_arch_create = arch_sub.add_parser("create", help="archive descriptor を作成して署名・登録する")
-    p_arch_create.add_argument("source", help="対象リモート名")
-    p_arch_create.add_argument("--version", type=int, help="対象バージョン（省略時は先頭版）")
-    p_arch_create.add_argument("--out", help="出力ディレクトリ（既定: カレント/アーカイブ名）")
-    p_arch_create.add_argument("--announce", action="append", default=[], help="BitTorrent アナウンス URL（複数指定可）")
-    p_arch_create.add_argument("--recovery", type=int, help="PAR2 リカバリ割合 0-100（既定: par2 があれば 5%%）")
-    p_arch_create.add_argument("--format", choices=["zstd:chunked", "tar.gz"], default="zstd:chunked", help="アーカイブ形式（既定 zstd:chunked）")
-    p_arch_create.add_argument("--keep-dir", action="store_true", help="bundle ディレクトリを残す")
-    p_arch_create.add_argument("--publish", action="store_true", help="作成後に名簿へ登録する")
-    p_arch_create.set_defaults(func=cmd_archive)
-    p_arch_verify = arch_sub.add_parser("verify", help="archive descriptor を検証する")
-    p_arch_verify.add_argument("source", help="対象リモート名")
-    p_arch_verify.add_argument("--version", type=int, help="対象バージョン（省略時は先頭版）")
-    p_arch_verify.set_defaults(func=cmd_archive)
-    p_arch_fetch = arch_sub.add_parser("fetch", help="archive descriptor と bundle を取得する")
-    p_arch_fetch.add_argument("source", nargs="?", help="対象リモート名（省略時は --remote）")
-    p_arch_fetch.add_argument("--version", type=int, help="対象バージョン")
-    p_arch_fetch.add_argument("--out", help="出力ディレクトリ（既定: カレント/アーカイブ名）")
-    p_arch_fetch.set_defaults(func=cmd_archive)
-    p_arch_extract = arch_sub.add_parser("extract", help="取得済み bundle からファイルを展開する")
-    p_arch_extract.add_argument("source", nargs="?", help="対象リモート名（省略時は --remote）")
-    p_arch_extract.add_argument("--version", type=int, help="対象バージョン")
-    p_arch_extract.add_argument("--src", help="bundle ディレクトリ（省略時は --out で指定した場所）")
-    p_arch_extract.add_argument("--out", help="展開先ディレクトリ")
-    p_arch_extract.set_defaults(func=cmd_archive)
-    p_arch.set_defaults(func=cmd_archive)
+    p = sub.add_parser("touch", help="リモートの作業ディレクトリを初期化する")
+    p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
+    p.set_defaults(func=cmd_touch)
 
-    # serve / promote / libp2p-serve (cli.py のものをそのまま使う)
+    # サーバ側は cli.py のものをそのまま使う
     p_serve = sub.add_parser("serve", help="L2 名簿 (HTTP) と L3 OST (TLS) を起動する")
     p_serve.add_argument("--bind", default="0.0.0.0")
     p_serve.add_argument("--registry-port", type=int, default=9440)
@@ -611,25 +687,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--root-anchor", default="/example.com")
     p_serve.add_argument("--root-pubkey", required=True)
     p_serve.add_argument("--state-dir", default="~/.dfs_server")
-    p_serve.add_argument("--ost-dir", help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）")
+    p_serve.add_argument(
+        "--ost-dir",
+        help="L3 OST チャンクの保存先（既定: <state-dir>/ost_chunks）",
+    )
     p_serve.add_argument("--role", choices=["primary", "secondary"])
     p_serve.add_argument("--role-epoch", type=int)
-    p_serve.add_argument("--advertise", help="L2 が L3 OST の場所として広告するホスト名/IP（既定は bind から推定）")
-    p_serve.add_argument("--replica", action="append", default=[], help="主名簿から複製する代替名簿 URL（複数指定可）")
+    p_serve.add_argument(
+        "--advertise",
+        help="L2 が L3 OST の場所として広告するホスト名/IP（既定は bind から推定）",
+    )
+    p_serve.add_argument(
+        "--replica", action="append", default=[],
+        help="主名簿から複製する代替名簿 URL（複数指定可）",
+    )
     p_serve.set_defaults(func=lambda args: (cli_mod.cmd_serve(args), 0)[1])
 
-    p_promote = sub.add_parser("promote", help="停止中の registry state を primary に昇格する")
+    p_promote = sub.add_parser(
+        "promote", help="停止中の registry state を primary に昇格する"
+    )
     p_promote.add_argument("--state-dir", default="~/.dfs_server")
     p_promote.add_argument("--role-epoch", type=int)
     p_promote.set_defaults(func=lambda args: (cli_mod.cmd_promote(args), 0)[1])
 
-    p_libp2p = sub.add_parser("libp2p-serve", help="OST の chunk ディレクトリを libp2p/QUIC で配布する")
-    p_libp2p.add_argument("--chunks-dir", required=True, help="過去に save_ost_chunks が作った .blk ディレクトリ")
-    p_libp2p.add_argument("--listen", action="append", default=[], help="QUIC multiaddr（既定 /ip4/0.0.0.0/udp/0/quic-v1）")
+    p_libp2p = sub.add_parser(
+        "libp2p-serve", help="OST の chunk ディレクトリを libp2p/QUIC で配布する"
+    )
+    p_libp2p.add_argument(
+        "--chunks-dir", required=True,
+        help="過去に save_ost_chunks が作った .blk ディレクトリ",
+    )
+    p_libp2p.add_argument(
+        "--listen", action="append", default=[],
+        help="QUIC multiaddr（既定 /ip4/0.0.0.0/udp/0/quic-v1）",
+    )
     p_libp2p.add_argument("--psk", help="private swarm 用 pre-shared key")
     p_libp2p.set_defaults(func=cmd_libp2p_serve)
 
-    # delegate
     p_del = sub.add_parser("delegate", help="L1 委譲を作って L2 名簿へ登録する")
     p_del.add_argument("--parent", required=True)
     p_del.add_argument("--path", required=True)
@@ -642,21 +736,75 @@ def build_parser() -> argparse.ArgumentParser:
     p_del.add_argument("--output")
     p_del.set_defaults(func=cmd_delegate)
 
-    # web
-    p_web = sub.add_parser("web", help="スマホ等から使えるブラウザ向けファイル共有 & Web CLI サーバを起動する")
-    p_web.add_argument("remote", nargs="?", help="対象リモート名（登録が 1 つだけなら省略可）")
-    p_web.add_argument("--bind", default=None, help="待機アドレス（既定 127.0.0.1。LAN 内のスマホ等から直接接続するには --bind 0.0.0.0 を指定）")
-    p_web.add_argument("--port", type=int, default=None, help="待機ポート（省略時は 8080 から空きポートを自動選択）")
-    p_web.add_argument("--read-only", action="store_true", help="閲覧・ダウンロード専用で公開する")
-    p_web.add_argument("--token", help="アクセストークン（省略時は起動ごとにランダム生成）")
-    p_web.add_argument("--ttl", type=int, default=0, help="共有リンクの有効期限（秒。0 は無期限、既定 0）")
-    p_web.add_argument("--base-path", default="", help="Caddy 等のリバースプロキシ配下プレフィックス（例: /dfs）")
-    p_web.add_argument("--public-url", default="", help="案内表示用の公開 URL（例: https://example.com/dfs）")
-    p_web.add_argument("--secure-cookie", action="store_true", help="セッションクッキーに常に Secure 属性を付ける")
-    p_web.add_argument("--trusted-proxy", action="append", default=[], help="X-Forwarded-For を信頼するリバースプロキシの IP または CIDR（複数指定可）")
+    p_web = sub.add_parser(
+        "web",
+        help="スマホ等から使えるブラウザ向けファイル共有 & Web CLI サーバを起動する",
+    )
+    p_web.add_argument(
+        "remote",
+        nargs="?",
+        help="対象リモート名（登録が 1 つだけなら省略可）",
+    )
+    p_web.add_argument(
+        "--bind",
+        default=None,
+        help="待機アドレス（既定 127.0.0.1。LAN 内のスマホ等から直接接続するには --bind 0.0.0.0 を指定）",
+    )
+    p_web.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="待機ポート（省略時は 8080 から空きポートを自動選択）",
+    )
+    p_web.add_argument(
+        "--read-only",
+        action="store_true",
+        help="閲覧・ダウンロード専用で公開する",
+    )
+    p_web.add_argument(
+        "--token",
+        help="アクセストークン（省略時は起動ごとにランダム生成）",
+    )
+    p_web.add_argument(
+        "--ttl",
+        type=int,
+        default=0,
+        help="共有リンクの有効期限（秒。0 は無期限、既定 0）",
+    )
+    p_web.add_argument(
+        "--base-path",
+        default="",
+        help="Caddy 等のリバースプロキシ配下プレフィックス（例: /dfs）",
+    )
+    p_web.add_argument(
+        "--public-url",
+        default="",
+        help="案内表示用の公開 URL（例: https://example.com/dfs）",
+    )
+    p_web.add_argument(
+        "--secure-cookie",
+        action="store_true",
+        help="セッションクッキーに常に Secure 属性を付ける",
+    )
+    p_web.add_argument(
+        "--trusted-proxy",
+        action="append",
+        default=[],
+        help="X-Forwarded-For を信頼するリバースプロキシの IP または CIDR（複数指定可）",
+    )
     p_web.set_defaults(func=cmd_web)
 
     return parser
+
+
+
+def _lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
 
 def main(argv: Optional[List[str]] = None) -> int:

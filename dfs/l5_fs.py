@@ -60,7 +60,22 @@ class _LocalChunkCache:
             return
         self.root.mkdir(parents=True, exist_ok=True)
         if not p.exists():
-            p.write_bytes(data)
+            fd, tmp_name = tempfile.mkstemp(prefix=".blk_", suffix=".tmp", dir=str(self.root))
+            tmp = Path(tmp_name)
+            try:
+                try:
+                    f = os.fdopen(fd, "wb")
+                except Exception:
+                    os.close(fd)
+                    raise
+                with f:
+                    f.write(data)
+                os.replace(tmp, p)
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 class _CachingOSTProxy:
@@ -251,7 +266,7 @@ class DFSNode:
                             manager=self.libp2p_manager,
                         )
                 elif libp2p_peers:
-                    Libp2pChunkClient(libp2p_peers, psk=self.libp2p_psk)
+                    self.libp2p_client = Libp2pChunkClient(libp2p_peers, psk=self.libp2p_psk)
             except (ImportError, ServiceUnavailableError) as e:  # pragma: no cover - 依存環境
                 import warnings
 

@@ -16,7 +16,7 @@ def _archive_registry_context(
     version: Optional[int],
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """ローカル設定を起点に、L2公開descriptorと対応L4 headを検証して返す。"""
-    from dfs import cli_core as _cm
+    from dfs import cli_main as _cm
     from dfs import cli as cli_mod
 
     registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
@@ -96,7 +96,7 @@ def _archive_registry_context(
 
 def cmd_archive(args: argparse.Namespace) -> int:
     """版単位の archive bundle / torrent を作成・公開・取得・復元する。"""
-    from dfs import cli_core as _cm
+    from dfs import cli_main as _cm
     from dfs import cli as cli_mod
 
     if args.action == "create":
@@ -109,10 +109,17 @@ def cmd_archive(args: argparse.Namespace) -> int:
             if args.out
             else Path.cwd() / f"dfs-archive-{remote.name}-{int(time.time())}"
         )
+        from dfs import archive as _arch_mod, cli_core as _cc
+
+        find_par2 = (
+            _cc.find_par2_binary
+            if _cm.find_par2_binary is _arch_mod.find_par2_binary
+            else _cm.find_par2_binary
+        )
         recovery_arg = getattr(args, "recovery", None)
         missing_par2_notice = False
         if recovery_arg is None:
-            if _cm.find_par2_binary():
+            if find_par2():
                 recovery_percent = 5
             else:
                 recovery_percent = 0
@@ -121,7 +128,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
             recovery_percent = int(recovery_arg)
             if recovery_percent < 0 or recovery_percent > 100:
                 raise _cm.UsageError("--recovery は 0〜100 の整数で指定してください")
-            if recovery_percent > 0 and not _cm.find_par2_binary():
+            if recovery_percent > 0 and not find_par2():
                 raise _cm.UsageError(
                     "par2 が見つかりません（macOS: brew install par2 / Ubuntu: sudo apt install par2）"
                 )
