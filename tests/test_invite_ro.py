@@ -272,7 +272,11 @@ class ReadOnlyInviteTests(unittest.TestCase):
             rc = cli_main.main(["share", "work"])
         self.assertEqual(rc, 0)
         line = out.getvalue().strip()
-        self.assertTrue(line.startswith(f"curl -sSL {self.reg_url}/bootstrap.sh | bash -s -- dfs-ro-v1:"))
+        self.assertTrue(
+            line.startswith(
+                "curl -sSL https://raw.githubusercontent.com/yashiki2005/dfs/main/scripts/bootstrap.sh | bash -s -- dfs-ro-v1:"
+            )
+        )
 
         out_rw = io.StringIO()
         with patch.dict("os.environ", {"DFS_CONFIG": str(writer_cfg)}), redirect_stdout(out_rw):

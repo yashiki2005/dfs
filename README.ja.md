@@ -17,8 +17,9 @@
 
 1. **クラウド GPU / 一時ワーカーへの 1 行データ配布（RunPod・Lambda 等）**
    - レンタル GPU に個人の SSH 鍵や S3 クレデンシャルを置いたり、毎回巨大な tarball を `scp` したりする必要はありません。
-   - 手元で `dfscli share mydata --write-path /example.com/mydata/out` を実行すると、1 行の `curl | bash` ブートストラップコマンドが生成されます。
-   - GPU ワーカーはデータセットを読み取り専用で取得（直接接続 / 複数シード libp2p-QUIC / 暗号化リレー）し、出力専用の委譲サブパスにだけ結果を書き戻せます。
+   - 手元で `dfscli share mydata --write-path out` を実行すると、`raw.githubusercontent.com` 上の `bootstrap.sh`（`git clone` + `uv sync`）を呼ぶ 1 行の `curl | bash` コマンドが生成されます。
+   - 自宅 NAT 越えで同期する場合も、自分の VPS 等で `dfssvc start` を立てるだけで完結し、第三者のハブサーバーへの自動接続や信用は一切不要です。
+   - GPU ワーカーはデータセットを読み取り専用で取得（直接接続 / 複数シード libp2p-QUIC / 暗号化リレー）し、委譲された `out` サブパスにだけ結果を書き戻せます。
 2. **Mac / Linux / Windows 間のゼロトラスト `rclone` 風同期**
    - 自宅サーバーや Raspberry Pi・VPS を暗号化チャンク保管庫（`dfssvc start`）にして、手元の PC から `dfscli sync`・`dfscli pull`・`dfscli mount` で同期できます。
    - ストレージサーバーやリレーサーバーには平文のファイル名も中身も一切見えません。

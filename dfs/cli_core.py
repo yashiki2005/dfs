@@ -1165,15 +1165,25 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
         pass
     try:
         if write_path:
-            root_key_arg = getattr(args, "root_key", None)
+            raw_write = str(write_path).strip()
+            if raw_write.startswith("/"):
+                norm_write_path = _normalize_path_arg(raw_write)
+            else:
+                if not share_path:
+                    raise UsageError(
+                        "相対 --write-path を使うにはリモートのサブツリーパスが必要です"
+                    )
+                norm_write_path = _normalize_path_arg(
+                    f"{share_path.rstrip('/')}/{raw_write.lstrip('/')}"
+                )
+            root_key_arg = getattr(args, "root_key", None) or remote.key
             if not root_key_arg:
                 raise UsageError(
-                    "--write-path を使うときは L1 委譲署名用の --root-key が必須です"
+                    "--write-path を使うときは L1 委譲署名用の --root-key（またはリモートの --key）が必要です"
                 )
             root_key_path = Path(root_key_arg).expanduser()
             if not root_key_path.is_file():
                 raise UsageError(f"--root-key が見つかりません: {root_key_path}")
-            norm_write_path = _normalize_path_arg(write_path)
             parent_path = norm_write_path.rsplit("/", 1)[0] or "/"
 
             reg_client = cli_mod.RemoteRegistryClient(remote.registry_urls())
@@ -1260,14 +1270,14 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
         raise UsageError(f"招待トークンを作成できませんでした: {e}") from e
 
 
-def _default_bootstrap_url(remote: Remote) -> str:
-    from urllib.parse import urlsplit, urlunsplit
+DEFAULT_BOOTSTRAP_URL = "https://raw.githubusercontent.com/yashiki2005/dfs/main/scripts/bootstrap.sh"
 
+
+def _default_bootstrap_url(remote: Remote) -> str:
     env_url = os.environ.get("DFS_BOOTSTRAP_URL", "").strip()
     if env_url:
         return env_url
-    parts = urlsplit(remote.registry)
-    return urlunsplit((parts.scheme or "https", parts.netloc, "/bootstrap.sh", "", ""))
+    return DEFAULT_BOOTSTRAP_URL
 
 
 def _add_create_args(p: argparse.ArgumentParser, args_name_required: bool) -> None:
