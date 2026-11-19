@@ -1134,6 +1134,7 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
             f"Remote {remote.name!r} に root_pubkey がありません。TOFU を避けるため必須です"
         )
     remote = _ensure_remote_secret(remote)
+    share_path = remote.path or (resolve_path(remote) if remote.key else "")
     write_path = getattr(args, "write_path", None)
     registries = list(remote.registry_urls())
     ost_primary = remote.ost
@@ -1232,7 +1233,7 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
                 write_priv_key=eph_priv_text,
                 write_pub_key=eph_pub_text,
                 write_epoch=write_epoch,
-                path=remote.path,
+                path=share_path,
                 ost=ost_primary,
                 ost_alternates=ost_alts,
                 ost_cert_sha256=ost_cert_sha256,
@@ -1246,7 +1247,7 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
             registries=registries,
             root_pubkey=remote.root_pubkey,
             tree_secret=remote.secret,
-            path=remote.path,
+            path=share_path,
             ost=ost_primary,
             ost_alternates=ost_alts,
             ost_cert_sha256=ost_cert_sha256,
