@@ -53,3 +53,6 @@ testpaths = ["tests"]
 # py-libp2p 0.8.1 still pins fastecdsa==2.3.2, but its Ed25519 code is
 # compatible with fastecdsa 4.0.0. Override that stale transitive pin.
 override-dependencies = ["fastecdsa==4.0.0"]
+required-environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
