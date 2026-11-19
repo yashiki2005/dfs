@@ -1,14 +1,50 @@
 # dfs
 
+[![CI](https://github.com/yashiki2005/dfs/actions/workflows/ci.yml/badge.svg)](https://github.com/yashiki2005/dfs/actions/workflows/ci.yml)
+
 > **English** | [日本語](README.ja.md)
 
-**dfs** is an end-to-end encrypted, deduplicated distributed file system with a single-writer trust model and an `rclone`-style CLI.
+**Sync encrypted datasets to cloud GPUs in one line—without trusting the server, the relay, or the rented GPU with your master key.**
 
-It lets you store, sync, mount, and share encrypted file trees across laptops, home servers, and cloud GPU workers—without trusting storage servers or relay nodes with your plaintext data.
+**dfs** is an end-to-end encrypted, deduplicated distributed file system with a single-writer trust model and an `rclone`-style CLI (`ls`, `copy`, `sync`, `pull`, `mount`). Every chunk is compressed, encrypted, and signed on your machine before leaving it.
 
 > **Project status:** `0.1.x` is an experimental initial-release series. It has not
 > undergone an independent security audit. Review the threat model before using
 > it with valuable data.
+
+---
+
+## Why dfs? (Core Use Cases)
+
+1. **One-Line Cloud GPU / Ephemeral Worker Sync (RunPod, Lambda, Colab)**
+   - Stop `scp`-ing tarballs or leaving your personal SSH/S3 keys on rented GPUs.
+   - Run `dfscli share mydata --write-path /example.com/mydata/out` on your laptop to generate a one-line `curl | bash` bootstrap command.
+   - The GPU worker pulls the dataset read-only (over direct LAN/ICE, multi-seed libp2p/QUIC, or encrypted relay) and can only write results back to the delegated output subpath.
+2. **Zero-Trust `rclone`-Style Sync Across Mac, Linux, and Windows**
+   - Keep a home server / Raspberry Pi / VPS as an untrusted encrypted chunk store (`dfssvc start`) and sync from your laptop with `dfscli sync`, `dfscli pull`, or `dfscli mount`.
+   - Storage servers and relays never see plaintext filenames, file contents, or keys.
+3. **Verifiable Single-Writer Integrity (No Silent Rollbacks or Drops)**
+   - Unlike naive object-store sync, every update is chained in a signed append-only log and Merkle tree. Clients automatically reject server-side version rollbacks (**B6**) and silent write drops (**B7**).
+
+---
+
+## Try It in 60 Seconds
+
+```bash
+git clone https://github.com/yashiki2005/dfs.git dfs && cd dfs
+uv sync
+
+# 1. Start a local registry + encrypted chunk store
+uv run dfssvc start
+
+# 2. Print the ready-to-run dfscli config command and register your remote
+uv run dfssvc env
+
+# 3. Push, list, and pull back
+uv run dfscli sync ./dataset local:dataset
+uv run dfscli ls local:dataset
+uv run dfscli pull local:dataset ./restored
+```
 
 ---
 

@@ -1,13 +1,49 @@
 # dfs
 
+[![CI](https://github.com/yashiki2005/dfs/actions/workflows/ci.yml/badge.svg)](https://github.com/yashiki2005/dfs/actions/workflows/ci.yml)
+
 > [English](README.md) | **日本語**
 
-**dfs** は、単一ライターの信頼モデルと `rclone` 風の CLI を備えた、エンドツーエンド暗号化・重複排除対応の分散ファイルシステムです。
+**サーバーもリレーも、レンタル GPU すら信用せずに、暗号化データセットを 1 行で同期する。**
 
-ストレージサーバーやリレーサーバーに平文を見せることなく、PC・自宅サーバー・クラウド GPU ワーカー間でファイルツリーを安全に保存・同期・マウント・共有できます。
+**dfs** は、単一ライターの信頼モデルと `rclone` 風 CLI（`ls`, `copy`, `sync`, `pull`, `mount`）を備えた、エンドツーエンド暗号化・重複排除対応の分散ファイルシステムです。チャンク分割・圧縮・暗号化・署名はすべて端末側で完結します。
 
 > **プロジェクト状態:** `0.1.x` は初期リリース系列です。独立したセキュリティ監査は
 > 受けていません。重要なデータへ適用する前に脅威モデルを確認してください。
+
+---
+
+## なぜ dfs なのか？（主なユースケース）
+
+1. **クラウド GPU / 一時ワーカーへの 1 行データ配布（RunPod・Lambda 等）**
+   - レンタル GPU に個人の SSH 鍵や S3 クレデンシャルを置いたり、毎回巨大な tarball を `scp` したりする必要はありません。
+   - 手元で `dfscli share mydata --write-path /example.com/mydata/out` を実行すると、1 行の `curl | bash` ブートストラップコマンドが生成されます。
+   - GPU ワーカーはデータセットを読み取り専用で取得（直接接続 / 複数シード libp2p-QUIC / 暗号化リレー）し、出力専用の委譲サブパスにだけ結果を書き戻せます。
+2. **Mac / Linux / Windows 間のゼロトラスト `rclone` 風同期**
+   - 自宅サーバーや Raspberry Pi・VPS を暗号化チャンク保管庫（`dfssvc start`）にして、手元の PC から `dfscli sync`・`dfscli pull`・`dfscli mount` で同期できます。
+   - ストレージサーバーやリレーサーバーには平文のファイル名も中身も一切見えません。
+3. **単一ライターによる改ざん・巻き戻し・黙殺の自動検知**
+   - すべての更新を署名付き追記ログと Merkle ツリーで連結し、サーバー側の勝手な巻き戻し（**B6**）や書き込みの黙った破棄（**B7**）をクライアント側で自動検知して拒否します。
+
+---
+
+## 60 秒で試す
+
+```bash
+git clone https://github.com/yashiki2005/dfs.git dfs && cd dfs
+uv sync
+
+# 1. ローカルに名簿 + 暗号化チャンク保管庫を起動
+uv run dfssvc start
+
+# 2. 接続設定コマンドを表示し、そのまま実行してリモートを登録
+uv run dfssvc env
+
+# 3. 同期・一覧・復元
+uv run dfscli sync ./dataset local:dataset
+uv run dfscli ls local:dataset
+uv run dfscli pull local:dataset ./restored
+```
 
 ---
 
