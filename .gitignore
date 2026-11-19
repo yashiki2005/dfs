@@ -16,3 +16,4 @@ dfs-archive-*
 *.archive.json
 *.par2
 *.torrent
+uv.lock
