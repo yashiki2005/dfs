@@ -1,5 +1,7 @@
 # Protocol & Operations
 
+> **English** | [日本語](protocol-and-operations.ja.md)
+
 This guide covers the runtime protocols, transport selection, service management (`dfssvc`), and operational workflows in **dfs**.
 
 ---

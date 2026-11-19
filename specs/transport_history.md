@@ -1,29 +1,31 @@
-# トランスポート変遷と「良いところ取り」Swarm 設計
+# Transport Evolution and "Best-of-All-Worlds" Swarm Design
 
-## 1. これまでの経緯
+> **English** | [日本語](transport_history.ja.md)
 
-1. **TLS/TCP カスタムフレーム (`OSTClient` / `ChunkStoreServer`)**
-   - 最小のオーバーヘッドと明示的切断 (`QUIT_FRAME`) で高スループットを実現。
-   - ただし `443/tcp` の HTTP プロキシや CDN の背後では直接接続できない。
-2. **`libp2p` の TCP → QUIC 切り替え ([dfs/libp2p_chunk.py](../dfs/libp2p_chunk.py))**
-   - 当初試した `py-libp2p` の TCP 経路で接続・多重化が不安定になり失敗したため、**QUIC (`/udp/.../quic-v1`)** へ切り替えた。
-   - 読み取り補助の `ChunkSource` としては機能するが、`py-libp2p` + `trio` の依存が重く、また RunPod 等のクラウド GPU コンテナでは UDP (QUIC) が制限される場合がある。
-3. **BitTorrent アーカイブ ([dfs/archive.py](../dfs/archive.py))**
-   - 固定バージョンの巨大データセット配布には有効だが、UDP/DHT/着信ポート待ちが制限環境と相性が悪く、小刻みな差分更新にも向かない。
-4. **HTTPS OST + Direct-first HTTP リレー ([dfs/l3_ost_adapter.py](../dfs/l3_ost_adapter.py), [dfs/relay.py](../dfs/relay.py))**
-   - Python 標準ライブラリのみで `443/tcp` を確実に貫通し、直接通信できる場合はリレー (`dfs.example.com`) を使わない。
+## 1. Background and History
+
+1. **TLS/TCP custom frames (`OSTClient` / `ChunkStoreServer`)**
+   - Achieves high throughput with minimal overhead and explicit disconnect (`QUIT_FRAME`).
+   - However, it cannot connect directly behind `443/tcp` HTTP proxies or CDNs.
+2. **Switching `libp2p` from TCP to QUIC ([dfs/libp2p_chunk.py](../dfs/libp2p_chunk.py))**
+   - The `py-libp2p` TCP path initially tested had unstable connections and multiplexing and failed, so it was switched to **QUIC (`/udp/.../quic-v1`)**.
+   - It works as an auxiliary read `ChunkSource`, but `py-libp2p` + `trio` is a heavy dependency, and UDP (QUIC) can be restricted in cloud GPU containers such as RunPod.
+3. **BitTorrent archive ([dfs/archive.py](../dfs/archive.py))**
+   - Effective for distributing huge datasets of fixed versions, but UDP/DHT/inbound listening ports do not play well with restricted environments, and it is not suited for small incremental updates.
+4. **HTTPS OST + Direct-first HTTP relay ([dfs/l3_ost_adapter.py](../dfs/l3_ost_adapter.py), [dfs/relay.py](../dfs/relay.py))**
+   - Reliably traverses `443/tcp` using only the Python standard library, and avoids the relay (`dfs.example.com`) whenever direct communication is possible.
 
 ---
 
-## 2. 「良いところ取り」(`SwarmOSTClient`) の方針
+## 2. "Best-of-All-Worlds" (`SwarmOSTClient`) Policy
 
-3 つの良いところだけを組み合わせ、重い外部依存（`libtorrent` 必須化等）は入れない：
+Combine only the strengths of the three approaches without introducing heavy external dependencies (such as making `libtorrent` mandatory):
 
-- **BitTorrent の良いところ（マルチピア並列・部分補完）**:
-  - 複数の読み取り候補（直接 OST・複製 OST・`libp2p/QUIC` ピア）があるとき、1 台だけに集中させず、`batch_has` で在庫を確認した上で **チャンクを並列ラウンドロビンで分散取得** する。
-  - あるピアが一部チャンクを欠損していても、別ピアから欠損分だけ補完できる。
-- **`libp2p` の良いところ（オプション P2P/QUIC ピア）**:
-  - `dfs[libp2p]` が入っている環境では `Libp2pChunkClient` もそのまま Swarm プールに参加させられる。
-- **HTTPS / HTTP リレーの良いところ（確実な最後の砦）**:
-  - `/relay/` エンドポイントは **フォールバック層（Relay Tier）** に分離し、直接ピア／複製ピア／QUIC ピアのいずれでも取れなかったチャンクだけをリレー経由で取得する。
-  - これにより、パブリックリレー (`dfs.example.com`) の負荷を抑えつつ、制限環境でも必ず完了する。
+- **Best of BitTorrent (multi-peer parallelism and partial completion)**:
+  - When multiple read candidates exist (direct OST, replica OST, `libp2p/QUIC` peers), instead of concentrating on a single node, check availability with `batch_has` and **fetch chunks in parallel round-robin across peers**.
+  - Even if one peer is missing some chunks, only the missing ones can be filled in from another peer.
+- **Best of `libp2p` (optional P2P/QUIC peers)**:
+  - In environments where `dfs[libp2p]` is installed, `Libp2pChunkClient` can also participate directly in the Swarm pool.
+- **Best of HTTPS / HTTP relay (reliable last resort)**:
+  - Separate `/relay/` endpoints into a **fallback tier (Relay Tier)** so that only chunks that could not be fetched from any direct peer, replica peer, or QUIC peer are retrieved via the relay.
+  - This keeps load on the public relay (`dfs.example.com`) low while guaranteeing completion even in restricted environments.

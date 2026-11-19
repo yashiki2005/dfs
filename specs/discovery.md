@@ -1,36 +1,38 @@
-# 小規模運用向けの署名付き立候補モデル (Signed Candidacy Discovery)
+# Signed Candidacy Discovery for Small-Scale Deployments
 
-## 方針決定の経緯
+> **English** | [日本語](discovery.ja.md)
 
-`dfs` の registry discovery には以下の 3 つの選択肢を検討した。
+## Rationale
 
-1. **無条件の立候補（最初に起動したサーバが root / primary）**
-   - なりすましやネットワーク分断時の split-brain を防げないため不採用。
-2. **過半数クォーラムによる立候補（Raft 等の多数決合意）**
-   - 小規模構成（2〜3 台）では 1 台停止で過半数を失う等、運用負荷・複雑さが見合わないため不採用。
-3. **DNSSEC による discovery**
-   - 公開ドメイン管理・ゾーン署名・外部リゾルバ依存が必須となり、未公開・閉域・小規模の分散ファイルシステムでは実運用として重すぎる。
+Three options were evaluated for `dfs` registry discovery:
 
-以上を踏まえ、**小規模・未公開運用では「署名付き立候補モデル（`dfs-candidacy-v1`）」を採用する**。
-将来的に**中規模を超える運用**（公開ドメイン配下での不特定クライアント配布、多拠点の外部リゾルバ経由 discovery 等）へ移行する場合は、[specs/dnssec.md](dnssec.md) の DNSSEC discovery へ移行する。
+1. **Unconditional candidacy (first server to start becomes root / primary)**
+   - Rejected because it cannot prevent spoofing or split-brain during network partitions.
+2. **Majority quorum candidacy (majority consensus such as Raft)**
+   - Rejected because in small setups (2–3 nodes), losing a single node loses the majority, making operational overhead and complexity disproportionate.
+3. **DNSSEC-based discovery**
+   - Requires public domain management, zone signing, and external resolver dependencies, which is too heavy in practice for private, closed-network, or small-scale distributed file systems.
 
----
-
-## 仕組み
-
-1. **信頼の根の共有（初回のみ帯域外）**
-   - クライアントには招待・設定時に `root_pubkey`（と候補 registry URL 群）を渡す。
-2. **立候補（告知）と検証**
-   - 管理者は `root` の秘密鍵で `dfs-candidacy-v1` エンベロープに署名し、各 registry の `/v1/candidacy/announce` へ登録（またはファイル配布）する。
-   - クライアントは候補 registry 群の `/v1/candidacy` へ問い合わせ、手元の `root_pubkey` で署名と有効期限を検証した上で、**有効かつ最大の `epoch`（`role_epoch`）** を持つ立候補を採用する。
-3. **primary 切り替え**
-   - `primary` を切り替える際は `epoch` を `+1` して再署名するだけで、古い `epoch` の立候補はロールバックとして拒否される。
+Based on the above, **small-scale and private deployments adopt the "Signed Candidacy Model (`dfs-candidacy-v1`)"**.
+When scaling to **medium or larger deployments** (distribution to unspecified clients under a public domain, discovery via external resolvers across multiple sites, etc.), migrate to DNSSEC discovery in [specs/dnssec.md](dnssec.md).
 
 ---
 
-## エンベロープ形式 (`dfs-candidacy-v1`)
+## Mechanism
 
-SSH 署名 namespace は `dfs-candidacy-v1`、identity は `root_anchor` とする。
+1. **Sharing the root of trust (out-of-band on initial setup only)**
+   - Clients are given `root_pubkey` (and candidate registry URLs) during invitation/configuration.
+2. **Candidacy (announcement) and verification**
+   - The administrator signs a `dfs-candidacy-v1` envelope with the `root` private key and registers it at `/v1/candidacy/announce` on each registry (or distributes it as a file).
+   - Clients query `/v1/candidacy` on the candidate registries, verify the signature and expiration using their local `root_pubkey`, and adopt the candidacy with the **valid and highest `epoch` (`role_epoch`)**.
+3. **Switching `primary`**
+   - To switch `primary`, simply increment `epoch` by `+1` and re-sign; candidacies with an older `epoch` are rejected as rollbacks.
+
+---
+
+## Envelope Format (`dfs-candidacy-v1`)
+
+The SSH signature namespace is `dfs-candidacy-v1`, and the identity is `root_anchor`.
 
 ```json
 {
@@ -50,21 +52,21 @@ SSH 署名 namespace は `dfs-candidacy-v1`、identity は `root_anchor` とす�
 }
 ```
 
-### 検証規則
+### Verification Rules
 - `schema == "dfs-candidacy-v1"`
-- `root_anchor` が正規化済み（`normalize_path` と一致）
-- `root_pubkey` がクライアントの手元の信頼済み `root_pubkey` と一致
+- `root_anchor` is normalized (matches `normalize_path`)
+- `root_pubkey` matches the client's locally trusted `root_pubkey`
 - `issued_at <= now < expires_at`
-- `epoch >= 1` かつローカル既知の `min_epoch` 以上
-- `registries` に重複 URL がなく、`primary` がちょうど 1 つ（`http://` または `https://`）
-- `ssh_verify(expected_root_pubkey, root_anchor, "dfs-candidacy-v1", canonical_json(payload), signature)` が真
+- `epoch >= 1` and at least the locally known `min_epoch`
+- `registries` has no duplicate URLs and has exactly one `primary` (`http://` or `https://`)
+- `ssh_verify(expected_root_pubkey, root_anchor, "dfs-candidacy-v1", canonical_json(payload), signature)` is true
 
 ---
 
 ## CLI / HTTP API
 
-- `POST /v1/candidacy`: 登録済みの署名付き立候補エンベロープを返す。
-- `POST /v1/candidacy/announce`: `{"envelope": ...}` を検証・保存する。
-- `dfscli candidacy create`: 立候補エンベロープを生成・署名し、`--out` や `--announce` で配布する。
-- `dfscli candidacy discover`: 候補 URL 群から `/v1/candidacy` を取得・検証し、最大 `epoch` の結果を表示する。
-- `dfscli config create <name> --candidacy-url <url>... --root-pubkey <pub>`: 立候補モデルからリモート定義を作成する。
+- `POST /v1/candidacy`: Returns the registered signed candidacy envelope.
+- `POST /v1/candidacy/announce`: Verifies and stores `{"envelope": ...}`.
+- `dfscli candidacy create`: Generates and signs a candidacy envelope, and distributes it via `--out` or `--announce`.
+- `dfscli candidacy discover`: Fetches and verifies `/v1/candidacy` from candidate URLs, and displays the result with the highest `epoch`.
+- `dfscli config create <name> --candidacy-url <url>... --root-pubkey <pub>`: Creates a remote definition from the candidacy model.

@@ -1,475 +1,378 @@
-# dfs 設計メモ
+# dfs Design Notes
 
-## 0. この文書の位置づけ
+> **English** | [日本語](DESIGN.ja.md)
 
-2026-11-11 の会話（dfs 系の各試作の評価 → 全域分散ファイルシステムの可否 → 設計案）を、
-dfs を「考えてみる」ための材料として残す。実装前の設計メモであり、決定ではない。
+## 0. Role of This Document
+
+This document records the 2026-11-11 discussion (evaluation of the `dfs` prototypes → feasibility of a global distributed file system → design proposal) as material for thinking through `dfs`. It is a pre-implementation design memo, not a final decision.
 
 ---
 
-## 1. これまでの試作で、実際に何が起きたか
+## 1. What Actually Happened in Previous Prototypes
 
-### 1.1 dfs 系（~/dfs, dfs2, dfs3, src/dfs4, src/dfs）
+### 1.1 The `dfs` Family (`~/dfs`, `dfs2`, `dfs3`, `src/dfs4`, `src/dfs`)
 
-学習用の暗号つき分散ファイルシステム。設計の核は次のとおり。
+An educational encrypted distributed file system. The core design is as follows:
 
-- 名前空間は `/ドメイン/ユーザー/...`。ユーザーごとに保管庫（vault）。
-- パスを `HMAC(DEK, パス)` で隠す。チャンクは zstd 圧縮 + ChaCha20-Poly1305。
-- 索引は署名する。形式 4 はディレクトリごとの塊に分ける（Git の tree と同じ考え方）。
-- 剥奪（revoke）のときは DEK を作り直して中身を再暗号化する。
-- 同期は三方向マージ。衝突は競合コピーで残す。
+- Namespace is `/domain/user/...`. One vault per user.
+- Paths are hidden using `HMAC(DEK, path)`. Chunks use zstd compression + ChaCha20-Poly1305.
+- Indexes are signed. Format 4 splits the index into per-directory chunks (same idea as Git trees).
+- On revocation, a new DEK is generated and contents are re-encrypted.
+- Synchronization uses three-way merge. Conflicts are preserved as conflict copies.
 
-**系統の整理（重要）**
+**Lineage Summary (Important)**
 
-| パス | 実体 |
+| Path | Reality |
 |---|---|
-| `~/src/dfs` | フォーク元（v0.23.7）。`~/dfs` と実質同一（差分 0 件、マージ衝突 0） |
-| `~/dfs` | 開発コピー。同じ修正を別コミットで持つ |
-| `~/dfs2` | 系統A（v0.23.76、+74コミット）。TLS / WG / TOFU / WG 限定 |
-| `~/dfs3` | 系統B（0.33.0、+41コミット）。暗号設計の書き直しと試験整備 |
-| `~/src/dfs4` | **統合系統**（v0.48.1、103コミット）。dfs3 0.33.0 からフォークし、dfs2 の成果を移植 |
+| `~/src/dfs` | Fork source (v0.23.7). Practically identical to `~/dfs` (0 diffs, 0 merge conflicts) |
+| `~/dfs` | Development copy. Has the same fixes in separate commits |
+| `~/dfs2` | Lineage A (v0.23.76, +74 commits). TLS / WG / TOFU / WG-only |
+| `~/dfs3` | Lineage B (0.33.0, +41 commits). Rewrite of cryptographic design and test suite |
+| `~/src/dfs4` | **Unified lineage** (v0.48.1, 103 commits). Forked from `dfs3` 0.33.0, with `dfs2` work ported over |
 
-**形式番号の衝突（致命的だった点）**
+**Format Number Collision (Fatal Issue)**
 
 - `~/dfs` / `~/src/dfs`: `FMT_CURRENT = 3`
-- `~/dfs3`: `FMT_CURRENT = 4` = 索引を**ディレクトリごとの塊**に分ける
-- `~/dfs2`: `FMT_MAX = 4` = 索引を**マニフェスト + スナップショット + 差分**にする
+- `~/dfs3`: `FMT_CURRENT = 4` = split index into **per-directory chunks**
+- `~/dfs2`: `FMT_MAX = 4` = represent index as **manifest + snapshot + delta**
 
-同じ「形式 4」が別の意味を持つ。マージすると、片方で作った保管庫をもう片方が誤って解釈しうる。
-番号が同じなので「知らない新しい形式は読まない」というガードも効かない。
+The same "Format 4" has two different meanings. When merged, one side could misinterpret a vault created by the other. Because the version number is identical, the guard "do not read unknown newer formats" fails to trigger.
 
-**dfs4 で起きたこと（時系列）**
+**Timeline of `dfs4`**
 
-- 0.41.0 で dfs2 から移植（保管庫ごとの認可、遠隔削除の拒否、ロック名の衝突、待ち受けの行列、fuse の任意化）。
-- 0.42.0 export（緊急時の取り出し）と復旧訓練の試験。
-- 0.43.0 **evil 試験**（チャンクの汚染・ロックの占有・名簿の埋め尽くし）とその修正。
-- 0.44.0 容量の守り。0.45.0 / 0.46.0 レビュー指摘への対応。
-- 0.47.0 / 0.48.0 でモジュール分割と型注釈（`vault.py` → `vault_core.py` の facade 化など）。
-- 10/23 以降は `chat.py` `signal_box.py` `rtc.py` `agent_service.py`、GUI（mac / GTK4）へ重心が移動。
-- 10/25 11:34 の「chat: 宛先の鍵は、設定の保管ノードに無ければ探索で見つかった他のノードで探す」で停止。
-- 中核FS（`vault_core.py` `vault_sync.py` `volume.py` `node.py` `chunks.py`）は 10/22 以降ほぼ凍結。
+- 0.41.0: Ported from `dfs2` (per-vault authorization, rejecting remote deletion, lock name collisions, listener queue, optional FUSE).
+- 0.42.0: `export` (emergency extraction) and recovery drill tests.
+- 0.43.0: **evil tests** (chunk poisoning, lock squatting, registry flooding) and fixes.
+- 0.44.0: Capacity guards. 0.45.0 / 0.46.0: Addressing review feedback.
+- 0.47.0 / 0.48.0: Module splitting and type annotations (e.g., turning `vault.py` into a facade over `vault_core.py`).
+- From 10/23 onward: Focus shifted to `chat.py`, `signal_box.py`, `rtc.py`, `agent_service.py`, and GUI (mac / GTK4).
+- Stopped at 10/25 11:34: "chat: if destination key is not on configured storage node, search other discovered nodes."
+- Core FS (`vault_core.py`, `vault_sync.py`, `volume.py`, `node.py`, `chunks.py`) has been mostly frozen since 10/22.
 
-**評価**
+**Evaluation**
 
-- evil 試験は 11/11 すべて通った。攻撃モデル（A: 共有ノードの悪意ある利用者 / B: 偽ノード・中継者 /
-  C: 鍵を持たない部外者）は正しい。**これは資産**。
-- 実行: `24 passed, 150 skipped`（既定）。`--dfs-all` で全件は長時間かかり、この環境では
-  `test_helper_sync`（GUI と同期エンジンの報告形式の不一致）などが失敗。
-- 失敗の本体はセキュリティではなく、**目的の混線**。分散ストレージを作りながら匿名共有の
-  代表（Tor）と比較し、匿名性を目的外と宣言しながら匿名性で評価していた。
+- All 11/11 evil tests passed. The threat model (A: malicious user on shared node / B: fake node or relay / C: outsider without keys) is sound. **This is an asset.**
+- Test run: `24 passed, 150 skipped` (default). Running all with `--dfs-all` takes a long time, and in this environment `test_helper_sync` (mismatch in report format between GUI and sync engine) and others fail.
+- The core failure was not security, but **conflated goals**. While building distributed storage, it was compared against a flagship anonymous sharing system (Tor), and despite declaring anonymity out of scope, it was evaluated on anonymity.
 
-### 1.2 mini_lustre（~/src/mini_lustre）
+### 1.2 `mini_lustre` (`~/src/mini_lustre`)
 
-Lustre 風。MDS / OST の完全分離とストライピング。
+Lustre-like. Complete separation of MDS / OST and striping.
 
-- メタデータ（MDS, SQLite WAL）と実データ（OST, `chunk_{file_id}_{index}.bin`）を分離。
-- レイアウトは MDS が決める（`crc32(path)` で開始 OST を決め、決定的・均等）。
-- メタデータは QUIC、チャンクは TLS/TCP（aioquic の Python 実装がデータパスの律速になるため）。
-- 適応的先読み、LRU チャンクキャッシュ、部分読み最適化、RMW（圧縮チャンクの部分書き）。
-- クォータ、分散ロック、オンラインスナップショット（`VACUUM INTO`）、fsck/gc。
+- Separates metadata (MDS, SQLite WAL) and actual data (OST, `chunk_{file_id}_{index}.bin`).
+- Layout is decided by MDS (`crc32(path)` picks starting OST, deterministic and balanced).
+- Metadata over QUIC, chunks over TLS/TCP (because `aioquic`'s Python implementation bottlenecks the data path).
+- Adaptive read-ahead, LRU chunk cache, partial read optimization, RMW (partial writes to compressed chunks).
+- Quotas, distributed locks, online snapshots (`VACUUM INTO`), `fsck`/`gc`.
 
-**評価**
+**Evaluation**
 
-- テストは 81 passed / 2 failed（失敗 2 件は `ost_data` が書き込み不可の環境要因）。
-- 実用段階とは言えない。理由:
-  1. **認証が実質的に存在しない。** `auth_token` があれば検証するが、無ければ `caller_owner` を
-     そのまま採用する。OST は無認証。mTLS は設定されているが aioquic が
-     クライアント証明書を要求しないため機能していない。
-  2. **可用性の設計がない。** MDS は単一障害点。書き込みは全か無かでなく、片系成功が残る。
-     ミラーの自動修復はない。
-  3. 性能は測ってあるが、単一クライアント・単一ホスト・小容量のみ。
-- ただし L3（ストライピング、並列I/O、レイアウト管理）の実装としては本物。**部品として資産**。
+- Tests: 81 passed / 2 failed (the 2 failures are environmental due to `ost_data` being non-writable).
+- Not production-ready. Reasons:
+  1. **Virtually no authentication.** `auth_token` is verified if present, but if absent, `caller_owner` is accepted as-is. OST has no authentication. mTLS is configured, but `aioquic` does not request client certificates, so it does not function.
+  2. **No availability design.** MDS is a single point of failure. Writes are not all-or-nothing, leaving partial successes on one side. No automatic mirror healing.
+  3. Performance was measured, but only for a single client, single host, and small capacity.
+- However, as an L3 implementation (striping, parallel I/O, layout management), it is genuine. **An asset as a component.**
 
-### 1.3 clayfs（~/src/clayfs）
+### 1.3 `clayfs` (`~/src/clayfs`)
 
-Swift 6 製の仮想ドライブ + 瞬間スナップショット + 巻き戻し。5,377 行、74 コミット、GitHub に公開。
+Virtual drive + instant snapshots + rollback written in Swift 6. 5,377 lines, 74 commits, published on GitHub.
 
-- macOS: sparsebundle（APFS）+ `clonefile(2)`。
-- Linux: Btrfs の subvolume スナップショット（`linux/clayfs_btrfs` は Python）。
-- 復元は「退避してから差し替える」原子的ロールバック。パストラバーサル対策あり。
-- 読み書きの経路には何も挟まない。圧縮・重複排除はあとからまとめてやる保守処理（`git gc` の位置づけ）。
-  `docs/SPEC-dedup-compress.md` に 7.86GB / 26.9万ファイルでの実測（重複排除+圧縮で 3.73GB）。
-- テストは実行して確認: macOS 12 件中 9 件成功（失敗は `hdiutil` が使えない環境要因）、
-  Linux の Btrfs ロジックテストは全通過。
+- macOS: sparsebundle (APFS) + `clonefile(2)`.
+- Linux: Btrfs subvolume snapshots (`linux/clayfs_btrfs` is in Python).
+- Restoration uses atomic rollback ("move aside, then swap"). Includes path traversal protection.
+- Nothing sits on the read/write path. Compression and deduplication are batch maintenance tasks run afterward (like `git gc`). `docs/SPEC-dedup-compress.md` has measurements on 7.86GB / 269k files (3.73GB after dedup + compression).
+- Tests verified: 9/12 passed on macOS (failures due to `hdiutil` being unavailable in the environment); Linux Btrfs logic tests all passed.
 
-**評価**
+**Evaluation**
 
-- **これまで見た中で最も完成している。** ただし用途は「巻き戻し装置」。
-- 完成した理由: **OS が提供するプリミティブ（clonefile / reflink / rename の原子性）に乗り、
-  自前で解く問題を最小化した。**
-- Mac 版と Linux 版は**別実装**（Swift / Python）。データ配置も非互換
-  （Mac: `.clayfs/snapshots/` + `timeline.sqlite3` / Linux: `store/layers/` + `log.jsonl`）。
-- subvolume は rsync で写せない（中身は写るが CoW の性質が落ちる）。Linux は
-  `btrfs send | receive` を使う（`clayfs_btrfs rebuild DEST`）。
-- **ネットワーク対応は不要。** NFS/Samba を被せるのは「読み書き」なら十分だが「巻き戻し」は
-  成立しない（i ノードの同一性、キャッシュ、競合、`.clayfs` の保護が壊れる）。
-  片方向 rsync も、**同一プラットフォーム内のスナップショット格納に限れば**成立する。
+- **The most complete of all prototypes seen so far.** However, its scope is a "rollback machine."
+- Why it succeeded: **It built on primitives provided by the OS (`clonefile` / `reflink` / atomic `rename`), minimizing the problems it had to solve itself.**
+- Mac and Linux versions are **separate implementations** (Swift / Python). On-disk layouts are also incompatible (Mac: `.clayfs/snapshots/` + `timeline.sqlite3` / Linux: `store/layers/` + `log.jsonl`).
+- Subvolumes cannot be copied with `rsync` (contents copy, but CoW properties are lost). Linux uses `btrfs send | receive` (`clayfs_btrfs rebuild DEST`).
+- **Network support is unnecessary.** Layering NFS/Samba works for "read/write," but "rollback" breaks (inode identity, caching, conflicts, and `.clayfs` protection break). One-way `rsync` only works **if restricted to storing snapshots within the same platform**.
 
-### 1.4 3 つの試作の関係（結論）
+### 1.4 Relationship Between the Three Prototypes (Conclusion)
 
-| 試作 | 作った層 | 状態 |
+| Prototype | Layers Built | Status |
 |---|---|---|
-| mini_lustre | L3（ストライピング・並列I/O）+ L2の一部（名簿による所在地解決） | 動く。認証と可用性が欠ける |
-| dfs | L0/L2（`.pubkey`, TOFU, 名簿）+ L4の芽（形式4の Merkle tree、署名付き索引） | 暗号設計は正しい。目的が混線 |
-| clayfs | L5（ローカル実体化・CoW・巻き戻し） | 完成。ネットワークは範囲外 |
+| `mini_lustre` | L3 (striping, parallel I/O) + part of L2 (location resolution via registry) | Works. Lacks authentication and availability |
+| `dfs` | L0/L2 (`.pubkey`, TOFU, registry) + seeds of L4 (Format 4 Merkle tree, signed index) | Sound crypto design. Conflated goals |
+| `clayfs` | L5 (local materialization, CoW, rollback) | Complete. Networking is out of scope |
 
-**足りないのは L1（権威の委譲）。3 つとも、ここを設計していない。**
+**What is missing is L1 (delegation of authority). None of the three designed this.**
 
 ---
 
-## 2. 問い: インターネット全域をカバーする分散ファイルシステムは可能か
+## 2. Question: Is a Distributed File System Covering the Entire Internet Possible?
 
-### 2.1 答えは「3. それ以外」
+### 2.1 The Answer is "3. Neither / Other"
 
-- **作り得ない**: 統一された 1 つの全域 POSIX ファイルシステムとしては、正しい。
-- **必要がない**: 用途を限定すれば正しいが、一般命題としては誤り。
-- **それ以外（採用）**: **分解すれば可能かつ既存。統合だけが不可能。**
+- **Impossible to build**: True if defined as a single unified global POSIX file system.
+- **Unnecessary**: True for restricted use cases, false as a general proposition.
+- **Other (Adopted)**: **Possible and already exists when decomposed. Only unification is impossible.**
 
-「統一された 1 つとして全域をカバーするものは作り得ない」が、
-「全域をカバーする分散ストアは必要で、すでに存在する」も同時に成り立つ。
-問いは対象を混ぜている。
+Both "a single unified global system cannot be built" and "a global distributed store is necessary and already exists" are true simultaneously. The question conflates the two.
 
-### 2.2 何が不可能を決めるか
+### 2.2 What Dictates Impossibility
 
-- **光速**: 地球の裏側は往復 100〜300ms。POSIX のメタデータ操作は同期で、`cp -r` は
-  数千 syscall を出す。各操作に 100ms かかるファイルシステムは定義上使えない。
-- **CAP**: 全域に広がれば分断は必ず起きる。一貫性を選べば分断中は使えず、可用性を選べば
-  POSIX でなくなる。**どちらを選んでも「全域の POSIX ファイルシステム」にはならない。**
-- AFS はこの壁に正面から当たり、セル構造・コールバック付きキャッシュ・ファイル単位の
-  楽観的整合性に落とし、POSIX の一部を明示的に手放した。それでもサイト規模。
+- **Speed of light**: Round-trip to the other side of the Earth is 100–300ms. POSIX metadata operations are synchronous, and `cp -r` issues thousands of syscalls. A file system taking 100ms per operation is unusable by definition.
+- **CAP**: At global scale, partitions are guaranteed to occur. Choosing consistency makes it unusable during partitions; choosing availability makes it non-POSIX. **Either choice fails to yield a "global POSIX file system."**
+- AFS hit this wall head-on, settling on cell structures, callback-based caching, and per-file optimistic consistency—explicitly giving up parts of POSIX. Even then, it remains site-scale.
 
-### 2.3 成功した全域システムは、必ず 1 つの問題だけを解いている
+### 2.3 Successful Global Systems Always Solve Only One Problem
 
-| システム | 全域化したもの | 諦めたもの |
+| System | What It Globalized | What It Gave Up |
 |---|---|---|
-| DNS | 名前空間 | データを持たない |
-| Web | 名前空間 + 読み出し | 書き込み、原子性、rename、一覧 |
-| BitTorrent | データ転送 | 名前空間、書き込み、整合性 |
-| Usenet | 追記型の複製ストア + 名前空間 | 編集、削除、整合性 |
-| Git | 履歴 | 生きたファイルシステム、自動同期 |
-| IPFS | 内容アドレッシング | 性能、可変名前空間、インセンティブ |
-| Tor | 匿名性 | 帯域、性能 |
-| CDN | 配布とキャッシュ | 書き込み、名前空間の権威 |
+| DNS | Namespace | Holds no data |
+| Web | Namespace + reads | Writes, atomicity, `rename`, directory listing |
+| BitTorrent | Data transfer | Namespace, writes, consistency |
+| Usenet | Append-only replicated store + namespace | Editing, deletion, consistency |
+| Git | History | Live file system, automatic sync |
+| IPFS | Content addressing | Performance, mutable namespace, incentives |
+| Tor | Anonymity | Bandwidth, performance |
+| CDN | Distribution and caching | Writes, namespace authority |
 
-**Web はほぼ全域ファイルシステム**（URL という全域名前空間、HTTP という read/write 意味論、
-全域キャッシュ）だが、原子性のある複数ファイル操作も rename も一覧も POSIX も無い。
-**全域で動くのは、ファイルシステムとして劣化させたから。**
+**The Web is almost a global file system** (URLs as a global namespace, HTTP as read/write semantics, global caching), yet it has no atomic multi-file operations, no `rename`, no directory listing, and no POSIX. **It works globally precisely because it degraded itself as a file system.**
 
-### 2.4 混同されている 2 つ
+### 2.4 Two Things Being Conflated
 
-1. **名前空間**: どこに何があり、誰のものか。非同期でよい。キャッシュ可能。安い。全域化できる。
-2. **データプレーン**: バイトの所在と移動。同期が必要。遅延に律速。高い。全域化すべきでない。
+1. **Namespace**: Where things are and whose they are. Can be asynchronous. Cacheable. Cheap. Can be globalized.
+2. **Data plane**: Location and movement of bytes. Needs synchronization. Latency-bound. Expensive. Should not be globalized.
 
-**dfs はこの 2 つを 1 つの仕組みで全域化しようとした。** 個別には正しかったものが、
-統合された瞬間に動かなくなった。clayfs は両方をローカルに固定し、OS に委ねた。だから完成した。
+**`dfs` tried to globalize both with a single mechanism.** Things that were individually sound stopped working the moment they were unified. `clayfs` pinned both locally and delegated to the OS—that is why it succeeded.
 
-### 2.5 技術だけでは決まらない部分
+### 2.5 Parts Not Decided by Technology Alone
 
-全域の書き込み可能ストアは、技術ではなく**経済と法**の問題になる。
+A global writable store becomes a problem of **economics and law**, not technology.
 
-- **誰が払うのか**: ストレージと帯域は金がかかる。BitTorrent は人気が互酬を作るから成立する。
-  dfs の私的保管庫には他人がホストする動機が無い。
-- **誰がモデレートするのか**: 全域の書き込み可能ストレージは spam / マルウェア / 違法
-  コンテンツの磁石になる。IPFS のゲートウェイが中央集権化した原因。Usenet が階層ごとの
-  統治を必要としたのも同じ。
-- **誰が名前を決めるのか**: 全域名前空間には全域の権威が要る。DNS は存在するが政治的中央集権。
-  write-everywhere の FS は所有権について全域合意を要する。
+- **Who pays**: Storage and bandwidth cost money. BitTorrent works because popularity creates reciprocity. Nobody has an incentive to host `dfs` private vaults for strangers.
+- **Who moderates**: Global writable storage becomes a magnet for spam, malware, and illegal content. This is why IPFS gateways centralized, and why Usenet required hierarchical governance.
+- **Who decides names**: A global namespace requires global authority. DNS exists, but is politically centralized. A write-everywhere FS requires global consensus on ownership.
 
-**dfs が鍵と承認の仕組みを延々と作っていたのは、この経済と法の問題を暗号で解こうとしていた
-から。解けなかったのは設計の問題ではなく、問題の種類の取り違え。**
+**`dfs` kept building key and approval mechanisms endlessly because it tried to solve these economic and legal problems with cryptography. It failed not from bad design, but from mistaking the category of the problem.**
 
-### 2.6 リアルタイム性を分解して考える
+### 2.6 Decomposing Real-Time Behavior
 
-光速は変えられない。しかし、それによって不可能になるのは「すべての操作を全域で即時に
-同期すること」であって、ファイルシステムそのものではない。リアルタイム性は少なくとも
-次の 2 つに分解できる。
+The speed of light cannot be changed. However, what this makes impossible is "synchronizing all operations globally in real time," not the file system itself. Real-time behavior can be decomposed into at least two parts:
 
-| 範囲 | 要求 | 実現方法 |
+| Scope | Requirement | How to Achieve |
 |---|---|---|
-| 1 台の機械の中 | 即時。書いたものが直ちに見えること（read-your-writes） | ローカル FS / ローカルキャッシュで足りる |
-| 機械をまたぐ伝播 | 遅れてよい。陳腐化の上限を決める | 非同期の複製・同期 |
+| Within one machine | Immediate. Written data must be visible immediately (read-your-writes) | Local FS / local cache suffices |
+| Cross-machine propagation | Can be delayed. Define an upper bound on staleness | Asynchronous replication / sync |
 
-**不可能なのは前者ではなく、後者を同期にすること。** 光速は「全域同期は無理」の証明では
-なく、**遅延の下限**を与えるだけである。たとえば「最大 300ms プラス待ち行列分だけ古い」と
-いう仕様にするなら、それは不可能ではなく設計パラメータになる。実際に Files On-Demand 系、
-AFS、Coda、Git は、それぞれの形でリアルタイム性を手放して世界規模または複数サイトで
-成立している。
+**What is impossible is not the former, but making the latter synchronous.** The speed of light does not prove "global sync is impossible"—it merely sets a **lower bound on latency**. Specifying "stale by at most 300ms plus queueing delay" turns it from an impossibility into a design parameter. Files On-Demand systems, AFS, Coda, and Git all operate globally or across multiple sites by giving up real-time guarantees in their own ways.
 
-この意味で、dfs が「孤立したファイルシステムを後から同期する」という構えを取った方向は
-正しい。間違っていたのは、遅延を許した後で、全ノードが同じツリーを三方向マージできると
-考えたことである。
+In this sense, `dfs`'s stance of "synchronizing isolated file systems afterward" was the right direction. What was wrong was assuming that after allowing delay, all nodes could perform a three-way merge on the same tree.
 
-また、リアルタイムでないものを POSIX ファイルシステムと呼ぶと約束が嘘になる。これは
-「ファイルシステム」ではなく、**同期されるワークスペース／ローカルに実体化されたビュー**
-として設計する。ローカルでは POSIX の即時性を保ち、機械間の伝播だけを遅延させる。
+Furthermore, calling something non-real-time a POSIX file system makes a false promise. Rather than a "file system," design it as a **synchronized workspace / locally materialized view**. Preserve POSIX immediacy locally, and delay only cross-machine propagation.
 
 ---
 
-## 3. なぜ「ドメイン + ユーザー名」では足りないか
+## 3. Why "Domain + Username" Is Not Enough
 
-domain + user が魅力的に見える理由は正当。メールと SSH が実証済みで、`alice@example.com`
-だけで世界一意が保証され、階層をパスに流用できる。dfs も mini_lustre も `/domain/user/...`
-を採用した。
+The appeal of `domain + user` is legitimate. Proven by email and SSH, `alice@example.com` guarantees global uniqueness and maps cleanly to hierarchical paths. Both `dfs` and `mini_lustre` adopted `/domain/user/...`.
 
-**しかし両実装とも、既に別の層を持っていた。**
+**However, both implementations already had other layers.**
 
-- mini_lustre: `/example.com/someone` を解決した後、データの在り処は MDS が返す
-  `StripeLayout`。MDS 自体は mDNS と `example.com:9005` のグローバル名簿で探す。
-- dfs: `/domain/user` を解決した後、保管庫は「設定した保管ノードの URL」にあった。
-  ノードは名簿（rendezvous）と mDNS で探す。鍵は `.pubkey`（TOFU）で、鍵の権威は未定義。
+- `mini_lustre`: After resolving `/example.com/someone`, the data location is a `StripeLayout` returned by MDS. MDS itself is discovered via mDNS and a global registry at `example.com:9005`.
+- `dfs`: After resolving `/domain/user`, the vault lived at "the configured storage node URL." Nodes were found via a registry (`rendezvous`) and mDNS. Keys used `.pubkey` (TOFU), with key authority undefined.
 
-つまり**すでに 4 層が必要で、それを手で設定ファイルに埋めていた**。足りない部分を人間が補っていた。
+In other words, **four layers were already needed, and humans were filling them in manually via config files**.
 
-| 欠けている層 | domain + user が答えない問い |
+| Missing Layer | Question `domain + user` Cannot Answer |
 |---|---|
-| 所在地 | そのデータはどのノードにあるのか |
-| 権威 | `alice@example.com` の鍵は誰が保証するのか。誰が更新できるのか |
-| 一貫性 | 2 台が同じパスを書いたとき、順序はどう決まるのか |
-| 委譲 | グループ、下位組織、管理者の委譲をどう表現するのか |
+| Location | Which node holds the data? |
+| Authority | Who vouches for `alice@example.com`'s key? Who can rotate it? |
+| Consistency | When two machines write to the same path, how is order decided? |
+| Delegation | How are groups, sub-organizations, and admin delegations expressed? |
 
-**権威が最も重い。** domain が鍵を保証するなら domain は全球的な認証局になり、CA の中央集権
-問題を再生産する。ユーザーが自己署名するなら TOFU モデルになり、鍵ローテーションも初回接触
-攻撃も扱えない。**どちらを選んでも domain + user だけでは閉じない。**
+**Authority is the heaviest.** If the domain vouches for keys, the domain becomes a global CA, reproducing CA centralization issues. If users self-sign, it becomes a TOFU model, unable to handle key rotation or first-contact attacks. **Either way, `domain + user` is not self-contained.**
 
 ---
 
-## 4. 設計案: 層に分け、各層を既存システムに委ねる
+## 4. Design Proposal: Split into Layers, Delegate Each Layer to Existing Systems
 
 ```text
-L5 ローカル実体化   FUSE + CoW キャッシュ + ローカル巻き戻し   (clayfs)
-        ↑ 遅延取得・ローカルで書く・明示的に公開
-L4 一貫性           名前空間ごとの署名付き追記ログ             (dfs3 形式4 / Git)
-        ↑ パーティションごとに書き手は 1 つ
-L3 データ平面       内容アドレス付きチャンク + 複数輸送
-        ↑ ローカル(reflink) / WG 直結 / libtorrent(DHT) / HTTP(range)
-L2 所在地解決       署名付きロケータ記録 (DNS の A/AAAA 相当) / DHT / 名簿
-        ↑ 名前から「どこにあるか」へ
-L1 権威の委譲       署名付き委譲 (DNS の NS/DNSSEC 相当)
-        ↑ 誰がこの部分木を名乗れるか
-L0 識別子           domain + user + 鍵 (既存: SSH 形式 Ed25519)
+L5 Local Materialization  FUSE + CoW cache + local rollback            (clayfs)
+        ↑ Lazy fetch · write locally · publish explicitly
+L4 Consistency             Per-namespace signed append-only log         (dfs3 Format 4 / Git)
+        ↑ One writer per partition
+L3 Data Plane              Content-addressed chunks + multiple transports
+        ↑ Local (reflink) / direct WG / libtorrent (DHT) / HTTP (range)
+L2 Location Resolution     Signed locator records (like DNS A/AAAA) / DHT / registry
+        ↑ From name to "where it is"
+L1 Authority Delegation    Signed delegation (like DNS NS/DNSSEC)
+        ↑ Who may claim this subtree
+L0 Identifier              domain + user + key (existing: SSH-format Ed25519)
 ```
 
-**L0 は既存のままでよい。** domain + user + `ssh-ed25519` は識別子として妥当。
-問題はここで止まっていたこと。
+**L0 can stay as-is.** `domain + user + ssh-ed25519` is valid as an identifier. The problem was stopping there.
 
-### 各層で借りるもの
+### What to Borrow at Each Layer
 
-| 層 | 借りるもの | なぜ |
+| Layer | What to Borrow | Why |
 |---|---|---|
-| L1 委譲 | DNSSEC の委譲モデル | 署名付き委譲・鍵の委譲・失効の枠組みが既にある |
-| L2 所在地 | DNS の NS/A 分離、Kademlia DHT | 名前と住所を分ける設計が既にある |
-| L3 データ | libtorrent の DHT・ピース交換 | 多対多転送とピア発見を自前で書かない |
-| L3 局所 | `clonefile` / reflink | clayfs の実証済み |
-| L4 一貫性 | Git の Merkle ツリーと追記ログ | dfs3 形式4 はまさにこれ |
-| L5 実体化 | clayfs の CoW スナップショット | 完成済み |
-| 制御 | Tor / I2P | 小メッセージの匿名化だけ |
+| L1 Delegation | DNSSEC delegation model | Signed delegation, key delegation, and revocation frameworks already exist |
+| L2 Location | DNS NS/A separation, Kademlia DHT | Separating names from addresses is already designed |
+| L3 Data | libtorrent DHT and piece exchange | Avoid writing many-to-many transfer and peer discovery from scratch |
+| L3 Local | `clonefile` / `reflink` | Proven in `clayfs` |
+| L4 Consistency | Git Merkle trees and append-only logs | `dfs3` Format 4 is literally this |
+| L5 Materialization | `clayfs` CoW snapshots | Already complete |
+| Control | Tor / I2P | Only for anonymizing small control messages |
 
-**「既存を統合する」とは、この表を埋めること。新しいアルゴリズムの発明ではない。**
+**"Integrating existing systems" means filling in this table—not inventing new algorithms.**
 
 ---
 
-## 5. 最重要の設計判断: 書き込み境界
+## 5. Most Important Design Decision: Write Boundaries
 
-**dfs の失敗を繰り返さないための核心。**
+**The core principle to avoid repeating `dfs`'s failure.**
 
-dfs はツリー全体を三方向マージしようとした。衝突コピー、署名の検証、版の比較、ロック。
-全ノードがどこでも書けるから、どこでも衝突する。
+`dfs` tried to three-way merge the entire tree: conflict copies, signature verification, version comparison, locks. Because every node can write anywhere, conflicts happen everywhere.
 
-正しい設計:
+The right design:
 
-> **部分木ごとに書き手を 1 つに固定し、書き手が変わる境界（委譲の境界）でだけ調停する。**
+> **Fix a single writer per subtree, and arbitrate only at boundaries where the writer changes (delegation boundaries).**
 
-- `/example.com/alice` の中を書けるのは alice の鍵を持つ端末だけ。
-- `/lab.univ.edu/project-x` を書けるのは、そのグループの鍵を持つ主体だけ。
-- **1 つの中では並行書き込みが起きないので、マージが不要になる。**
+- Only devices holding Alice's key can write inside `/example.com/alice`.
+- Only principals holding the group key can write inside `/lab.univ.edu/project-x`.
+- **Because concurrent writes do not happen within a single subtree, merging is eliminated.**
 
-調停が必要なのは委譲の境界だけ。「lab.univ.edu が alice に /lab/project-x を委譲した」という
-署名付き記録を 1 つ合意すれば、その中は単一書き手。
+Arbitration is only needed at delegation boundaries. Once a single signed record is agreed upon—" `lab.univ.edu` delegated `/lab/project-x` to `alice` "—everything inside has a single writer.
 
-**これで dfs が解こうとして解けなかった問題が消える。** 全域で合意しなければならないのは、
-各パーティションの**所有者が誰か**だけで、内容そのものではない。DNS が成功したのと同じ構図。
+**This eliminates the problem `dfs` tried and failed to solve.** What must be agreed upon globally is only **who owns** each partition, not the contents themselves. The exact same structure that made DNS succeed.
 
-### 5.1 遅延を選ぶなら、書き手を先に決める
+### 5.1 If You Choose Delay, Decide the Writer First
 
-遅延伝播を採用すると、リアルタイム性による「同時に書けない」という防御が外れる。その結果、
-マージ問題は消えるのではなく、中央へ押し出される。
+Adopting delayed propagation removes the real-time defense of "cannot write simultaneously." As a result, the merge problem does not disappear—it gets pushed to the center.
 
-- **遅延伝播 + 単一書き手** → 必要なのは複製だけ。マージは起きない。追記型で単純。
-- **遅延伝播 + 複数書き手** → マージが必須。OT、CRDT、または衝突コピーが必要。
+- **Delayed propagation + single writer** → Only replication is needed. No merges occur. Simple and append-only.
+- **Delayed propagation + multiple writers** → Merging is mandatory. Requires OT, CRDTs, or conflict copies.
 
-したがって、**「いつ伝えるか」より先に「誰が書くか」を決める**。これは単なる実装の都合では
-なく、遅延を安全に許すための前提条件である。部分木ごとの単一書き手が決まっていれば、
-機械間の遅延は複製の遅れに留まり、和解が必要なのは委譲の境界だけになる。
+Therefore, **decide "who writes" before "when to propagate."** This is not an implementation convenience; it is a prerequisite for safely allowing delay. Once a single writer per subtree is established, cross-machine delay remains mere replication lag, and reconciliation is needed only at delegation boundaries.
 
-この順序を逆にすると、dfs と同じ失敗を再現する。孤立した保管庫と後からの同期という構えは
-正しくても、書き手を絞らずに全域のツリーをマージしようとすれば、避けられたはずの衝突を
-自分で呼び戻すことになる。
+Reversing this order reproduces `dfs`'s failure. Even with the right stance of isolated vaults and later synchronization, trying to merge a global tree without restricting writers invites back avoidable conflicts.
 
-### 5.2 書き手・イベント・表示名を分ける
+### 5.2 Separate Writer, Event, and Display Name
 
-`user@domain % ssh-publickey /path/to/file # UTC-timestamp` のような文字列は、
-**人間が書き込みを読むための表示形式**としては便利である。しかし、これをそのまま
-「書き手の識別子」にすると、権威・署名者・ファイル名・版の 4 つが混ざる。
+A string like `user@domain % ssh-publickey /path/to/file # UTC-timestamp` is convenient as a **display format for humans reading writes**. However, using it directly as a "writer identifier" conflates four things: authority, signer, file name, and version.
 
-| 要素 | 何を表すか | そのまま使うと困ること |
+| Element | What It Represents | Problem If Used Directly |
 |---|---|---|
-| `user@domain` | 人間が読める名前 | 名前を名乗る鍵の**権威**を保証しない |
-| `ssh-publickey` | 署名を検証する鍵 | 鍵の更新で文字列が変わる。公開鍵全体は長すぎる |
-| `/path/to/file` | 現在の表示名 | rename で同一ファイルの住所が変わる |
-| `UTC-timestamp` | 人間向けの記録時刻 | 時計ずれ・偽装があり、正しい順序を保証しない |
+| `user@domain` | Human-readable name | Does not guarantee the **authority** of the key claiming the name |
+| `ssh-publickey` | Key to verify signature | String changes on key rotation; full public key is too long |
+| `/path/to/file` | Current display name | `rename` changes the address of the same file |
+| `UTC-timestamp` | Human-facing timestamp | Subject to clock skew and spoofing; does not guarantee true order |
 
-推奨する分離は次のとおり。
+Recommended separation:
 
 ```text
-名前（安定）        user@domain
-書き手鍵（署名者）   key-id = SHA-256(公開鍵) などの不変ID
-権威（署名）         domain または委譲された権威が writer-key を認可する記録
-書き込み（順序）     subtree + seq + parent-hash + event-hash
-表示（人間向け）     user@domain%key-id/path#UTC-time
+Name (stable)        user@domain
+Writer key (signer)  Immutable ID such as key-id = SHA-256(public-key)
+Authority (signed)   Record where domain or delegated authority authorizes writer-key
+Write (ordering)     subtree + seq + parent-hash + event-hash
+Display (human)      user@domain%key-id/path#UTC-time
 ```
 
-- **書き手はユーザー名そのものではなく、認可された書き手鍵**とする。同じユーザーが複数端末を
-  持つなら、端末ごとに別の書き手鍵を発行できる。ただし部分木の単一書き手を守るには、
-  同時に有効な書き手鍵を 1 つに制限するか、書き込み順序を決める sequencer を置く。
-- **パスは安定IDにしない。** 安定した `file-id` を別に持ち、パスは名前空間上の別名として
-  扱う。これにより rename 後もイベントと実体の同一性を保てる。
-- **時刻は順序の正解にしない。** `seq` と `parent-hash` で順序を決め、署名した UTC 時刻は
-  監査・表示用の属性として持つ。時計のずれや偽装があっても、書き込みの前後関係を壊さない。
-- **イベントIDは正規化した内容のハッシュ**とし、そのハッシュへの署名を書き手鍵で行う。
-  表示用文字列をそのままハッシュ化すると、区切り文字やエスケープの変更でIDが変わるため、
-  内部の正規形を別に定義する。
+- **The writer is not the username itself, but an authorized writer key.** If the same user has multiple devices, a separate writer key can be issued per device. However, to preserve single-writer per subtree, either restrict active writer keys to one at a time or place a sequencer to order writes.
+- **Do not use paths as stable IDs.** Maintain a separate stable `file-id` and treat paths as namespace aliases. This preserves identity between events and entities across renames.
+- **Do not use timestamps as the source of truth for ordering.** Order by `seq` and `parent-hash`, and keep the signed UTC timestamp as an audit/display attribute. Clock skew or spoofing will not break causal write order.
+- **Make the event ID the hash of canonicalized content**, signed by the writer key. Hashing the display string directly changes the ID whenever delimiters or escaping change, so define a separate internal canonical form.
 
-この形で解けるのは **L0 の「名前と署名者の組」** と **L4 の「書き込みイベントの識別・順序」**
-である。まだ解けないのは **L1 の「その書き手鍵がその名前の部分木を書いてよい」という
-権威の連鎖**である。
+This solves **L0's "name and signer pair"** and **L4's "write event identification and ordering."** What remains unsolved is **L1's chain of authority: "this writer key is permitted to write to this named subtree."**
 
 ---
 
-## 6. 鍵と失効
+## 6. Keys and Revocation
 
-dfs の「剥奪時に全チャンクを再暗号化」は分散環境で破綻する。次の形にする。
+`dfs`'s "re-encrypt all chunks on revocation" breaks down in a distributed environment. Use the following approach instead:
 
-- **エポック番号付き鍵**: `dek = KDF(master, epoch)`。チャンクごとにエポックを持たせる。
-- **失効は「以後のエポックを渡さない」。** 古いエポックは持っている者が読める。これは暗号の
-  性質で避けられないと明示的に受け入れる（dfs の DESIGN.md も「過去に読まれた内容は
-  取り戻せない」と正しく書いていた）。
-- **ローテーションは署名付きの委譲記録として L1 に置く。** 誰がいつ鍵を変えたかが追える。
+- **Epoch-numbered keys**: `dek = KDF(master, epoch)`. Tag each chunk with its epoch.
+- **Revocation means "do not hand out future epochs."** Those who already hold old epochs can still read them. Explicitly accept this as unavoidable by the nature of cryptography (as `dfs`'s `DESIGN.md` rightly noted: "previously read content cannot be taken back").
+- **Record rotation in L1 as a signed delegation record.** This makes it traceable who changed keys and when.
 
-「全再暗号化」を捨てるだけで、分散環境で成立する。
+Simply dropping "full re-encryption" makes it viable in a distributed environment.
 
-### 6.1 鍵の公開・発見・更新をどう扱うか
+### 6.1 How to Handle Key Publishing, Discovery, and Rotation
 
-書き手鍵を検証するには、公開鍵そのものではなく、**「この名前とこの鍵の結び付きが誰によって
-保証されているか」**を検証できなければならない。単なる鍵サーバは、鍵を集めて返すだけで、
-その結び付きの正しさを保証しない。
+To verify a writer key, one must verify not just the public key itself, but **who vouches for the binding between this name and this key**. A plain keyserver only collects and returns keys without guaranteeing the validity of that binding.
 
-keys.openpgp.org は OpenPGP 鍵の公開・発見には使えるが、**認証局ではない**。メールアドレスの
-確認は「そのアドレスを受け取れる」ことの確認であって、`alice@example.com` という身元や、
-`/example.com/alice/...` を書く権限の証明ではない。また、同じ名前に対して利用者ごとに違う
-鍵を見せる分割表示（split-view）も、単独の鍵サーバでは防げない。
+`keys.openpgp.org` is useful for publishing and discovering OpenPGP keys, but **it is not a certificate authority**. Email verification only proves "this address can receive mail," not the identity `alice@example.com` or the authority to write `/example.com/alice/...`. Moreover, a standalone keyserver cannot prevent split-view attacks where different keys are shown to different users for the same name.
 
-この設計で必要なのは、次の 3 つを分けて持つことである。
+This design requires separating three things:
 
-1. **名前と鍵の結び付き（L0/L1）**: ドメインまたは委譲された権威が、`user@domain` と
-   `writer-key` の対応を署名する。必要なら SSH CA の principal、DNSSEC、HTTPS の
-   `.well-known` などを、そのドメインの既存の権威として利用する。
-2. **更新・失効の履歴（L1）**: 鍵のローテーションは新しい鍵による署名付きの委譲記録とし、
-   失効は「以後のエポックを認めない」という署名付き記録にする。過去のイベントは消さず、
-   追記型で残す。
-3. **透過性（L2 の一部）**: 名前と鍵の対応を追記型のログに載せ、inclusion proof と
-   consistency proof を提供する。これにより、運営者や攻撃者が相手によって違う鍵を見せる
-   分割表示を検出できる。keys.openpgp.org の代わりに必要なのは、この種の
-   **key transparency** であり、単なる鍵検索サービスではない。
+1. **Name-to-key binding (L0/L1)**: The domain or delegated authority signs the mapping between `user@domain` and `writer-key`. Use existing domain authorities where appropriate—SSH CA principals, DNSSEC, HTTPS `.well-known`, etc.
+2. **Rotation and revocation history (L1)**: Key rotation is a signed delegation record by the new key, and revocation is a signed record stating "no further epochs are valid." Past events are never deleted; they remain append-only.
+3. **Transparency (part of L2)**: Place name-to-key mappings in an append-only log providing inclusion proofs and consistency proofs. This detects split-view attacks where an operator or attacker serves different keys to different peers. What is needed instead of `keys.openpgp.org` is this kind of **key transparency**, not a mere key lookup service.
 
-**OpenPGP である必然性はない。** この用途では SSH Ed25519 鍵の方が単純で、SSH CA の
-principal と有効期限をそのまま利用できる。OpenPGP を使う場合も、Web of Trust を全域の権威と
-みなさず、ドメイン権威の署名または透過性ログを別に持つ。
+**There is no necessity to use OpenPGP.** For this use case, SSH Ed25519 keys are simpler, and SSH CA principals and expiration times can be used directly. Even if OpenPGP is used, do not treat the Web of Trust as a global authority; maintain domain-authority signatures or a transparency log separately.
 
-なお、この節は「どの権威を採用するか」をまだ決定していない。L1 の未解決問題（ドメイン権威と
-ストレージ所有者の一致、初回接触、失効の扱い）は残る。
+Note that this section does not yet decide which authority to adopt. Open L1 questions (alignment between domain authority and storage owner, first contact, revocation handling) remain.
 
 ---
 
-## 7. 統合してはいけない部分（明示的に範囲外にする）
+## 7. Parts That Must Not Be Integrated (Explicitly Out of Scope)
 
-技術で解こうとして失敗した領域。3 つを範囲外と明記する。
+Areas where technical solutions failed. Explicitly mark three as out of scope:
 
-1. **経済**: 他人のディスクと帯域を誰が払うか。インセンティブを設計するか、私的ノードに
-   限定するかのどちらかを選ぶ。
-2. **モデレーション**: 全域の書き込み可能ストレージは違法コンテンツの磁石になる。公開する
-   部分と私的な部分を最初から分ける。
-3. **初回接触の信頼**: TOFU か CA か。未解決のままでよいが、**どちらを選んだかを明示する**。
+1. **Economics**: Who pays for others' disk and bandwidth? Either design incentives or restrict to private nodes.
+2. **Moderation**: Global writable storage becomes a magnet for illegal content. Separate public and private parts from the start.
+3. **First-contact trust**: TOFU or CA? It can remain open, but **explicitly state which one is chosen**.
 
 ---
 
-## 8. 最初に作るもの、作らないもの
+## 8. What to Build First, What Not to Build
 
-### 最初に作る（小さく、検証しやすい）
+### Build First (Small, Easy to Verify)
 
-1. **L0 + L1 + L2 だけの名前解決。** 署名付き委譲とロケータ記録。対象がストレージなので必要。
-2. **単一書き手の L4 追記ログ。** dfs3 形式4 の Merkle ツリーを流用。
-3. **L5 のローカル実体化。** clayfs をそのまま使う（完成済み）。
+1. **Name resolution using only L0 + L1 + L2.** Signed delegations and locator records. Necessary because the target is storage.
+2. **Single-writer L4 append-only log.** Reuse `dfs3` Format 4 Merkle trees.
+3. **L5 local materialization.** Use `clayfs` as-is (already complete).
 
-### 作らない（危険）
+### Do Not Build (Dangerous)
 
-- 全域三方向マージ
-- 全域での POSIX 一貫性
-- 独自の DHT・独自のピア交換（libtorrent から借りる）
-- 遠隔からの巻き戻し
-- 双方向の自動同期
-
----
-
-## 9. 各試作を「設計の中の 1 層」として捉え直す
-
-「失敗」ではなく、層ごとの試作として見ると価値が見える。
-
-- **mini_lustre** = L3 + L2 の一部。MDS/OST 分離は正しく、実際に動いている。
-- **dfs** = L0/L2 + L4 の芽。形式4 の Merkle ツリーは使える。**evil 試験の 11 項目は、
-  L4 のセキュリティ要件としてそのまま使える**
-  （特に「書き込みを黙って捨てる中継者に成功と報告しない」= 読み直して照合は、
-  BitTorrent を土台にしても必要）。
-- **clayfs** = L5。そのまま使える。
-
-**足りないのは L1。** domain + user で足りると考えたのは、L1 を「ドメイン名が権威」という
-暗黙の前提で代用したから。実際にはドメイン名はただの文字列で、権威は誰も定義していなかった。
-
-書き手の表現を `user@domain % ssh-publickey /path # UTC-time` のように 1 本の文字列に
-まとめる案は、L0 と L4 の表示には使える。ただし、名前・署名者・パス・時刻を混ぜると
-権威と順序が曖昧になる（5.2 節）。また、鍵の公開と発見だけを外部サービスに任せても、
-名前と鍵の結び付きが正しいかは検証できない（6.1 節）。L1 の不足は、この 2 点を分離して
-初めて具体的に扱える。
+- Global three-way merge
+- Global POSIX consistency
+- Custom DHT / custom peer exchange (borrow from libtorrent)
+- Remote rollback
+- Automatic bidirectional sync
 
 ---
 
-## 10. 未解決の問い（ここを考えたい）
+## 9. Reinterpreting Each Prototype as "One Layer in the Design"
 
-1. **L1（権威の委譲）を、DNSSEC に本当に乗せられるか。** ドメイン名の権威とストレージの
-   所有権は一致するのか（`example.com` の持ち主が `/example.com/*` の権威である必然性）。
-2. **書き込み境界の「境界」を誰が決めるか。** 委譲は一方的に宣言できてよいか、承認が要るか。
-3. **L2 のロケータをどこに置くか。** DHT は匿名性と引き換えに性能を失う。名簿は中央集権に
-   なる。DNS を流用すると検閲が入る。
-4. **単一書き手を守るために、書き込みをどう排他するか。** ローカルなら lock で足りる。
-   書き手が複数端末（同一人物）のときは、端末間の合意が要る（ここが最小の合意問題）。
-5. **~~L3 で libtorrent を土台にしたとき、dfs の「内容アドレスなし」問題をどう直すか。~~**
-   **→ 解決済み（2026-11-11）。** 単一書き手なので、重複排除の主体は OST ではなく書き手自身である。
-   判定は暗号化の前に平文の内容アドレス `plain_id` で行い、索引（`plain_id -> wire_id`）は署名済み履歴から
-   再構築する。したがって暗号は決定的である必要がなく、標準 AEAD（ChaCha20-Poly1305）と
-   毎回ランダムな Nonce を使ってよい。重複排除と機密性は直交する。
-   実測: 無変更の再 push で暗号文本体の送信量 0、同一内容の別名追加で本文 0 送信。
-   内容アドレス鍵 `K_addr` は暗号化鍵のローテーションから分離する（混ぜると鍵交代で重複排除が全滅する）。
-6. **どこまで既存のままにするか。** clayfs をそのまま使うか、L5 だけ作り直すか。
-7. **範囲外とした 3 つ（経済・モデレーション・初回接触）を、本当に範囲外でよいか。**
-   範囲外にした瞬間に「私的なノード間」に限定される。それでよいのか。
+Viewing them not as "failures" but as per-layer prototypes reveals their value:
+
+- **`mini_lustre`** = L3 + part of L2. MDS/OST separation is sound and actually works.
+- **`dfs`** = L0/L2 + seeds of L4. Format 4 Merkle trees are usable. **All 11 evil tests can be reused directly as L4 security requirements** (especially "do not report success when a relay silently drops writes" = read-back verification, which is needed even on top of BitTorrent).
+- **`clayfs`** = L5. Usable as-is.
+
+**What was missing was L1.** Thinking `domain + user` was enough came from substituting L1 with an implicit assumption that "domain names are authority." In reality, a domain name was just a string, and nobody had defined authority.
+
+Representing writers as a single string like `user@domain % ssh-publickey /path # UTC-time` works for displaying L0 and L4. However, mixing name, signer, path, and timestamp blurs authority and ordering (§5.2). Likewise, delegating key publishing and discovery to an external service cannot verify whether the name-to-key binding is genuine (§6.1). The L1 gap can only be addressed concretely once these two points are separated.
 
 ---
 
-## 11. この会話で出た、判断の指針（迷ったとき用）
+## 10. Open Questions (To Think Through)
 
-- **「相手が変わったらどうするか」を説明できるなら、その機能は足してよい。** 説明できないものを
-  足した瞬間に dfs の二の舞になる（rsync が済むのは、片方向という説明可能な契約しかしないから）。
-- **OS がすでに解いている問題を、自前で解き直さない。** 原子性は rename で、CoW は
-  クローンで、圧縮は透過圧縮で解ける（clayfs がこれをやった）。
-- **全域で合意するのは「所有者が誰か」だけにする。** 内容そのものを全域合意の対象にしない。
-- **層を増やすより、層ごとに書き込める主体を 1 つに絞る。**
-- **読み書きの経路には何も挟まない。重い処理はあとからまとめてやる**（clayfs の設計方針）。
+1. **Can L1 (authority delegation) truly ride on DNSSEC?** Does domain name authority align with storage ownership (why should the owner of `example.com` necessarily have authority over `/example.com/*`)?
+2. **Who decides the "boundaries" of write boundaries?** Can delegation be declared unilaterally, or is approval required?
+3. **Where should L2 locators live?** DHT trades performance for anonymity. A registry centralizes. Reusing DNS invites censorship.
+4. **How to enforce mutual exclusion for writes to protect single-writer?** Locally, a lock suffices. When the writer spans multiple devices (same person), consensus between devices is needed (the minimal consensus problem).
+5. **~~When using libtorrent as the L3 foundation, how to fix `dfs`'s "lack of content addressing" problem?~~**
+   **→ Resolved (2026-11-11).** Because there is a single writer, the writer itself—not the OST—performs deduplication. Deduplication happens before encryption using plaintext content address `plain_id`, and the index (`plain_id -> wire_id`) is reconstructed from signed history. Thus encryption does not need to be deterministic; standard AEAD (ChaCha20-Poly1305) with a fresh random nonce per write can be used. Deduplication and confidentiality are orthogonal.
+   Observed: re-pushing unchanged data sends 0 ciphertext bytes; adding identical content under another name sends 0 payload bytes.
+   Keep the content-addressing key `K_addr` separate from encryption key rotation (mixing them wipes out deduplication on key rotation).
+6. **How much of the existing code to keep as-is?** Use `clayfs` directly, or rebuild only L5?
+7. **Is it really okay to leave the three out-of-scope items (economics, moderation, first contact) out of scope?** The moment they are excluded, the system is restricted to "between private nodes." Is that acceptable?
+
+---
+
+## 11. Decision Guidelines from This Discussion (For When in Doubt)
+
+- **If you can explain "what happens when the other party changes," you may add the feature.** The moment you add something you cannot explain, you repeat `dfs` (`rsync` gets away with it because it only makes an explainable one-way contract).
+- **Do not re-solve problems the OS has already solved.** Atomicity is solved by `rename`, CoW by cloning, compression by transparent compression (`clayfs` did this).
+- **Only agree globally on "who owns it."** Never make the content itself the subject of global consensus.
+- **Rather than adding layers, restrict each layer to a single writable principal.**
+- **Keep nothing on the read/write path. Do heavy work afterward in batches** (`clayfs` design principle).

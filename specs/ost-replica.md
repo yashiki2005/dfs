@@ -1,65 +1,66 @@
-# OST 読み取りレプリカと複数 endpoint
+# OST Read Replicas and Multiple Endpoints
 
-## 前提
+> **English** | [日本語](ost-replica.ja.md)
 
-dfs はサブツリーごとに単一書き手を持つ。書き込みは書き手ノードの**主 OST**で完結させ、
-別ノードの OST は読み取り専用の複製として扱う。
+## Assumptions
 
-- 主 OST: 書き手がチャンクを最初に置く OST
-- 複製 OST: 主 OST のチャンクをコピーして保持する OST
-- locator: 主 OST と複製 OST の両方を `endpoints` に持つ
+dfs has a single writer per subtree. Writes are completed on the writer node's **primary OST**,
+and OSTs on other nodes are treated as read-only replicas.
 
-複製 OST は書き込み先ではない。書き手が複数いる構成や、複製 OST への直接
-`announce` は対象外とする。
+- Primary OST: the OST where the writer first places chunks
+- Replica OST: an OST that copies and retains chunks from the primary OST
+- locator: holds both the primary OST and replica OSTs in `endpoints`
 
-さらに長期保存・最終復旧用として、版単位の BitTorrent archive を別層で扱う。
-詳細は `specs/bittorrent.md`。
+Replica OSTs are not write targets. Multi-writer configurations or direct `announce` calls
+to a replica OST are out of scope.
 
-読み取り専用の追加経路として、libp2p/QUIC の chunk source も利用できる。
-詳細は `specs/libp2p.md`。
+In addition, per-version BitTorrent archives are handled as a separate layer for long-term
+retention and last-resort recovery. See `specs/bittorrent.md` for details.
 
-## 書き込み
+A libp2p/QUIC chunk source can also be used as an additional read-only path.
+See `specs/libp2p.md` for details.
 
-1. 書き手はスナップショットを作り、チャンクを主 OST へ送る
-2. 主 OST への送信が成功したら、その版に含まれる全チャンクを複製 OST へコピーする
-3. 複製 OST には `batch_has` で不足分だけを送る
-4. 複製 OST が停止・失敗しても主 OST への書き込みは成功とする
-5. 複製失敗は警告として記録する
-6. 次の push では、その時点のツリーに含まれる全チャンクを再度複製対象にする
-   （前回の失敗分もここで追いつく）
+## Writes
 
-チャンクは `wire_id` で内容検証される。複製 OST に同じ `wire_id` の塊が既にあれば
-再送しない。
+1. The writer creates a snapshot and sends chunks to the primary OST.
+2. Once the upload to the primary OST succeeds, all chunks included in that version are copied to the replica OST(s).
+3. Only missing chunks are sent to the replica OST using `batch_has`.
+4. Even if a replica OST is down or fails, the write to the primary OST is considered successful.
+5. Replication failures are recorded as warnings.
+6. On the next push, all chunks in the current tree are targeted for replication again
+   (any chunks missed in the previous failure catch up here).
 
-## 読み取り
+Chunks are content-verified by `wire_id`. If a chunk with the same `wire_id` already exists on
+the replica OST, it is not re-sent.
 
-locator の `endpoints` は主 OST を先頭に、複製 OST を続けて持つ。
+## Reads
 
-- 読み取りクライアントは endpoint を順に試す
-- 主 OST が停止・タイムアウト・チャンク欠損なら次の endpoint を試す
-- 書き込み用の `OSTClient` は主 OST に固定する
-- 読み取り専用の `FailoverOSTClient` は、接続できた endpoint をそのセッションの
-  読み取り先として使う
+`endpoints` in the locator lists the primary OST first, followed by replica OSTs.
 
-`cat` / `pull` / `ls` のメタデータ取得は、L2 の複数名簿フォールバックと組み合わせる。
+- Read clients try endpoints in order.
+- If the primary OST is down, times out, or is missing a chunk, the client tries the next endpoint.
+- The write `OSTClient` is pinned to the primary OST.
+- The read-only `FailoverOSTClient` uses whichever endpoint it successfully connected to as the read target for that session.
 
-## 失敗時の意味
+Metadata retrieval for `cat` / `pull` / `ls` is combined with L2 multi-registry fallback.
 
-| 失敗 | 挙動 |
+## Failure Semantics
+
+| Failure | Behavior |
 |---|---|
-| 主 OST への書き込み失敗 | push は失敗。L4 head は進めない |
-| 複製 OST へのコピー失敗 | push は成功。警告を出し、次回 push で再試行 |
-| 主 OST の読み取り失敗 | 複製 OST を試す |
-| 全 OST の読み取り失敗 | 読み取りは失敗 |
-| 書き手ノードの停止 | 単一書き手なので書き込みは停止。読み取りは複製 OST と複数名簿で継続できる |
+| Write to primary OST fails | push fails; L4 head is not advanced |
+| Copy to replica OST fails | push succeeds; a warning is emitted and retried on the next push |
+| Read from primary OST fails | tries replica OST |
+| Read from all OSTs fails | read fails |
+| Writer node is down | writes stop because of the single-writer model; reads can continue via replica OST and multiple registries |
 
-スプール方式は採用しない。書き込みは主 OST で完結することを前提とし、未コミットの
-ローカル書き込みをためる機能は持たない。
+A spooling model is not used. Writes are assumed to complete on the primary OST, and there is no
+mechanism to buffer uncommitted local writes.
 
-## 設定
+## Configuration
 
 ```bash
-# 書き手: 主 OST と複製 OST を登録
+# Writer: register primary OST and replica OST
 dfscli create scw \
   --registry http://primary-registry:9440 \
   --registry-alternate http://secondary-registry:9440 \
@@ -67,7 +68,7 @@ dfscli create scw \
   --ost-alternate 127.0.0.1:19453
 ```
 
-`remotes.json` では次のように保持する。
+In `remotes.json`, this is stored as:
 
 ```json
 {
@@ -76,20 +77,20 @@ dfscli create scw \
 }
 ```
 
-読み取り側はロケータの `endpoints` からも複製 OST を発見するため、通常は
-`--ost-alternate` を省略できる。設定に書く場合は、主 OST が停止している初回読み取りの
-フォールバックに使われる。
+Readers also discover replica OSTs from `endpoints` in the locator, so `--ost-alternate` can
+usually be omitted. When specified in config, it is used as a fallback on initial reads if the
+primary OST is down.
 
-## 制約
+## Limitations
 
-- 複製 OST は読み取り専用。複製 OST だけを書き手に昇格させる機能はまだない
-- 複製 OST の内容は、次の push まで一時的に古いことがある
-- 書き手ノードと主 OST が同時に停止した場合、未複製のチャンクは読めない
-- チャンク単位の完全な replication log / quorum は持たない
+- Replica OSTs are read-only. There is not yet a feature to promote a replica OST alone to be a writer.
+- The contents of a replica OST may be temporarily stale until the next push.
+- If both the writer node and the primary OST go down at the same time, unreplicated chunks cannot be read.
+- There is no per-chunk complete replication log or quorum.
 
-## 回帰試験
+## Regression Tests
 
 - `tests/test_availability.py::AvailabilityCase::test_read_fails_over_to_replicated_ost`
-- 主 OST 停止後、複製 OST と locator endpoints から pull できること
-- locator の endpoints が主 + 複製の 2 つになること
-- 主 OST の全チャンクが複製 OST に存在すること
+- Pulling from the replica OST and locator endpoints succeeds after the primary OST stops.
+- The locator `endpoints` contains both primary and replica (2 endpoints).
+- All chunks on the primary OST exist on the replica OST.

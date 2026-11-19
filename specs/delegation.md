@@ -1,199 +1,188 @@
-# L1 権威の委譲仕様（`specs/delegation.md`）
+# L1 Authority Delegation Specification (`specs/delegation.md`)
 
-## 0. 目的と位置づけ
+> **English** | [日本語](delegation.ja.md)
 
-本文書は `dfs` における **L1（権威の委譲: Authority Delegation）** の仕様と検証規則を定義する。
-L1 の役割は「どの公開鍵が、どの部分木（パス）に対して書き込み権限を持つか」を暗号学的に証明・検証することであり、次の 2 点を満たすことで設計を閉じる。
+## 0. Purpose and Scope
 
-1. 親から子への権限委譲（および再委譲）が、DNSSEC と同様の信頼チェーンとして単方向で検証できる。
-2. 鍵の交代や失効（Revocation）が起きたとき、L4（追記ログ）と連携して古い鍵による巻き戻しや偽装追記を拒否できる。
+This document defines the specification and verification rules for **L1 (Authority Delegation)** in `dfs`.
+The role of L1 is to cryptographically prove and verify "which public key has write authority over which subtree (path)," closing the design by satisfying the following two points:
 
-**実装との対応**: `dfs/l1_delegation.py`（検証）、`dfs/crypto.py`（正規化・署名）、`tests/test_evil_suite.py::test_l1_delegation_invariants`（検証試験）。
+1. Authority delegation (and re-delegation) from parent to child can be verified unidirectionally as a chain of trust, similar to DNSSEC.
+2. When key rotation or revocation occurs, it coordinates with L4 (append-only log) to reject rollbacks or forged appends signed by old keys.
+
+**Implementation mapping**: `dfs/l1_delegation.py` (verification), `dfs/crypto.py` (canonicalization and signing), `tests/test_evil_suite.py::test_l1_delegation_invariants` (verification tests).
 
 ---
 
-## 1. データ形式（Canonical JSON）
+## 1. Data Format (Canonical JSON)
 
-### 1.1 ペイロード（署名対象）
+### 1.1 Payload (Signed Data)
 
-委譲記録の本体（ペイロード）は、キーを辞書順（ASCII コード順）にソートし、余分な空白を含まない 1 行の UTF-8 JSON（`dfs.crypto.canonical_json()` の出力形式、末尾 LF 1 バイトを含む）とする。
+The body (payload) of a delegation record is a single-line UTF-8 JSON object with keys sorted lexicographically (ASCII code order) and no extra whitespace (the output format of `dfs.crypto.canonical_json()`, including a trailing 1-byte LF).
 
 ```json
 {"base_version":0,"epoch":1,"expires_at":1794436000,"issued_at":1762900000,"parent":"/example.com","path":"/example.com/alice","writer":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@example.com"}
 ```
 
-| フィールド | 型 | 意味 |
+| Field | Type | Meaning |
 |---|---|---|
-| `parent` | string | 委譲元の部分木パス。署名する鍵（親の書き手）の管轄。 |
-| `path` | string | 委譲先の部分木パス。`parent` の直下（前方一致）でなければならない。 |
-| `writer` | string | 委譲先の書き手公開鍵（`ssh-ed25519 AAAA...` の 1 行）。書き手は名前ではなく**鍵**で識別する。 |
-| `epoch` | int | 権威の世代。親が新しい世代を署名すると、その部分木の書き手が交代する。1 以上で単調増加。 |
-| `base_version` | int | 書き手交代のときに引き継ぐ L4 ログの版番号。後述の §3.2 を参照。 |
-| `issued_at` | int | 署名時刻（UNIX 秒）。 |
-| `expires_at` | int | 失効時刻（UNIX 秒）。親の `expires_at` を超えてはならない。 |
+| `parent` | string | Source subtree path of the delegation. Governed by the signing key (parent writer). |
+| `path` | string | Target subtree path of the delegation. Must be directly under `parent` (prefix match). |
+| `writer` | string | Public key of the delegated writer (single line, e.g. `ssh-ed25519 AAAA...`). Writers are identified by **key**, not by name. |
+| `epoch` | int | Authority generation. When the parent signs a new generation, the writer for that subtree changes. `>= 1` and monotonically increasing. |
+| `base_version` | int | L4 log version number handed over on writer rotation. See §3.2 below. |
+| `issued_at` | int | Signing timestamp (UNIX seconds). |
+| `expires_at` | int | Expiration timestamp (UNIX seconds). Must not exceed the parent's `expires_at`. |
 
-**パスは名前空間の識別子であり、ファイルの安定 ID ではない。** rename に耐える同一性は L4 側の `file-id` が担う。L1 が扱うのは「誰がこの部分木を書けるか」だけである。
+**A path is a namespace identifier, not a stable file ID.** Identity across renames is handled by `file-id` in L4. L1 deals only with "who can write to this subtree."
 
-### 1.2 エンベロープ（署名の入れ物）
+### 1.2 Envelope (Signature Container)
 
-署名はペイロードに含めない。ペイロードと署名を分離したエンベロープとする。
+The signature is not included in the payload. The envelope separates the payload and the signature.
 
 ```json
 {
-  "payload": { ... 1.1 の本体 ... },
+  "payload": { ... body from 1.1 ... },
   "signature": "-----BEGIN SSH SIGNATURE-----\n...\n-----END SSH SIGNATURE-----\n"
 }
 ```
 
-署名は OpenSSH の分離署名（SSHSIG）を用い、名前空間（namespace）`dfs-delegation-v1` を必ず含める。これにより、L1 の署名を L2 や L4 の署名として流用できない。
+The signature uses OpenSSH detached signatures (SSHSIG) and must include the namespace `dfs-delegation-v1`. This prevents L1 signatures from being repurposed as L2 or L4 signatures.
 
 ---
 
-## 2. 署名と検証の手順
+## 2. Signing and Verification Procedure
 
-1. ペイロードを `canonical_json` で正規化バイト列にする（キーソート・空白なし・末尾 LF）。
-2. 親の秘密鍵で、名前空間 `dfs-delegation-v1` の分離署名を作る。
-3. 検証では、同じ正規化バイト列に対して、**親の公開鍵**で署名を検証する。
+1. Canonicalize the payload into normalized bytes using `canonical_json` (sorted keys, no whitespace, trailing LF).
+2. Create a detached signature with the parent's private key using namespace `dfs-delegation-v1`.
+3. During verification, verify the signature against the same canonicalized bytes using the **parent's public key**.
 
-署名の実装は `cryptography`（Ed25519）を第一とし、復号できない鍵だけ `ssh-keygen -Y sign` にフォールバックする。`ssh-keygen` 呼び出しには必ずタイムアウトを付ける（無応答で停止しない）。
-
----
-
-## 3. 検証規則（5 つの不変条件）
-
-多段の委譲チェーン `[D_1, D_2, ..., D_n]` をルートアンカーから順に検証する。各段で次を満たさなければならない。
-
-### 不変条件 1: 署名の正当性
-- 各段の署名が、前段の書き手公開鍵（根ならルートアンカー公開鍵）で検証できること。
-- 正規化前のペイロードに署名が付いていた場合は拒否する（正規化のゆれを使った偽造を防ぐ）。
-
-### 不変条件 2: 名前空間の包含（減衰の原則）
-- `path` が `parent` の直下（`path` が `parent + "/"` で始まる）であること。
-- パスは事前に正規化されていること（`..`、`//`、末尾スラッシュ、NUL、空セグメントを拒否）。
-- 親は子より広いか等しい範囲しか委譲できない。**権限は子へ向かって減るだけで、増えない。**
-
-### 不変条件 3: 有効期限の包含
-- 現在時刻 `now` が `[issued_at, expires_at)` に入ること。
-- 子の `expires_at` が親の `expires_at` を超えないこと。
-- これも減衰の原則である。子は親より長生きできない。
-
-### 不変条件 4: エポックの単調増加（即時失効）
-- `epoch >= 1` であること。
-- 同じ `path` に既に有効な委譲がある場合、新しい `epoch` は現在の `epoch` より大きいこと。
-- エポックが上がると、以前のエポックで署名された L4 への追記は拒否される（古い鍵の即時失効）。
-
-### 不変条件 5: チェーンの連結
-- チェーンが空でないこと。
-- 先頭の `parent` がルートアンカーのパスと一致すること。
-- 各段の `parent` が、直前の段の `path` と一致すること。
-- ルートアンカー（`/example.com` の公開鍵）は、別途定める信頼の起点（DNSSEC、SSH CA、ローカルのトラストアンカー等）で検証する。**チェーンの途中に検証を飛ばせる段を作らない。**
+Signing uses `cryptography` (Ed25519) as the primary implementation, falling back to `ssh-keygen -Y sign` only for keys it cannot decrypt. Any `ssh-keygen` invocation must have a timeout (never hang indefinitely).
 
 ---
 
-## 3.2 書き手交代時の引き継ぎ（`base_version`）
+## 3. Verification Rules (5 Invariants)
 
-書き手を交代するとき、新しい書き手は前任者の履歴の続きから書き始める。これを保証するのが `base_version` である。
+A multi-hop delegation chain `[D_1, D_2, ..., D_n]` is verified sequentially from the root anchor. Each hop must satisfy the following:
 
-- 委譲記録の `base_version` は、**交代時点の L4 ログの先頭版番号**と一致しなければならない。
-- L4 側は、`version > base_version` を満たす追記だけを受け付ける（`dfs/l2_registry.py::announce_and_append`）。
-- これがないと、新しい書き手が版 1 から書き直して履歴を巻き戻せてしまう。
+### Invariant 1: Signature Validity
+- Each hop's signature must verify against the previous hop's writer public key (or the root anchor public key for the root hop).
+- Signatures over non-canonicalized payloads must be rejected (prevents forgery using normalization ambiguities).
+
+### Invariant 2: Namespace Containment (Principle of Attenuation)
+- `path` must be strictly under `parent` (`path` starts with `parent + "/"`).
+- Paths must be pre-normalized (reject `..`, `//`, trailing slashes, NUL, and empty segments).
+- A parent can only delegate a scope narrower than or equal to its own. **Authority only decreases toward children, never increases.**
+
+### Invariant 3: Expiration Containment
+- Current time `now` must fall within `[issued_at, expires_at)`.
+- A child's `expires_at` must not exceed its parent's `expires_at`.
+- This is also the principle of attenuation: a child cannot outlive its parent.
+
+### Invariant 4: Monotonic Epoch Increase (Immediate Revocation)
+- `epoch >= 1`.
+- If a valid delegation already exists for the same `path`, the new `epoch` must be strictly greater than the current `epoch`.
+- Once the epoch advances, appends to L4 signed under an earlier epoch are rejected (immediate revocation of old keys).
+
+### Invariant 5: Chain Linkage
+- The chain must be non-empty.
+- The first hop's `parent` must match the root anchor's path.
+- Each hop's `parent` must match the preceding hop's `path`.
+- The root anchor (public key for `/example.com`) is verified via a separately defined trust anchor (DNSSEC, SSH CA, local trust anchor, etc.). **Never allow any hop in the chain to skip verification.**
 
 ---
 
-## 3.5 root アンカーと、名簿を信頼しない検証
+## 3.2 Handover on Writer Rotation (`base_version`)
 
-L1 の信頼の根は **root アンカーの公開鍵** 1 つである。これを手元に持てば、以降の委譲は
-すべて root から連鎖をたどって検証でき、**名簿（L2）を信頼する必要がない**。
+When rotating writers, the new writer resumes from the continuation of the predecessor's history. `base_version` guarantees this.
 
-### 3.5.1 なぜ名簿から取ってはいけないか
+- The delegation record's `base_version` must match the **L4 log head version at the time of rotation**.
+- L4 accepts only appends satisfying `version > base_version` (`dfs/l2_registry.py::announce_and_append`).
+- Without this, a new writer could rewrite from version 1 and roll back history.
 
-「root 公開鍵を名簿に聞けばよい」は成り立たない。悪意ある名簿は root 公開鍵として
-*自分（攻撃者）の公開鍵* を返せる。すると「自分を root とする委譲チェーン」を作れて通る。
+---
+
+## 3.5 Root Anchor and Registry-Untrusted Verification
+
+The root of trust in L1 is a single **root anchor public key**. As long as a client holds this locally, all subsequent delegations can be verified by following the chain from the root, **without needing to trust the registry (L2)**.
+
+### 3.5.1 Why You Must Not Fetch It from the Registry
+
+"Just ask the registry for the root public key" does not work. A malicious registry could return *its own (the attacker's) public key* as the root public key, and then construct a delegation chain rooted at itself that passes verification.
 
 ```text
-名簿が root 公開鍵として攻撃者の鍵を返した場合
-  チェーン検証: 通ってしまう（攻撃者が root を名乗れる）
+If the registry returns the attacker's key as the root public key:
+  Chain verification: passes (attacker can impersonate root)
 
-正しい root 公開鍵を外から与えた場合
-  チェーン検証: 拒否（Invalid L1 delegation signature）
+If the correct root public key is provided externally:
+  Chain verification: rejected (Invalid L1 delegation signature)
 ```
 
-信頼の根を相手から取れば、根にならない。だから root 公開鍵は手元に置く。
+If you obtain the root of trust from the party being verified, it is not a root of trust. That is why the root public key is held locally.
 
-### 3.5.2 検証の手順（クライアント側）
+### 3.5.2 Verification Procedure (Client Side)
 
-1. 名簿の `resolve` は、末端の委譲に **チェーン全体**（root 直下から末端まで）と
-   **root アンカーのパス**を足して返す（`delegation_chain`）。
-2. クライアントは手元の root 公開鍵で `verify_delegation_chain` を呼び、root から末端まで
-   5 つの不変条件を検証する。
-3. 検証で**確定した writer**でだけ、L4 の先頭版の署名を検証する。名簿が名乗った writer は
-   使わない（さもないと偽の委譲が通る）。
+1. The registry's `resolve` returns the leaf delegation together with the **entire chain** (from just below root to the leaf) and the **root anchor path** (`delegation_chain`).
+2. The client calls `verify_delegation_chain` with its local root public key to verify all 5 invariants from root to leaf.
+3. Only the **writer confirmed by verification** is used to verify the L4 head signature. Never use a writer merely claimed by the registry (otherwise forged delegations would pass).
 
-### 3.5.3 root 公開鍵の入手（TOFU と明示）
+### 3.5.3 Obtaining the Root Public Key (TOFU vs. Explicit)
 
-| 場面 | 方法 |
+| Scenario | Method |
 |---|---|
-| 初回（手元で試す） | 名簿の `/v1/paths` から取り、**指紋を表示して記録する（TOFU）** |
-| 本番 | `--root-pubkey FILE` で初回から固定する |
-| 以降 | 記録した公開鍵だけを信頼する。名簿が違う値を返したら拒否する |
+| First time (local testing) | Fetch from the registry's `/v1/paths`, **display and record the fingerprint (TOFU)** |
+| Production | Pin from the start via `--root-pubkey FILE` |
+| Subsequent runs | Trust only the recorded public key. Reject if the registry returns a different value |
 
-TOFU は SSH の `known_hosts` と同じ強さで、**初回に攻撃者へ誘導されると弱い**。手元の
-試験では便利だが、本番は `--root-pubkey` で明示する。
+TOFU has the same strength as SSH `known_hosts` and is **vulnerable if redirected to an attacker on first contact**. It is convenient for local testing, but production deployments should specify `--root-pubkey` explicitly.
 
-指紋は `ssh-keygen -lf` と同じ `SHA256:<base64>` 形式で表示する（人間が目で比べるため）。
+Fingerprints are displayed in the same `SHA256:<base64>` format as `ssh-keygen -lf` (for visual human comparison).
 
 ```text
   root アンカー: SHA256:n2ypRtbEq5vZOTK+i0WmBioSgHFEPFPCr21KWO7c4Jc （名簿から取得（TOFU））
                  これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）
 ```
 
-### 3.5.4 記録する場所
+### 3.5.4 Where It Is Stored
 
-root 公開鍵は**リモート定義**（`~/.config/dfs/remotes.json`）に持つ。1 つの root を
-複数のリモートで共有できるため。作業ディレクトリの `dfs_config.json` にも写しを置く
-（`dfs` CLI が `--mount` から読むため）。
+The root public key is stored in the **remote definition** (`~/.config/dfs/remotes.json`) so that a single root can be shared across multiple remotes. A copy is also placed in the working directory's `dfs_config.json` (so the `dfs` CLI can read it via `--mount`).
 
-### 3.5.5 DHT でノードを発見するときへ
+### 3.5.5 Toward Node Discovery via DHT
 
-各ノードが自分の署名済み委譲を DHT に置けば、発見したノードの委譲を**手元の root 公開鍵**で
-root まで検証できる。検証に失敗したノードは攻撃ノードとして排除する（アクセスしない）。
+If each node publishes its own signed delegation in the DHT, any discovered node's delegation can be verified back to the root using the **local root public key**. Nodes that fail verification are excluded as malicious nodes (never accessed).
 
-**root ノードに逐一問い合わせる必要はない。** root 公開鍵だけで足りる。root に聞く形に
-すると、root が把握していないノードを全部排除することになり、DHT の利点（誰でも参加）を
-消すうえ、単一障害点と余計な信頼を作る。
+**There is no need to query a root node every time.** The root public key alone is sufficient. Querying the root node would exclude all nodes unknown to the root, defeating the purpose of DHT (anyone can join) while introducing a single point of failure and unnecessary trust.
 
-## 4. 失効（Revocation）
+## 4. Revocation
 
-失効は「委譲を取り消すレコード」を別に作るのではなく、**親が新しい世代を署名する**ことで行う。
+Revocation is performed not by creating a separate "revoke delegation record," but by **having the parent sign a new generation**.
 
-- 親が `epoch` を 1 増やした委譲記録を署名し直す。新しい `writer` を別人にしてもよいし、空にしてもよい。
-- 新しいエポックが登録された時点で、古いエポックの鍵による L4 への追記は拒否される。
-- **過去に読まれた内容は取り戻せない。** これは暗号の性質であり、受け入れる（`DESIGN.md` §6 と同じ立場）。失効が守るのは以後の書き込みである。
+- The parent re-signs a delegation record with `epoch` incremented by 1. The new `writer` may be someone else or empty.
+- Once the new epoch is registered, L4 appends signed by the old epoch's key are rejected.
+- **Content already read in the past cannot be clawed back.** This is a fundamental property of cryptography and is accepted (same stance as `DESIGN.md` §6). Revocation protects subsequent writes.
 
-鍵のローテーション（同じ人が新しい鍵に移る場合）も同じ仕組みで行う。新しい鍵を `writer` にした委譲記録を、親（または自分自身の上位の権威）が署名する。
+Key rotation (when the same person moves to a new key) uses the exact same mechanism: the parent (or a higher authority of oneself) signs a delegation record with the new key as `writer`.
 
 ---
 
-## 5. 試験ケースと期待結果
+## 5. Test Cases and Expected Results
 
-`tests/test_evil_suite.py::test_l1_delegation_invariants` が次を検証している。
+`tests/test_evil_suite.py::test_l1_delegation_invariants` verifies the following:
 
-| 場合 | 内容 | 期待 |
+| Case | Description | Expected |
 |---|---|---|
-| (a) 正しい委譲 | 親が子を正しく委譲 | 検証成功。末端の `writer` が得られる |
-| (b) 偽の委譲 | `bob` が親のふりをして自分に委譲 | 署名検証で**拒否** |
-| (c) 期限切れ | `now` が `expires_at` を過ぎている | 不変条件 3 で**拒否** |
-| (d) 再委譲 | 親→子→孫と正しく連鎖 | 検証成功 |
-| (e) 期限の逸脱 | 子の `expires_at` が親を超える | 不変条件 3 で**拒否** |
+| (a) Valid delegation | Parent properly delegates to child | Verification succeeds; leaf `writer` is returned |
+| (b) Forged delegation | `bob` impersonates parent and delegates to himself | **Rejected** at signature verification |
+| (c) Expired | `now` is past `expires_at` | **Rejected** by Invariant 3 |
+| (d) Re-delegation | Valid chain parent → child → grandchild | Verification succeeds |
+| (e) Expiration overflow | Child's `expires_at` exceeds parent's | **Rejected** by Invariant 3 |
 
-判定の基準は、**(b)(c)(e) を拒否でき、(a)(d) を許せること。** (b) が拒否できないなら、L1 の設計をやり直す。
+The acceptance criterion is **rejecting (b)(c)(e) and allowing (a)(d)**. If (b) cannot be rejected, the L1 design must be reworked.
 
 ---
 
-## 6. 実装上の注意
+## 6. Implementation Notes
 
-- **`writer` は公開鍵全体である。** 表示や索引では鍵 ID（`SHA-256(公開鍵)` 等）を使い、委譲記録そのものには鍵を持つ（`DESIGN.md` §5.2 の方針）。
-- **名前（`user@domain`）は L1 の検証対象ではない。** L1 が保証するのは鍵と部分木の対応だけである。名前と鍵の結び付けは、ドメイン権威の署名または透過性ログ（`DESIGN.md` §6.1）で別に扱う。
-- **ルートアンカーの配布**: DNSSEC の `_dfs.<domain>` TXT から root 公開鍵と
-  registry 一覧を取得する方式を採用する。DNSSEC は root 鍵の配布に限定し、動的な
-  head や primary 昇格の判断には使わない。詳細は `specs/dnssec.md`。
+- **`writer` is the full public key.** Key IDs (such as `SHA-256(pubkey)`) are used for display and indexing, while the delegation record itself holds the full key (`DESIGN.md` §5.2 policy).
+- **Names (`user@domain`) are not verified by L1.** L1 guarantees only the binding between keys and subtrees. Name-to-key binding is handled separately via domain authority signatures or transparency logs (`DESIGN.md` §6.1).
+- **Root anchor distribution**: Adopts fetching the root public key and registry list from the DNSSEC `_dfs.<domain>` TXT record. DNSSEC is limited to distributing the root key and is not used for dynamic head or primary promotion decisions. See `specs/dnssec.md` for details.

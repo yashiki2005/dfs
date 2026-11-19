@@ -1,19 +1,20 @@
 # BitTorrent archive
 
-## 位置付け
+> **English** | [日本語](bittorrent.ja.md)
 
-BitTorrent は dfs のホットパスを置き換えない。**版単位の読み取り専用アーカイブ**と、
-OST / registry が全滅したときの最終復旧経路として使う。
+## Role
 
-- 主 OST: 書き込みと通常の読み取り
-- 複製 OST: 読み取り可用性
-- BitTorrent archive: 過去版の長期保存と最終復旧
+BitTorrent does not replace the dfs hot path. It is used as a **per-version read-only archive** and as a last-resort recovery path when the OST / registry are completely lost.
 
-BitTorrent は最新版を保証しない。復元できるのは「infohash と bundle を知っている版」だけである。
+- Primary OST: writes and normal reads
+- Replica OST: read availability
+- BitTorrent archive: long-term retention of past versions and last-resort recovery
 
-## bundle
+BitTorrent does not guarantee the latest version. Only versions whose infohash and bundle are known can be restored.
 
-`dfscli archive create` は、現在の先頭版について次のディレクトリを作る。
+## Bundle
+
+`dfscli archive create` creates the following directory for the current head version:
 
 ```text
 <bundle>/
@@ -21,105 +22,97 @@ BitTorrent は最新版を保証しない。復元できるのは「infohash と
   chunks/<wire_id>
 ```
 
-`meta.json` には次を保存する。
+`meta.json` stores:
 
-- サブツリーパス、版番号
-- root の `plain_id` / `wire_id`
-- 検証済みの委譲チェーン
-- 署名済み locator と head log
-- root 公開鍵
-- 収録した chunk の一覧（`wire_id`, `plain_id`, `size`）
+- Subtree path, version number
+- Root `plain_id` / `wire_id`
+- Verified delegation chain
+- Signed locator and head log
+- Root public key
+- List of included chunks (`wire_id`, `plain_id`, `size`)
 
-chunk は暗号化済み blob のまま保存する。平文パスや平文ファイル名は bundle の
-ファイル名に使わない。
+Chunks are stored as encrypted blobs. Plaintext paths and filenames are never used as filenames in the bundle.
 
-## torrent
+## Torrent
 
-`<bundle>.torrent` を生成する。現在の実装は BitTorrent v1 の file mode を使う。
+Generates `<bundle>.torrent`. The current implementation uses BitTorrent v1 file mode.
 
-- `meta.json` と `chunks/*` を 1 つの torrent にまとめる
-- piece length は 256 KiB
-- torrent の infohash は SHA-1（v1）
-- chunk 自体の真正性は DFS の `wire_id`（SHA-256）で再検証する
+- Bundles `meta.json` and `chunks/*` into a single torrent
+- Piece length is 256 KiB
+- The torrent infohash is SHA-1 (v1)
+- Authenticity of the chunks themselves is re-verified using the DFS `wire_id` (SHA-256)
 
-v1 の SHA-1 は BitTorrent の transport 用であり、DFS の最終的な完全性判定には
-使わない。BitTorrent v2 への移行は今後の課題。
+SHA-1 in v1 is only for BitTorrent transport and is not used for DFS's final integrity verification. Migrating to BitTorrent v2 is future work.
 
-## 作成・検証・復元
+## Creation, Verification, and Restoration
 
 ```bash
-# 現在の先頭版をアーカイブする
+# Archive the current head version
 dfscli archive create scw: --out ./scw-v1
 
-# 過去の版を指定してアーカイブする
+# Archive a specific past version
 dfscli archive create scw: --version 3 --out ./scw-v3
 
-# bundle の署名・chunk hash・サイズを検証する
+# Verify bundle signatures, chunk hashes, and sizes
 dfscli archive verify ./scw-v1
 
-# ローカルに復元する（tree_secret が必要）
+# Restore locally (requires tree_secret)
 dfscli archive extract ./scw-v1 ./restored
 
-# descriptor から archive 一覧を表示する
+# List archives from descriptors
 dfscli archive catalog .
 ```
 
-`archive create` は torrent の infohash と magnet link を表示する。`--publish` を
-付けると、書き手署名付き archive descriptor を L2 に登録する。descriptor は
-path、版、infohash、L4 entry hash、root wire ID を結び付ける。
+`archive create` displays the torrent's infohash and magnet link. With `--publish`, it registers a writer-signed archive descriptor in L2. The descriptor binds the path, version, infohash, L4 entry hash, and root wire ID together.
 
 ```bash
-# 作成と同時にL2へ公開
+# Create and publish to L2 simultaneously
 dfscli archive create scw: --version 3 --out ./scw-v3 --publish
 
-# 既に作成済みのbundleを公開
+# Publish an already-created bundle
 dfscli --remote scw archive publish ./scw-v3
 
-# L2からdescriptorを取得し、外部BT CLIのDHT/trackerで取得後に検証・復号
+# Fetch descriptor from L2, download via external BT CLI DHT/tracker, then verify and decrypt
 dfscli archive fetch scw: --version 3 \
   --out ./downloads --secret <tree_secret> ./restored
 ```
 
-実際のpeer探索とdownloadingは `aria2c` または `transmission-cli` を使う。
-`archive fetch` は両者を自動検出し、標準機能のDHT/trackerを利用する。
-DFS はDHT・ピア交換を独自実装しない。
+Actual peer discovery and downloading use `aria2c` or `transmission-cli`.
+`archive fetch` auto-detects both and uses standard DHT/tracker functionality.
+DFS does not implement its own DHT or peer exchange.
 
-`archive create --version N` は、L2 の L4 履歴から指定版の署名済み head を取得する。
-過去版には現在の locator を流用せず、locator なしで bundle を作る。bundle の
-`meta.json` には選択した版の head / delegation が入る。
+`archive create --version N` fetches the signed head for the specified version from L4 history in L2.
+For past versions, the current locator is not reused; the bundle is created without a locator. `meta.json` in the bundle contains the selected version's head / delegation.
 
-## 復元の条件
+## Restoration Conditions
 
-ある過去版を復元できるのは、次が揃った場合だけである。
+A past version can be restored only when all of the following are satisfied:
 
-- その版の bundle を完全に持つ seeder が存在する
-- その版の infohash / torrent を知っている
-- `meta.json` の L1/L2/L4 署名が検証できる
-- 全 chunk の SHA-256 が一致する
-- `tree_secret` を持っている
+- A seeder exists that holds the complete bundle for that version
+- The infohash / torrent for that version is known
+- The L1/L2/L4 signatures in `meta.json` can be verified
+- The SHA-256 of all chunks matches
+- `tree_secret` is available
 
-「一人でも seeder がいれば」は、その seeder が完全な bundle を持ち、到達可能である
-ことが条件になる。可用性の保証ではなく best-effort のアーカイブと位置付ける。
+"As long as at least one seeder exists" requires that the seeder holds the complete bundle and is reachable. It is positioned as a best-effort archive, not an availability guarantee.
 
-## セキュリティと運用
+## Security and Operations
 
-- BitTorrent は IP アドレスや swarm 情報を露出する。private tracker / 認証付き
-  swarm / 別 transport を検討する
-- 一度配布した torrent は削除できない。失効は `tree_secret` のローテーションで行う
-- infohash と bundle の対応は署名済み metadata と合わせて配布する
-- 小さい版を大量に torrent 化すると overhead が大きい。版単位または一定期間単位で
-  まとめる
-- tracker が無い場合は DHT / 手動 peer 設定を使う。DHT は seeder の存在を保証しない
-- DHTから得るのは既知infohashのpeer候補だけであり、最新版の判断には使わない
-- descriptorはL2から取得できるが、必ず書き手署名とL4 headへの束縛を検証する
+- BitTorrent exposes IP addresses and swarm information. Consider private trackers, authenticated swarms, or alternative transports
+- Once distributed, a torrent cannot be deleted. Revocation is handled by rotating `tree_secret`
+- Distribute the mapping between infohash and bundle together with signed metadata
+- Turning many small versions into separate torrents incurs high overhead. Group by version or by a fixed time interval
+- When no tracker is available, use DHT or manual peer configuration. DHT does not guarantee seeder presence
+- DHT only provides peer candidates for a known infohash and must not be used to determine the latest version
+- Descriptors can be fetched from L2, but always verify the writer signature and binding to the L4 head
 
-## 制約
+## Limitations
 
-- infohash の配布はL2の署名済みdescriptorが中心。L4へのarchive descriptor統合は未実装
-- torrent は v1。v2、erasure coding、k-of-n 復元は未実装
-- bundle の自動 retention / garbage collection は未実装
+- Infohash distribution relies primarily on L2 signed descriptors. Integration of archive descriptors into L4 is not yet implemented
+- Torrents are v1. v2, erasure coding, and k-of-n recovery are not yet implemented
+- Automatic bundle retention / garbage collection is not yet implemented
 
-## 回帰試験
+## Regression Tests
 
-- `tests/test_archive.py`: bundle 作成、署名検証、chunk 改ざん検出、復元
+- `tests/test_archive.py`: bundle creation, signature verification, chunk tampering detection, restoration
 - `tests/test_archive.py`: `archive verify` CLI

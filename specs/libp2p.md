@@ -1,19 +1,21 @@
 # libp2p/QUIC chunk source
 
-## 位置付け
+> **English** | [日本語](libp2p.ja.md)
 
-libp2p は OST を置き換えない。既存の OST / 複製 OST に続く**読み取り専用の
-追加 ChunkSource** として使う。
+## Positioning
 
-- 主 OST: 書き込みと通常読み取り
-- 複製 OST: 読み取り可用性
-- libp2p/QUIC: peer から必要な chunk だけを取得
-- BitTorrent: 版単位の長期アーカイブ
+libp2p does not replace OST. It is used as a **read-only additional ChunkSource**
+following the existing primary OST and replica OST.
 
-libp2p は HTTP 専用でも QUIC 専用でもないが、dfs では **QUIC transport** を使う。
-TCP はこの環境で別プロセス間のカスタムストリームが動作しなかったため採用しない。
+- Primary OST: writes and normal reads
+- Replica OST: read availability
+- libp2p/QUIC: fetch only the required chunks from peers
+- BitTorrent: per-version long-term archive
 
-## プロトコル
+libp2p is neither HTTP-only nor QUIC-only, but dfs uses the **QUIC transport**.
+TCP is not used because custom streams between separate processes did not work in this environment.
+
+## Protocol
 
 ```text
 /dfs/chunk/1.0.0
@@ -23,13 +25,13 @@ H response = "O" + flags[count](1 byte each)
 G response = "O" + (length(4, BE) + blob)[count]
 ```
 
-`wire_id` は SHA-256。取得した blob は必ずクライアント側で SHA-256 を再検証する。
-書き込み op は持たない。
+`wire_id` is SHA-256. The client must always re-verify the SHA-256 of every fetched blob.
+There is no write op.
 
-## サーバ
+## Server
 
-py-libp2p のホストはプロセスごとの Trio ループで動かす。`dfs serve` のスレッドに
-同居させず、専用プロセスで起動する。
+The py-libp2p host runs in a per-process Trio loop. Rather than sharing threads with
+`dfs serve`, it is launched as a dedicated process.
 
 ```bash
 dfscli libp2p-serve \
@@ -37,14 +39,14 @@ dfscli libp2p-serve \
   --listen /ip4/0.0.0.0/udp/0/quic-v1
 ```
 
-起動時に `peer: /ip4/.../udp/.../quic-v1/p2p/...` を表示する。この multiaddr を
-読み取り側の `--libp2p-peer` に渡す。
+On startup, it prints `peer: /ip4/.../udp/.../quic-v1/p2p/...`. Pass this multiaddr
+to `--libp2p-peer` on the reader side.
 
-`--chunks-dir` は `PersistentRegistryState.save_ost_chunks` が保存した
-`<wire_id>.blk` を読む。OST のメモリ状態を直接共有するものではないため、直近の
-announce 後に保存された chunk が対象になる。
+`--chunks-dir` reads `<wire_id>.blk` files saved by `PersistentRegistryState.save_ost_chunks`.
+Because it does not directly share the in-memory state of OST, only chunks persisted after
+the most recent announce are available.
 
-## クライアント
+## Client
 
 ```bash
 dfscli create scw \
@@ -52,30 +54,30 @@ dfscli create scw \
   --libp2p-peer /ip4/203.0.113.10/udp/19443/quic-v1/p2p/12D3KooW...
 ```
 
-`DFSNode` の読み取り候補は次の順になる。
+The read candidates for `DFSNode` are tried in the following order:
 
-1. 主 OST
-2. 複製 OST
+1. Primary OST
+2. Replica OST
 3. libp2p peer
 
-locator の OST endpoint が全滅しても、libp2p peer が chunk を持っていれば
-`cat` / `pull` を継続できる。書き込みは主 OST のまま。
+Even if all OST endpoints in the locator are down, `cat` / `pull` can continue as long as
+a libp2p peer has the chunks. Writes still go to the primary OST.
 
-## private swarm
+## Private Swarm
 
-`--libp2p-psk` をサーバとクライアントの両方に設定すると、private swarm 用の
-pre-shared key を libp2p host に渡す。PSK は設定ファイル内で秘密として扱う。
+When `--libp2p-psk` is set on both server and client, a pre-shared key for a private swarm
+is passed to the libp2p host. The PSK is treated as a secret inside the configuration file.
 
-## 制約
+## Limitations
 
-- peer discovery はまだ静的設定。Kademlia provider record / mDNS は未実装
-- libp2p サーバは独立プロセス。`dfs serve` からの自動起動は未実装
-- サーバは chunk ディレクトリを読む。メモリ上の OST を直接配信するには IPC が必要
-- QUIC の UDP ポート、NAT、firewall、relay の運用が必要
-- libp2p 自体は retention / seeding incentive を持たない
-- 書き込み、CAS、L4 の整合性は従来どおり OST / L2 / L4 が担う
+- Peer discovery is still statically configured. Kademlia provider records / mDNS are not implemented.
+- The libp2p server is an independent process. Automatic startup from `dfs serve` is not implemented.
+- The server reads from the chunk directory. Serving directly from an in-memory OST would require IPC.
+- Requires operating QUIC UDP ports, NAT, firewalls, and relays.
+- libp2p itself does not provide retention or seeding incentives.
+- Writes, CAS, and L4 consistency remain the responsibility of OST / L2 / L4 as before.
 
-## 回帰試験
+## Regression Tests
 
-- `tests/test_libp2p_chunk.py`: 別プロセスの QUIC サーバからの HAS / GET
-- `tests/test_libp2p_chunk.py`: 欠損 chunk の拒否、読み取り専用の確認
+- `tests/test_libp2p_chunk.py`: HAS / GET from a separate-process QUIC server
+- `tests/test_libp2p_chunk.py`: rejection of missing chunks, verification of read-only behavior

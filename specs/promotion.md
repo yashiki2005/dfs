@@ -1,51 +1,53 @@
-# Registry の primary / secondary と手動昇格
+# Registry Primary / Secondary and Manual Promotion
 
-## 目的
+> **English** | [日本語](promotion.ja.md)
 
-読み取りは複数 registry / OST / libp2p へフォールバックできる。書き込みは単一の
-primary registry に集約する。primary が停止した場合に備え、secondary を
-**明示的に** primary へ昇格できるようにする。
+## Purpose
 
-これは自動選挙や合意形成ではない。旧 primary を停止・隔離したうえで運用者が
-昇格する方式である。
+Reads can fall back to multiple registries / OSTs / libp2p. Writes are consolidated
+on a single primary registry. In case the primary goes down, a secondary can be
+**explicitly** promoted to primary.
 
-## role と fencing epoch
+This is not automatic election or consensus. It is a model where the operator stops
+and isolates the old primary before promoting the secondary.
 
-registry state は次の 2 つを持つ。
+## Role and Fencing Epoch
 
-- `role`: `primary` または `secondary`
-- `role_epoch`: 昇格の世代（単調増加）
+The registry state holds the following two fields:
 
-primary だけが `/v1/delegate` と `/v1/announce` を受け付ける。secondary は
-`/v1/replicate` を受け付けるが、書き込みは拒否する。
+- `role`: `primary` or `secondary`
+- `role_epoch`: promotion generation (monotonically increasing)
 
-writer は `remotes.json` の `role_epoch` を `announce` に載せる。registry 側の
-`role_epoch` と一致しなければ `ConflictError` になる。旧 primary が `role_epoch=1`、
-昇格後の secondary が `role_epoch=2` の場合、旧 primary への `role_epoch=2` の
-書き込みは拒否される。
+Only the primary accepts `/v1/delegate` and `/v1/announce`. A secondary accepts
+`/v1/replicate`, but rejects writes.
 
-## 昇格手順
+The writer includes `role_epoch` from `remotes.json` in `announce`. If it does not
+match the `role_epoch` on the registry side, a `ConflictError` is raised. If the old
+primary has `role_epoch=1` and the promoted secondary has `role_epoch=2`, a write
+with `role_epoch=2` to the old primary is rejected.
 
-1. secondary の複製が primary に追いついていることを確認する
-   - 両方の `resolve` で同じ head version / entry_hash が返ること
-   - `history` で必要な版が存在すること
-2. 旧 primary を停止する
-3. secondary の state を昇格する
+## Promotion Procedure
+
+1. Verify that replication on the secondary has caught up to the primary:
+   - `resolve` on both returns the same head version / entry_hash
+   - `history` contains the required versions
+2. Stop the old primary.
+3. Promote the secondary's state:
 
 ```bash
 dfs promote --state-dir ~/.dfs_server --role-epoch 2
 ```
 
-4. secondary を primary として再起動する
+4. Restart the secondary as primary:
 
 ```bash
 dfs serve ... --role primary --role-epoch 2
 ```
 
-5. writer の `remotes.json` を更新する
-   - `registry` を secondary の URL にする
-   - 旧 primary を `registry_alternates` に残す（読み取り専用）
-   - `role_epoch` を 2 にする
+5. Update the writer's `remotes.json`:
+   - Set `registry` to the secondary's URL
+   - Keep the old primary in `registry_alternates` (read-only)
+   - Set `role_epoch` to 2
 
 ```bash
 dfscli config create NAME \
@@ -54,23 +56,22 @@ dfscli config create NAME \
   --role-epoch 2 ...
 ```
 
-6. DNSSEC discovery を使っている場合は、primary/secondary の URL と `epoch` を
-   更新する
+6. If using DNSSEC discovery, update the primary/secondary URLs and `epoch`.
 
-## 重要な制約
+## Important Constraints
 
-- 自動選挙・quorum・lease は持たない
-- 旧 primary は必ず停止してから昇格する
-- 旧 primary を再起動して両方を primary にしない
-- 古い `role_epoch` を持つ writer は旧 primary に書き込めるため、writer 設定も
-  同時に更新する
-- 強固な split-brain 防止が必要なら、lease / fencing token / 合意形成を追加する
+- No automatic election, quorum, or leases.
+- Always stop the old primary before promoting.
+- Do not restart the old primary and let both run as primary.
+- A writer with an old `role_epoch` can still write to the old primary, so update
+  writer configurations at the same time.
+- If strong split-brain prevention is required, add leases, fencing tokens, or consensus.
 
-`role_epoch` は「明示的に昇格したこと」を示す fencing 値であり、単独では
-ネットワーク分断を解決しない。
+`role_epoch` is a fencing value indicating "explicit promotion has occurred" and does not
+resolve network partitions by itself.
 
-## 回帰試験
+## Regression Tests
 
-- `tests/test_availability.py`: secondary の write 拒否
-- `tests/test_availability.py`: role_epoch 不一致の拒否
-- `tests/test_availability.py`: state の promote と epoch 永続化
+- `tests/test_availability.py`: secondary write rejection
+- `tests/test_availability.py`: `role_epoch` mismatch rejection
+- `tests/test_availability.py`: state promote and epoch persistence

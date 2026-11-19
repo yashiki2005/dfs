@@ -1,52 +1,54 @@
-# ローカルにサーバを立てる（`dfssvc`）
+# Running a Local Server (`dfssvc`)
 
-## 0. 目的と位置づけ
+> **English** | [日本語](svc.ja.md)
 
-`dfs serve` は状態ディレクトリ・root 公開鍵・L2/L3 のポートをすべて自分で用意する。
-層を確かめるにはそれでよいが、「ローカルで 1 つ立てて試す」には手数が多い。
-`dfssvc` はその入口で、次を肩代わりする。
+## 0. Purpose and Positioning
 
-1. **連続した空きポートを 2 つ探し**、1 つ目を L2（名簿）、2 つ目を L3（OST）に割り当てる。
-2. root の鍵（L1 権威の Ed25519）と、**書き手の鍵**（L4 のログに署名する人）が無ければ作る。
-3. 状態ディレクトリを用意し、`dfs serve` を起動する。OST チャンクだけを
-   別ディスクへ置く場合は `--ost-dir` を使う。
-4. 立ち上がりを待って確認し、**書き手への委譲を登録する**。
-5. 接続に必要な値を記録する（`~/.config/dfs/services.json`）。
-6. `stop` / `list` / `status` / `env` / `dnssec` / `logs` で後始末と確認ができる。
+With `dfs serve`, you have to prepare the state directory, root public key, and L2/L3 ports
+yourself. That is fine for testing individual layers, but too many steps for "spin one up
+locally to try it out." `dfssvc` is the entry point that handles the following for you:
 
-- 実装: `dfs/svc.py`
-- エントリポイント: `./dfssvc`
-- 試験: `tests/test_svc_cli.py`
+1. **Finds two consecutive free ports**, assigning the first to L2 (registry) and the second to L3 (OST).
+2. Creates the root key (L1 authority Ed25519) and **writer key** (which signs the L4 log) if they do not exist.
+3. Prepares the state directory and starts `dfs serve`. Use `--ost-dir` if you want to place
+   only the OST chunks on a separate disk.
+4. Waits for startup, verifies it, and **registers the delegation to the writer**.
+5. Records the values needed to connect (`~/.config/dfs/services.json`).
+6. Provides `stop` / `list` / `status` / `env` / `dnssec` / `logs` for cleanup and inspection.
 
----
-
-## 1. 理由: L2 と L3 を隣り合わせにする
-
-L2 と L3 は別のポートで待ち受ける。連続した空きを 2 つ取ると、`--registry-port N` /
-`--ost-port N+1` のように覚えやすく、衝突の確認も 1 回で済む。
-
-### 1.1 空きポートの判定（macOS の落とし穴）
-
-**`SO_REUSEADDR` を立てた bind だけで「空き」と判断してはいけない。** macOS では
-他のプロセスが `0.0.0.0:19440` で待ち受けていても、`127.0.0.1:19440` への bind は
-通ってしまう（別のアドレスとして扱われるため）。
-
-そこで `is_port_free` は 2 段で確かめる。
-
-1. **接続を試す**（timeout 0.4 秒）。応答があれば「誰かがいる」＝使用中。
-   L3 は TLS のサーバなのでハンドシェイクの前で切れるが、connect が成功した時点で
-   そのポートには誰かがいると判断してよい。
-2. **`SO_REUSEADDR` を付けずに bind する**。`TIME_WAIT` の残骸にも当たる。
-
-最初はこの 2 段目を `SO_REUSEADDR` 付きで実装してしまい、launchd のサーバ（`0.0.0.0:19440`）が
-あるのに `127.0.0.1:19440` を「空き」と誤判定した。上の 2 段で直っている。
-
-さらに、記録済みのサービスが使っているポートは探索の候補から外す（同じ番号を 2 度
-取らないように）。
+- Implementation: `dfs/svc.py`
+- Entry point: `./dfssvc`
+- Tests: `tests/test_svc_cli.py`
 
 ---
 
-## 2. コマンド
+## 1. Why: Placing L2 and L3 Adjacent to Each Other
+
+L2 and L3 listen on separate ports. Taking two consecutive free ports makes them easy to
+remember—`--registry-port N` / `--ost-port N+1`—and lets us check for collisions in one pass.
+
+### 1.1 Checking Free Ports (macOS Pitfall)
+
+**Do not judge a port as "free" just by binding with `SO_REUSEADDR`.** On macOS, even if
+another process is listening on `0.0.0.0:19440`, a bind to `127.0.0.1:19440` still
+succeeds (because they are treated as different addresses).
+
+Therefore, `is_port_free` checks in two stages:
+
+1. **Attempt a connection** (timeout 0.4 s). If there is a response, someone is there = in use.
+   Since L3 is a TLS server, it closes before the handshake, but as soon as `connect` succeeds
+   we know someone is on that port.
+2. **Bind without `SO_REUSEADDR`**. This also catches `TIME_WAIT` remnants.
+
+Originally, stage 2 was implemented with `SO_REUSEADDR`, which falsely reported `127.0.0.1:19440`
+as "free" even when a launchd server was listening on `0.0.0.0:19440`. The two-stage check above fixes this.
+
+In addition, ports already used by recorded services are excluded from the search candidates
+(so the same number is never picked twice).
+
+---
+
+## 2. Commands
 
 ```text
 dfssvc start [--name NAME] [--host HOST] [--port N] [--advertise HOST]
@@ -61,31 +63,31 @@ dfssvc dnssec [NAME] [--domain DOMAIN] [--primary-url URL]
 dfssvc logs   [NAME] [-n LINES]
 ```
 
-`--json` を付けると、`start` / `list` / `status` の結果を機械可読で出す。
+Passing `--json` outputs machine-readable results for `start` / `list` / `status`.
 
-### 2.1 引数
+### 2.1 Arguments
 
-| 引数 | 既定 | 意味 |
+| Argument | Default | Meaning |
 |---|---|---|
-| `--name` | `local` | サービスの名前。状態と記録の鍵になる |
-| `--host` | `127.0.0.1` | bind するアドレス。外から使うなら `0.0.0.0` |
-| `--advertise` | `--host` から推定 | L2 が L3 の場所として広告するホスト |
-| `--port` | `19440` | この番号から連続した空きを探す |
-| `--state-dir` | `~/dfssvc/<name>/server` | サーバの状態（チャンクと名簿） |
-| `--ost-dir` | `<state-dir>/ost_chunks` | L3 OST チャンクの保存先。外付け SSD などに分離できる |
-| `--root-key` | `~/dfssvc/<name>/keys/root` | L1 権威の Ed25519 鍵（無ければ作る） |
-| `--root-anchor` | `/example.com` | 根のパス |
-| `--writer-key` | `~/dfssvc/<name>/keys/writer` | 書き手の Ed25519 鍵（無ければ作る） |
-| `--path` | `<root-anchor>/<name>` | 委譲するサブツリー。`dfscli` は鍵から引く |
-| `--no-delegate` | — | 委譲を登録しない（サーバだけ立てる） |
-| `--wait` | `30` | 起動を待つ秒数 |
-| `--foreground` | — | 前面で動かす（Ctrl-C で停止） |
-| `--force` | — | 稼働中の同名サービスを停止してから記録を作り直す |
+| `--name` | `local` | Service name; key for state and records |
+| `--host` | `127.0.0.1` | Address to bind; use `0.0.0.0` for external access |
+| `--advertise` | inferred from `--host` | Host advertised by L2 as the L3 location |
+| `--port` | `19440` | Start searching for two consecutive free ports from this number |
+| `--state-dir` | `~/dfssvc/<name>/server` | Server state (chunks and registry) |
+| `--ost-dir` | `<state-dir>/ost_chunks` | Storage directory for L3 OST chunks; can be separated onto an external SSD, etc. |
+| `--root-key` | `~/dfssvc/<name>/keys/root` | L1 authority Ed25519 key (created if missing) |
+| `--root-anchor` | `/example.com` | Root path |
+| `--writer-key` | `~/dfssvc/<name>/keys/writer` | Writer Ed25519 key (created if missing) |
+| `--path` | `<root-anchor>/<name>` | Subtree to delegate; `dfscli` looks this up from the key |
+| `--no-delegate` | — | Do not register delegation (only start the server) |
+| `--wait` | `30` | Seconds to wait for startup |
+| `--foreground` | — | Run in foreground (stop with Ctrl-C) |
+| `--force` | — | Stop any running service with the same name and recreate its record |
 
-### 2.2 記録
+### 2.2 Records
 
-`~/.config/dfs/services.json`（600）に置く。`start` で書き、`stop` で PID を 0 にし、
-`--forget` で消す。
+Stored in `~/.config/dfs/services.json` (mode 600). Written by `start`, PID set to 0 by `stop`,
+and removed by `--forget`.
 
 ```json
 {
@@ -110,47 +112,50 @@ dfssvc logs   [NAME] [-n LINES]
 }
 ```
 
-`registry_url` と `ost_endpoint` は記録に書かず、読むときに組み立てる（重複を避け、
-書き換えで食い違わないように）。
+`registry_url` and `ost_endpoint` are not written to the record; they are constructed when
+reading (to avoid duplication and prevent divergence on edits).
 
-`ost_dir` を指定した場合、L2 の状態（`registry_state.json`）と TLS 証明書は
-`--state-dir` に残り、L3 の暗号化チャンクだけが `--ost-dir` に置かれる。
+When `ost_dir` is specified, L2 state (`registry_state.json`) and TLS certificates remain in
+`--state-dir`, and only L3 encrypted chunks are placed in `--ost-dir`.
 
 ```bash
 dfssvc start --name dev --ost-dir /Volumes/ExtSSD/dfs/ost/dev
 ```
 
-### 2.3 委譲まで自動で登録する
+### 2.3 Automatic Delegation Registration
 
-`dfs serve` を上げただけでは、リモートは空である（`/v1/paths` が空）。そのため
-`dfscli` はサブツリーを解決できない。`dfssvc start` はここまで面倒を見る。
+Simply starting `dfs serve` leaves the remote empty (`/v1/paths` is empty), so `dfscli` cannot
+resolve any subtree. `dfssvc start` takes care of this too:
 
-- 書き手の Ed25519 鍵を `~/dfssvc/<name>/keys/writer` に用意する。
-- 根から見て途中の階層にも委譲を張る（L1 は多段を要求する）。`/example.com/team/notes` なら
-  `/example.com/team` を経て末端へ至る。中間は root の書き手で作る。
-- 末端は書き手の鍵へ委譲する。
-- 同じ書き手・同じパスの委譲が既にあれば登録しない（再起動で作り直さない）。
+- Prepares the writer's Ed25519 key at `~/dfssvc/<name>/keys/writer`.
+- Registers delegations at intermediate levels from the root as well (L1 requires multi-hop).
+  For `/example.com/team/notes`, it goes through `/example.com/team` to the leaf. Intermediates
+  are created with the root key as writer.
+- Delegates the leaf to the writer's key.
+- If a delegation for the same writer and path already exists, it does not re-register it
+  (does not recreate it on restart).
 
-有効期間は、**末端（書き手への委譲）を 365 日、中間を 366 日**にする。L1 は
-`child.expires_at <= parent.expires_at` を要求する（Invariant 3）。親子は別のプロセスで
-署名するため、同じ日数だと実行時刻が 1 秒ずれただけで子が親を超えて落ちる（試験で実際に
-起きた）。中間を 1 日長くして、必ず親 > 子になるようにしている。ずれは高々数秒なので、
-日単位の粗さで足りる。
+The validity period is **365 days for the leaf (writer delegation) and 366 days for intermediates**.
+L1 requires `child.expires_at <= parent.expires_at` (Invariant 3). Because parent and child are
+signed in separate steps/processes, using the same number of days caused the child to exceed the
+parent and fail if execution crossed a 1-second boundary (this actually happened in tests). Making
+intermediates 1 day longer guarantees parent > child. Since clock skew/execution delta is at most
+a few seconds, day-level granularity is sufficient.
 
-`--no-delegate` を付けると、サーバだけ立てて委譲は自分で組む。
+Passing `--no-delegate` starts only the server so you can set up delegations yourself.
 
-### 2.4 DNSSEC TXT を出力する
+### 2.4 Outputting DNSSEC TXT
 
-`dnssec` は、サービス記録の root 公開鍵・root アンカー・registry URL から
-`_dfs.<domain>` TXT に置く JSON を生成する。
+`dnssec` generates the JSON to place in the `_dfs.<domain>` TXT record from the service record's
+root public key, root anchor, and registry URL.
 
 ```bash
 dfssvc dnssec dev
 ```
 
-既定のドメインは `root_anchor` の先頭要素（`/example.com/dev` なら
-`example.com`）で、registry URL はそのサービスの L2 URL。公開 DNSSEC では
-必要に応じて上書きする。
+The default domain is the first component of `root_anchor` (e.g., `example.com` for
+`/example.com/dev`), and the registry URL is the service's L2 URL. For public DNSSEC,
+override as needed:
 
 ```bash
 dfssvc dnssec dev \
@@ -161,30 +166,30 @@ dfssvc dnssec dev \
   --epoch 2
 ```
 
-標準出力は TXT にそのまま入れる 1 行 JSON で、レコード名は標準エラーに出す。
-`--json` を付けると整形 JSON になる（`dfssvc --json dnssec dev`）。
-生成値は discovery パーサで再検証し、primary がちょうど 1 つであること、
-URL と TTL が有効であることを確認する。
+Stdout outputs single-line JSON ready to put into a TXT record, and stderr prints the record name.
+Passing `--json` outputs formatted JSON (`dfssvc --json dnssec dev`).
+The generated value is re-validated with the discovery parser to ensure there is exactly one
+primary and that URLs and TTL are valid.
 
 ---
 
-## 3. 使い方
+## 3. Usage
 
-### 3.1 立てて、つないで、書く
+### 3.1 Start, Connect, Write
 
 ```bash
 cd ~/src/dfs
 
-# 1. サーバを立てる（連続した空きポートを選び、鍵と委譲まで用意する）
+# 1. Start the server (picks consecutive free ports and prepares keys & delegation)
 ./dfssvc start --name dev
 
-# 2. dfscli につなぐ。L3 もサブツリーも L2 が知っているので --ost も --path も不要
+# 2. Connect dfscli. L2 knows both L3 and the subtree, so --ost and --path are unnecessary
 ./dfscli config create dev \
     --registry http://127.0.0.1:19441 \
     --key ~/dfssvc/dev/keys/writer \
     --secret dev-secret
 
-# 3. 使う
+# 3. Use it
 mkdir -p /tmp/sample
 echo "hello" > /tmp/sample/hello.txt
 ./dfscli copy /tmp/sample dev:
@@ -192,86 +197,86 @@ echo "hello" > /tmp/sample/hello.txt
 ./dfscli cat  dev:hello.txt
 ```
 
-`./dfssvc env dev` を実行すると、4 の行（`--secret` を除く）をそのまま出せる。
+Running `./dfssvc env dev` prints the connection line (excluding `--secret`) ready to copy:
 
 ```
 $ ./dfssvc env dev
-# dev に接続する（L3 は L2 が広告するので --ost は不要）
+# Connect to dev (L2 advertises L3, so --ost is not needed)
 dfscli config create dev --registry http://127.0.0.1:19441 --key ~/dfssvc/dev/keys/writer --secret <tree_secret>
 
-# 参考: このサーバの L3 は tls://127.0.0.1:19442
-#        書き手の鍵 : ~/dfssvc/dev/keys/writer（--key にそのまま使える）
-#        サブツリー : /example.com/dev（L2 が鍵から引くので --path は不要）
-#        L1 の root : ~/dfssvc/dev/keys/root（--signing-key に使う）
+# Info: L3 for this server is tls://127.0.0.1:19442
+#       Writer key : ~/dfssvc/dev/keys/writer (usable directly for --key)
+#       Subtree    : /example.com/dev (L2 resolves from key, so --path is not needed)
+#       L1 root    : ~/dfssvc/dev/keys/root (used for --signing-key)
 ```
 
-### 3.2 確認と後始末
+### 3.2 Status and Cleanup
 
 ```bash
-./dfssvc list             # 記録済みのサービスと稼働状況
-./dfssvc status dev       # 詳細と L2 の応答確認
-./dfssvc logs dev -n 20   # ログの末尾
-./dfssvc stop dev         # 止める（記録は残す）
-./dfssvc stop dev --forget  # 止めて記録からも消す
+./dfssvc list             # Recorded services and running status
+./dfssvc status dev       # Details and L2 health check
+./dfssvc logs dev -n 20   # Tail of logs
+./dfssvc stop dev         # Stop (keeps record)
+./dfssvc stop dev --forget  # Stop and remove from record
 ```
 
-`stop` は `SIGTERM` を送り、10 秒待って落ちなければ `SIGKILL` にする。
+`stop` sends `SIGTERM`, waits 10 seconds, and falls back to `SIGKILL` if the process has not exited.
 
 ---
 
-## 4. 試験
+## 4. Tests
 
-`tests/test_svc_cli.py` に 14 件。
+14 tests in `tests/test_svc_cli.py`:
 
-| 試験 | 確かめること |
+| Test | What it verifies |
 |---|---|
-| `test_consecutive_ports_are_adjacent` | 返る 2 つのポートが隣り合っている |
-| `test_busy_port_is_skipped` | 実際に待ち受けたポートを使われていると判定する |
-| `test_start_port_that_is_busy_is_avoided` | 使用中の番号から始めても、その番号を避ける |
-| `test_out_of_range_start_is_rejected` | 65535 から 2 つ取ろうとしたら弾く |
-| `test_store_roundtrip_with_600` | 記録の往復と 600、派生値を書かないこと |
-| `test_start_then_stop` | 起動 → 稼働中 → L2 が応答 → stop で落ちる |
-| `test_same_name_without_force_is_refused` | 同じ名前を `--force` 無しで上書きしない |
-| `test_two_services_get_different_ports` | 2 つ目は別の連続ペアを取る |
-| `test_start_registers_delegation` | start が書き手の鍵と委譲まで用意する |
-| `test_ls_works_before_any_write` | 何も書いていないリモートでも `ls` が通る |
-| `test_no_delegate_leaves_registry_empty` | `--no-delegate` なら委譲を作らない |
-| `test_explicit_path_is_used` | `--path` の末端と中間の両方に委譲が張られる |
-| `test_dnssec_outputs_txt_json` | `dnssec` が TXT 用 JSON とレコード名を出す |
-| `test_dnssec_json_and_secondary_primary_requirement` | 整形 JSON、secondary の primary 必須、secondary URL の自動追加 |
+| `test_consecutive_ports_are_adjacent` | The two returned ports are adjacent |
+| `test_busy_port_is_skipped` | A port with an active listener is detected as in use |
+| `test_start_port_that_is_busy_is_avoided` | Starting from a busy port number skips that port |
+| `test_out_of_range_start_is_rejected` | Rejects trying to allocate 2 ports starting at 65535 |
+| `test_store_roundtrip_with_600` | Record roundtrip with mode 600, and derived values are not written |
+| `test_start_then_stop` | start → running → L2 responds → stop terminates it |
+| `test_same_name_without_force_is_refused` | Refuses to overwrite the same name without `--force` |
+| `test_two_services_get_different_ports` | Second service gets a different consecutive pair |
+| `test_start_registers_delegation` | `start` prepares the writer key and delegation |
+| `test_ls_works_before_any_write` | `ls` succeeds even on a remote with nothing written yet |
+| `test_no_delegate_leaves_registry_empty` | `--no-delegate` creates no delegation |
+| `test_explicit_path_is_used` | Delegations are created for both leaf and intermediate paths of `--path` |
+| `test_dnssec_outputs_txt_json` | `dnssec` outputs TXT JSON and record name |
+| `test_dnssec_json_and_secondary_primary_requirement` | Formatted JSON, primary required for secondary, automatic addition of secondary URL |
 
-試験は `HOME` を一時ディレクトリに差し替え、その中に状態と記録を閉じる。
-`tearDown` で記録に残ったサービスを全部止める（`addCleanup` は一時ディレクトリの
-後始末より後に走ることがあり、順序に頼るとプロセスが残る）。
+Tests redirect `HOME` to a temporary directory and isolate state and records inside it.
+`tearDown` stops all services remaining in the record (`addCleanup` can run after temporary
+directory cleanup, leaving orphan processes if you rely on ordering).
 
 ---
 
-## 5. 注意
+## 5. Notes
 
-- **認証は無い。** `--host 0.0.0.0` で立てるなら WireGuard / LAN の中に限ること。
-  完全性は L4 の署名で担保する。
-- **`tree_secret` は `dfssvc` が作らない。** サーバに置かない共有秘密なので、
-  `dfscli config create --secret` で自分で渡す。
-- **`stop` は記録を残す。** 同じ名前で立て直すと `--force` が要る。`--force` は
-  旧プロセスを停止し、同じ状態ディレクトリを同時に使うプロセスを残さない。消すなら `--forget`。
-- **root 鍵は使い回す。** 同じ `--name` で立て直すと、以前の委譲がそのまま使える。
-  作り直したいときは `--root-key` を別の場所にする。
-- **`dfscli` の参照系は作業ディレクトリを自動で作る。** `ls` / `cat` / `size` / `check` などは
-  リモートの版を読むだけだが、接続情報（解決した ost と sub_path）と HeadPin を置く場所が
-  要る。`touch` を先に打たせず、その場で作る。
+- **No authentication.** If binding `--host 0.0.0.0`, restrict it to WireGuard / LAN.
+  Integrity is guaranteed by L4 signatures.
+- **`dfssvc` does not generate `tree_secret`.** Because it is a shared secret not stored on the
+  server, pass it yourself via `dfscli config create --secret`.
+- **`stop` keeps the record.** Starting again with the same name requires `--force`. `--force`
+  stops the old process so no two processes share the same state directory. Use `--forget` to remove.
+- **The root key is reused.** Restarting with the same `--name` preserves previous delegations.
+  To start fresh, specify a different `--root-key` path.
+- **Read-only `dfscli` commands automatically create a working directory.** Commands like `ls` / `cat` / `size` / `check`
+  only read remote versions, but still need a place to store connection info (resolved ost and `sub_path`)
+  and HeadPin. They create it on the fly without requiring `touch` first.
 
-## 6. 落とし穴の記録
+## 6. Pitfalls Log
 
-- **参照系に `touch` を要求していた。** 最初、`open_remote(create=False)` で実装したため、
-  `dfscli ls` が「not initialized、先に touch を打て」と返していた。読み取り専用なのに
-  初期化を求めるのは筋が悪いので、参照系も `create=True` にした。
-- **`dfssvc start` が委譲を登録していなかった。** サーバは立てば動くが、リモートが空なので
-  `ls` に出せるものが無く、`dfscli` はサブツリーを解決できない。start に含めた。
-- **`SO_REUSEADDR` の bind で空きを誤判定していた。** §1.1 の 2 段判定に直した。
-- **多段委譲の有効期間が同じで、時刻のずれで落ちていた。** 中間と末端を別プロセスで
-  署名するため、1 秒ずれるだけで子の `expires_at` が親を超え、Invariant 3 に落ちる。
-  中間を 1 日長くして直した（§2.3）。
-- **委譲の登録に失敗すると、起動済みのサーバが孤児として残っていた。** `start` は
-  サーバを起動してから委譲を登録する。登録で例外が出ると、記録にも載らないプロセスが
-  ポートを掴んだまま残る（試験で実際に起きた）。失敗したら必ず止めてから抜けるように
-  した（SIGTERM → 10 秒 → SIGKILL）。
+- **Read-only commands used to require `touch`.** Initially implemented with `open_remote(create=False)`,
+  so `dfscli ls` returned "not initialized, run touch first." Requiring initialization for a read-only
+  command was poor ergonomics, so read-only commands were changed to `create=True`.
+- **`dfssvc start` did not register delegations.** The server ran, but the remote was empty so `ls`
+  had nothing to show and `dfscli` could not resolve a subtree. Added to `start`.
+- **`SO_REUSEADDR` bind misdetected busy ports.** Fixed with the two-stage check in §1.1.
+- **Multi-hop delegations had identical validity periods and failed on clock/second boundaries.**
+  Because intermediate and leaf delegations are signed separately, a 1-second difference caused the
+  child's `expires_at` to exceed the parent's, failing Invariant 3. Fixed by making intermediates 1 day longer (§2.3).
+- **Failed delegation registration left the started server orphaned.** `start` launches the server and
+  then registers the delegation. If registration raised an exception, an unrecorded process remained
+  holding the port (actually happened in tests). Fixed to always stop the server before exiting on
+  failure (SIGTERM → 10 s → SIGKILL).

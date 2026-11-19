@@ -1,21 +1,19 @@
-# DNSSEC による L1 root / registry discovery
+# L1 Root / Registry Discovery via DNSSEC
 
-## 結論
+> **English** | [日本語](dnssec.ja.md)
 
-DNSSEC は **root アンカー公開鍵と registry 一覧の配布**に使う。動的な head、CAS、
-primary 昇格の判断には使わない。
+## Conclusion
 
-「最初に起動したサーバが domain root になる」方式は採用しない。
-primary / secondary は DNSSEC レコードに明示された役割、または運用者の静的設定で
-決める。最初に起動したことは権威の根拠にならない。
+DNSSEC is used for **distributing the root anchor public key and registry list**. It is not used for dynamic head tracking, CAS, or primary promotion decisions.
 
-DNSSEC レコードが落ちても、クライアントは最後に検証済みの設定をキャッシュして
-読み取りを継続できる。ただし、レコードの更新・失効には TTL があるため、
-registry の即時フェイルオーバーを DNS に依存させない。
+The "first server to start becomes the domain root" approach is not adopted.
+`primary` / `secondary` roles are determined by the roles explicitly stated in the DNSSEC record or by the operator's static configuration. Starting first is not a basis for authority.
 
-## レコード
+Even if the DNSSEC record becomes unavailable, clients can continue reading using the cached last-verified configuration. However, because record updates and expirations are subject to TTL, immediate registry failover must not depend on DNS.
 
-`_dfs.<domain>` の TXT レコードに JSON を 1 つ置く。
+## Record
+
+Place a single JSON object in the `_dfs.<domain>` TXT record.
 
 ```json
 {
@@ -32,101 +30,88 @@ registry の即時フェイルオーバーを DNS に依存させない。
 }
 ```
 
-### フィールド
+### Fields
 
-| フィールド | 意味 |
+| Field | Meaning |
 |---|---|
-| `schema` | `dfs-discovery-v1` 固定 |
-| `domain` | このレコードが管理するドメイン |
-| `root_anchor` | L1 root のパス（例: `/example.com`） |
-| `root_pubkey` | L1 root の OpenSSH 公開鍵 |
-| `registries` | `primary` 1 つと `secondary` 0 個以上 |
-| `epoch` | レコードの世代。単調増加させる |
-| `ttl` | クライアントが採用を検討する目安の TTL |
+| `schema` | Fixed to `dfs-discovery-v1` |
+| `domain` | Domain managed by this record |
+| `root_anchor` | Path of the L1 root (e.g., `/example.com`) |
+| `root_pubkey` | OpenSSH public key of the L1 root |
+| `registries` | One `primary` and zero or more `secondary` entries |
+| `epoch` | Record generation; monotonically increasing |
+| `ttl` | Guideline TTL for clients to consider adopting updates |
 
-`primary` はちょうど 1 つでなければならない。複数 primary、primary なしは拒否する。
-URL は `http(s)://host:port` 形式で、重複を拒否する。
+There must be exactly one `primary`. Multiple primaries or no primary are rejected.
+URLs must be in `http(s)://host:port` format, and duplicates are rejected.
 
-## 検証
+## Verification
 
-1. EDNS0 の DO ビットを付けて `_dfs.<domain>` TXT を引く
-2. TXT の RRSIG から署名ゾーンを特定する
-3. IANA の root trust anchor（KSK-2017 / KSK-2024 の DS）を根として、
-   署名ゾーンまでの DNSKEY / DS チェーンをクライアント側で検証する
-4. TXT RRset の RRSIG を検証する
-5. TXT の JSON をスキーマ・型・必須項目について検証する
-6. `root_pubkey` を `root_anchor` の信頼の根として記録する
-7. 以後の L1 委譲チェーンは、既存の root アンカー検証で検証する
+1. Query `_dfs.<domain>` TXT with the EDNS0 DO bit set
+2. Identify the signing zone from the TXT's RRSIG
+3. Verify the DNSKEY / DS chain down to the signing zone on the client side, rooted at the IANA root trust anchor (DS for KSK-2017 / KSK-2024)
+4. Verify the RRSIG of the TXT RRset
+5. Validate the TXT JSON for schema, types, and required fields
+6. Record `root_pubkey` as the trust root for `root_anchor`
+7. Subsequent L1 delegation chains are verified using the existing root anchor verification
 
-AD（Authenticated Data）ビットは既定の検証では使わない。`validate=False` を
-明示した旧互換経路だけが、検証済みリゾルバの AD ビットを信頼する。
-この旧経路は `--dnssec-no-validate --dnssec-no-ad` で選ぶ。診断用であり、
-通常運用では使わない。
+The AD (Authenticated Data) bit is not used in default verification. Only the legacy compatibility path with explicit `validate=False` trusts the AD bit from a validating resolver.
+This legacy path is selected with `--dnssec-no-validate --dnssec-no-ad`. It is for diagnostics only and must not be used in normal operation.
 
-## DNSSEC と L2/L3 の役割
+## Roles of DNSSEC and L2/L3
 
-- DNSSEC: root 公開鍵、registry の初期一覧、primary/secondary の役割
-- L2 registry: 委譲チェーン、ロケータ、L4 head の CAS / 複製
-- L3 OST: 暗号化チャンク。主 OST と読み取りレプリカ OST
+- DNSSEC: root public key, initial registry list, `primary`/`secondary` roles
+- L2 registry: delegation chains, locators, CAS / replication of L4 heads
+- L3 OST: encrypted chunks; primary OST and read-replica OST
 
-DNSSEC レコードは静的な discovery 情報であり、L4 head を載せない。
-head の更新は L2 の署名付きログで行う。
+DNSSEC records are static discovery information and do not carry L4 heads.
+Head updates are performed via signed logs in L2.
 
-DNSSEC は **必須ではない**。閉域・WireGuard・LAN の初期運用や小規模運用では、
-[specs/discovery.md](discovery.md) の「署名付き立候補モデル (`dfs-candidacy-v1`)」
-または `dfscli config create --registry ... --root-pubkey ...` を使う。
-中規模を超える運用になりそうな場合に DNSSEC へ移行する。
-DNSSEC を使う場合も、その役割は初期 root/registry discovery に限定する。
+DNSSEC is **not required**. For initial deployments in closed networks, WireGuard, LANs, or small-scale deployments, use the "Signed Candidacy Model (`dfs-candidacy-v1`)" in [specs/discovery.md](discovery.md) or `dfscli config create --registry ... --root-pubkey ...`.
+Migrate to DNSSEC when scaling beyond medium-sized deployments.
+Even when DNSSEC is used, its role is limited to initial root/registry discovery.
 
-## 障害時の前提
+## Failure Assumptions
 
-「registry は落ちない」とは仮定しない。
+We do not assume "the registry never goes down."
 
-| 障害 | 期待する挙動 |
+| Failure | Expected Behavior |
 |---|---|
-| DNSSEC / DNS 停止 | 最後に検証済みの root 鍵と registry 一覧を使う |
-| primary registry 停止 | 読み取りは secondary にフォールバック。書き込みは失敗 |
-| secondary registry 停止 | primary で読み書きを継続 |
-| primary の復帰 | `role_epoch` による fencing で、昇格後の writer からの書き込みだけを受理する |
-| DNSSEC 鍵漏洩 | ドメイン権威の侵害として扱い、root 鍵と registry 一覧をローテーションする |
+| DNSSEC / DNS outage | Use the last verified root key and registry list |
+| `primary` registry outage | Reads fall back to `secondary`; writes fail |
+| `secondary` registry outage | Continue reads and writes on `primary` |
+| `primary` recovery | Fencing via `role_epoch` accepts writes only from writers after promotion |
+| DNSSEC key compromise | Treat as domain authority compromise; rotate root key and registry list |
 
-最初に起動したサーバを root にする方式は、同時起動・分断・復帰時に split-brain を
-起こすため採用しない。
+Making the first server to start the root is rejected because it causes split-brain during simultaneous startup, network partitions, and recovery.
 
 ## CLI
 
 ```bash
-# discovery の内容を確認
+# Inspect discovery contents
 dfscli discover example.com
 
-# DNSSEC から root 鍵・primary/secondary を取得してリモートを登録
+# Fetch root key and primary/secondary from DNSSEC and register remote
 dfscli config create scw \
   --dnssec-domain example.com \
   --key ~/.ssh/alice \
   --secret <tree_secret>
 
-# dfssvc が管理するサービスの TXT JSON を生成
+# Generate TXT JSON for a service managed by dfssvc
 dfssvc dnssec scw --domain example.com
 ```
 
-`--registry` / `--registry-alternate` を併記した場合は、DNSSEC の内容と一致しなければ
-エラーにする。`--root-pubkey` を併記した場合も、DNSSEC の root 公開鍵と一致しなければ
-拒否する。
+If `--registry` / `--registry-alternate` are also specified, an error is raised unless they match the DNSSEC contents. If `--root-pubkey` is also specified, it is rejected unless it matches the DNSSEC root public key.
 
-## 制約
+## Limitations
 
-- root trust anchor はコードに埋め込んでいる。IANA の KSK ロールオーバー時には
-  `ROOT_TRUST_ANCHOR_DS` を更新する必要がある
-- primary 昇格時の fencing は `role_epoch` で行う。旧 primary は、昇格後の
-  `role_epoch` を持つ writer からの書き込みを拒否する。ただし旧 epoch の writer は
-  引き続き旧 primary に書き込めるため、writer 設定の更新を同時に行う必要がある
-- TXT レコードのサイズ・TTL・伝播遅延を考慮し、多数の registry を 1 レコードに
-  詰め込まない
-- DNSSEC は primary の生存監視や自動昇格を行わない
-- DNSSEC レコードの更新は、TSIG / 動的更新 / ゾーン管理の権限で保護する
+- The root trust anchor is embedded in code. On an IANA KSK rollover, `ROOT_TRUST_ANCHOR_DS` must be updated
+- Fencing upon `primary` promotion uses `role_epoch`. The old `primary` rejects writes from writers with a post-promotion `role_epoch`. However, writers on the old epoch can still write to the old `primary`, so writer configurations must be updated simultaneously
+- Consider TXT record size, TTL, and propagation delay; do not pack too many registries into a single record
+- DNSSEC does not perform liveness monitoring or automatic promotion of `primary`
+- Updates to DNSSEC records must be protected by TSIG / dynamic update / zone management permissions
 
-## 回帰試験
+## Regression Tests
 
-- `tests/test_dnssec.py`: JSON のスキーマ、primary 1 つ、URL、root 鍵、epoch の検証
-- `tests/test_dnssec.py`: CLI の `--dnssec-domain` が Remote に root 鍵と
-  primary/secondary を反映すること
+- `tests/test_dnssec.py`: validation of JSON schema, single primary, URLs, root key, and epoch
+- `tests/test_dnssec.py`: `--dnssec-domain` CLI flag populates Remote with root key and primary/secondary

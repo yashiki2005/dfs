@@ -1,69 +1,65 @@
-# dfs 試験計画
+# dfs Test Plan
 
-## 0. この文書の目的
+> **English** | [日本語](PLAN.ja.md)
 
-`DESIGN.md` の設計案（L0〜L5 の層構造）を、**実装前に検証する**ための計画。
+## 0. Purpose of This Document
 
-設計案のうち、危険なのは次の 2 つ。ここを先に試す。
+A plan to **verify before implementation** the design proposal in `DESIGN.md` (the L0–L5 layered architecture).
 
-1. **L1（権威の委譲）** が本当に DNSSEC 的なモデルで閉じるか。
-   → 閉じなければ設計全体が崩れる。
-2. **単一書き手の境界（§5）** が現実に守れるか。
-   → 守れなければ三方向マージに逆戻りする（dfs の二の舞）。
+Of the design proposal, two parts are risky. Test these first:
 
-逆に、**L3 と L5 は既に動いているものを使う**ので、検証の対象ではない。
-mini_lustre（L3）と clayfs（L5）をそのまま呼び出して、層の境界が成立するかだけを見る。
+1. **L1 (Authority Delegation)**: Can it truly close under a DNSSEC-like model?
+   → If not, the entire design collapses.
+2. **Single-Writer Boundaries (§5)**: Can they be enforced in practice?
+   → If not, we fall back to three-way merge (repeating `dfs`).
 
-## 方針
+Conversely, **L3 and L5 use things that already work**, so they are not the subject of verification. Call `mini_lustre` (L3) and `clayfs` (L5) as-is and only check whether the layer boundaries hold.
 
-- **1 つの層を、独立したコマンドとして作る。** 層をまたいだ統合は最後。
-- **各段で「失敗したらどうするか」を先に決める。** 決められない機能は作らない
-  （`DESIGN.md` §11 の指針）。
-- **既存の成果物を捨てない。** dfs3 形式4（Merkle ツリー）、evil 試験 11 項目、
-  clayfs、mini_lustre は、そのまま使うか、そのまま流用する。
-- **数値で確かめる。** 「動いた」ではなく、往復回数・転送量・容量・時間を測る。
+## Policy
 
----
-
-## 段階 0: L5（ローカル実体化）がそのまま使えることの確認
-
-**目的**: clayfs を L5 として無改造で使えるか。改造が要るなら、その範囲を先に知る。
-
-**手順**
-
-1. clayfs（macOS）で仮想ドライブを作り、マウントする。
-2. `~/src/dfs/scratch/tree/` を作業ツリーとして置き、スナップショットを 3 回取る。
-3. 各スナップショットのディレクトリを、外部から直接読めることを確認する
-   （`/.clayfs/snapshots/<id>/` が普通のフォルダであること）。
-4. スナップショットを `rsync -a` で別の場所へ送り、そこで読めることを確認する。
-5. スナップショットの中に `.clayfs` が入っていないこと（再帰しないこと）を確認する。
-
-**判定**
-
-- 3 と 4 が通れば、**L5 は「普通のフォルダとして読める」**。これが L4 との接点になる。
-- 5 が通れば、L5 の中に L4 のメタデータを置いても衝突しない。
-
-**測るもの**: スナップショット作成時間、3 回分の合計容量増（CoW が効いているか）。
-
-**失敗したときの対処**: 改造せず、L5 の外側で吸収する（スナップショットを読むだけの
-薄い層を足す）。clayfs 本体には手を入れない。
+- **Build each layer as an independent command.** Cross-layer integration comes last.
+- **Decide "what to do on failure" at each stage beforehand.** Do not build features where this cannot be decided (`DESIGN.md` §11 guideline).
+- **Do not discard existing artifacts.** Use or adapt `dfs3` Format 4 (Merkle tree), the 11 evil tests, `clayfs`, and `mini_lustre` directly.
+- **Verify with numbers.** Not "it worked," but measure round trips, transfer volume, capacity, and time.
 
 ---
 
-## 段階 1: L0 と L1（識別子と権威の委譲）— 最小の検証
+## Stage 0: Verify L5 (Local Materialization) Works As-Is
 
-**目的**: `DESIGN.md` §10 の問い 1 と 2 に答える。
-「ドメイン名の権威とストレージの所有権は一致するのか」「委譲は一方的に宣言できてよいか」。
+**Purpose**: Can `clayfs` be used unmodified as L5? If modifications are needed, determine their scope up front.
 
-**前提**: ここは**実装しない**。紙と署名だけで検証する（`openssl` と既存の Ed25519 鍵で足りる）。
+**Steps**
 
-**手順**
+1. Create and mount a virtual drive with `clayfs` (macOS).
+2. Place `~/src/dfs/scratch/tree/` as the working tree and take 3 snapshots.
+3. Confirm each snapshot directory can be read directly from outside (`/.clayfs/snapshots/<id>/` is a normal folder).
+4. Send a snapshot elsewhere with `rsync -a` and confirm it is readable there.
+5. Confirm `.clayfs` is not inside the snapshots (no recursion).
 
-1. 3 つの鍵を作る。
-   - `root.json`（自分のルート鍵。`~/.ssh/id_ed25519` を流用）
-   - `alice.json`（`alice@example.com` 用）
-   - `bob.json`（`bob@example.com` 用）
-2. 委譲記録の**最小の形式**を決めて書く。例:
+**Criteria**
+
+- If 3 and 4 pass, **L5 is "readable as a normal folder."** This becomes the interface with L4.
+- If 5 passes, placing L4 metadata inside L5 will not collide.
+
+**What to measure**: Snapshot creation time, total capacity growth across 3 snapshots (whether CoW is effective).
+
+**Fallback on failure**: Do not modify `clayfs`; absorb outside L5 (add a thin layer that only reads snapshots). Do not touch `clayfs` itself.
+
+---
+
+## Stage 1: L0 and L1 (Identifiers & Authority Delegation) — Minimal Verification
+
+**Purpose**: Answer Questions 1 and 2 of `DESIGN.md` §10: "Does domain authority align with storage ownership?" and "Can delegation be declared unilaterally?"
+
+**Premise**: **Do not implement** here. Verify on paper and with signatures (`openssl` and existing Ed25519 keys suffice).
+
+**Steps**
+
+1. Create 3 keys:
+   - `root.json` (your root key; reuse `~/.ssh/id_ed25519`)
+   - `alice.json` (for `alice@example.com`)
+   - `bob.json` (for `bob@example.com`)
+2. Define and write a **minimal format** for delegation records. Example:
 
    ```json
    {
@@ -72,240 +68,218 @@ mini_lustre（L3）と clayfs（L5）をそのまま呼び出して、層の境�
      "parent": "/example.com",
      "issued_at": 1762900000,
      "expires_at": 1794436000,
-     "signature": "<parent の鍵による署名>"
+     "signature": "<signature by parent's key>"
    }
    ```
 
-3. 次の 4 つの場合を、手で作って検証する。
-   - (a) 正しい委譲: 親の署名が検証できる。
-   - (b) 偽の委譲: `bob` が `/example.com/alice` を自分に委譲しようとする → **拒否できるか**。
-   - (c) 期限切れの委譲: `expires_at` を過ぎたもの → **拒否できるか**。
-   - (d) 再委譲: `/example.com/alice` の持ち主が、その下の `/example.com/alice/shared` を
-     `bob` に委譲する → **許してよいか**。
+3. Hand-craft and verify the following 4 cases:
+   - (a) Valid delegation: Parent's signature verifies.
+   - (b) Forged delegation: `bob` tries to delegate `/example.com/alice` to himself → **Can it be rejected?**
+   - (c) Expired delegation: Past `expires_at` → **Can it be rejected?**
+   - (d) Re-delegation: Owner of `/example.com/alice` delegates `/example.com/alice/shared` beneath it to `bob` → **Should it be allowed?**
 
-**判定の基準**
+**Criteria**
 
-- (b) と (c) が拒否でき、(d) を許せるなら、**L1 は閉じる**。DNSSEC の委譲と同じ形。
-- (b) が拒否できないなら、**L1 の設計をやり直す**（ここが崩れると全部崩れる）。
+- If (b) and (c) can be rejected and (d) can be allowed, **L1 closes**—same shape as DNSSEC delegation.
+- If (b) cannot be rejected, **redesign L1** (if this breaks, everything breaks).
 
-**この段階の成果物**: `specs/delegation.md`（形式と、4 つの場合の判定）。コードは書かない。
+**Deliverable for this stage**: `specs/delegation.md` (format and judgments for the 4 cases). Write no code.
 
-**なぜコードを書かないか**: L1 は「誰が名乗れるか」の合意であり、実装は後回しでよい。
-**形式が決まらないうちにコードを書くと、dfs と同じく後から直せなくなる。**
+**Why write no code**: L1 is consensus on "who may claim a name"; implementation can wait. **Writing code before the format is settled leads to the same unfixable trap as `dfs`.**
 
 ---
 
-## 段階 2: L4（一貫性）— 単一書き手の追記ログ
+## Stage 2: L4 (Consistency) — Single-Writer Append-Only Log
 
-**目的**: `DESIGN.md` §5 の書き込み境界が、実際に守れることを確かめる。
-dfs3 形式4 の Merkle ツリーを土台にする。
+**Purpose**: Verify that write boundaries from `DESIGN.md` §5 can actually be enforced. Build on `dfs3` Format 4 Merkle trees.
 
-**手順**
+**Steps**
 
-1. dfs3（または dfs4）の `layout.py` を流用し、**ディレクトリごとの塊**の読み書きだけを
-   切り出す。同期・暗号・保管ノードは付けない（今回は L4 だけ）。
-2. 追記ログを作る。1 行 1 版で、`{版, 時刻, 根の塊の名前, 親の版, 署名}`。
-3. 次の試験を書く（dfs の evil 試験の形を踏襲する）。
-   - **単一書き手**: 同じ部分木に 2 つの書き手が同時に書けないこと（ロックで足りる）。
-   - **書き手の交代**: 委譲記録（段階 1 の形式）で書き手が変わったとき、
-     **新しい書き手が古い版を親として続けられる**こと。
-   - **巻き戻しの検出**: 古い版を見せられても、新しい版のままであること
-     （dfs の evil B6 と同じ試験。これは**必ず再実装する**）。
-   - **書き込みを黙って捨てられたとき**: 読み直して照合し、成功と報告しないこと
-     （dfs の evil B7。**これも再実装する**）。
-4. 二重書き込みが**起きないこと**を確かめる。起きたら設計が違うので、そこで止める。
+1. Reuse `layout.py` from `dfs3` (or `dfs4`), extracting only reading/writing of **per-directory chunks**. Do not attach sync, encryption, or storage nodes (L4 only this time).
+2. Build an append-only log. One version per line: `{version, timestamp, root_chunk_name, parent_version, signature}`.
+3. Write the following tests (following `dfs` evil test style):
+   - **Single writer**: Two writers cannot write concurrently to the same subtree (a lock suffices).
+   - **Writer handoff**: When the writer changes via a delegation record (Stage 1 format), **the new writer can continue from the old version as parent**.
+   - **Rollback detection**: Even if shown an old version, stay on the newer version (same test as `dfs` evil B6—**must be reimplemented**).
+   - **Silently dropped writes**: Read back and verify; never report success (same as `dfs` evil B7—**must also be reimplemented**).
+4. Confirm double writes **do not occur**. If they do, the design is wrong—stop there.
 
-**判定**
+**Criteria**
 
-- 「同じ部分木に 2 つの書き手が同時に書けない」が成立すれば、**三方向マージが不要**になる。
-  これが設計の要。
-- 成立しなければ、**書き込み境界の引き方を変える**（部分木の粒度を上げる）。
+- If "two writers cannot write concurrently to the same subtree" holds, **three-way merge becomes unnecessary**. This is the crux of the design.
+- If it fails, **change how write boundaries are drawn** (increase subtree granularity).
 
-**測るもの**: 1 版あたりの書き込み量（変わったディレクトリの塊だけか）、
-読み込みの往復回数（根から塊をたどる段数）。
+**What to measure**: Write volume per version (only changed directory chunks?), read round trips (levels traversed from root to chunk).
 
-**移すもの（そのまま使う）**: dfs の evil 試験のうち、次の 4 項目。
+**What to port (use as-is)**: These 4 items from `dfs` evil tests:
 
-| dfs の試験 | この段階での対応 |
+| `dfs` Test | Counterpart in This Stage |
 |---|---|
-| A2 チャンクを違う中身で上書きできない | 塊の名前と中身の照合（同じ考え方） |
-| A5 盗み見た署名つきの要求を再送しても通らない | 版の単調性で対応 |
-| B6 名乗りを中継して古い索引を見せても巻き戻らない | **そのまま再実装** |
-| B7 書き込みを黙って捨てる中継者に成功と報告しない | **そのまま再実装** |
+| A2 Cannot overwrite chunk with different content | Verify chunk name against content (same idea) |
+| A5 Replaying eavesdropped signed requests fails | Handled by version monotonicity |
+| B6 Relay showing old index does not roll back | **Reimplement as-is** |
+| B7 Relay silently dropping writes does not report success | **Reimplement as-is** |
 
 ---
 
-## 段階 3: L2（所在地解決）— 名前から住所へ
+## Stage 3: L2 (Location Resolution) — From Name to Address
 
-**目的**: `DESIGN.md` §10 の問い 3 に答える。「ロケータをどこに置くか」。
+**Purpose**: Answer Question 3 of `DESIGN.md` §10: "Where should locators live?"
 
-**前提の修正**: 以前は「成果物はコードではなく表」としていたが、これは誤りだった。
-表だけを残すと、数値の生成方法が失われて再現できなくなる（実際、段階 2〜5 の計測値は
-生成スクリプトが残っておらず、`DESIGN-ANSWER.md` から削除する結果になった）。
-**計測コードと生データをリポジトリに残すことを、この段階の成果物とする。**
-表はその出力として生成する。
+**Revised Premise**: Previously stated "deliverable is a table, not code," which was a mistake. Leaving only a table loses how numbers were generated, making them unreproducible (indeed, Stage 2–5 measurements had to be deleted from `DESIGN-ANSWER.md` because generating scripts were missing). **Keeping measurement code and raw data in the repository is the deliverable of this stage.** Tables are generated as outputs from them.
 
-**手順**
+**Steps**
 
-1. 選択肢を 3 つ、**同じ計測ハーネス**で比べる。
-   - (a) **名簿**: 中央集権。速い。単一障害点。
-   - (b) **DHT**: 分散。経路長が伸びる。初期版では実装せず、モデルと最小実装で測る。
-   - (c) **DNS の流用**: 既存基盤。TTL と検閲の制約。
-2. 計測ハーネスを `bench/` に置き、次の 3 条件で同じ指標を測る。
-   - **ローカル**（ループバック）
-   - **LAN**（実機。Mac と Pi5）
-   - **高遅延**（`tc qdisc` またはプロキシで RTT 200ms を注入）
-3. 各方式・各条件で次を記録する。
-   - 解決の往復回数（プロトコル上の段数。実装から数える）
-   - 解決の所要時間（中央値・p95）
-   - ノード 1 つ停止時の解決成功率
-   - 中央の名簿を 1 つ落としたときの影響範囲（(a) のみ）
-4. 生データを `bench/results/<日付>-<環境>.json` に残し、表はそれを集計して作る。
-5. `DESIGN.md` §9 の判断に従い、**まず名簿で作り、後から DHT を足せる形**にする。
+1. Compare 3 options using **the same benchmark harness**:
+   - (a) **Registry**: Centralized. Fast. Single point of failure.
+   - (b) **DHT**: Decentralized. Longer path lengths. Not implemented in initial version; measure via model and minimal implementation.
+   - (c) **DNS reuse**: Existing infrastructure. TTL and censorship constraints.
+2. Place the benchmark harness in `bench/` and measure the same metrics under 3 conditions:
+   - **Local** (loopback)
+   - **LAN** (real devices: Mac and Pi5)
+   - **High latency** (inject 200ms RTT via `tc qdisc` or proxy)
+3. Record for each approach and condition:
+   - Resolution round trips (protocol hops, counted from implementation)
+   - Resolution latency (median, p95)
+   - Resolution success rate with 1 node down
+   - Blast radius when central registry goes down ((a) only)
+4. Save raw data in `bench/results/<date>-<env>.json` and generate tables by aggregating them.
+5. Following `DESIGN.md` §9, **build with a registry first in a form that allows adding DHT later**.
 
-**判定**
+**Criteria**
 
-- 高遅延条件で往復が 2 回以内なら、L2 として実用。
-- 3 回以上必要なら、**キャッシュの設計**を先に決める（L2 の設計に含める）。
-- 単一障害点を受け入れられるかを、明示的に記録する。
+- If high-latency round trips ≤ 2, practical as L2.
+- If ≥ 3 round trips needed, **design caching first** (include in L2 design).
+- Explicitly document whether the single point of failure is acceptable.
 
-**測るもの**: 往復回数・所要時間・障害時の成功率。**計測コードと生データを残す。**
-数値を本文に書くときは、必ず「どのハーネスで、どの環境で、いつ測ったか」を併記する。
+**What to measure**: Round trips, latency, failure-case success rate. **Keep measurement code and raw data.** When citing numbers in prose, always state "which harness, which environment, and when measured."
 
-**成果物**
+**Deliverables**
 
-| ファイル | 内容 |
+| File | Contents |
 |---|---|
-| `bench/l2_bench.py` | 3 方式・3 条件の共通計測ハーネス |
-| `bench/results/*.json` | 生データ（環境・日時・各試行の値） |
-| `specs/l2_comparison.md` | 生データから生成した比較表と採用判断 |
+| `bench/l2_bench.py` | Common benchmark harness for 3 approaches × 3 conditions |
+| `bench/results/*.json` | Raw data (environment, timestamp, per-trial values) |
+| `specs/l2_comparison.md` | Comparison table and adoption decision generated from raw data |
 
-**やらないこと**: 3 方式をすべて本格実装すること。(b) と (c) は判断に必要な最小限にとどめ、
-(a) 名簿を本実装とする。
-
----
-
-## 段階 4: L3（データ平面）— 既存を使う
-
-**目的**: 新しい転送を書かないことの確認。`DESIGN.md` §10 の問い 5（内容アドレッシング）。
-
-**手順**
-
-1. mini_lustre の OST を **そのまま**起動し、L4 が示した塊を置く。
-   - ここで mini_lustre の認証が無い点（`DESIGN.md` §1.2）が問題になる。
-   - **対処**: OST を LAN 内に限定し、認証は L4 の署名で代替する。OST 自体には入れない。
-2. 塊の名前を**内容アドレスに変える**（現在の dfs は暗号文の SHA-256 で、同じ内容でも
-   名前が変わる。これは分散配置の効率に直結する）。
-   - 平文の SHA-256 を名前の一部にし、**暗号化は名前の外側**で行う（`DESIGN.md` §10 の問い 5）。
-   - 同じ内容の塊が、同じ名前になることを確認する（重複排除とレアリティが効く）。
-3. 転送効率を `bench/l3_bench.py` で測り、生データを残す。
-   - 一括 PUT の往復回数・送信量・所要時間（ファイル数とサイズを変えて）。
-   - 同一内容の重複排除が効くか（同一バッチ・別バッチ）。
-   - mini_lustre の OST との互換性（フレームと塊の識別子）。
-   libtorrent は、この計測で必要性が示されるまで導入しない。
-
-**判定（実測で更新）**
-
-- 塊が 100 個以下の規模なら、**libtorrent を足さない**。現行 L3 の一括 PUT で 2 往復に収まる
-  （100 ファイル × 64KB で 24.7ms）。
-- 1000 個以上、または多数のピアから引く必要が出たら、libtorrent を検討する。
-- **mini_lustre の OST は無改造では使えない。** フレーム形式も塊の識別子も異なる
-  （`specs/l3_data_plane.md` §3）。使うなら RPC アダプタを挟む。
-
-**注意**: ここで libtorrent を土台にすると、**`DESIGN.md` §3 の torch/匿名性の議論に戻る**。
-匿名性が要るなら、データは Tor/I2P に載せない（混雑で破綻する）。
-**この段階まで匿名性を持ち込まない。**
+**What not to do**: Fully implementing all 3 approaches. Keep (b) and (c) minimal for decision-making; implement (a) Registry for real.
 
 ---
 
-## 段階 5: 統合 — 2 台で 1 つのツリーを共有する
+## Stage 4: L3 (Data Plane) — Use Existing
 
-**目的**: 層が実際に繋がることを、**最小の構成**で確かめる。
+**Purpose**: Confirm no new transport needs to be written. Question 5 of `DESIGN.md` §10 (content addressing).
 
-**構成**
+**Steps**
+
+1. Start `mini_lustre`'s OST **as-is** and store chunks pointed to by L4.
+   - Here `mini_lustre`'s lack of authentication (`DESIGN.md` §1.2) becomes an issue.
+   - **Mitigation**: Restrict OST to LAN and substitute authentication with L4 signatures. Do not add auth into OST itself.
+2. Change chunk naming to **content addressing** (current `dfs` uses SHA-256 of ciphertext, so identical content gets different names—directly hurting distributed placement efficiency).
+   - Include plaintext SHA-256 in the name, and **perform encryption outside the name** (`DESIGN.md` §10 Question 5).
+   - Confirm chunks with identical content get identical names (deduplication and rarity work).
+3. Measure transfer efficiency with `bench/l3_bench.py` and keep raw data:
+   - Batch PUT round trips, bytes sent, elapsed time (varying file count and size).
+   - Whether deduplication works for identical content (same batch and separate batches).
+   - Compatibility with `mini_lustre`'s OST (framing and chunk identifiers).
+   Do not introduce libtorrent until these measurements show it is needed.
+
+**Criteria (Updated with Measurements)**
+
+- At ≤ 100 chunks, **do not add libtorrent**. Current L3 batch PUT fits in 2 round trips (100 files × 64KB in 24.7ms).
+- At ≥ 1000 chunks or when pulling from many peers becomes necessary, consider libtorrent.
+- **`mini_lustre`'s OST cannot be used unmodified.** Both framing and chunk identifiers differ (`specs/l3_data_plane.md` §3). Using it requires an RPC adapter.
+
+**Note**: Building on libtorrent here brings back **the Tor/anonymity debate from `DESIGN.md` §3**. If anonymity is needed, do not put data over Tor/I2P (collapses under congestion). **Do not bring anonymity into this stage.**
+
+---
+
+## Stage 5: Integration — Share One Tree Between Two Machines
+
+**Purpose**: Confirm layers actually connect in a **minimal configuration**.
+
+**Architecture**
 
 ```text
 [Mac]                                      [Linux / Pi5]
-clayfs (L5) ←→ L4 追記ログ ←→ L2 名簿 ←→ L4 追記ログ ←→ clayfs (L5)
-                                   ↕
-                              L3 データ (ChunkStore)
+clayfs (L5) ←→ L4 append log ←→ L2 registry ←→ L4 append log ←→ clayfs (L5)
+                                     ↕
+                              L3 data (ChunkStore)
 ```
 
-**手順**
+**Steps**
 
-1. 2 台で、**同じユーザーの同じ部分木**（例: `/example.com/alice/notes`）を持つ。
-2. 片方で書く → もう片方へ届く → **両方で clayfs のスナップショットが取れる**ことを確認する。
-3. **同時に書く**。→ 単一書き手の境界（段階 2）により、**片方が待つか、片方が断られる**ことを
-   確認する。**三方向マージが起きないこと**が正解。
-4. ノードを 1 つ落として、もう 1 台だけで読み書きが続くことを確認する
-   （可用性。ここで断られるなら、それは設計どおり）。
-5. 委譲（段階 1）で書き手を `bob` に移し、**bob が続きを書ける**ことを確認する。
+1. Hold **the same subtree of the same user** on two machines (e.g., `/example.com/alice/notes`).
+2. Write on one → arrives on the other → confirm **both can take `clayfs` snapshots**.
+3. **Write concurrently.** → Confirm that via single-writer boundaries (Stage 2), **one waits or one is rejected**. **No three-way merge occurs** is the passing condition.
+4. Drop one node and confirm the other continues reading/writing (availability; if rejected here, that is by design).
+5. Transfer writer via delegation (Stage 1) to `bob`, and confirm **`bob` can continue writing**.
 
-**判定**
+**Criteria**
 
-- 3 で「断られる」または「待つ」が出て、**衝突コピーが出ない**なら設計は成功。
-- 衝突コピーが出たら、書き込み境界が破れている。**段階 2 に戻る**。
+- If step 3 yields "rejected" or "waits" with **0 conflict copies**, the design succeeds.
+- If conflict copies appear, write boundaries are broken. **Return to Stage 2.**
 
-**結果（2026-11-11、Mac ↔ Pi5 の実機）**
+**Results (2026-11-11, Mac ↔ Pi5 Real Devices)**
 
-- ハーネス: `bench/e2e_lan.py`、生データ: `bench/results/20261111-200812-e2e-lan.json`
-- 詳細: `specs/e2e_lan.md`
-- L2（HTTP 9440）と L3（TLS 1.3、9443）が LAN 越しに動いた。RTT 平均 2.25ms。
-- Mac push → Pi5 pull、Pi5 push → Mac pull の双方向で内容が SHA-256 まで一致した。
-- 同じ親版からの同時 push は、後着が `ConflictError` で拒否された。
-- 衝突コピーは 0 件。三方向マージは起きていない。
-- **未検証**: 高遅延（RTT 200ms）、3 台以上、長時間運用、LAN 越しの 2 OST。
+- Harness: `bench/e2e_lan.py`, raw data: `bench/results/20261111-200812-e2e-lan.json`
+- Details: `specs/e2e_lan.md`
+- L2 (HTTP 9440) and L3 (TLS 1.3, 9443) ran over LAN. Average RTT 2.25ms.
+- Bidirectional Mac push → Pi5 pull and Pi5 push → Mac pull matched down to SHA-256.
+- Concurrent pushes from the same parent version had the later one rejected with `ConflictError`.
+- 0 conflict copies. No three-way merge occurred.
+- **Unverified**: High latency (RTT 200ms), 3+ machines, long-running operation, 2 OSTs over LAN.
 
-**測るもの（最終）**
+**What to measure (Final)**
 
-| 指標 | 目標 |
+| Metric | Target |
 |---|---|
-| 片方で書いてから、他方で読めるまでの時間 | LAN で 1 秒以内 |
-| 1 版あたりの転送量 | 変わった部分木の大きさの 2 倍以内 |
-| 同時書き込み時の挙動 | 待つか断る（衝突コピー 0 件） |
-| ノード 1 つ停止時の読み書き | 可用性が要るなら続く。要らないなら断る（設計どおり） |
-| 委譲後の書き込み主体 | 新しい書き手が続けられる |
+| Time from write on one side to readable on the other | Within 1 second on LAN |
+| Transfer volume per version | Within 2× size of changed subtree |
+| Behavior on concurrent writes | Wait or reject (0 conflict copies) |
+| Read/write with 1 node down | Continues if availability required; rejects if not (by design) |
+| Writer identity after delegation | New writer can continue |
 
 ---
 
-## 段階の順序と、やらないこと
+## Stage Order and Non-Goals
 
 ```text
-段階 0 (L5 確認)       → 段階 1 (L1 仕様)     ← ここが要。コードなし
-                      → 段階 2 (L4 実装)     ← 単一書き手。evil の B6/B7 を移す
-                      → 段階 3 (L2 比較)     ← 表を作る
-                      → 段階 4 (L3 流用)     ← 既存を使う
-                      → 段階 5 (2 台で統合)
+Stage 0 (L5 check)     → Stage 1 (L1 spec)     ← Crucial. No code
+                       → Stage 2 (L4 impl)     ← Single writer. Port evil B6/B7
+                       → Stage 3 (L2 compare)  ← Build table
+                       → Stage 4 (L3 reuse)    ← Use existing
+                       → Stage 5 (2-node integration)
 ```
 
-**やらないこと（`DESIGN.md` §8 と同じ）**
+**Non-Goals (Same as `DESIGN.md` §8)**
 
-- 全域三方向マージ
-- 全域での POSIX 一貫性
-- 独自の DHT・独自のピア交換
-- 遠隔からの巻き戻し
-- 双方向の自動同期
-- 匿名性をデータ平面に持ち込むこと
+- Global three-way merge
+- Global POSIX consistency
+- Custom DHT / custom peer exchange
+- Remote rollback
+- Automatic bidirectional sync
+- Bringing anonymity into the data plane
 
-## 各段階で「やめる」判断
+## "Stop" Criteria per Stage
 
-| 段階 | やめる条件 | やめたときの対処 |
+| Stage | Stop Condition | Mitigation When Stopped |
 |---|---|---|
-| 0 | clayfs に改造が必要になる | 改造せず、外側で吸収する |
-| 1 | 偽の委譲を拒否できない | L1 の設計をやり直す（全体を止める） |
-| 2 | 単一書き手が守れない | 部分木の粒度を上げる。それでもだめなら設計の見直し |
-| 3 | 高遅延で往復 3 回以上 | キャッシュの設計を先に決める |
-| 4 | libtorrent が必要になる | **ここで止めて、匿名性の議論に戻る** |
-| 5 | 衝突コピーが出る | 段階 2 に戻る |
+| 0 | `clayfs` requires modification | Do not modify; absorb externally |
+| 1 | Cannot reject forged delegation | Redesign L1 (halt everything) |
+| 2 | Single-writer cannot be enforced | Increase subtree granularity; if still failing, revisit design |
+| 3 | ≥ 3 round trips under high latency | Design caching first |
+| 4 | libtorrent becomes necessary | **Stop here and return to the anonymity discussion** |
+| 5 | Conflict copies appear | Return to Stage 2 |
 
-## 未解決の問い（`DESIGN.md` §10 からの引き継ぎ）
+## Open Questions (Carried Over from `DESIGN.md` §10)
 
-段階を進める中で答える。**先に答えを決めない。**
+Answer as stages progress. **Do not decide answers beforehand.**
 
-1. L1 を DNSSEC に乗せられるか → **段階 1 で答える**
-2. 書き込み境界の「境界」を誰が決めるか → **段階 1 と 2 で答える**
-3. L2 のロケータをどこに置くか → **段階 3 で答える**
-4. 単一書き手の排他（同一人物の複数端末） → **段階 2 と 5 で答える**
-5. 内容アドレッシングと暗号化の両立 → **段階 4 で答える**
-6. clayfs をそのまま使うか → **段階 0 で答える**
-7. 経済・モデレーション・初回接触を範囲外でよいか → **段階 5 の後で答える**
+1. Can L1 ride on DNSSEC? → **Answer in Stage 1**
+2. Who decides write boundary borders? → **Answer in Stages 1 & 2**
+3. Where should L2 locators live? → **Answer in Stage 3**
+4. Single-writer exclusion (multiple devices of same user) → **Answer in Stages 2 & 5**
+5. Reconciling content addressing and encryption → **Answer in Stage 4**
+6. Use `clayfs` as-is? → **Answer in Stage 0**
+7. Keep economics, moderation, first contact out of scope? → **Answer after Stage 5**

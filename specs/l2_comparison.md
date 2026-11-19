@@ -1,202 +1,180 @@
-# L2 所在地解決 方式比較と仕様（`specs/l2_comparison.md`）
+# L2 Location Resolution Comparison and Specification (`specs/l2_comparison.md`)
 
-## 0. 目的と位置づけ
+> **English** | [日本語](l2_comparison.ja.md)
 
-本文書は `dfs` の段階 3（L2: 所在地解決 — 名前から住所へ）の比較結果と仕様を記録する。
-`DESIGN.md` §10 の問い 3「ロケータをどこに置くか」に答える。
+## 0. Purpose and Scope
 
-結論を先に書く。
+This document records the comparison results and specification for Phase 3 of `dfs` (L2: Location Resolution — from name to address).
+It answers Question 3 of `DESIGN.md` §10: "Where should locators be placed?"
 
-> **初期実装は (a) 名簿方式とする。** 高遅延条件でも 2 往復以内に収まり、
-> ロケータと先頭版を 1 往復で返せる。DHT はノード数に対して経路長が伸び、
-> 高遅延条件で 3 往復を超えるため、初期実装には採用しない。
-> DNS は既存基盤を使えるが、検閲と TTL の制約を受ける。
+The conclusion first:
+
+> **The initial implementation uses (a) the Registry approach.** Even under high latency, it fits within 2 round trips and can return both the locator and head version in 1 round trip. DHT path lengths grow with node count and exceed 3 round trips under high latency, so it is not adopted for the initial implementation. DNS can reuse existing infrastructure, but is subject to censorship and TTL constraints.
 
 ---
 
-## 1. 共通データ形式：署名付きロケータ
+## 1. Common Data Format: Signed Locator
 
-L2 がどのバックエンド（名簿 / DHT / DNS）で実装されていても、やり取りされるデータ構造は
-単一の正規化 JSON ペイロードと OpenSSH Ed25519 分離署名の組に統一する。
-実装は `dfs/l2_registry.py` の `create_locator_envelope` / `verify_locator_envelope`。
+Regardless of which backend (Registry / DHT / DNS) implements L2, the exchanged data structure is standardized as a pair of a single canonical JSON payload and an OpenSSH Ed25519 detached signature.
+Implemented in `create_locator_envelope` / `verify_locator_envelope` in `dfs/l2_registry.py`.
 
-### 1.1 ペイロード（署名対象）
+### 1.1 Payload (Signed Data)
 
-キーを辞書順にソートし、余白を含まない 1 行の UTF-8 JSON（`dfs.crypto.canonical_json()`、末尾 LF 1 バイト）とする。
+A single-line UTF-8 JSON object with keys sorted lexicographically and no extra whitespace (`dfs.crypto.canonical_json()`, trailing 1-byte LF).
 
 ```json
 {"delegation_epoch":1,"endpoints":["tls://198.51.100.50:9443"],"expires_at":1763086400,"head_hash":"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9","head_version":2,"path":"/example.com/alice","ttl":300}
 ```
 
-| フィールド | 意味 |
+| Field | Meaning |
 |---|---|
-| `path` | 対象の部分木。`normalize_path` 済みであること。 |
-| `endpoints` | データ所在地の候補（`tls://host:port`）。順序は優先順位。 |
-| `head_version` / `head_hash` | この時点の L4 先頭版。解決結果に先頭版を含めることで、L2 の 1 往復と L4 の照合を分離できる。 |
-| `delegation_epoch` | L1 のエポック。古いエポックのロケータを拒否する材料になる。 |
-| `expires_at` / `ttl` | 署名付き有効期限とキャッシュ用の推奨 TTL。`ttl` は `expires_at` を超えない。 |
+| `path` | Target subtree. Must be `normalize_path`-normalized. |
+| `endpoints` | Candidate data locations (`tls://host:port`), ordered by priority. |
+| `head_version` / `head_hash` | L4 head version at this point. Including the head version in the resolution result decouples the 1-RT L2 lookup from L4 verification. |
+| `delegation_epoch` | L1 epoch. Used to reject locators from stale epochs. |
+| `expires_at` / `ttl` | Signed expiration time and recommended cache TTL. `ttl` does not exceed `expires_at`. |
 
-**重要な区別**: `ttl` はキャッシュの助言であり、**署名付きの `expires_at` が権威**である。
-キャッシュが TTL 内でも、`expires_at` を過ぎたロケータは拒否する。
+**Important distinction**: `ttl` is a caching hint, whereas **the signed `expires_at` is authoritative**.
+Even if a cached entry is within its `ttl`, a locator past `expires_at` is rejected.
 
-### 1.2 エンベロープ
+### 1.2 Envelope
 
 ```json
 {"payload":{...上記...},"signature":"-----BEGIN SSH SIGNATURE-----\n...\n-----END SSH SIGNATURE-----\n"}
 ```
 
-署名の名前空間は `dfs-l2-locator-v1`。L1（`dfs-delegation-v1`）や L4 と混同できないよう、
-名前空間を必ず含める。
+The signature namespace is `dfs-l2-locator-v1`. Always include the namespace so it cannot be confused with L1 (`dfs-delegation-v1`) or L4 signatures.
 
 ---
 
-## 2. 3 方式の比較
+## 2. Comparison of the 3 Approaches
 
-### 2.1 測定条件
+### 2.1 Measurement Conditions
 
-| 項目 | 内容 |
+| Item | Details |
 |---|---|
-| ハーネス | `bench/l2_bench.py`（同じ指標を同じ手順で測る） |
-| 生データ | `bench/results/20261111-195032-local.json` |
-| 環境 | macOS-27.3-arm64、Python 3.12 |
-| 名簿 | `DirectoryRegistryService.resolve()` を 2,000 回、プロセス内 |
-| 署名検証 | `verify_locator_envelope` を 100 回（`ssh-keygen -Y verify` の起動を含む） |
-| DNS | `dig +short +time=2 +tries=1 example.com A` を 10 回、ローカルリゾルバ経由 |
-| DHT | 実装がないため Kademlia の経路長モデル `ceil(log2(N)/alpha)`（alpha=3）で見積もる |
+| Harness | `bench/l2_bench.py` (measures the same metrics with the same procedure) |
+| Raw data | `bench/results/20261111-195032-local.json` |
+| Environment | macOS-27.3-arm64, Python 3.12 |
+| Registry | `DirectoryRegistryService.resolve()` 2,000 times, in-process |
+| Signature verification | `verify_locator_envelope` 100 times (including `ssh-keygen -Y verify` process spawns) |
+| DNS | `dig +short +time=2 +tries=1 example.com A` 10 times via local resolver |
+| DHT | No implementation; estimated via Kademlia path-length model `ceil(log2(N)/alpha)` (`alpha=3`) |
 
-**この数値はローカル条件の参考値である。** LAN 実機や RTT 200ms の条件は §2.4 で推定として扱い、
-実測が必要なら同じハーネスをその環境で再実行する。
+**These numbers are reference values under local conditions.** LAN hardware and 200ms RTT conditions are treated as estimates in §2.4; if actual measurements are needed, re-run the same harness in that environment.
 
-### 2.2 往復回数（プロトコル上の段数）
+### 2.2 Round Trips (Protocol Hops)
 
-| 方式 | 解決に必要な往復 | 先頭版の取得 | 合計 |
+| Approach | Round trips for resolution | Head version fetch | Total |
 |---|---|---|---|
-| **(a) 名簿** | 1（`resolve` がロケータと先頭版を同時に返す） | 同上 | **1** |
-| **(b) DHT** | `ceil(log2(N)/alpha)`（α=3） | 通常 1 | **4〜7** |
-| **(c) DNS** | 1（TXT 問い合わせ） | **別途 1**（L4 から） | **2** |
+| **(a) Registry** | 1 (`resolve` returns locator and head version together) | Same | **1** |
+| **(b) DHT** | `ceil(log2(N)/alpha)` (α=3) | Typically 1 | **4–7** |
+| **(c) DNS** | 1 (TXT query) | **Separate 1** (from L4) | **2** |
 
-DHT の見積もり（`bench/results/20261111-195032-local.json` の `dht.model`）:
+DHT estimates (`dht.model` in `bench/results/20261111-195032-local.json`):
 
-| ノード数 | 期待ホップ | 直列段数（α=3） |
+| Node count | Expected hops | Serial steps (α=3) |
 |---|---|---|
 | 100 | 6.64 | 3 |
 | 1,000 | 9.97 | 4 |
 | 10,000 | 13.29 | 5 |
 | 1,000,000 | 19.93 | 7 |
 
-### 2.3 ローカル実測
+### 2.3 Local Measurements
 
-| 方式 | 実測値 | 備考 |
+| Approach | Measured value | Notes |
 |---|---|---|
-| 名簿 `resolve` | 中央値 **0.0005 ms**（p95 0.0005） | プロセス内辞書引き。ネットワーク往復を含まない |
-| ロケータ署名検証 | 中央値 **7.35 ms**（p95 9.13） | `ssh-keygen -Y verify` のプロセス起動を含む |
-| DNS 問い合わせ | 中央値 **13.62 ms**（p95 15.91） | ローカルリゾルバ、キャッシュヒット時 |
+| Registry `resolve` | Median **0.0005 ms** (p95 0.0005) | In-process dict lookup. Excludes network round trips |
+| Locator signature verification | Median **7.35 ms** (p95 9.13) | Includes `ssh-keygen -Y verify` process spawn |
+| DNS query | Median **13.62 ms** (p95 15.91) | Local resolver, cache hit |
 
-署名検証の 7ms は**解決の往復そのものではなくローカル CPU コスト**である。
-1 応答あたりロケータが 1 つなら 1 回で済むが、数が増えると支配的になる。
+The 7ms for signature verification is **local CPU cost, not a resolution round trip**.
+With 1 locator per response it happens once, but becomes dominant as the count grows.
 
-### 2.4 高遅延条件（RTT 200ms）の推定
+### 2.4 High-Latency Estimate (RTT 200ms)
 
-`bench/results/20261111-195032-local.json` の `high_latency_estimate_ms` は、
-往復回数×RTT の単純計算である。署名検証のローカル CPU コストは別に加算される。
+`high_latency_estimate_ms` in `bench/results/20261111-195032-local.json` is a simple `round_trips * RTT` calculation. Local CPU cost for signature verification is added separately.
 
-| 方式 | 往復 | 推定所要時間 | 判定 |
+| Approach | Round trips | Estimated time | Verdict |
 |---|---|---|---|
-| **(a) 名簿** | 1 | **200 ms** + 検証 7ms | **合格**（2 往復以内） |
-| **(b) DHT（1,000 ノード）** | 4 | **800 ms** | **不合格**（キャッシュが必須） |
-| **(b) DHT（10,000 ノード）** | 5 | **1,000 ms** | **不合格** |
-| **(c) DNS** | 2 | **400 ms** | 閾値ちょうど。高遅延では余裕がない |
+| **(a) Registry** | 1 | **200 ms** + 7ms verify | **Pass** (within 2 round trips) |
+| **(b) DHT (1,000 nodes)** | 4 | **800 ms** | **Fail** (caching mandatory) |
+| **(b) DHT (10,000 nodes)** | 5 | **1,000 ms** | **Fail** |
+| **(c) DNS** | 2 | **400 ms** | Right on the threshold; no margin under high latency |
 
-DNS の 2 往復は、TXT の取得と L4 先頭版の取得を別に行うためである。
-DNS レコード自体に先頭版を含めれば 1 往復にできるが、更新のたびに DNS を書き換えることになり、
-TTL の間は古い版が見える。
+DNS takes 2 round trips because fetching TXT and fetching the L4 head version are separate.
+Embedding the head version in the DNS record itself could make it 1 round trip, but would require rewriting DNS on every update, and stale versions would be visible during the TTL.
 
-### 2.5 障害時の挙動
+### 2.5 Behavior Under Failure
 
-| 方式 | ノード 1 つ停止 | 中央 1 つ潰し |
+| Approach | 1 node down | Central node down |
 |---|---|---|
-| (a) 名簿 | **全停止**（単一障害点） | 全停止 |
-| (b) DHT | 継続（冗長化されていれば） | 影響限定 |
-| (c) DNS | リゾルバ次第 | ドメインの権威次第 |
+| (a) Registry | **Total outage** (single point of failure) | Total outage |
+| (b) DHT | Continues (if replicated) | Limited impact |
+| (c) DNS | Depends on resolver | Depends on domain authority |
 
-**これは (a) の弱点である。** 名簿が落ちると解決できない。`PLAN.md` 段階 5 の判定でも
-「可用性が要るなら続く。要らないなら断る（設計どおり）」として扱う。
+**This is the weakness of (a).** If the registry goes down, resolution fails. Even in `PLAN.md` Phase 5 evaluation, this is treated as "if availability is needed, follow up; if not, fail cleanly (as designed)."
 
-**現状（2026-11-12）**: L2 の複数名簿フォールバックと、主から複製名簿への署名済み
-バンドル複製を実装した。さらに、主 OST のチャンクを読み取り専用の複製 OST へコピーし、
-locator に複数 endpoint を持たせるようにした。主名簿と主 OST の片方が停止しても、
-代替名簿と複製 OST が生きていれば読み取りは継続できる。書き込みは主名簿・主 OST で
-完結する単一書き手のまま。
+**Current status (2026-11-12)**: Multi-registry fallback in L2 and signed bundle replication from primary to replica registries are implemented. Furthermore, primary OST chunks are copied to read-only replica OSTs, and locators carry multiple endpoints. Even if either the primary registry or primary OST goes down, reads can continue as long as an alternate registry and replica OST are alive. Writes remain single-writer, handled by the primary registry and primary OST.
 
-- 名簿を信頼しなくてよい検証を実装した（root アンカーによる委譲チェーンの検証）。
-  名簿が偽の委譲を返しても拒否する（`specs/delegation.md` §3.5）。
-- これは「名簿を複数立てて、どれから読んでもよい」ための前提である。どの名簿の答えでも
-  root 公開鍵で検証できるので、名簿の選択が安全になる。
+- Implemented registry-untrusted verification (verifying delegation chains against the root anchor). Even if a registry returns a forged delegation, it is rejected (`specs/delegation.md` §3.5).
+- This is a prerequisite for "running multiple registries and reading from any of them." Because any registry's answer can be verified with the root public key, selecting any registry is safe.
 
-**実装済み A（読み取りの可用性）**: リモート定義で名簿を複数持ち、`resolve` / `paths` /
-`ost` を順に試す。書き込み（`announce`）は 1 つの「主」に送り、主が落ちたら失敗させる
-（昇格は B で扱う）。主は署名済みの委譲チェーン・ログ・ロケータを複製名簿へ送る。
-詳細は `TODO.md` と `tests/test_availability.py`。
+**Implemented A (Read availability)**: Configure multiple registries in the remote definition and try `resolve` / `paths` / `ost` in order. Writes (`announce`) are sent to a single "primary" and fail if the primary is down (promotion is handled in B). The primary pushes signed delegation chains, logs, and locators to replica registries.
+See `TODO.md` and `tests/test_availability.py` for details.
 
-## 3. 採用する方式と、後から DHT を足す形
+## 3. Chosen Approach and Path for Adding DHT Later
 
-### 3.1 採用: 名簿方式
+### 3.1 Chosen: Registry Approach
 
-- 解決は 1 往復。ロケータと先頭版を同時に返す（`resolve` の戻り値は 3 つ組）。
-- 応答は署名済みで、名簿自体を信頼しなくても検証できる。
-- 名簿が落ちれば解決できないが、初期の私的クラスタでは許容する。
+- Resolution is 1 round trip. Returns locator and head version together (`resolve` returns a 3-tuple).
+- Responses are signed and can be verified without trusting the registry itself.
+- Resolution fails if the registry goes down, which is acceptable for initial private clusters.
 
-### 3.2 後から DHT を足すための境界
+### 3.2 Boundary for Adding DHT Later
 
-`PLAN.md` の判断どおり、**エンドポイントの解決と先頭版の取得を分ける**。
+As decided in `PLAN.md`, **separate endpoint resolution from head version retrieval**:
 
 ```text
 resolve(path) -> { locator_envelope, head_log_envelope }
 ```
 
-- `locator_envelope` は「どのエンドポイントに置かれているか」だけを持つ。
-- `head_log_envelope` は「そのエンドポイントから取得した L4 先頭版」を持つ。
-- 名簿では両方を 1 往復で返せるが、DHT ではロケータだけを DHT から引き、
-  先頭版はエンドポイントへ直接問い合わせる 2 段になる。
-- したがって実装は、**戻り値の型を最初から分けておく**。1 往復実装が 2 往復実装を
-  特別扱いせずに差し替えられるようにする。
+- `locator_envelope` holds only "which endpoints hold the data."
+- `head_log_envelope` holds "the L4 head version retrieved from that endpoint."
+- While a registry returns both in 1 round trip, DHT requires 2 steps: fetch only the locator from the DHT, then query the endpoint directly for the head version.
+- Therefore, the implementation **keeps the return types separated from the start**, so a 1-RT implementation can be swapped for a 2-RT implementation without special-casing.
 
-### 3.3 読み取りキャッシュ（実装済み）
+### 3.3 Read Cache (Implemented)
 
-registry がすべて停止しても読み取りを継続できるよう、リモートの
-`.clayfs/l2_cache.json` に検証済みの応答を保存する。
+To continue reads even if all registries go down, verified responses are saved in the remote's `.clayfs/l2_cache.json`.
 
-- 保存単位は `path -> (delegation, locator, head_log)`
-- 保存するのは L4 が委譲チェーン・head 署名・ロケータ署名を検証した応答だけ
-- 全 registry が到達不能なときだけフォールバックする
-- 読み出し時にもロケータの `expires_at` と委譲の有効期限を確認する
-- `local_head.json` より古い版は、キャッシュから読んでも B6 として拒否する
+- Storage unit: `path -> (delegation, locator, head_log)`
+- Only responses whose delegation chain, head signature, and locator signature were verified by L4 are stored
+- Used as a fallback only when all registries are unreachable
+- On read, the locator's `expires_at` and delegation expiration are still checked
+- Versions older than `local_head.json` are rejected as B6 even when read from cache
 
-更新は online の `resolve` が成功したとき、または push 後の B7 照合が成功したときに行う。
-無変更の解決を繰り返してもキャッシュの更新だけで、L2 への往復は増えない。
+Updates occur when an online `resolve` succeeds or when post-push B7 verification succeeds.
+Repeatedly resolving unchanged paths only updates the cache and does not add L2 round trips.
 
 ---
 
-## 4. 実装状況と残課題
+## 4. Implementation Status and Remaining Work
 
-| 項目 | 状態 |
+| Item | Status |
 |---|---|
-| 署名付きロケータ形式 | 実装済み（`l2_registry.py`） |
-| 名簿方式の `resolve`（1 往復） | 実装済み |
-| 先頭版 CAS（`announce_and_append`） | 実装済み |
-| DHT 実装 | **未実装**（初期版では不要と判断） |
-| DNS 方式 | **未実装**（検閲と TTL のため採用しない） |
-| キャッシュ | 実装済み（`.clayfs/l2_cache.json`、全 registry 停止時の読み取りフォールバック） |
-| 計測ハーネス | 実装済み（`bench/l2_bench.py`） |
-| 生データ | `bench/results/20261111-195032-local.json` |
+| Signed locator format | Implemented (`l2_registry.py`) |
+| Registry `resolve` (1 round trip) | Implemented |
+| Head version CAS (`announce_and_append`) | Implemented |
+| DHT implementation | **Not implemented** (deemed unnecessary for initial release) |
+| DNS approach | **Not implemented** (not adopted due to censorship and TTL) |
+| Cache | Implemented (`.clayfs/l2_cache.json`, read fallback when all registries are down) |
+| Benchmark harness | Implemented (`bench/l2_bench.py`) |
+| Raw data | `bench/results/20261111-195032-local.json` |
 
-**残課題（優先順）**:
+**Remaining work (by priority)**:
 
-1. **読み取りの可用性（A、L2 / OST 実装済み）**: 名簿を複数持ち、OST も複製する。
-   全ノードが同じ root 公開鍵を持つので、どの答えでも検証できる。
-2. **書き込みの複製と昇格（B）**: 主従で複製し、主が落ちたら従を昇格させる。「主はどれか」
-   は固定設定とし、secondary の手動昇格と role epoch による fencing を実装した。
-   自動選挙・quorum・lease は未実装。
-3. **合意形成（C、当面やらない）**: 単一書き手なので同時に書くのは 1 人。B で足りることが
-   多く、C は過剰になりやすい。
-4. **DNS/DHT へのフォールバック**: 大規模運用のとき（`TODO.md` の方針を参照）。
+1. **Read availability (A, L2 / OST implemented)**: Run multiple registries and replicate OSTs. Since all nodes hold the same root public key, any answer can be verified.
+2. **Write replication and promotion (B)**: Replicate primary-to-secondary and promote secondary if primary fails. "Which is primary" is statically configured; manual secondary promotion and fencing via `role_epoch` are implemented. Automatic election, quorum, and leases are not yet implemented.
+3. **Consensus (C, deferred for now)**: Single-writer means only one writer writes at a time. B is usually sufficient and C tends to be overkill.
+4. **Fallback to DNS/DHT**: For large-scale deployments (see `TODO.md` policy).

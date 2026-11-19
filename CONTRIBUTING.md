@@ -1,35 +1,37 @@
-# コントリビューション
+# Contributing
 
-バグ報告、再現手順、ドキュメント修正、テスト追加、互換性を保つ小さな修正を歓迎します。
+> **English** | [日本語](CONTRIBUTING.ja.md)
 
-## 最初に
+Bug reports, reproduction steps, documentation fixes, additional tests, and small backward-compatible fixes are welcome.
 
-- セキュリティ問題は公開Issueに書かず、[SECURITY.md](SECURITY.md) の連絡先へ送ってください。
-- 大きな設計変更、プロトコル変更、暗号方式の変更は、実装前にIssueで目的と互換性方針を共有してください。
-- 小さなバグ修正やドキュメント修正は、そのままPull Requestを送って構いません。
+## Getting Started
 
-## 開発環境
+- Do not report security issues in public issues; send them to the contact address in [SECURITY.md](SECURITY.md).
+- For major design, protocol, or cryptographic changes, please open an issue first to share the goal and compatibility plan before implementing.
+- For small bug fixes or documentation updates, feel free to submit a Pull Request directly.
 
-Python 3.11以上と `uv` を利用します。
+## Development Environment
+
+Python 3.11 or later and `uv` are used.
 
 ```bash
 uv sync --extra test
 uv run --extra test pytest -q
 ```
 
-変更内容に応じて、macOS、Linux、Windows固有の処理も確認してください。
+Depending on your changes, please also check macOS-, Linux-, and Windows-specific behavior.
 
-## Pull Requestの条件
+## Pull Request Requirements
 
-- 既存のテストを壊さない
-- バグ修正には再現テストを追加する
-- 暗号、署名、委譲、ログ、archive形式を変更する場合は、互換性と移行方法を説明する
-- 秘密鍵、`tree_secret`、実ユーザーの設定ファイルをコミットしない
-- 公開するログやfixtureは、合成データまたは予約済みの例示用ドメイン・IPにする
-- 生成物や依存更新が意図した範囲に限定されていることを確認する
+- Do not break existing tests
+- Add a regression test for bug fixes
+- If changing cryptography, signatures, delegation, logs, or archive formats, explain compatibility and migration paths
+- Never commit private keys, `tree_secret`, or real user configuration files
+- Ensure any published logs or fixtures use synthetic data or reserved example domains/IPs
+- Verify that generated artifacts and dependency updates are limited to the intended scope
 
-実装方針が複数あり、利用者への互換性影響が大きい場合は、コードより先に設計を議論します。
+When multiple implementation approaches exist and user-facing compatibility impact is significant, discuss the design before writing code.
 
-## ライセンス
+## License
 
-コントリビューションは、[MIT License](LICENSE) の下で提供されるものとします。
+Contributions are provided under the [MIT License](LICENSE).

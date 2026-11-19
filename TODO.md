@@ -1,436 +1,440 @@
-# dfs 再開用の状況メモ（`TODO.md`）
+# dfs Resumption Status Notes (`TODO.md`)
 
-この文書は **2026-11-12 時点**で作業を中断したときの記録である。再開する人は、
-まずここを読んで「どこまで動いていて、次に何をするか」を掴んでほしい。
+> **English** | [日本語](TODO.ja.md)
 
-- リポジトリ: `~/src/dfs`（`/Volumes/ExtSSD/src/dfs` へのシンボリックリンク）
-- 基準コミット: `1562f01 feat: add fuse-t mount support`
-- テスト: **160 件パス、1 件 skip**（`~/dfs-venv/bin/python -m pytest tests -q`）
-- 作業ツリー: 未コミット差分あり（checksum 形式、フォルダ圧縮、B3 チャンク）
+This document records the state of work when paused **as of 2026-11-12**. When
+resuming, read this first to grasp what is already working and what to do next.
 
----
-
-## 1. 今どうなっているか（動くもの）
-
-### 1.1 層の実装
-
-| 層 | 状態 | 実体 |
-|---|---|---|
-| L1 委譲 | 実装済み・検証済み | `l1_delegation.py`（5 不変条件、チェーン検証） |
-| L2 名簿 | 実装済み | `l2_registry.py`（署名付きロケータ、CAS 追記、root へチェーン復元） |
-| L3 データ平面 | 実装済み・WAN 計測済み | `l3_ost_adapter.py`（TLS/TCP、batch_has / put / get） |
-| L4 一貫性 | 実装済み・evil 試験済み | `l4_log.py`（追記ログ、Merkle 塊、HeadPin、B6/B7 防御） |
-| L5 実体化 | 実装済み | `l5_clayfs.py`（`dfs.fs` 経由のスナップショット連携） |
-| L5 CoW 抽象 | 実装済み | `dfs/fs/`（CoW があれば CoW、無ければ実コピー） |
-
-### 1.2 2 つの CLI
-
-| コマンド | 役割 | 実体 |
-|---|---|---|
-| `./dfscli` | ローカル CLI（rclone ライク）。`ls` / `cat` / `copy` / `sync` / `pull` / `rm` / `mkdir` など | `dfs/cli_main.py` |
-| `./dfssvc` | ローカルにサーバを立てる（空きポート 2 つ + 委譲まで自動） | `dfs/svc.py` |
-| `python -m dfs.cli` | サーバ側の生の操作（`serve` / `delegate` / `push` / `pull`） | `dfs/cli.py` |
-
-**注意**: 以前の名前は `dfsr` / `rclone_cli.py` だった。`122afcf` より前のメモや
-手順書にある `./dfsr` は `./dfscli` に読み替える。
-
-### 1.3 できること（実機で確認済み）
-
-- ローカルにサーバを立てて、ファイルを push / pull できる（Mac）
-- LAN（Mac ↔ Pi5）と WAN（Mac / Sakura / Scaleway の 3 拠点）で同期できる
-- 同一の親版からの同時 push を CAS で拒否する（衝突コピー 0 件）
-- 通信断でハングせず `ServiceUnavailableError` になる
-
-### 1.4 速さ（計測済み）
-
-| 場面 | 往復 | 根拠 |
-|---|---|---|
-| push | **1 往復**（チャンク数に依らない） | `specs/e2e_wan.md`、`specs/l3_data_plane.md` |
-| pull（平らな構造） | **2 往復**（根 1 + ファイル 1） | 同上。500 ファイルでもローカルで 2 往復 |
-| pull（入れ子） | 階層数 + 1 | 同上 |
-
-WAN（RTT 285ms、20 × 128KB）で push 4.3 秒 / pull 4.0 秒。batch 系の導入前は
-pull が 8.0 秒（21 往復）だった。
-
-2026-11-12 のローカル再測では、2.62MB の初回 copy が 52.5ms、無変更 copy が 16.9ms、
-128KiB read が 7.3ms。Ed25519 検証の in-process 化と DNSSEC ゾーン鍵キャッシュで
-短縮した。詳細は `specs/performance.md`。
-
-3 拠点（Mac / Sakura / Scaleway）の 2.62MB 試験では、2 複製込み push が 9.98 秒、
-primary 停止後の secondary pull が 0.82 秒、Sakura 停止後の Scaleway pull が
-4.15 秒で、全経路の内容が一致した。
+- Repository: `~/src/dfs` (symlink to `/Volumes/ExtSSD/src/dfs`)
+- Baseline commit: `1562f01 feat: add fuse-t mount support`
+- Tests: **160 passed, 1 skipped** (`~/dfs-venv/bin/python -m pytest tests -q`)
+- Working tree: uncommitted changes present (checksum format, folder compression, B3 chunks)
 
 ---
 
-## 2. 次にやること（優先順）
+## 1. Current State (What Works)
 
-### 2.1 実装済み: A（L2 読み取りの可用性）
+### 1.1 Layer Implementation
 
-2026-11-12 に、L2 名簿の読み取りフォールバックと主→複製を実装した。
-
-- `Remote.registry_alternates` に代替名簿を持てる
-- 読み取りは主 → 代替の順に試し、書き込みは主だけに送る
-- `dfs serve --replica` / `dfssvc start --replica` で、主から署名済みバンドルを複製する
-- 複製側は root アンカー・委譲チェーン・L4 署名・CAS を再検証し、古いバンドルで巻き戻さない
-- 回帰試験: `tests/test_availability.py`
-
-**OST 複製**: 主 OST のチャンクを読み取り専用の複製 OST へコピーし、locator に
-複数 endpoint を持たせる実装を追加した。主 OST が停止しても、複製 OST が生きていれば
-`pull` / `cat` は継続できる。スプールは採用せず、書き込みは主 OST で完結させる。
-詳細は `specs/ost-replica.md`。
-
-**なぜ**: L2 名簿が落ちると**全停止**する（単一障害点）。`specs/l2_comparison.md` §2.5。
-`ls` / `cat` / `pull` が名簿に届かないだけで止まる。
-
-**前提は整っている**: `122afcf` で「名簿を信頼しない検証」を実装した。名簿が偽の委譲を
-返しても拒否する（root アンカーからチェーンを検証）。だから**名簿を複数立てても、どの
-答えでも安全**に扱える。
-
-**やること**:
-
-1. リモート定義で名簿を複数持てるようにする。案: `registry` を配列にする、または
-   `registry` + `registry_alternates` を持つ。
-2. `resolve` / `paths` / `ost` を**順に試し、最初に読めたものを使う**。全応答は root 公開鍵で
-   検証するので、どの名簿の答えでもよい。
-3. 書き込み（`announce`）は 1 つの「主」に送る。主が落ちたら失敗させる（昇格は B）。
-4. 試験: 名簿を 2 つ立て、片方を止めても `ls` / `cat` / `pull` が続くこと。
-   `dfssvc` を別ポートで 2 つ立てれば、1 台で試せる（下の §4 参照）。
-
-**設計上の注意**:
-
-- root 公開鍵は**名簿から取って信頼してはいけない**（`specs/delegation.md` §3.5.1）。
-  初回だけ TOFU で取り、以降は手元の記録（`remotes.json` の `root_pubkey`）を使う。
-- 名簿の選択で「どれが正しいか」を比べる必要はない。署名で検証できるため。
-
-### 2.2 B（書き込みの複製と昇格）
-
-primary/secondary の role と role epoch、secondary の書き込み拒否、手動昇格を
-実装した。旧 primary を停止してから secondary の state を昇格し、writer の
-`role_epoch` を更新する。詳細は `specs/promotion.md`。
-
-自動選挙・quorum・lease は持たない。旧 primary を停止せずに両方を primary にすると
-split-brain になるため、強固な自動昇格が必要なら lease / 合意形成を追加する。
-C（合意形成）は当面やらない。
-
-### 2.3 CLI の追加（使い勝手）
-
-2026-11-12 に、次の CLI 機能を実装した。
-
-| コマンド | 内容 | 状態 |
+| Layer | Status | Implementation |
 |---|---|---|
-| `mv` | 同一リモート内の移動・改名を 1 版で行う。既存宛先は拒否し、ファイル同士だけ `--overwrite` 可 | 実装済み |
-| `--exclude` / `--include` | `copy` / `sync` / `pull` の相対パスフィルタ。`sync --delete` はフィルタ外を消さない | 実装済み |
-| `lsd` | 直下のディレクトリだけを一覧する | 実装済み |
-| `import_tar` | `.tar` / `.tar.gz` / `.tar.xz` / `.tar.bz2` を安全に 1 版でインポートする | 実装済み |
-| `mount` | fuse-t / fusepy でリモートをローカルにマウントする | 実装済み |
-| `--checksum` | `size` / `crc32` / `sha1` / `plain_id` の変更検出 | 実装済み |
-| フォルダ圧縮 | `user.dfs.compression` xattr と `DFSB3` codec ヘッダー | 実装済み |
+| L1 Delegation | Implemented & verified | `l1_delegation.py` (5 invariants, chain verification) |
+| L2 Registry | Implemented | `l2_registry.py` (signed locators, CAS append, chain restoration to root) |
+| L3 Data Plane | Implemented & WAN-measured | `l3_ost_adapter.py` (TLS/TCP, batch_has / put / get) |
+| L4 Consistency | Implemented & evil-tested | `l4_log.py` (append-only log, Merkle chunks, HeadPin, B6/B7 defenses) |
+| L5 Materialization | Implemented | `l5_clayfs.py` (snapshot integration via `dfs.fs`) |
+| L5 CoW Abstraction | Implemented | `dfs/fs/` (uses CoW when available, falls back to real copy) |
 
-書き手の内容アドレス索引は `.clayfs/ost_index.json` に永続化する。tree_secret が
-変わると `address_key` が一致しなくなるため、古い索引は自動的に無効化される。
+### 1.2 Two CLIs
 
-`mv` は宛先を新しい名前そのものとして扱う（既存ディレクトリへの自動格納や merge はしない）。
-詳細は `specs/cli.md` §3.2.1〜3.2.2。
-
-### 2.4 配置（完成時）
-
-`pyproject.toml` を追加し、pip / pipx で配布できるようにした。
-
-- console scripts: `dfscli = dfs.cli_main:main`、`dfssvc = dfs.svc:main`
-- 必須依存: `cryptography` / `dnspython`
-- optional extra: `libp2p`
-- `pip install --no-deps --target ... .` で wheel を作り、両エントリポイントの起動を確認済み
-- リポジトリ直下のシェルラッパーは開発用の互換入口として残す
-
-現在の Mac の OST は `/Volumes/ExtSSD/dfs/ost/` 配下に置き、各 state dir の
-`ost_chunks` はそこへの symlink にしている。新規サービスは
-`dfssvc start --ost-dir ...`、直接起動は `dfs serve --ost-dir ...` で指定できる。
-
-### 2.5 root アンカーの配布（大規模運用のとき）
-
-DNSSEC の `_dfs.<domain>` TXT から root 公開鍵と registry 一覧を取得する方式を
-実装した。`dfscli discover <domain>` と `config create --dnssec-domain <domain>` で使う。
-
-DNSSEC は **root 鍵と初期 registry 一覧の配布**に限定し、L4 head や primary 昇格の
-判断には使わない。primary / secondary は DNSSEC レコードまたは静的設定で決め、
-「最初に起動したサーバを root にする」方式は採用しない。
-
-詳細は `specs/dnssec.md`。クライアント側で root trust anchor から DNSKEY/DS
-チェーンを検証し、TXT の RRSIG を確認する。AD ビットは `validate=False` の
-旧互換経路だけで使う。
-
-### 2.5.1 BitTorrent archive（MVP 実装済み）
-
-現在の先頭版を、署名済みメタデータ + 全 chunk + `.torrent` として保存する
-`archive create` を実装した。BitTorrent はホットパスではなく、過去版の長期保存・
-最終復旧用とする。`archive verify` と `archive extract` も利用できる。
-
-署名済みarchive descriptorのL2公開、複製名簿への伝播、`archive fetch` を追加した。
-`fetch` は外部 `aria2c` / `transmission-cli` のDHT/trackerで取得し、取得後に
-descriptorのL4束縛、bundle署名、chunk hashを再検証する。通常の `--registry` 設定だけで
-動作し、DNSSECは必須ではない。
-
-詳細は `specs/bittorrent.md`。v1 torrent の SHA-1 は transport 用で、chunk の
-真正性は DFS の SHA-256 で検証する。BitTorrent v2、L4 への archive descriptor
-統合、erasure coding は未実装。
-
-### 2.5.2 libp2p/QUIC chunk source（実験実装）
-
-libp2p を OST の追加 ChunkSource として実装した。最初の TCP 試作は別プロセス間で
-カスタムストリームが動かなかったが、`enable_quic=True` と
-`/ip4/.../udp/.../quic-v1` では動作することを確認した。
-
-`dfscli libp2p-serve` で chunk ディレクトリを QUIC 配布し、クライアントは
-`--libp2p-peer` で読み取り候補に追加する。書き込みは従来の主 OST のまま。
-詳細は `specs/libp2p.md`。
-
-### 2.6 検証が足りていないもの
-
-| 項目 | 状況 | やり方 |
+| Command | Role | Implementation |
 |---|---|---|
-| 3 台以上の同時参加 | 自動試験と実機 3 拠点（Mac / Sakura / Scaleway）を実施済み | 1 台で複数起動（§4）。足りなければ Docker |
-| 長時間運用・連続 push/pull の劣化 | 未実施 | — |
-| WAN での 100 塊以上の実測 | 未実施 | 20 ファイルのみ。ローカルで 500 は確認 |
-| 実効スループット | 未計測 | 所要時間とバイト数からの概算のみ |
-| 高遅延の追加注入（`tc qdisc`） | 未実施 | Scaleway の実測 285ms を代用 |
-| LAN 越しの 2 OST（ストライピング） | 未実施 | ローカル検証のみ（`TestL3Striping`） |
-| 1,000 塊以上の再計測 | 未実施 | — |
-| Pi5 での pytest | 未実施 | Mac のみ |
+| `./dfscli` | Local CLI (`rclone`-like). `ls` / `cat` / `copy` / `sync` / `pull` / `rm` / `mkdir`, etc. | `dfs/cli_main.py` |
+| `./dfssvc` | Spin up local servers (2 free ports + delegation automated) | `dfs/svc.py` |
+| `python -m dfs.cli` | Raw server-side operations (`serve` / `delegate` / `push` / `pull`) | `dfs/cli.py` |
 
-### 2.7 未実装（必要になったとき）
+**Note**: The previous names were `dfsr` / `rclone_cli.py`. Any `./dfsr` references in
+notes or runbooks prior to `122afcf` should be read as `./dfscli`.
 
-| 項目 | 状況 |
+### 1.3 Capabilities (Verified on Real Machines)
+
+- Spin up a local server and push / pull files (Mac)
+- Sync over LAN (Mac ↔ Pi5) and WAN (3 sites: Mac / Sakura / Scaleway)
+- Reject concurrent pushes from the same parent version via CAS (0 conflict copies)
+- Raise `ServiceUnavailableError` on network disconnection instead of hanging
+
+### 1.4 Speed (Measured)
+
+| Scenario | Round-trips | Reference |
+|---|---|---|
+| push | **1 round-trip** (independent of chunk count) | `specs/e2e_wan.md`, `specs/l3_data_plane.md` |
+| pull (flat structure) | **2 round-trips** (root 1 + files 1) | Same as above. 2 round-trips locally even for 500 files |
+| pull (nested) | depth + 1 | Same as above |
+
+Over WAN (RTT 285ms, 20 × 128KB), push took 4.3s / pull took 4.0s. Before batch
+operations were introduced, pull took 8.0s (21 round-trips).
+
+In local re-measurements on 2026-11-12, an initial 2.62MB copy took 52.5ms, an
+unchanged copy took 16.9ms, and a 128KiB read took 7.3ms. Speedups came from
+in-process Ed25519 verification and DNSSEC zone key caching. See `specs/performance.md`
+for details.
+
+In the 3-site (Mac / Sakura / Scaleway) 2.62MB test, push with 2 replicas took
+9.98s, secondary pull after primary shutdown took 0.82s, and Scaleway pull after
+Sakura shutdown took 4.15s, with identical contents across all paths.
+
+---
+
+## 2. Next Steps (In Priority Order)
+
+### 2.1 Implemented: A (L2 Read Availability)
+
+On 2026-11-12, L2 registry read fallback and primary → replica replication were implemented.
+
+- `Remote.registry_alternates` can hold alternate registries
+- Reads try primary → alternates in order; writes go only to primary
+- `dfs serve --replica` / `dfssvc start --replica` replicates signed bundles from primary
+- Replicas re-verify the root anchor, delegation chain, L4 signature, and CAS, refusing rollback via stale bundles
+- Regression test: `tests/test_availability.py`
+
+**OST Replication**: Added support for copying chunks from the primary OST to a
+read-only replica OST and storing multiple endpoints in locators. Even if the
+primary OST goes down, `pull` / `cat` can continue as long as a replica OST is alive.
+Spooling is not used; writes complete on the primary OST. See `specs/ost-replica.md`.
+
+**Why**: If the L2 registry goes down, **everything stops** (single point of failure).
+`specs/l2_comparison.md` §2.5. `ls` / `cat` / `pull` all halt simply because the
+registry is unreachable.
+
+**Prerequisites are ready**: `122afcf` implemented "untrusted registry verification".
+Even if a registry returns a forged delegation, it is rejected (chain verified from
+the root anchor). Thus, **running multiple registries is safe regardless of which
+registry answers**.
+
+**Tasks**:
+
+1. Allow holding multiple registries in remote definitions. Idea: make `registry`
+   an array, or have `registry` + `registry_alternates`.
+2. Try `resolve` / `paths` / `ost` **in order and use the first readable response**.
+   All responses are verified with the root public key, so any registry's answer is fine.
+3. Send writes (`announce`) to a single "primary". Fail if the primary is down (promotion is B).
+4. Test: run 2 registries, stop one, and verify `ls` / `cat` / `pull` continue.
+   Running two `dfssvc` instances on different ports lets you test on one machine (see §4 below).
+
+**Design Notes**:
+
+- **Never fetch and trust the root public key from the registry** (`specs/delegation.md` §3.5.1).
+  Fetch it via TOFU only on first use, and thereafter use the local record (`root_pubkey` in `remotes.json`).
+- When selecting a registry, there is no need to compare "which one is right" because signatures verify it.
+
+### 2.2 B (Write Replication and Promotion)
+
+Implemented primary/secondary roles, role epochs, write rejection on secondary,
+and manual promotion. Stop the old primary first, promote the secondary state, and
+update the writer's `role_epoch`. See `specs/promotion.md`.
+
+No automatic election, quorum, or lease is implemented. Making both nodes primary
+without stopping the old primary causes split-brain, so add leases / consensus if
+robust automatic promotion is required. C (consensus) will not be done for now.
+
+### 2.3 CLI Additions (Usability)
+
+On 2026-11-12, the following CLI features were implemented.
+
+| Command | Description | Status |
+|---|---|---|
+| `mv` | Move/rename within the same remote in 1 version. Rejects existing destinations; `--overwrite` allowed for files only | Implemented |
+| `--exclude` / `--include` | Relative path filters for `copy` / `sync` / `pull`. `sync --delete` does not delete filtered-out paths | Implemented |
+| `lsd` | List only immediate subdirectories | Implemented |
+| `import_tar` | Safely import `.tar` / `.tar.gz` / `.tar.xz` / `.tar.bz2` in 1 version | Implemented |
+| `mount` | Mount a remote locally via fuse-t / fusepy | Implemented |
+| `--checksum` | Change detection via `size` / `crc32` / `sha1` / `plain_id` | Implemented |
+| Folder compression | `user.dfs.compression` xattr and `DFSB3` codec header | Implemented |
+
+The writer's content-addressed index is persisted to `.clayfs/ost_index.json`. If
+`tree_secret` changes, `address_key` no longer matches, so old index entries are
+automatically invalidated.
+
+`mv` treats the destination as the exact new name (no automatic placement into an
+existing directory or merging). See `specs/cli.md` §3.2.1–3.2.2.
+
+### 2.4 Packaging (For Distribution)
+
+Added `pyproject.toml` so it can be distributed via pip / pipx.
+
+- Console scripts: `dfscli = dfs.cli_main:main`, `dfssvc = dfs.svc:main`
+- Required dependencies: `cryptography` / `dnspython`
+- Optional extra: `libp2p`
+- Built a wheel via `pip install --no-deps --target ... .` and verified both entrypoints launch
+- Root-level shell wrappers remain as compatibility entrypoints for development
+
+The current Mac OST is placed under `/Volumes/ExtSSD/dfs/ost/`, and `ost_chunks`
+in each state dir is a symlink to it. New services can specify `dfssvc start --ost-dir ...`,
+and direct launches can use `dfs serve --ost-dir ...`.
+
+### 2.5 Root Anchor Distribution (For Large-Scale Operations)
+
+Implemented fetching the root public key and registry list from DNSSEC
+`_dfs.<domain>` TXT records. Used via `dfscli discover <domain>` and
+`config create --dnssec-domain <domain>`.
+
+DNSSEC is strictly limited to **distributing the root key and initial registry list**,
+and is not used for L4 head or primary promotion decisions. Primary / secondary
+roles are determined by DNSSEC records or static configuration; "first server to
+start becomes root" is not used.
+
+See `specs/dnssec.md`. The client verifies the DNSKEY/DS chain from the root trust
+anchor and checks the TXT RRSIG. The AD bit is only used in the legacy fallback path
+with `validate=False`.
+
+### 2.5.1 BitTorrent archive (MVP Implemented)
+
+Implemented `archive create` to save the current head version as signed metadata +
+all chunks + `.torrent`. BitTorrent is not on the hot path; it is for long-term
+archival of past versions and last-resort recovery. `archive verify` and
+`archive extract` are also available.
+
+Added L2 publication of signed archive descriptors, propagation to replica
+registries, and `archive fetch`. `fetch` retrieves data via external `aria2c` /
+`transmission-cli` DHT/trackers, and after retrieval re-verifies the descriptor's
+L4 binding, bundle signature, and chunk hashes. It works with standard `--registry`
+configuration alone; DNSSEC is not required.
+
+See `specs/bittorrent.md`. SHA-1 in v1 torrents is for transport; chunk authenticity
+is verified with DFS SHA-256. BitTorrent v2, L4 integration of archive descriptors,
+and erasure coding are not yet implemented.
+
+### 2.5.2 libp2p/QUIC chunk source (Experimental)
+
+Implemented libp2p as an additional `ChunkSource` for OST. The initial TCP prototype
+failed to run custom streams across separate processes, but `enable_quic=True` with
+`/ip4/.../udp/.../quic-v1` was confirmed to work.
+
+`dfscli libp2p-serve` serves a chunk directory over QUIC, and clients add it as a
+read candidate with `--libp2p-peer`. Writes continue to go to the traditional primary
+OST. See `specs/libp2p.md`.
+
+### 2.6 Items Needing More Verification
+
+| Item | Status | How |
+|---|---|---|
+| 3+ nodes participating simultaneously | Automated tests and 3 real sites (Mac / Sakura / Scaleway) done | Run multiple on 1 machine (§4); Docker if insufficient |
+| Long-running / continuous push/pull degradation | Not tested | — |
+| WAN measurement with 100+ chunks | Not tested | 20 files only; 500 verified locally |
+| Effective throughput | Not measured | Only rough estimates from duration and byte counts |
+| Artificial high-latency injection (`tc qdisc`) | Not tested | Used Scaleway's actual 285ms instead |
+| 2 OSTs over LAN (striping) | Not tested | Local verification only (`TestL3Striping`) |
+| Re-measurement with 1,000+ chunks | Not tested | — |
+| pytest on Pi5 | Not tested | Mac only |
+
+### 2.7 Unimplemented (When Needed)
+
+| Item | Status |
 |---|---|
-| mini_lustre との RPC アダプタ | 未実装。そもそも mini_lustre 自体が試作なので、必要なら載せ替えを検討 |
-| DHT によるノード発見 | 未実装。`specs/delegation.md` §3.5.5 に、発見後の排除の設計を書いた |
-| 名簿のキャッシュ | 実装済み（`.clayfs/l2_cache.json`、全 registry 停止時の読み取りフォールバック） |
-| 過去の版の取り出し（ロールバック） | 実装済み。`/v1/history` / `/v1/resolve?version` / `dfscli history` / `archive create --version` |
+| RPC adapter for mini_lustre | Not implemented. mini_lustre itself is a prototype, so consider replacing it if needed |
+| Node discovery via DHT | Not implemented. Post-discovery exclusion design is documented in `specs/delegation.md` §3.5.5 |
+| Registry cache | Implemented (`.clayfs/l2_cache.json`, read fallback when all registries are down) |
+| Retrieving past versions (rollback) | Implemented. `/v1/history` / `/v1/resolve?version` / `dfscli history` / `archive create --version` |
 
-### 2.8 2026-11-16 コードレビュー指摘
+### 2.8 2026-11-16 Code Review Findings
 
-基準コミットは `d0700d1`。既存の全テストは
-`.venv/bin/pytest -q` で **319 passed, 10 skipped**（Python 3.13 / macOS）。
-以下は動的テストでは検出されなかった項目を含む。
+Baseline commit is `d0700d1`. All existing tests pass in `.venv/bin/pytest -q`
+with **319 passed, 10 skipped** (Python 3.13 / macOS).
+The items below include issues not caught by dynamic tests.
 
-#### 高優先度
+#### High Priority
 
-- [ ] **libp2pの応答を一括メモリ展開せず、累積サイズを制限する**
-  - 対象: `dfs/libp2p_chunk.py` の `Libp2pChunkServer._handle_stream()` と
-    `Libp2pHostManager._handle_stream()`。
-  - 現状: `G` 応答は最大65,536塊を `b"".join(parts)` で一つのbytesにしている。
-    各塊の上限は256MiBで、応答全体の上限は送信前に検査していない。
-  - 助長要因: 許可リスト未設定時は全Peerを許可し、`libp2p-serve` の既定起動も
-    allowlist / PSKなし。
-  - 修正: 応答全体を `MAX_FRAME_BYTES` 以下に制限する。大量応答はストリーミングする。
-    読み込みタイムアウトを追加する。public bind時の既定をallowlistまたはPSK必須にする。
-  - 回帰試験: 大量の `G` 要求で応答構築前に拒否されること、未許可Peerが拒否されること、
-    応答途中で閉じてもメモリ使用量が上限を超えないこと。
+- [ ] **Stream or bound cumulative size of libp2p responses instead of buffering all in memory**
+  - Target: `Libp2pChunkServer._handle_stream()` and `Libp2pHostManager._handle_stream()` in `dfs/libp2p_chunk.py`.
+  - Current state: `G` responses join up to 65,536 chunks with `b"".join(parts)` into a single `bytes` object.
+    Each chunk has a 256MiB cap, and total response size is not checked before sending.
+  - Aggravating factor: All peers are allowed when no allowlist is configured, and `libp2p-serve` defaults to no allowlist / PSK.
+  - Fix: Cap the total response to `MAX_FRAME_BYTES` or less. Stream large responses.
+    Add read timeouts. Require an allowlist or PSK by default on public binds.
+  - Regression test: Large `G` requests are rejected before constructing the response, unauthorized peers are rejected,
+    and closing mid-response does not exceed the memory cap.
 
-- [ ] **信頼しないL2から読み込むHTTP応答にサイズ上限を設ける**
-  - 対象: `dfs/cli.py` の `RemoteRegistryClient._post_one()`。
-  - 現状: 正常応答とエラー応答の双方で `read()` がサイズ無制限。
-    サーバ側には8MiBの上限があるが、クライアント側にはない。
-  - 影響: L2が侵害または停止しているという脅威モデルにおいて、巨大応答で
-    クライアントをOOMさせられる。
-  - 修正: `Content-Length` を検査し、本文は `MAX_REGISTRY_BODY_BYTES + 1` バイトまで
-    ストリーム読み込みする。`discovery.fetch_candidacy()` など、同じ無制限 `read()` を
-    使う経路もまとめて修正する。
-  - 回帰試験: 上限超過の正常応答とエラー応答をローカルHTTPサーバから返し、
-    `RegistryError` または `ServiceUnavailableError` として拒否されること。
+- [ ] **Enforce size limits on HTTP responses read from untrusted L2 registries**
+  - Target: `RemoteRegistryClient._post_one()` in `dfs/cli.py`.
+  - Current state: `read()` is unbounded for both normal and error responses.
+    The server enforces an 8MiB limit, but the client does not.
+  - Impact: Under the threat model where L2 is compromised or down, a huge response can OOM the client.
+  - Fix: Check `Content-Length` and stream-read the body up to `MAX_REGISTRY_BODY_BYTES + 1` bytes.
+    Fix other paths using unbounded `read()`, such as `discovery.fetch_candidacy()`.
+  - Regression test: Return oversized normal and error responses from a local HTTP server and verify
+    they are rejected as `RegistryError` or `ServiceUnavailableError`.
 
-#### 中優先度
+#### Medium Priority
 
-- [ ] **複数OSTストライピング時も全chunkを正しい取得元から複製する**
-  - 対象: `dfs/l4_log.py` の `MerkleTreeBuilder._replicate_chunks()`。
-  - 現状: 全 `wire_id` を既定OSTの `self.ost.batch_get()` から取得している。
-    他のOSTにだけ存在する塊は取得結果から静かに欠落し、警告も出ない。
-  - 再現結果: 2 OSTに3塊を分散したところ
-    `ost1=2`, `ost2=1`, `replica=2`, `missing_on_replica=1`, `warnings=`。
-  - 修正: `wire_id -> store_id` の対応を今回の版から保持し、取得元OSTごとに
-    `batch_get()` する。取得結果が要求IDを満たさない場合は警告または例外にする。
-  - 回帰試験: 2 OSTへのストライピングと複製OSTを同時に有効化し、
-    主OSTの全塊が複製先に存在すること。
+- [ ] **Replicate all chunks from their correct source OST when multi-OST striping is enabled**
+  - Target: `MerkleTreeBuilder._replicate_chunks()` in `dfs/l4_log.py`.
+  - Current state: All `wire_id`s are fetched from the default OST's `self.ost.batch_get()`.
+    Chunks present only on other OSTs are silently omitted from the result without warning.
+  - Reproduction: Distributing 3 chunks across 2 OSTs produced
+    `ost1=2`, `ost2=1`, `replica=2`, `missing_on_replica=1`, `warnings=`.
+  - Fix: Retain the `wire_id -> store_id` mapping from the current version and call `batch_get()` per source OST.
+    Emit a warning or raise an error if fetched results do not satisfy all requested IDs.
+  - Regression test: Enable 2-OST striping and replica OST together, and verify all primary OST chunks exist on the replica.
 
-- [ ] **`dfscli listremotes --no-check` の `NameError` を修正する**
-  - 対象: `dfs/commands/remote.py` の `cmd_listremotes()`。
-  - 現状: 16文字の共有ID形式の部分木名で `re.fullmatch()` を呼ぶが、`re` がない。
-  - 再現結果: `[dfscli] 予期しないエラー: NameError: name 're' is not defined`。
-  - 修正: `import re` を追加する。
-  - 回帰試験: `/example.com/AbCdEfGhIjKlMnOp` のようなパスを登録し、
-    `listremotes --no-check` が正常終了すること。
+- [ ] **Fix `NameError` in `dfscli listremotes --no-check`**
+  - Target: `cmd_listremotes()` in `dfs/commands/remote.py`.
+  - Current state: Calls `re.fullmatch()` for 16-character share-ID subtree names, but `re` is not imported.
+  - Reproduction: `[dfscli] 予期しないエラー: NameError: name 're' is not defined`.
+  - Fix: Add `import re`.
+  - Regression test: Register a path like `/example.com/AbCdEfGhIjKlMnOp` and verify `listremotes --no-check` exits cleanly.
 
-- [ ] **Webサーバの接続数、読み込み時間、アップロードメモリを制限する**
-  - 対象: `dfs/web.py` の `make_web_handler()` / `start_web_server()`。
-  - 現状: 無制限の `ThreadingHTTPServer` を使い、ヘッダーと本文の読み込みに
-    ソケットタイムアウトがない。アップロード本文も最大256MiBを一度にメモリへ読む。
-  - 影響: `--bind 0.0.0.0` でslowloris、過剰な同時接続、並列大容量アップロードにより
-    プロセスを枯渇させられる。
-  - 修正: 接続数制限付きHTTPサーバを使い、`setup()` で読み込みタイムアウトを設定する。
-    アップロードは一時ファイルへストリーミングし、同時アップロード数も制限する。
-  - 回帰試験: 接続数超過時の503、部分ヘッダーで停止した接続のタイムアウト、
-    上限サイズのアップロード時にメモリへ全量を保持しないこと。
+- [ ] **Limit web server connections, read timeouts, and upload memory**
+  - Target: `make_web_handler()` / `start_web_server()` in `dfs/web.py`.
+  - Current state: Uses an unbounded `ThreadingHTTPServer` with no socket timeout for reading headers or bodies.
+    Upload bodies up to 256MiB are read into memory at once.
+  - Impact: With `--bind 0.0.0.0`, slowloris, excessive concurrent connections, or parallel large uploads can exhaust the process.
+  - Fix: Use a connection-limited HTTP server and set a read timeout in `setup()`.
+    Stream uploads to temporary files and limit concurrent uploads.
+  - Regression test: 503 on connection limit exceeded, timeout on stalled partial headers,
+    and max-size uploads not buffering the entire payload in memory.
 
-- [ ] **tar/archive展開に展開量の上限を設ける**
-  - 対象: `dfs/cli_main.py` の `_extract_tar_safely()`。
-  - 現状: パストラバーサル、symlink、hardlink、特殊ファイルは拒否するが、
-    合計展開サイズ、エントリ数、1ファイルのサイズ、圧縮率に上限がない。
-  - 影響: 信頼しないtarのimportでディスクや時間を枯渇させられる。
-  - 修正: 最大エントリ数、最大合計展開バイト数、最大単体サイズ、圧縮率上限を設ける。
-    展開前に空き容量も確認する。
-  - 回帰試験: 多数の小ファイル、単一巨大ファイル、高圧縮率のtarを作成し、
-    出力先へ展開する前に拒否されること。
+- [ ] **Enforce extraction limits on tar/archive unpacking**
+  - Target: `_extract_tar_safely()` in `dfs/cli_main.py`.
+  - Current state: Rejects path traversal, symlinks, hardlinks, and special files,
+    but has no limits on total extracted size, entry count, single-file size, or compression ratio.
+  - Impact: Importing an untrusted tar can exhaust disk space or time.
+  - Fix: Enforce max entry count, max total extracted bytes, max single-file size, and max compression ratio.
+    Check available disk space before extracting.
+  - Regression test: Create tars with many small files, a single huge file, or a high compression ratio,
+    and verify they are rejected before extracting to the destination.
 
-#### 低優先度・保守性
+#### Low Priority / Maintainability
 
-- [ ] **秘密情報を含む設定を `write_private_json()` に統一する**
-  - 対象: `dfs/remotes.py` の `RemoteStore.save()` など。
-  - 現状: 予測可能な `*.tmp` に `tree_secret` を含むJSONを書いてから `chmod 0600` する。
-    クラッシュや差し替えの競合時に秘密が残る、または別ファイルへ書く余地がある。
-  - 修正: 既存の `dfs/private_io.py` を使い、`mkstemp`、0600、`fsync`、
-    `os.replace` に統一する。
-  - 回帰試験: 新規設定と既存設定の更新後、ファイルmodeが0600であること。
-    一時ファイルが予測可能な名前で作成されないこと。
+- [ ] **Standardize secret-bearing config writes on `write_private_json()`**
+  - Target: `RemoteStore.save()` in `dfs/remotes.py` and similar places.
+  - Current state: Writes JSON containing `tree_secret` to a predictable `*.tmp` file before calling `chmod 0600`.
+    On crash or replacement race, secrets may remain or be written to another file.
+  - Fix: Use existing `dfs/private_io.py` to standardize on `mkstemp`, `0600`, `fsync`, and `os.replace`.
+  - Regression test: After creating or updating config, file mode is `0600` and temp files do not use predictable names.
 
-- [ ] **bootstrapでインストールするパッケージとダウンローダを固定・検証する**
-  - 対象: `scripts/bootstrap.sh` と `scripts/bootstrap_ro.sh`。
-  - 現状: `uv tool install --force dfs` はバージョンやハッシュを固定していない。
-    `uv` がない場合は `curl ... | sh` でインストーラを直接実行する。
-  - 修正: リリース版をバージョン固定し、配布物のSHA256を検証する。
-    必要なら署名検証も追加する。
-  - 回帰試験: 固定バージョンとハッシュが一致する場合だけインストールが進むこと。
-    改ざんされた配布物を拒否すること。
+- [ ] **Pin and verify packages and downloaders installed by bootstrap**
+  - Target: `scripts/bootstrap.sh` and `scripts/bootstrap_ro.sh`.
+  - Current state: `uv tool install --force dfs` does not pin version or hash.
+    When `uv` is missing, it executes `curl ... | sh` directly.
+  - Fix: Pin the release version and verify the distribution SHA256. Add signature verification if needed.
+  - Regression test: Installation proceeds only when the pinned version and hash match; tampered artifacts are rejected.
 
-- [ ] **静的解析と型検査をCIへ追加し、検出済みの診断を整理する**
-  - 現状: RuffのF系だけで未使用importが多数あり、未定義名も検出される。
-    `dfs/cli.py` の `Callable` / `Set`、`dfs/svc.py` の `Any` は
-    `from __future__ import annotations` により実行時エラーにはなっていない。
-  - 修正: Ruffの最小ルールとmypyまたはpyrightをCIへ追加する。
-    まず `F401`, `F821`, `F811`, `F841` を通し、その後に段階的にルールを増やす。
-  - 受入条件: 既存のpytest全件と静的解析がCIで成功すること。
+- [ ] **Add static analysis and type checking to CI and clean up existing diagnostics**
+  - Current state: Even Ruff's `F` rules report many unused imports and undefined names.
+    `Callable` / `Set` in `dfs/cli.py` and `Any` in `dfs/svc.py` do not fail at runtime only because of `from __future__ import annotations`.
+  - Fix: Add minimal Ruff rules and mypy or pyright to CI.
+    First pass `F401`, `F821`, `F811`, `F841`, then gradually enable more rules.
+  - Acceptance criteria: All existing pytest cases and static analysis pass in CI.
 
 ---
 
-## 3. 設計の要点（再開時に効く知識）
+## 3. Key Design Points (Useful When Resuming)
 
-### 3.1 名簿を信頼しない
+### 3.1 Do Not Trust the Registry
 
-信頼の根は **root アンカーの公開鍵 1 つ**。`resolve` は末端の委譲に**チェーン全体**と
-`root_anchor` を足して返し、クライアントは `verify_delegation_chain` で root から検証する。
-署名を検証する鍵は「**検証で確定した writer**」だけを使う（名簿が名乗った writer は使わない）。
+The root of trust is **a single root anchor public key**. `resolve` returns the leaf
+delegation together with the **full chain** and `root_anchor`, and the client
+verifies from root using `verify_delegation_chain`. Only the **"verified writer"**
+is used to verify signatures (never the writer claimed by the registry).
 
 ```
-名簿が root 公開鍵として攻撃者の鍵を返す → 手元の記録と食い違うので拒否
+Registry returns attacker's key as root public key → mismatches local record → rejected
 ```
 
-`specs/delegation.md` §3.5 に詳細。試験は `tests/test_root_anchor.py`（7 件）。
+Details in `specs/delegation.md` §3.5. Tests in `tests/test_root_anchor.py` (7 cases).
 
-**限界**: TOFU 前（root 未設定）は、初回に欺かれると通る（SSH の `known_hosts` と同じ）。
-本番は `--root-pubkey` で初回から固定する。この「通ってしまう」こともテストに残してある。
+**Limitation**: Before TOFU (when root is unset), an attacker can spoof the first
+response (same as SSH `known_hosts`). In production, pin from the start with
+`--root-pubkey`. This "passes before TOFU" behavior is also kept in tests.
 
-### 3.2 空のディレクトリも版に残る
+### 3.2 Empty Directories Persist in Versions
 
-ディレクトリ塊は `{"entries": [], "format": "dfs-dir-v1"}` として表現され、読み出し側は
-それを見て実体を作る。`rm` でファイルを消してもディレクトリは残り、`pull` すると空の
-ディレクトリごと降りてくる。片付けるには `rm --rmdirs` か `sync --delete`。
-`specs/cli.md` §3.4。
+Directory chunks are represented as `{"entries": [], "format": "dfs-dir-v1"}`, and
+readers materialize them accordingly. Deleting files with `rm` leaves the directory,
+and `pull` downloads empty directories as well. To clean them up, use `rm --rmdirs`
+or `sync --delete`. See `specs/cli.md` §3.4.
 
-### 3.3 送信元ポートを固定する
+### 3.3 Pin Source Port
 
-WireGuard のスポーク（Scaleway）は `ListenPort` を固定してある。エフェメラルだと送信元
-ポートが変わり、ハブ（Sakura）側が最後に受信したポートから学習する都合で一時的に不通に
-なる。ハブ側の keepalive も対称に揃えてある（`specs/e2e_wan.md`）。
+The WireGuard spoke (Scaleway) has `ListenPort` pinned. With an ephemeral port,
+the source port changes and the hub (Sakura) temporarily loses connectivity because
+it learns from the last received port. Hub keepalive is also configured symmetrically
+(`specs/e2e_wan.md`).
 
-### 3.4 ハマったところ
+### 3.4 Pitfalls Encountered
 
-| 症状 | 原因 | 対処 |
+| Symptom | Cause | Fix |
 |---|---|---|
-| `ls` が「先に touch しろ」と言う | 参照系を `create=False` で呼んでいた | 参照系も作業ディレクトリを作る |
-| `create` したのに「委譲が無い」と言う | `dfssvc start` が委譲を登録していなかった | `start` に含めた |
-| 空きポートを見落とす | `SO_REUSEADDR` 付き bind が `0.0.0.0:N` を素通り | 接続を試す 2 段判定に |
-| 多段委譲が時刻のずれで落ちる | 中間と末端の有効期間が同じ | 中間を 1 日長く |
-| 委譲失敗でサーバが孤児に残る | `start` が例外時に止めていなかった | 失敗時は必ず止める |
-| テストでサーバが残る | `addCleanup` の順序 | `tearDown` で記録を全部止める |
+| `ls` says "touch first" | Read commands called with `create=False` | Create working dir for read commands too |
+| `create` says "no delegation" | `dfssvc start` did not register delegation | Included it in `start` |
+| Missed occupied ports | `bind` with `SO_REUSEADDR` bypassed `0.0.0.0:N` | Two-step check that also tries connecting |
+| Multi-hop delegation failed on clock skew | Intermediate and leaf had the same validity | Made intermediate 1 day longer |
+| Orphaned server on delegation failure | `start` did not stop on exception | Always stop on failure |
+| Servers left running after tests | `addCleanup` ordering | Stop all recorded servers in `tearDown` |
 
 ---
 
-## 4. 検証の仕方（1 台で複数ノード）
+## 4. How to Test (Multiple Nodes on One Machine)
 
-`dfssvc` を別ポートで複数立てれば、1 台で「複数の拠点」を模擬できる。
+You can simulate "multiple sites" on one machine by running multiple `dfssvc` instances
+on different ports.
 
 ```bash
 cd ~/src/dfs
 
-# 名簿を 2 つ立てる（A の試験用。別ポートになる）
+# Start 2 registries (for testing A; different ports will be used)
 ./dfssvc start --name node-a --port 20000
 ./dfssvc start --name node-b --port 20010
 ./dfssvc list
 
-# やめる
+# Stop them
 ./dfssvc stop node-a --forget
 ./dfssvc stop node-b --forget
 ```
 
-- `--port` は「この番号から連続した空きを探す」起点。L2 が 1 つ目、L3 が 2 つ目。
-- 名前ごとに状態ディレクトリ（`~/dfssvc/<名前>/`）と鍵が分かれる。
-- `--advertise` で広告するホストを変えられる（既定は `--host` から推定）。
-- ネットワーク分断や遅延も試すなら Docker（`docker network create` + 各コンテナに
-  `tc netem`）を使う。ポート違いでは再現しない。
+- `--port` is the starting port to search for two consecutive free ports: 1st for L2, 2nd for L3.
+- Each name gets its own state directory (`~/dfssvc/<name>/`) and keys.
+- `--advertise` overrides the advertised host (defaults to inferring from `--host`).
+- To test network partitions or latency, use Docker (`docker network create` +
+  `tc netem` in each container); different ports alone cannot simulate those.
 
-サーバ側のタイムアウトは環境変数で変えられる（`DFS_L2_TIMEOUT`、`DFS_OST_SOCKET_TIMEOUT`、
-`DFS_OST_CONNECT_TIMEOUT`）。`dfscli` も `dfssvc` も `os.environ` をそのまま見る。
+Server-side timeouts can be configured via environment variables (`DFS_L2_TIMEOUT`,
+`DFS_OST_SOCKET_TIMEOUT`, `DFS_OST_CONNECT_TIMEOUT`). Both `dfscli` and `dfssvc`
+read `os.environ` directly.
 
 ---
 
-## 5. 環境の現状（2026-11-12）
+## 5. Current Environment (2026-11-12)
 
-### 5.1 手元（Mac）
+### 5.1 Local (Mac)
 
-| もの | 状態 |
+| Item | Status |
 |---|---|
-| launchd のサーバ | `com.example.dfs-local`（L2 19440 / L3 19443、`~/dfs-local/`）**稼働中** |
-| `dfssvc` のサービス | `local`（L2 19441 / L3 19442、`~/dfssvc/local/`）**稼働中** |
-| `dfscli` のリモート | `local`（`http://127.0.0.1:19441`）のみ |
-| Python | `~/dfs-venv/bin/python`（3.12、`cryptography` 入り） |
+| launchd server | `com.example.dfs-local` (L2 19440 / L3 19443, `~/dfs-local/`) **running** |
+| `dfssvc` service | `local` (L2 19441 / L3 19442, `~/dfssvc/local/`) **running** |
+| `dfscli` remote | `local` (`http://127.0.0.1:19441`) only |
+| Python | `~/dfs-venv/bin/python` (3.12, with `cryptography`) |
 
-**注意**: 上記の 2 つのサーバは `122afcf` より前のコードで起動している。root 公開鍵を
-返すのは新しいコードなので、`root_pubkey` を使う試験をする前に再起動が要る
-（`launchctl bootout` → `bootstrap`、`./dfssvc stop local` → `start`）。
+**Note**: Both servers above were started with code prior to `122afcf`. Since
+returning the root public key requires the new code, restart them before testing
+`root_pubkey` (`launchctl bootout` → `bootstrap`, `./dfssvc stop local` → `start`).
 
-### 5.2 遠隔（WireGuard）
+### 5.2 Remote (WireGuard)
 
-| 拠点 | 接続 | 備考 |
+| Site | Connection | Notes |
 |---|---|---|
-| Scaleway | `deploy@192.0.2.60`（公開 `203.0.113.162`） | RTT 約 285ms。`ListenPort` 固定済み |
-| Sakura | `deploy@example.com`（192.0.2.254） | ハブ。RTT 約 21ms。keepalive 対称 |
-| Pi5 | `operator@198.51.100.7` | RTT 約 0.5ms |
+| Scaleway | `deploy@192.0.2.60` (public `203.0.113.162`) | RTT ~285ms. `ListenPort` pinned |
+| Sakura | `deploy@example.com` (192.0.2.254) | Hub. RTT ~21ms. Symmetric keepalive |
+| Pi5 | `operator@198.51.100.7` | RTT ~0.5ms |
 
-**注意**: WireGuard の経路は不安定なときがある。テスト中に Mac → Scaleway が数分不通に
-なった（公開 IP と Sakura 経由では到達できた）。断が起きたら時刻を控えると追いやすい。
+**Note**: WireGuard routes can be unstable at times. During testing, Mac → Scaleway
+became unreachable for several minutes (reachable via public IP and via Sakura).
+Recording timestamps when drops occur makes them easier to trace.
 
-dfs のサーバは**どの拠点でも止めてある**（確認済み）。再開時に立て直す。
+All dfs servers on **all sites are stopped** (verified). Restart them when resuming.
 
 ---
 
-## 6. 再開の手順
+## 6. Resumption Steps
 
 ```bash
 cd ~/src/dfs
 
-# 1. 状態の確認
+# 1. Check state
 git log --oneline -3
-git status --short          # 空ならクリーン
-~/dfs-venv/bin/python -m pytest tests -q   # 160 件パス、1 skip（約 171 秒）
+git status --short          # clean if empty
+~/dfs-venv/bin/python -m pytest tests -q   # 160 passed, 1 skipped (~171s)
 
-# 2. サーバを立てる（新コードで）
-./dfssvc list               # 既存のサービスを確認
+# 2. Start server (with new code)
+./dfssvc list               # check existing services
 ./dfssvc start --name work --port 20000
-./dfssvc env work           # dfscli の設定行が出る
+./dfssvc env work           # prints dfscli config lines
 
-# 3. つないで使う
+# 3. Connect and use
 ./dfscli create work --registry http://127.0.0.1:20001 \
     --key ~/dfssvc/work/keys/writer --secret <tree_secret>
 ./dfscli ls work:
-./dfscli config show work   # root_fingerprint が記録されているはず
+./dfscli config show work   # root_fingerprint should be recorded
 ```
 
-そのあと §2.1（A: 読み取りの可用性）に進む。
+Then proceed to §2.1 (A: Read Availability).

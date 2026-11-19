@@ -1,53 +1,55 @@
-# 単一書き手 `dfssvc` の分散配置と root 中継リレー (`dfs-relay-v1`)
+# Distributed Single-Writer `dfssvc` Deployment and Root Relay (`dfs-relay-v1`)
 
-## 方針決定の経緯
+> **English** | [日本語](relay.ja.md)
 
-`dfs` では **1 つの書き込み境界ごとに単一の書き手と自前の `dfssvc`（L2 名簿 + L3 OST）を持つ** モデルを採っている。これにより各ホストが自身のデータ・スナップショット・チャンク保存先を自律的に管理できるが、実際の配置では以下のネットワーク制約が生じる。
+## Rationale
 
-1. **自宅 Mac 等の書き手ホストは NAT の背後にいる**
-   - アウトバウンドの IPv4/IPv6（特に HTTPS 443/tcp）は通るが、外部から自宅ホストへのインバウンド接続は受けられない。
-2. **RunPod / vast.ai 等の計算ホストは `scp` やインバウンド待受が制限される**
-   - こちらも外部から直接繋ぐことはできず、アウトバウンドの HTTP/HTTPS 接続のみが安定して通る。
-3. **データの実体は各ホストの `dfssvc` に残したい**
-   - root ホスト（`dfs.example.com`）に全ホストの全データを複製・集約するのではなく、各ホストの `dfssvc` が実データと状態の正本を持ち、`dfs.example.com` は **暗号化済み L3 チャンクと署名済み L2/L4 メタデータを透過中継するだけ** に留めたい。
-   - すべてのチャンクは書き手端末側で AEAD 暗号化（`tree_secret`）されているため、root リレーが中継トラフィックの内容を復号・改ざんすることはできない。
+`dfs` adopts a model where **each write boundary has a single writer and its own `dfssvc` (L2 registry + L3 OST)**. This allows each host to autonomously manage its own data, snapshots, and chunk storage, but in real deployments the following network constraints arise:
 
-以上を踏まえ、**パブリック IPv4/IPv6 を持つ root `dfssvc`（`dfs.example.com`）に HTTP/1.1 リバースリレーハブ（`RelayHub`）を持たせ、NAT/FW 裏の各 `dfssvc` がアウトバウンドで接続して公開パス `/relay/<node_id>/...` を生やす構造** を採用する。
+1. **Writer hosts such as a home Mac are behind NAT**
+   - Outbound IPv4/IPv6 (especially HTTPS 443/tcp) works, but inbound connections from outside to the home host are blocked.
+2. **Compute hosts such as RunPod / vast.ai restrict `scp` and inbound listening**
+   - They also cannot be connected to directly from outside; only outbound HTTP/HTTPS connections work reliably.
+3. **Actual data should remain on each host's `dfssvc`**
+   - Rather than replicating and aggregating all data from all hosts onto the root host (`dfs.example.com`), each host's `dfssvc` should hold the authoritative source of actual data and state, and `dfs.example.com` should **only transparently relay encrypted L3 chunks and signed L2/L4 metadata**.
+   - Because all chunks are AEAD-encrypted (`tree_secret`) on the writer device, the root relay cannot decrypt or tamper with the relayed traffic.
+
+Based on this, we adopt a design where **the root `dfssvc` with public IPv4/IPv6 (`dfs.example.com`) hosts an HTTP/1.1 reverse relay hub (`RelayHub`), and each `dfssvc` behind NAT/FW connects outbound to expose the public path `/relay/<node_id>/...`**.
 
 ---
 
-## 仕組み
+## Mechanism
 
 ```text
-[自宅 Mac dfssvc (NAT裏)]                         [root: dfs.example.com (RelayHub)]                         [RunPod クライアント]
+[Home Mac dfssvc (behind NAT)]                     [root: dfs.example.com (RelayHub)]                         [RunPod Client]
    127.0.0.1:19440                                       https://dfs.example.com
          ▲                                                         │                                                 │
-         └── RelayAgent ──(アウトバウンド POST /_relay/pull)───────┤                                                 │
-                          (アウトバウンド POST /_relay/reply)      ◀── POST /relay/mac1/v1/resolve ─────────────────┤
-                                                                   ◀── POST /relay/mac1/v1/ost/batch_get ───────────┤
+         └── RelayAgent ──(outbound POST /_relay/pull)─────────────┤                                                 │
+                          (outbound POST /_relay/reply)            ◀── POST /relay/mac1/v1/resolve ──────────────────┤
+                                                                   ◀── POST /relay/mac1/v1/ost/batch_get ────────────┤
 ```
 
-1. **エージェント側のアウトバウンド接続 (`RelayAgent`)**
-   - NAT 裏の `dfssvc` は `--relay https://dfs.example.com --relay-node mac1` で起動する。
-   - 複数ワーカー（既定 4 本）が `POST /_relay/pull?node=mac1` をロングポーリング（最大 25 秒）で張り続ける。
-   - リクエストが届いたらローカルの `dfssvc`（`127.0.0.1:<registry_port>`）へ転送し、応答を `POST /_relay/reply?node=mac1&id=<req_id>` で返す。
-2. **ハブ側の中継 (`/relay/<node_id>/...`) と Direct-first 優先制御**
-   - root リレー `dfs.example.com` に全トラフィックを流すと過負荷になるため、**直接通信できる場合は対象ホストの `dfssvc` と直接通信し、直接通信できない場合のみリレーにフォールバックする（Direct-first, Relay-as-fallback）**。
-   - `dfssvc` は `/v1/ost` で直接の `endpoint` を先頭に維持したまま、`alternates` / `relay_endpoint` に `https://dfs.example.com/relay/<node_id>` を広告する。
-   - クライアント（`RemoteRegistryClient`・`FailoverOSTClient`・`DFSNode`・`dfscli share`）は先頭の直接 URL をまず試し、同一 LAN や到達可能な環境では `dfs.example.com` を一切経由しない。NAT/FW で直接接続に失敗した環境（RunPod 等）だけが `/relay/<node_id>` へ自動的にフォールバックする。
-3. **バイナリフレーム形式**
-   - `/_relay/pull` の応答と `/_relay/reply` のリクエストは、Base64 膨張を避けるため以下のバイナリフレームを使う。
+1. **Agent-side outbound connection (`RelayAgent`)**
+   - A `dfssvc` behind NAT starts with `--relay https://dfs.example.com --relay-node mac1`.
+   - Multiple workers (default 4) continuously hold long-polling connections on `POST /_relay/pull?node=mac1` (up to 25 seconds).
+   - When a request arrives, it is forwarded to the local `dfssvc` (`127.0.0.1:<registry_port>`), and the response is sent back via `POST /_relay/reply?node=mac1&id=<req_id>`.
+2. **Hub-side relaying (`/relay/<node_id>/...`) and Direct-first priority control**
+   - Routing all traffic through the root relay `dfs.example.com` would overload it, so **when direct communication is possible, clients communicate directly with the target host's `dfssvc`, falling back to the relay only when direct communication fails (Direct-first, Relay-as-fallback)**.
+   - In `/v1/ost`, `dfssvc` keeps the direct `endpoint` first while advertising `https://dfs.example.com/relay/<node_id>` in `alternates` / `relay_endpoint`.
+   - Clients (`RemoteRegistryClient`, `FailoverOSTClient`, `DFSNode`, `dfscli share`) try the leading direct URL first, so on the same LAN or in reachable environments they never go through `dfs.example.com`. Only environments where direct connection fails due to NAT/FW (such as RunPod) automatically fall back to `/relay/<node_id>`.
+3. **Binary frame format**
+   - Responses to `/_relay/pull` and requests to `/_relay/reply` use the following binary frame to avoid Base64 bloat:
    - `[4-byte big-endian JSON header length] + [UTF-8 JSON header] + [raw body bytes]`
-4. **認証 (`X-DFS-Relay-Token`)**
-   - ハブ側で `--relay-token <secret>`（または環境変数 `DFS_RELAY_TOKEN`）を設定した場合、`/_relay/pull` と `/_relay/reply` は `X-DFS-Relay-Token` ヘッダの定数時間比較で検証される。
+4. **Authentication (`X-DFS-Relay-Token`)**
+   - When `--relay-token <secret>` (or environment variable `DFS_RELAY_TOKEN`) is configured on the hub, `/_relay/pull` and `/_relay/reply` are verified using a constant-time comparison of the `X-DFS-Relay-Token` header.
 
 ---
 
-## 中〜大規模運用（DNSSEC + パブリックホストによる分散リレー）
+## Medium- to Large-Scale Operation (Distributed Relays via DNSSEC + Public Hosts)
 
-- **なぜ任意の本番パブリックホストをリレーにできるのか**:
-  - `dfs` の L3 チャンクは書き手端末側で AEAD 暗号化されており、L2/L4 メタデータも Ed25519 で署名されている。そのためリレーノードは**平文を復号することも署名付きログ・委譲を偽造することもできない**（ゼロトラスト中継）。
-- **DNSSEC による安全なリレー群の配布**:
-  - 小規模運用では単一ハブ（`dfs.example.com`）+ `--relay-token` で十分だが、中〜大規模運用では **パブリック IPv4/IPv6 を持ち NAT 不要でインバウンド・アウトバウンド両方向が通る任意のホスト** で `dfssvc --enable-relay` を動かし、DNSSEC 署名付きレコードでそのドメイン配下のリレー群として配布できる。
-- **複数リレーへの冗長接続**:
-  - NAT 裏の `dfssvc` は `--relay` を複数回指定して複数のパブリックリレーへ同時にアウトバウンド接続できる。クライアント側は **Direct-first → Relay 1 → Relay 2 ...** の順で試行するため、特定のハブ（`dfs.example.com`）への過負荷と単一障害点を同時に避けられる。
+- **Why any production public host can act as a relay**:
+  - `dfs` L3 chunks are AEAD-encrypted on the writer device, and L2/L4 metadata is signed with Ed25519. Therefore, a relay node **can neither decrypt plaintext nor forge signed logs or delegations** (zero-trust relaying).
+- **Secure distribution of relay fleets via DNSSEC**:
+  - For small-scale operation, a single hub (`dfs.example.com`) + `--relay-token` is sufficient, but for medium- to large-scale operation, `dfssvc --enable-relay` can be run on **any host with public IPv4/IPv6 that requires no NAT and allows both inbound and outbound traffic**, and distributed as the relay fleet under that domain via DNSSEC-signed records.
+- **Redundant connections to multiple relays**:
+  - A `dfssvc` behind NAT can specify `--relay` multiple times to maintain simultaneous outbound connections to multiple public relays. Because the client tries **Direct-first → Relay 1 → Relay 2 ...** in order, both overload on a single hub (`dfs.example.com`) and a single point of failure are avoided.

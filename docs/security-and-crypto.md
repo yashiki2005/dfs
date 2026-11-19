@@ -1,5 +1,7 @@
 # Security & Cryptography
 
+> **English** | [日本語](security-and-crypto.ja.md)
+
 **dfs** is designed around an untrusted-infrastructure threat model: storage nodes (L3 OST), locator registries (L2), and WebSocket relays may be observed, compromised, or replaced by an active attacker. Confidentiality and integrity are enforced end-to-end on clients.
 
 ---

@@ -1,22 +1,21 @@
-# dfscli（`specs/cli.md`）
+# dfscli (`specs/cli.md`)
 
-## 0. 目的と位置づけ
+> **English** | [日本語](cli.ja.md)
 
-`dfs/cli.py` は層の試験用で、`serve` / `delegate` / `init` / `push` / `pull` という
-「層の操作」をそのまま見せる。日常のファイル操作には、もっと普通の道具が要る。
-そこで `dfs/cli.py` の部品（L2 名簿クライアント、サーバ、ノード構築）をそのまま使い、
-**リモート名で場所を指す** CLI を被せたものが `dfscli` である。
+## 0. Purpose and Scope
 
-- 実装: `dfs/cli_main.py`、`dfs/remotes.py`
-- エントリポイント: `./dfscli`
-- 試験: `tests/test_cli_main.py`
+`dfs/cli.py` is for testing the layers, exposing raw layer operations such as `serve` / `delegate` / `init` / `push` / `pull`. For everyday file operations, a more conventional tool is needed.
+`dfscli` reuses the components of `dfs/cli.py` (L2 registry client, server, node construction) and wraps them in a CLI that **addresses locations by remote name**.
 
-`dfs/cli.py` は残す。層を直接確かめる用途（`serve` の起動、`delegate` の登録、
-`push`/`pull` の往復計測）では今もそちらを使う。
+- Implementation: `dfs/cli_main.py`, `dfs/remotes.py`
+- Entry point: `./dfscli`
+- Tests: `tests/test_cli_main.py`
 
-### インストール
+`dfs/cli.py` is kept for directly verifying layers (starting `serve`, registering `delegate`, measuring `push`/`pull` round trips).
 
-pip / pipx で console script として入れられる。
+### Installation
+
+Can be installed as console scripts via `pip` / `pipx`:
 
 ```bash
 pipx install .
@@ -24,97 +23,88 @@ dfscli --version
 dfssvc --help
 ```
 
-libp2p/QUIC も使う場合は optional extra を付ける。
+To also use libp2p/QUIC, include the optional extra:
 
 ```bash
 pipx install '.[libp2p]'
 ```
 
-Zstandard 圧縮も使う場合。
+To also use Zstandard compression:
 
 ```bash
 pipx install '.[compression]'
 ```
 
-FUSE マウントも使う場合は `fuse` extra を付ける。
+To also use FUSE mounts, include the `fuse` extra:
 
 ```bash
 pipx install '.[fuse]'
 ```
 
-macOS では fuse-t も必要になる。
+On macOS, `fuse-t` is also required:
 
 ```bash
 brew install macos-fuse-t/homebrew-cask/fuse-t
 ```
 
-リポジトリ直下の `./dfscli` / `./dfssvc` は、開発中にそのまま使うための
-互換ラッパーとして残している。
+`./dfscli` and `./dfssvc` at the repository root are kept as compatibility wrappers for direct use during development.
 
 ---
 
-## 1. 考え方
+## 1. Concepts
 
-### 1.1 リモート = 書き込み境界
+### 1.1 Remote = Write Boundary
 
-dfs の単一書き手の境界は「サブツリーのパス」である（`/example.com/alice/notes`）。
-rclone のリモートはこれに対応させた。**ホスト名ではない。**
+The single-writer boundary in `dfs` is a "subtree path" (e.g., `/example.com/alice/notes`).
+An `rclone`-style remote maps to this—**not to a hostname**.
 
-1 つのリモートが持つ情報のうち、**L2 名簿に問い合わせれば分かるものは書かなくてよい**。
+Among the fields of a remote, **anything that can be queried from the L2 registry can be omitted**:
 
-| 項目 | 例 | 省略したとき |
+| Item | Example | When omitted |
 |---|---|---|
-| L2 名簿 | `192.0.2.60` | **必須**（出発点。ホスト名だけでよい） |
-| 書き手の OpenSSH Ed25519 秘密鍵 | `~/.ssh/alice` | その場で作る（`~/.config/dfs/keys/<名前>_ed25519`） |
-| L3 OST の host:port | `192.0.2.60:19443` | L2 のロケータ（`endpoints`）から解決する |
-| サブツリーのパス | `/example.com/alice/notes` | L2 で書き手公開鍵から探す |
-| `tree_secret`（共有秘密） | — | 端末からエコーなしで読む |
-| 作業ディレクトリ | `~/.cache/dfs/<名前>` | 既定（`--workdir` で変更） |
+| L2 registry | `192.0.2.60` | **Required** (starting point; hostname alone suffices) |
+| Writer's OpenSSH Ed25519 private key | `~/.ssh/alice` | Generated on the spot (`~/.config/dfs/keys/<name>_ed25519`) |
+| L3 OST `host:port` | `192.0.2.60:19443` | Resolved from L2 locator (`endpoints`) |
+| Subtree path | `/example.com/alice/notes` | Looked up in L2 by writer public key |
+| `tree_secret` (shared secret) | — | Read from terminal without echo |
+| Working directory | `~/.cache/dfs/<name>` | Default (override with `--workdir`) |
 
-最小の登録はこうなる。
+The minimal registration is:
 
 ```bash
-# ホスト名だけ。鍵は作り、secret は端末から読む
+# Hostname only. Generates key and reads secret from terminal
 dfscli config create scw --registry 192.0.2.60
 ```
 
-#### レジストリはホスト名だけでよい
+#### Registry Only Needs a Hostname
 
-L2 の既定ポートは **9440**。`--registry` に `192.0.2.60` のようにホスト名（または IP）だけ
-を渡すと、`http://` と `:9440` を補う。別のポートなら `--registry-port` で変えるか、
-`host:port` をそのまま書く。
+The default L2 port is **9440**. Passing only a hostname (or IP) such as `192.0.2.60` to `--registry` automatically fills in `http://` and `:9440`. For a different port, pass `--registry-port` or write `host:port` explicitly.
 
 ```
 192.0.2.60                -> http://192.0.2.60:9440
-http://host:1234           -> http://host:1234        （そのまま）
+http://host:1234           -> http://host:1234        (as-is)
 host --registry-port 19440 -> http://host:19440
 ```
 
-`urlparse` で判定するので、`host:port` と `host` を取り違えない。
+Parsed with `urlparse`, so `host:port` and `host` are never confused.
 
-#### 読み取り用の代替名簿
+#### Alternate Registries for Reads
 
-`--registry-alternate` を繰り返すと、読み取り時のフォールバック先を登録できる。
-書き込み（`announce` / `delegate`）は常に `--registry` の主名簿だけに送る。
+Repeating `--registry-alternate` registers fallback registries for reads.
+Writes (`announce` / `delegate`) are always sent only to the primary registry in `--registry`.
 
 ```bash
 dfscli create scw --registry 192.0.2.60 \
   --registry-alternate 192.0.2.61
 ```
 
-主名簿は `dfs serve --replica http://192.0.2.61:9440` のように起動すると、
-署名済みの委譲チェーン・L4 ログ・ロケータを代替名簿へ複製する。代替名簿は
-root アンカーから再検証し、古いバンドルで巻き戻さない。
+When the primary registry is started with e.g. `dfs serve --replica http://192.0.2.61:9440`, it replicates signed delegation chains, L4 logs, and locators to the alternate registries. Alternate registries re-verify from the root anchor and never roll back to older bundles.
 
-`--ost-alternate` を繰り返すと、書き手の主 OST とは別の読み取り専用 OST を
-登録できる。書き込みは主 OST だけで行い、複製 OST にはチャンクをコピーする。
-`pull` / `cat` は locator の `endpoints` を順に試すため、主 OST が停止しても
-複製 OST が生きていれば読み取りを継続できる。詳細は `specs/ost-replica.md`。
+Repeating `--ost-alternate` registers read-only OSTs separate from the writer's primary OST. Writes go only to the primary OST, and chunks are copied to replica OSTs. Because `pull` / `cat` try `endpoints` in the locator in order, reads can continue even if the primary OST goes down as long as a replica OST is alive. See `specs/ost-replica.md` for details.
 
-#### DNSSEC から root 鍵と registry 一覧を取得する
+#### Fetching Root Key and Registry List via DNSSEC
 
-`--dnssec-domain` を指定すると、`_dfs.<domain>` の DNSSEC 検証済み TXT レコードから
-root 公開鍵と primary/secondary registry を取得する。`--registry` は不要。
+Passing `--dnssec-domain` fetches the root public key and primary/secondary registries from the DNSSEC-verified TXT record at `_dfs.<domain>`. `--registry` is not required.
 
 ```bash
 dfscli discover example.com
@@ -125,14 +115,12 @@ dfscli config create scw \
   --secret <tree_secret>
 ```
 
-DNSSEC は root 鍵と初期 registry 一覧の配布に限定し、L4 head や primary 昇格の
-判断には使わない。`--registry` / `--root-pubkey` を併記した場合は、DNSSEC の内容と
-一致しなければ拒否する。詳細は `specs/dnssec.md`。
+DNSSEC is limited to distributing the root key and initial registry list; it is not used for L4 head or primary promotion decisions. If `--registry` / `--root-pubkey` are also specified, they are rejected unless they match the DNSSEC contents. See `specs/dnssec.md` for details.
 
-#### BitTorrent archive
+#### BitTorrent Archive
 
-現在の先頭版を、署名済みメタデータ + 全 chunk + `.torrent` として保存できる。
-BitTorrent はホットパスではなく、長期保存・最終復旧用である。
+The current head version can be saved as signed metadata + all chunks + `.torrent`.
+BitTorrent is not on the hot path; it is for long-term retention and last-resort recovery.
 
 ```bash
 dfscli archive create scw: --out ./scw-v1
@@ -145,41 +133,36 @@ dfscli archive extract ./scw-v1 ./restored
 dfscli archive catalog .
 ```
 
-`create --publish` は署名済みdescriptorをL2へ登録する。`fetch` はL2から
-descriptorを取得し、`aria2c` または `transmission-cli` のDHT/trackerでbundleを
-取得してからDFS署名を再検証する。DNSSECはroot公開鍵の初期取得経路の一つであり、
-通常の `--registry` と `remotes.json` だけでfetchできる。
-詳細は `specs/bittorrent.md`。
+`create --publish` registers a signed descriptor in L2. `fetch` retrieves the descriptor from L2, downloads the bundle via DHT/tracker using `aria2c` or `transmission-cli`, and re-verifies the DFS signatures. DNSSEC is one way to initially obtain the root public key, and `fetch` works with just a normal `--registry` and `remotes.json`.
+See `specs/bittorrent.md` for details.
 
-#### L4 版履歴
+#### L4 Version History
 
-`history` は L2 が保持する署名済み L4 ログの履歴を新しい順に表示する。
+`history` displays the signed L4 log history held by L2 in newest-first order.
 
 ```bash
 dfscli history scw:
 dfscli history scw:/example.com/alice --limit 20
 ```
 
-L2 の API では `/v1/history` と `/v1/resolve` の `version` 指定を使う。
+On the L2 API, this uses `/v1/history` and the `version` parameter of `/v1/resolve`.
 
-#### registry の手動昇格
+#### Manual Registry Promotion
 
-secondary registry を primary に昇格する場合は、旧 primary を停止してから
-secondary 側で state の role epoch を進める。
+To promote a secondary registry to primary, stop the old primary and advance the state's role epoch on the secondary:
 
 ```bash
 dfs promote --state-dir ~/.dfs_server --role-epoch 2
 dfs serve ... --role primary --role-epoch 2
 ```
 
-writer 側も `config create ... --role-epoch 2` で同じ世代に更新する。
-secondary は `role_epoch` が一致する書き込みだけを受け付ける。詳細は
-`specs/promotion.md`。
+Update the writer side to the same generation with `config create ... --role-epoch 2`.
+A secondary accepts only writes with a matching `role_epoch`. See `specs/promotion.md` for details.
 
-#### libp2p/QUIC 読み取り
+#### libp2p/QUIC Reads
 
-OST の chunk ディレクトリを libp2p/QUIC で配布し、読み取り候補に追加できる。
-サーバは py-libp2p のプロセス制約のため専用プロセスで起動する。
+An OST's chunk directory can be served over libp2p/QUIC and added as a read candidate.
+The server runs in a dedicated process due to `py-libp2p` process constraints.
 
 ```bash
 dfscli libp2p-serve \
@@ -191,29 +174,21 @@ dfscli create scw \
   --libp2p-peer /ip4/203.0.113.10/udp/19443/quic-v1/p2p/12D3KooW...
 ```
 
-読み取りは主 OST → 複製 OST → libp2p の順に試す。書き込みは主 OST のみ。
-詳細は `specs/libp2p.md`。
+Reads try primary OST → replica OST → libp2p in order. Writes go only to the primary OST.
+See `specs/libp2p.md` for details.
 
-**L2 が OST の場所とパスを知っている理由**: L2 のロケータ（`dfs-l2-locator-v1`）は
-`endpoints` を持ち、そこに L3 の場所（`tls://192.0.2.60:19443`）が入る。これは版を
-書くたびに更新される。委譲レコードは書き手の公開鍵（`writer`）を持つので、「この鍵が
-書くのはどのサブツリーか」を L2 に聞ける。最初の版を書く前はロケータがまだ無いため、
-L2 は `--advertise`（または bind から推定したホスト）で自分の L3 の場所を広告する。
+**Why L2 knows OST locations and paths**: L2 locators (`dfs-l2-locator-v1`) carry `endpoints` containing L3 locations (`tls://192.0.2.60:19443`), updated whenever a version is written. Delegation records contain the writer's public key (`writer`), so L2 can answer "which subtree does this key write to?" Before the first version is written, no locator exists yet, so L2 advertises its L3 location via `--advertise` (or a host inferred from bind).
 
-#### 書き手の鍵はその場で作る
+#### Writer Keys Are Generated on the Spot
 
-`--key` を省くと、`~/.config/dfs/keys/<名前>_ed25519` に Ed25519 の鍵を作る
-（`--key-dir` で場所を変えられる）。OpenSSH 形式で、パーミッションは 600。
+If `--key` is omitted, an Ed25519 key is created at `~/.config/dfs/keys/<name>_ed25519` (configurable via `--key-dir`), in OpenSSH format with permissions `600`.
 
-`--key` を**渡した**のにそのパスが無い場合は、勝手に作らず使い方の誤り（終了コード 2）で
-止める。既存の鍵を使いたい人が、打ち間違いで新しい鍵を作ってしまうのを避けるため。
+If `--key` **is** passed but the path does not exist, `dfscli` does not create one and exits with a usage error (exit code 2), preventing typos from silently creating a new key when the user intended to use an existing one.
 
-#### tree_secret は端末から読む
+#### `tree_secret` Is Read from the Terminal
 
-`tree_secret` は L2 から引けない（サーバに置かない共有秘密だから）。**書く前に**必要になる。
-`--secret` を省くと、端末から**エコーなしで 2 回**聞く。打ち間違えると復号できないツリーに
-なる（サーバに平文を置かないので取り返しがつかない）ため、確認用にもう一度聞き、一致した
-ものだけ採る。
+`tree_secret` cannot be fetched from L2 (it is a shared secret never stored on the server) and is required **before writing**.
+If `--secret` is omitted, it prompts **twice without echo** from the terminal. Because a typo creates an undecryptable tree (irrecoverable since no plaintext is stored on the server), it asks a second time for confirmation and accepts only matching inputs.
 
 ```
 $ dfscli create scw --registry 192.0.2.60
@@ -225,94 +200,88 @@ scw の tree_secret（確認のためもう一度）:  ← 同じものを打つ
   tree_secret : *** （端末から読みました）
 ```
 
-一致しなければやり直す（3 回まで）。
+If they do not match, it retries (up to 3 times):
 
 ```
 [dfscli] 入力が一致しません。もう一度入力してください（1/3）
 ```
 
-3 回とも一致しなければ、secret を空のまま登録し、あとで `--secret` を設定するよう促す。
-空のまま書こうとすると使い方の誤り（終了コード 2）で止まる。
+If all 3 attempts fail to match, it registers the remote with an empty secret and prompts the user to set `--secret` later. Attempting to write with an empty secret stops with a usage error (exit code 2).
 
-#### `create` は `config create` の短い入口
+#### `create` Is a Shorthand for `config create`
 
-登録は一番よく打つので、`config` を省いた入口を用意した。中身は同じ関数。
+Since registration is the most frequent operation, a shorthand omitting `config` is provided (calls the same function):
 
 ```bash
 dfscli create scw --registry 192.0.2.60       # = dfscli config create scw ...
-dfscli config show scw                         # 表示・削除・一覧は config の下
+dfscli config show scw                         # show, delete, list are under config
 dfscli config delete scw
-dfscli listremotes                             # config list と同じ
+dfscli listremotes                             # same as config list
 ```
 
-実装は Python の `getpass`（標準ライブラリ）。`/dev/tty` からエコーなしで読む。
-パイプやリダイレクトの中では端末が無いので読まず、`--secret` を渡すよう促す。
-`--no-prompt` を付けると、端末があっても読まない（スクリプト用）。
+Implemented using Python's standard-library `getpass` reading without echo from `/dev/tty`.
+Inside pipes or redirects where no TTY exists, it does not prompt and asks for `--secret`.
+Passing `--no-prompt` skips prompting even when a TTY is present (for scripts).
 
-空のまま書こうとすると、黙って弱い暗号にせず使い方の誤り（終了コード 2）で止める。
+Attempting to write with an empty secret stops with a usage error (exit code 2) rather than silently using weak encryption.
 
-#### なぜ pinentry を使わないか
+#### Why Not `pinentry`
 
-パスフレーズを端末から安全に読む Unix の標準部品は **`pinentry`（`pinentry-curses`）** で、
-`dialog` / `whiptail` も同種である。ただし macOS には既定で入っていないため、外部コマンドに
-頼らず `getpass` で済ませている。
+The standard Unix component for safely reading passphrases from a terminal is **`pinentry` (`pinentry-curses`)** (or `dialog` / `whiptail`). However, it is not pre-installed on macOS, so `getpass` is used to avoid external command dependencies.
 
-### 1.2 root アンカー（信頼の根）と証明書ピン
+### 1.2 Root Anchor (Trust Root) and Certificate Pinning
 
-委譲チェーンを root から検証するには、root アンカーの公開鍵が要る。これは**リモート定義に
-持つ**（`root_pubkey` と、表示用の `root_fingerprint`）。
+Verifying a delegation chain from the root requires the root anchor's public key. This is **stored in the remote definition** (`root_pubkey` and display `root_fingerprint`).
 
-- `--root-pubkey FILE`（`create` / `join`）を渡せば、その中身で事前固定する（本番はこちら。DNSSEC や名簿の鍵と不一致ならエラー）。
-- 省略すると、初回登録時に名簿（`/v1/paths`）から取得して記録する（**初回 TOFU ピン留め**）。取得元と `SHA256:...` 指紋を表示する。
-- 以降は記録した公開鍵だけを信頼し、名簿が違う値を返したら拒否する。
-- `--allow-tofu`（`create` / `join`）を明示した場合は、root 公開鍵を取得できない／未設定のリモートでも writer 検証を省略して TOFU を許可する（既定では `root_pubkey` 未設定時の署名検証は拒否）。
+- Passing `--root-pubkey FILE` (`create` / `join`) pins it upfront from the file (recommended for production; errors if it mismatches DNSSEC or the registry's key).
+- When omitted, it is fetched from the registry (`/v1/paths`) on initial registration and recorded (**initial TOFU pinning**), displaying the source and `SHA256:...` fingerprint.
+- Thereafter, only the recorded public key is trusted; if a registry returns a different value, it is rejected.
+- Explicitly passing `--allow-tofu` (`create` / `join`) permits TOFU without writer verification even on remotes where the root public key is unavailable or unset (by default, signature verification fails when `root_pubkey` is unset).
 
 ```text
   root アンカー: SHA256:n2ypRtbEq5vZOTK+i0WmBioSgHFEPFPCr21KWO7c4Jc （名簿から取得（初回 TOFU ピン留め））
                  これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）
 ```
 
-L3 OST の TLS 証明書ピン（`ost_cert_sha256`）も同様に扱う:
+L3 OST TLS certificate pinning (`ost_cert_sha256`) works similarly:
 
-- `--ost-cert-sha256` で明示指定でき、ローテーション時は新しいピンを指定して反映する。
-- 未指定時は、選択した OST エンドポイントが名簿 `/v1/ost` の `endpoint` と正規化後に一致し、かつ `tls://`（`host:port`）接続である場合のみ自動ピン留めする（`https://` リバースプロキシや別 OST には自動適用しない）。
-- `Remote.ost` を別エンドポイントへ切り替えた際、新しい定義にピンが無い場合は作業ディレクトリの古い証明書ピンを自動でクリアする。
+- Can be specified explicitly with `--ost-cert-sha256`; update to the new pin during rotation.
+- When omitted, auto-pinning occurs only if the selected OST endpoint matches the normalized `endpoint` from registry `/v1/ost` and uses `tls://` (`host:port`) (never auto-applied to `https://` reverse proxies or other OSTs).
+- When switching `Remote.ost` to a different endpoint, any stale certificate pin in the working directory is automatically cleared if the new definition has no pin.
 
-理由と限界は `specs/delegation.md` §3.5 に書いた。要は「信頼の根を相手から取ると根に
-ならない」ので、初回だけ TOFU で取り、以降は手元の記録を使う。本番は明示する。
+The rationale and limitations are in `specs/delegation.md` §3.5: because "fetching the root of trust from the peer does not make it a root of trust," TOFU is used only on first contact and the local record is used thereafter. Production should specify it explicitly.
 
-### 1.3 鍵の形式
+### 1.3 Key Format
 
-`--key` は **OpenSSH 形式の Ed25519 秘密鍵**。PEM ではない（省略時はこの形式で作る）。
+`--key` expects an **OpenSSH-format Ed25519 private key**, not PEM (also generated in this format when omitted).
 
-- `crypto.py` はまず `cryptography` の `load_ssh_private_key` で読み、復号できない鍵は
-  `ssh-keygen -Y sign` に委ねる。どちらも OpenSSH 形式を前提にする。
-- `ssh-ed25519` のみ対応。RSA / ECDSA は署名検証で弾かれる。
-- パスフレーズ無しが速い。有りでも動くが、署名のたびに `ssh-keygen` が起動する。
+- `crypto.py` first tries `cryptography`'s `load_ssh_private_key`, and falls back to `ssh-keygen -Y sign` for keys it cannot decrypt. Both assume OpenSSH format.
+- Only `ssh-ed25519` is supported. RSA / ECDSA are rejected during signature verification.
+- Passphrase-less keys are faster; passphrase-protected keys work too, but spawn `ssh-keygen` on every signature.
 
 ---
 
-## 2. コマンド
+## 2. Commands
 
 ```text
 dfscli listremotes
-# 最小（ホスト名だけ。鍵を作り、secret は端末から 2 回読む）
+# Minimal (hostname only; generates key and reads secret twice from terminal)
 dfscli create NAME --registry HOST
-# ↑ は config create と同じ。以下は明示したいときだけ
+# ↑ Same as config create. Below are optional explicit flags
 dfscli config create NAME --registry HOST
 
-# 省略したくないときだけ足す
-#   --registry-port N  ポートを補う番号（既定 9440）
-#   --key FILE         既存の Ed25519 秘密鍵（無ければ断る）
-#   --key-dir DIR      鍵を作る場所（既定 ~/.config/dfs/keys）
-#   --secret VALUE     tree_secret（省くと端末から読む）
-#   --no-prompt        端末から読まない
+# Add only when you don't want defaults
+#   --registry-port N  Port to fill in (default 9440)
+#   --key FILE         Existing Ed25519 private key (refuses if missing)
+#   --key-dir DIR      Directory to create key in (default ~/.config/dfs/keys)
+#   --secret VALUE     tree_secret (reads from terminal if omitted)
+#   --no-prompt        Do not read from terminal
 #   --ost / --path / --workdir / --epoch / --compression / --node-name
 dfscli config create NAME --registry HOST --key FILE --ost HOST:PORT --path /sub/path \
                           [--workdir DIR] [--epoch N] [--node-name NAME]
 dfscli config show|delete|list [NAME]
 
-# 読み出し（版を進めない）
+# Read operations (do not advance version)
 dfscli ls     REMOTE:path
 dfscli lsd    REMOTE:path
 dfscli mount  REMOTE:path LOCAL_MOUNT
@@ -323,72 +292,66 @@ dfscli cat    REMOTE:path/file
 dfscli about  REMOTE:
 dfscli check  REMOTE:path LOCAL_DIR
 
-# 書き込み（1 版としてまとめる）
+# Write operations (committed as 1 version)
 dfscli copy   LOCAL REMOTE:path [--checksum [MODE]] [--include PATTERN] [--exclude PATTERN] [-n]
 dfscli copyto LOCAL_FILE REMOTE:path/file [--checksum [MODE]] [-n]
 dfscli import_tar ARCHIVE REMOTE:path [--strip-components N] [-n]
 dfscli mv     REMOTE:path REMOTE:path [--overwrite] [-n]
 dfscli sync   LOCAL_DIR REMOTE:path [--delete] [--checksum [MODE]] [--include PATTERN] [--exclude PATTERN] [-n]
 
-# ディレクトリと削除
+# Directories and deletion
 dfscli mkdir  REMOTE:dir
 dfscli rm     REMOTE:path [-R|--recursive] [--rmdirs] [-n]
 dfscli rmdir  REMOTE:dir [-n]
 dfscli purge  REMOTE:path [-n]
 
-# 取り出し
+# Fetch
 dfscli pull   REMOTE:path LOCAL_DIR [--force] [--include PATTERN] [--exclude PATTERN]
 
-# サーバ側は cli.py のものをそのまま使う
-dfscli serve    ... --advertise <L3 を広告するホスト>
+# Server side uses dfs/cli.py directly
+dfscli serve    ... --advertise <host advertising L3>
 dfscli serve    ... --ost-dir /Volumes/ExtSSD/dfs/ost/<name>
 dfscli delegate ...
 ```
 
-`REMOTE` は `config create` で付けた名前。`REMOTE:` はそのリモートの根、`REMOTE:docs` は
-配下を指す。`--remote NAME` を付ければ `remote:` を省略してパスだけ書ける
-（rclone の `:backend:` 相当）。
+`REMOTE` is the name given to `config create`. `REMOTE:` refers to that remote's root, and `REMOTE:docs` refers to a subpath. Passing `--remote NAME` lets you omit `remote:` and write only the path (equivalent to `rclone`'s `:backend:`).
 
 ---
 
-## 2.1 L2 が答える追加の問い合わせ
+## 2.1 Additional L2 Queries
 
-`config create` を短くするために、L2 に 2 つの口を足した（`dfs/cli.py`）。
+To keep `config create` concise, two endpoints were added to L2 (`dfs/cli.py`):
 
-| エンドポイント | 返すもの |
+| Endpoint | Returns |
 |---|---|
-| `POST /v1/ost` | L3 の場所（`tls://host:port`）と、パスごとのロケータの endpoint |
-| `POST /v1/paths` | 登録済みのサブツリー、書き手公開鍵、epoch、先頭版 |
+| `POST /v1/ost` | L3 location (`tls://host:port`) and per-path locator endpoints |
+| `POST /v1/paths` | Registered subtrees, writer public keys, epochs, head versions |
 
-`dfscli` はこの 2 つを使って `--ost` と `--path` を解決する。
+`dfscli` uses these two endpoints to resolve `--ost` and `--path`:
 
-- **OST**: まずロケータの `endpoints` を見る。無ければ（初回）`/v1/ost` の広告を使う。
-- **パス**: 秘密鍵の公開鍵を作り（`ssh-keygen -y` または `.pub`）、`/v1/paths` で
-  一致するサブツリーを探す。複数あれば短いものを選ぶ。
+- **OST**: First checks `endpoints` in the locator. If none exist yet (initial setup), uses the `/v1/ost` advertisement.
+- **Path**: Derives the public key from the private key (`ssh-keygen -y` or `.pub`) and searches `/v1/paths` for matching subtrees. If multiple match, picks the shortest one.
 
 ---
 
-## 3. 振る舞い
+## 3. Behavior
 
-### 3.1 書き込みは「写しを合わせてから 1 版」
+### 3.1 Writes "Sync Local Copy First, Then Commit 1 Version"
 
-書き込み系は次の順で動く。
+Write commands execute in the following order:
 
-1. 作業ディレクトリの写しを、リモートの先頭版に合わせる（既に同じ版なら L2 の 1 往復だけ）。
-2. ローカルの変更を写しへ載せる。
-3. 1 版としてまとめて `push` する。
+1. Sync the working directory copy to the remote's head version (just 1 L2 round trip if already on the same version).
+2. Apply local changes to the working copy.
+3. `push` them together as 1 version.
 
-途中で失敗しても、リモートの版は壊れない。dfs の push は「塊を送ってから CAS で 1 版を
-追記する」順なので、CAS が失敗すれば版は増えない。
+If it fails mid-way, the remote version is never corrupted. Because `dfs` push sends chunks first and then appends 1 version via CAS, a failed CAS does not advance the version.
 
-primary / secondary registry が両方停止した場合は、`.clayfs/l2_cache.json` の
-検証済み応答へフォールバックする。キャッシュも期限切れ・巻き戻しは拒否する。
+If both primary and secondary registries are down, it falls back to verified responses in `.clayfs/l2_cache.json`. Expired or rolled-back cached entries are still rejected.
 
-### 3.2 冪等
+### 3.2 Idempotency
 
-変更が無ければ**新しい版を作らない**。判定は rclone の既定と同じく大きさを先に見る。
-`--checksum` には `size` / `crc32` / `sha1` / `plain_id` を指定できる。単独の
-`--checksum` は既存互換のため `plain_id` として扱う。
+If nothing changed, **no new version is created**. Like `rclone`'s default, size is checked first.
+`--checksum` accepts `size` / `crc32` / `sha1` / `plain_id`. A bare `--checksum` is treated as `plain_id` for backward compatibility.
 
 ```
 $ dfscli copy ./sample local:
@@ -398,244 +361,214 @@ $ dfscli copy ./sample local:
 [dfscli] copy: 変更なし（4 ファイルが同じ）。新しい版は作りません
 ```
 
-dfs は書き手側の索引で塊を重複排除するので、内容が同じなら `push` しても本文は送られない。
-それでも版が増えるのは無駄なので、CLI 側で「変わらないなら版を作らない」を決めている。
+Because `dfs` deduplicates chunks via the writer-side index, pushing identical content would not resend file bodies. Even so, incrementing the version number is wasteful, so the CLI avoids creating a new version when nothing changed.
 
-#### 3.2.1 移動は 1 版
+#### 3.2.1 Move Uses 1 Version
 
-`mv` は同一リモート内の rename として扱い、最後に 1 版だけ push する。
-`copy` + `rm` のように 2 版を消費しない。
+`mv` is handled as an intra-remote rename and pushes only 1 version at the end.
+It does not consume 2 versions like `copy` + `rm`.
 
-- 宛先は「新しい名前そのもの」として解釈する（既存ディレクトリへの自動格納はしない）
-- 宛先が存在する場合は既定で拒否する
-- ファイル同士の置換だけは `--overwrite` で許可する
-- ディレクトリの merge は行わない
-- 別リモート間の移動は `copy` + `rm` を使う
+- Destination is interpreted as "the new name itself" (does not auto-nest into an existing directory)
+- Refuses if the destination already exists by default
+- Allows replacing a file with another file only with `--overwrite`
+- Does not merge directories
+- Cross-remote moves use `copy` + `rm`
 
-#### 3.2.2 フィルタ
+#### 3.2.2 Filters
 
-`copy` / `sync` / `pull` は `--include PATTERN` と `--exclude PATTERN` を受け付ける。
-パターンは操作の基準ディレクトリからの相対パスに適用し、`*` / `?` / `[]` の
-シェル風ワイルドカードを使える。`--exclude` は `--include` より常に優先する。
+`copy` / `sync` / `pull` accept `--include PATTERN` and `--exclude PATTERN`.
+Patterns apply to paths relative to the operation's base directory and support shell-style wildcards (`*` / `?` / `[]`). `--exclude` always takes precedence over `--include`.
 
-`sync --delete` では、フィルタの外側にあるリモートファイルを削除しない。
-たとえば `--exclude 'docs/private/*'` を付ければ、その範囲は同期対象から完全に外れる。
+In `sync --delete`, remote files outside the filter are not deleted.
+For example, passing `--exclude 'docs/private/*'` completely excludes that scope from synchronization.
 
-#### 3.2.3 tar インポート
+#### 3.2.3 tar Import
 
-`import_tar` は、`.tar` / `.tar.gz` / `.tar.xz` / `.tar.bz2` を自動判定して
-リモートへインポートする。展開結果は `copy` と同じく追加・更新として 1 版にまとめ、
-リモートにしかないファイルは削除しない。
+`import_tar` auto-detects `.tar` / `.tar.gz` / `.tar.xz` / `.tar.bz2` and imports into a remote. Like `copy`, extracted entries are committed as additions/updates in 1 version, without deleting remote-only files.
 
-- 通常ファイルとディレクトリだけを許可する
-- symlink / hardlink / device / FIFO は拒否する
-- 絶対パスと `..` を拒否し、`\` も区切りとして正規化して検査する
-- `.clayfs` は取り込まない
-- `--strip-components N` で tar の先頭 N 要素を除ける
-- 内容が同じファイルだけなら新しい版を作らない
+- Allows only regular files and directories
+- Rejects symlinks, hardlinks, devices, and FIFOs
+- Rejects absolute paths and `..`, normalizing `\` as a separator before checking
+- Ignores `.clayfs`
+- `--strip-components N` strips the first N path components from tar entries
+- Does not create a new version if all files have identical content
 
 ```bash
 dfscli import_tar release.tar.gz backup:
 dfscli import_tar bundle.tar.xz backup:project --strip-components 1
 ```
 
-#### 3.2.4 FUSE マウント
+#### 3.2.4 FUSE Mount
 
-`mount` はリモートのサブツリーをローカルのマウントポイントに公開する。
-macOS では fuse-t を優先し、Linux では libfuse を使う。
+`mount` exposes a remote subtree at a local mount point.
+Prefers `fuse-t` on macOS and uses `libfuse` on Linux.
 
 ```bash
 dfscli mount scw:docs /mnt/dfs-docs
 dfscli mount scw:docs /mnt/dfs-docs --read-only
 ```
 
-読み書きは作業ツリー上で行い、ファイルを close したとき（FUSE の `release`）と
-アンマウント時に DFS へ push する。複数ファイルを同時に書く場合は、ファイルごとに
-版が増えることがある。マウント中も単一書き手の前提を維持するため、同じサブツリーを
-別の DFS 書き手から同時に変更しないこと。
+Reads and writes happen on the working tree, and changes are pushed to DFS on file close (FUSE `release`) and on unmount. Writing multiple files concurrently may increment versions per file. To preserve the single-writer assumption while mounted, do not modify the same subtree from another DFS writer concurrently.
 
-`--allow-other`、`--debug`、`--fuse-library PATH` も指定できる。macOS で
-fusepy が macFUSE を選んでしまう場合は、`--fuse-library` に fuse-t の
-`libfuse-t.dylib` を渡す。
+`--allow-other`, `--debug`, and `--fuse-library PATH` are also supported. On macOS, if `fusepy` picks macFUSE instead, pass `fuse-t`'s `libfuse-t.dylib` to `--fuse-library`.
 
-#### 3.2.5 フォルダ単位の圧縮
+#### 3.2.5 Per-Folder Compression
 
-圧縮ポリシーはディレクトリの xattr `user.dfs.compression` で指定できる。
-値は `none` / `zstd`。子は最も近い親の設定を継承する。
+Compression policy can be set via the directory xattr `user.dfs.compression`.
+Values are `none` / `zstd`. Children inherit the setting of their nearest ancestor.
 
 ```bash
 xattr -w user.dfs.compression zstd /path/to/tree/src
 xattr -w user.dfs.compression none /path/to/tree/archive
 ```
 
-push 時には実効ポリシーを署名済みディレクトリ塊へ保存するため、xattr が後で
-失われてもリモート側の解釈は変わらない。圧縮は平文に対して行い、チャンクは
-`DFSB3` の codec 付きヘッダーで保存する。実際の圧縮率が 95% 以上なら
-非圧縮の `DFSB2` として保存する。
+On push, the effective policy is saved in the signed directory chunk, so the remote interpretation remains unchanged even if xattrs are later lost. Compression is applied to plaintext, and chunks are stored with the `DFSB3` codec header. If the actual compressed ratio is 95% or higher, it is stored uncompressed as `DFSB2`.
 
-リモート全体の既定値は `config create --compression zstd` で指定できる。
-xattr が無い場合にだけこの既定値を使う。
+A remote-wide default can be set via `config create --compression zstd`.
+This default is used only when no xattr is present.
 
-### 3.3 一覧は内容を取らない
+### 3.3 Listings Do Not Fetch File Contents
 
-`ls` / `lsd` / `lsl` / `lsjson` / `size` は、ディレクトリ塊だけを辿ってファイルの中身は取らない。
-取得量は**構造の階層数**で決まる（`l4_log.py::list_tree` の幅優先走査）。
-`cat` は目的のファイルまでのディレクトリ塊と、そのファイル塊だけを取る。
-`lsd` は直下のディレクトリだけを返す。
+`ls` / `lsd` / `lsl` / `lsjson` / `size` traverse only directory chunks and never fetch file contents.
+Transfer volume depends only on **tree depth** (breadth-first traversal in `l4_log.py::list_tree`).
+`cat` fetches only the directory chunks along the path to the target file and that file's chunks.
+`lsd` returns only immediate subdirectories.
 
-### 3.4 削除と空ディレクトリ
+### 3.4 Deletion and Empty Directories
 
-dfs は**空のディレクトリも版に残す**。ディレクトリ塊は `{"entries": [], "format": "dfs-dir-v1"}`
-として表現され、読み出し側はそれを見て実体を作る。つまり「中のファイルが全部消えた」だけでは
-ディレクトリは消えず、`pull` すると空のディレクトリごと降りてくる。
+`dfs` **preserves empty directories in versions**. A directory chunk is represented as `{"entries": [], "format": "dfs-dir-v1"}`, and readers recreate the directory from it. That is, deleting all files inside a directory does not delete the directory itself; `pull` will materialize the empty directory.
 
-| コマンド | すること |
+| Command | Action |
 |---|---|
-| `mkdir REMOTE:dir` | 空のディレクトリを作る（版に残る） |
-| `rm REMOTE:file` | ファイルを消す。**空になったディレクトリは既定で残す** |
-| `rm REMOTE:dir -R` | ディレクトリを中身ごと消す（ファイルだけ。空の階層は残す） |
-| `rm REMOTE:dir -R --rmdirs` | 中身ごと消し、**空になったディレクトリも片付ける** |
-| `rmdir REMOTE:dir` | 空のディレクトリだけを消す（中身があれば断る） |
-| `purge REMOTE:path` | 指定パスの中身をすべて消し、ディレクトリ自身も消す |
+| `mkdir REMOTE:dir` | Creates an empty directory (persisted in version) |
+| `rm REMOTE:file` | Deletes a file. **Leaves any resulting empty directory by default** |
+| `rm REMOTE:dir -R` | Deletes directory contents recursively (files only; empty hierarchy remains) |
+| `rm REMOTE:dir -R --rmdirs` | Deletes contents recursively and **prunes resulting empty directories** |
+| `rmdir REMOTE:dir` | Deletes only an empty directory (refuses if non-empty) |
+| `purge REMOTE:path` | Deletes everything under the path and the directory itself |
 
-`--rmdirs` は「rclone のように、リモートをローカルの見た目に合わせたい」とき、
-付けなければ「空のディレクトリは資産として残したい」とき、と使い分ける。
+Use `--rmdirs` when you want the remote to match the local view like `rclone`, and omit it when you want to keep empty directories as assets.
 
-`rm` の `--rmdirs` は、**消したパスの親ディレクトリ**だけを対象にする。作業ツリー全体や
-同じ親に並ぶ無関係な空ディレクトリは削除しない。
+`rm --rmdirs` targets **only the parent directories of the deleted path**. It does not prune unrelated empty directories across the working tree or siblings under the same parent.
 
-`sync --delete` は「ローカルと一致させる」操作なので、消した結果として空になった
-ディレクトリも片付ける（`--rmdirs` は要らない）。
+`sync --delete` is an operation to "match local," so it also prunes directories that become empty as a result of deletion (without needing `--rmdirs`).
 
-### 3.5 単一書き手の衝突
+### 3.5 Single-Writer Conflicts
 
-他の端末が先に書いていた場合、`push` の CAS が失敗する。CLI はこれを例外にせず、
-終了コード 7 と案内（`pull` してからやり直す）にする。
+If another machine wrote first, `push`'s CAS fails. The CLI handles this cleanly instead of raising an unhandled exception, exiting with code 7 and instructing the user to `pull` and retry.
 
-| 終了コード | 意味 |
+| Exit code | Meaning |
 |---|---|
-| 0 | 成功 |
-| 1 | 予期しないエラー |
-| 2 | 使い方の誤り（リモート未定義・パス不正など） |
-| 6 | L2/L3 に到達できない |
-| 7 | 単一書き手の競合（CAS 失敗） |
-| 8 | 巻き戻しを検出（B6） |
-| 9 | 黙った破棄を検出（B7） |
+| 0 | Success |
+| 1 | Unexpected error |
+| 2 | Usage error (undefined remote, invalid path, etc.) |
+| 6 | L2/L3 unreachable |
+| 7 | Single-writer conflict (CAS failure) |
+| 8 | Rollback detected (B6) |
+| 9 | Silent discard detected (B7) |
 
 ---
 
-## 4. 内部構造（何がディスクに出来るか）
+## 4. Internal Structure (What Is Written to Disk)
 
-`copy ./sample local:` を 1 回実行した後の姿。`sample/` には a.txt（12B）、
-dup.txt（同一内容）、b.bin（3KB）、docs/readme.md、docs/sub/deep.txt があるとする。
+State after running `copy ./sample local:` once, assuming `sample/` contains `a.txt` (12B), `dup.txt` (identical content), `b.bin` (3KB), `docs/readme.md`, and `docs/sub/deep.txt`.
 
 ```text
-# クライアント側（作業ディレクトリ）
+# Client side (working directory)
 wd/
-├── tree/                         実際に読み書きする作業ツリー
+├── tree/                         Working tree for actual reads/writes
 │   ├── a.txt  b.bin  dup.txt
 │   └── docs/readme.md  docs/sub/deep.txt
 └── .clayfs/
-    ├── dfs_config.json          L2 URL・OST・sub_path・tree_secret
-    ├── local_head.json           HeadPin（版番号 / entry_hash / epoch）
-    ├── l2_cache.json             検証済みの delegation / locator / head
-    ├── ost_index.json            書き手の plain_id -> (wire_id, store_id) 索引
-    ├── cache_version             rclone CLI が足した「今の写しの版」
-    └── snapshots/v1/             push 時に取った版の写し（ハードリンク）
+    ├── dfs_config.json          L2 URL, OST, sub_path, tree_secret
+    ├── local_head.json           HeadPin (version / entry_hash / epoch)
+    ├── l2_cache.json             Verified delegation / locator / head
+    ├── ost_index.json            Writer's plain_id -> (wire_id, store_id) index
+    ├── cache_version             "Current working copy version" added by rclone CLI
+    └── snapshots/v1/             Version snapshot taken on push (hardlinks)
 
-# サーバ側
+# Server side
 srv/
-├── ost_cert.pem  ost_key.pem    L3 の TLS 証明書（初回に自動生成）
-├── ost_chunks/                   L3 の塊。ファイル名は wire_id
-│   ├── 546d0806...blk  (12 B)   平文 "hello world\n"
-│   ├── 99d12a68...blk  (879 B)  ディレクトリ塊（ルート）
+├── ost_cert.pem  ost_key.pem    L3 TLS certificate (auto-generated on first run)
+├── ost_chunks/                   L3 chunks; filenames are wire_id
+│   ├── 546d0806...blk  (12 B)   Plaintext "hello world\n"
+│   ├── 99d12a68...blk  (879 B)  Directory chunk (root)
 │   └── ...
-└── registry_state.json          L1 委譲 + L2 ロケータ + L4 ログ
+└── registry_state.json          L1 delegation + L2 locator + L4 log
 ```
 
-ファイル本体は **8 MiB ごと**、ディレクトリは**ディレクトリごと**に 1 塊へ分ける。
-ファイルエントリは `chunks` に各塊の `plain_id`、`wire_id`、`offset`、`size` を持つ。
-`a.txt` と `dup.txt` が同一内容なら、同じ `wire_id` の塊を両方が指す（重複排除）。
-旧形式の「ファイル全体を 1 塊」とするマニフェストも読める。
+File bodies are split into **8 MiB chunks**, and directories into **1 chunk per directory**.
+File entries list each chunk's `plain_id`, `wire_id`, `offset`, and `size` under `chunks`.
+If `a.txt` and `dup.txt` have identical content, both point to the same `wire_id` chunk (deduplication).
+Legacy manifests with "whole file as 1 chunk" are also readable.
 
-各塊は平文 + 固定費 60B（plain_id 32 + nonce 12 + tag 16）+ フレームで、小さいファイルでは
-固定費の方が大きい。
+Each chunk is plaintext + 60B fixed overhead (`plain_id` 32 + `nonce` 12 + `tag` 16) + framing, so for small files the fixed overhead is larger.
 
-ファイルとディレクトリの mode、mtime、`user.*` / `com.apple.*` xattr も署名済み
-ディレクトリ塊へ保存し、`pull` 時に復元する。所有者、ACL、特権 xattr は保存対象外。
+File and directory `mode`, `mtime`, and `user.*` / `com.apple.*` xattrs are also stored in signed directory chunks and restored on `pull`. Owners, ACLs, and privileged xattrs are not stored.
 
 ---
 
-## 5. 試験
+## 5. Tests
 
-`tests/test_cli_main.py` に 49 件。
+49 tests in `tests/test_cli_main.py`.
 
-`tests/test_fuse_mount.py` に 4 件（読み書き、`release` 時の push、read-only、
-fuse-t 不在時のエラー）。
+4 tests in `tests/test_fuse_mount.py` (read/write, push on `release`, read-only, error when `fuse-t` is missing).
 
-| 試験 | 確かめること |
+| Test | What it verifies |
 |---|---|
-| `test_config_roundtrip` | リモート定義の保存と 600 のパーミッション |
-| `test_unknown_remote_is_an_error` | 知らないリモートを弾く |
-| `test_copy_ls_cat_pull` | copy → cat → pull で内容が一致する |
-| `test_copy_is_idempotent` | 2 回目の copy が版を作らない |
-| `test_copyto_and_checksum` | 同じ内容の copyto が版を作らない |
-| `test_mv_file_uses_one_version` | `mv` が 1 版でファイルを改名する |
-| `test_mv_directory_and_dry_run` | ディレクトリ移動と dry-run の非更新 |
-| `test_mv_refuses_collision_and_allows_file_overwrite` | 衝突拒否と `--overwrite` |
-| `test_mv_rejects_cross_remote_and_descendant_destination` | 別リモート・自己配下への移動を拒否する |
-| `test_copy_include_exclude` | `copy` の include / exclude |
-| `test_sync_delete_does_not_touch_excluded_paths` | フィルタ外を `sync --delete` で消さない |
-| `test_pull_include_and_exclude` | `pull` の include / exclude |
-| `test_lsd_lists_only_directories` | `lsd` が直下のディレクトリだけを返す |
-| `test_sync_delete` | `--delete` でリモートにしかないものを消す |
-| `test_sync_without_delete_keeps_remote_only_files` | `--delete` 無しでは消さない |
-| `test_dry_run_does_not_write` | `-n` がリモートに書かない |
-| `test_check_reports_difference` | 差分の有無で終了コードが変わる |
-| `test_ls_prefix_only_lists_direct_children` | `ls` が直下だけを返す |
-| `test_rm_file_leaves_empty_dir` | ファイルを消すと空ディレクトリが残る |
-| `test_rm_rmdirs_prunes_empty` | `--rmdirs` で空になったディレクトリも片付く |
-| `test_rm_dir_needs_recursive` | ディレクトリは `--recursive` 無しでは消さない |
-| `test_rm_missing_is_an_error` | 無いパスは終了コード 2 |
-| `test_mkdir_and_rmdir` | 空ディレクトリを作って消せる |
-| `test_rmdir_refuses_non_empty` | 中身のあるディレクトリを `rmdir` で消さない |
-| `test_purge_removes_everything` | `purge` で全部消える |
-| `test_empty_dir_survives_roundtrip` | 空ディレクトリは版に残り `pull` で降りてくる |
-| `test_rm_dry_run` | `rm -n` が実際に消さない |
-| `test_no_default_remote_is_reported` | `--remote` 無しのパスを終了コード 2 で弾く |
-| `test_remote_error_exit_code` | 知らないリモートが終了コード 2 で返る |
-| `test_config_can_omit_ost_and_path` | `--ost` / `--path` を省いても L2 から解決して読み書きできる |
-| `test_registry_host_only_gets_default_port` | `--registry` はホスト名だけでよく、ポートを補う |
-| `test_config_create_makes_key_when_omitted` | `--key` を省くと OpenSSH 形式の鍵を作る（600） |
-| `test_explicit_missing_key_is_refused` | `--key` の打ち間違いでは鍵を作らない |
-| `test_no_prompt_keeps_secret_empty` | `--no-prompt` なら端末から読まない |
-| `test_create_alias_exists` | `dfscli create` が `config create` と同じに動く |
-| `test_prompt_verifies_secret_twice` | 端末では secret を 2 回聞き、不一致ならやり直す |
-| `test_path_without_leading_slash_is_accepted` | `--path` は `/` で始まらなくてよい |
-| `test_empty_secret_is_refused_on_write` | `tree_secret` が空のまま書こうとすると止まる |
-| `test_registry_advertises_ost_and_paths` | L2 が L3 の場所と登録済みパスを返す |
+| `test_config_roundtrip` | Remote config persistence and `600` permissions |
+| `test_unknown_remote_is_an_error` | Rejects unknown remotes |
+| `test_copy_ls_cat_pull` | `copy` → `cat` → `pull` preserves content |
+| `test_copy_is_idempotent` | Second `copy` does not create a version |
+| `test_copyto_and_checksum` | `copyto` with identical content does not create a version |
+| `test_mv_file_uses_one_version` | `mv` renames a file in 1 version |
+| `test_mv_directory_and_dry_run` | Directory move and non-updating dry-run |
+| `test_mv_refuses_collision_and_allows_file_overwrite` | Collision rejection and `--overwrite` |
+| `test_mv_rejects_cross_remote_and_descendant_destination` | Rejects cross-remote and self-descendant moves |
+| `test_copy_include_exclude` | `copy` include / exclude |
+| `test_sync_delete_does_not_touch_excluded_paths` | `sync --delete` does not delete excluded paths |
+| `test_pull_include_and_exclude` | `pull` include / exclude |
+| `test_lsd_lists_only_directories` | `lsd` returns only immediate subdirectories |
+| `test_sync_delete` | `--delete` removes remote-only items |
+| `test_sync_without_delete_keeps_remote_only_files` | Keeps remote-only files without `--delete` |
+| `test_dry_run_does_not_write` | `-n` does not write to remote |
+| `test_check_reports_difference` | Exit code reflects presence of differences |
+| `test_ls_prefix_only_lists_direct_children` | `ls` lists only direct children |
+| `test_rm_file_leaves_empty_dir` | Deleting a file leaves empty directory |
+| `test_rm_rmdirs_prunes_empty` | `--rmdirs` prunes resulting empty directories |
+| `test_rm_dir_needs_recursive` | Directory is not deleted without `--recursive` |
+| `test_rm_missing_is_an_error` | Missing path returns exit code 2 |
+| `test_mkdir_and_rmdir` | Can create and remove empty directories |
+| `test_rmdir_refuses_non_empty` | `rmdir` refuses non-empty directories |
+| `test_purge_removes_everything` | `purge` deletes everything |
+| `test_empty_dir_survives_roundtrip` | Empty directories persist in versions and return on `pull` |
+| `test_rm_dry_run` | `rm -n` does not actually delete |
+| `test_no_default_remote_is_reported` | Path without `--remote` fails with exit code 2 |
+| `test_remote_error_exit_code` | Unknown remote returns exit code 2 |
+| `test_config_can_omit_ost_and_path` | Omitting `--ost` / `--path` still resolves via L2 for read/write |
+| `test_registry_host_only_gets_default_port` | `--registry` accepts hostname only and fills in port |
+| `test_config_create_makes_key_when_omitted` | Omitting `--key` creates OpenSSH key (`600`) |
+| `test_explicit_missing_key_is_refused` | Typo in `--key` does not create a key |
+| `test_no_prompt_keeps_secret_empty` | `--no-prompt` does not read from terminal |
+| `test_create_alias_exists` | `dfscli create` behaves identically to `config create` |
+| `test_prompt_verifies_secret_twice` | Prompts twice for secret on terminal; retries on mismatch |
+| `test_path_without_leading_slash_is_accepted` | `--path` does not need a leading `/` |
+| `test_empty_secret_is_refused_on_write` | Writing with empty `tree_secret` is blocked |
+| `test_registry_advertises_ost_and_paths` | L2 returns L3 location and registered paths |
 
-`tests/test_integration.py` の `TestPullBatch` は、`list_tree` を支える読み出し側の
-一括取得（1 階層 1 往復）を確かめる。
+`TestPullBatch` in `tests/test_integration.py` verifies batched reads (1 round trip per level) that back `list_tree`.
 
 ---
 
-## 6. 使うときの注意
+## 6. Usage Notes
 
-- **リモートは 1 つの書き込み境界**。同じサブツリーを別のリモート名で 2 つ定義して
-  同時に書くと、単一書き手の CAS で片方が拒否される（設計どおり）。
-- **`sync --delete` はリモートを消す**。`-n` で何が消えるか先に見ること。
-- **`purge` は取り消せない。** 指定パスの中身を全部消し、ディレクトリも消す。`-n` で確認する。
-- **空ディレクトリは既定で残る。** ローカルに合わせたいときは `rm --rmdirs` か
-  `sync --delete` を使う。
-- **`--key` を省くと鍵を作る。** 既存の鍵を使いたいときは必ず `--key` で渡す。渡したパスが
-  無ければ断る（打ち間違いで新しい鍵を作らないため）。
-- **`--secret` を省くと端末から読む。** パイプの中で使うなら `--secret` か `--no-prompt` を
-  明示する。
-- **`tree_secret` はリモートごとに独立**。WAN 試験のツリー（`dfs-wan-shared-secret`）と
-  別の秘密で `config create` すれば、別のツリーとして扱われる。共有したい場合は同じ秘密を使う。
-  L2 からは引けない（サーバに置かない共有秘密）ので、書く前に必ず設定する。
-- **`--path` は 1 つの鍵で 1 つの境界**を書く前提で省略できる。1 つの鍵を複数のサブツリーに
-  使っている場合、L2 はどれか 1 つ（短いもの）を返す。そのときは `--path` を明示する。
-- **認証は無い**。L3 は WireGuard / LAN の中だけで使うこと。完全性は L4 の署名で担保する。
-- サーバを常駐させるなら launchd を使う。`nohup` だけだと親のセッション終了で落ちる。
+- **A remote is a single write boundary.** Defining two remotes for the same subtree and writing concurrently will cause one to be rejected by single-writer CAS (by design).
+- **`sync --delete` deletes from the remote.** Preview with `-n` first to see what will be deleted.
+- **`purge` cannot be undone.** Deletes everything under the path and the directory itself. Check with `-n`.
+- **Empty directories are kept by default.** Use `rm --rmdirs` or `sync --delete` to match local state.
+- **Omitting `--key` creates a key.** Always pass `--key` to use an existing key; if the path does not exist, it refuses (to avoid creating a new key on a typo).
+- **Omitting `--secret` reads from the terminal.** When using in pipelines, specify `--secret` or `--no-prompt` explicitly.
+- **`tree_secret` is independent per remote.** Running `config create` with a different secret from the WAN test tree (`dfs-wan-shared-secret`) treats it as a separate tree; use the same secret to share. Because it cannot be fetched from L2 (never stored on the server), always set it before writing.
+- **`--path` can be omitted assuming 1 key = 1 boundary.** If one key is used for multiple subtrees, L2 returns one of them (the shortest); specify `--path` explicitly in that case.
+- **There is no authentication.** Use L3 only inside WireGuard or a LAN. Integrity is guaranteed by L4 signatures.
+- To run the server persistently, use `launchd`. `nohup` alone terminates when the parent session ends.

@@ -1,37 +1,38 @@
-# L5 ファイルシステム抽象 (`dfs.fs`)
+# L5 Filesystem Abstraction (`dfs.fs`)
 
-## 目的
+> **English** | [日本語](fs-cow.ja.md)
 
-スナップショットとローカル実体化を、**OS の CoW に依存せず**成立させる。
-Python さえ動けば Windows / macOS / Linux のどこでも同じ結果になることを最優先する。
+## Purpose
 
-## 方針
+Make snapshots and local materialization work **without depending on OS CoW**.
+The top priority is producing identical results anywhere Python runs—Windows, macOS, or Linux.
 
-| 項目 | 方針 |
+## Policy
+
+| Item | Policy |
 |---|---|
-| 既定 backend | `copy`（実コピー）。どこでも動く。 |
-| CoW | あれば使う（最適化）。無ければ `copy` に落ちる。 |
-| 正しさ | CoW の有無に依存しない。スナップショットは常に独立した inode。 |
-| 設定 | `auto`（既定）/ `copy` / `reflink` / `fast_clone` |
+| Default backend | `copy` (full copy). Works everywhere. |
+| CoW | Used if available (optimization). Falls back to `copy` if unavailable. |
+| Correctness | Independent of CoW availability. Snapshots always have independent inodes. |
+| Setting | `auto` (default) / `copy` / `reflink` / `fast_clone` |
 
-## backend
+## Backends
 
-| 名前 | 能力 | 実装 | 主な環境 |
+| Name | Capability | Implementation | Primary Environments |
 |---|---|---|---|
-| `copy` | 実コピー | `shutil.copy2` / symlink 再生成 | どこでも |
-| `reflink` | ファイル単位 CoW | macOS `clonefile(2)` / Linux `FICLONE` | APFS, Btrfs, XFS |
-| `fast_clone` | ファイル単位 CoW | Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` | ReFS, Dev Drive |
+| `copy` | Full copy | `shutil.copy2` / symlink recreation | Everywhere |
+| `reflink` | Per-file CoW | macOS `clonefile(2)` / Linux `FICLONE` | APFS, Btrfs, XFS |
+| `fast_clone` | Per-file CoW | Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` | ReFS, Dev Drive |
 
-- `reflink` / `fast_clone` はディレクトリを再帰し、ファイルごとに CoW を試みる。
-- CoW できないファイル（`EINVAL`/`ENOTSUP`/`EXDEV`）だけ実コピーへフォールバックし、
-  `SnapshotResult.warnings` に記録する。
-- FIFO / socket / device はスナップショットに含めず、`SnapshotResult.skipped` に記録する。
+- `reflink` / `fast_clone` recurse into directories and attempt CoW per file.
+- Only files that cannot be CoW-cloned (`EINVAL`/`ENOTSUP`/`EXDEV`) fall back to a full copy and are recorded in `SnapshotResult.warnings`.
+- FIFOs, sockets, and devices are excluded from snapshots and recorded in `SnapshotResult.skipped`.
 
-## 検出
+## Detection
 
-`detect_backends(root)` は `root` の上で実際に 1 ファイルを複製して確かめる。
-したがって「macOS だから APFS」ではなく「今このディレクトリで CoW が動くか」で決まる。
-NFS / SMB / 外付け exFAT 上では `copy` に落ちる。
+`detect_backends(root)` verifies support by actually cloning a test file inside `root`.
+Therefore, backend selection is determined by "whether CoW works in this directory right now," not "macOS means APFS."
+On NFS, SMB, or external exFAT, it falls back to `copy`.
 
 ## API
 
@@ -53,10 +54,10 @@ dfscli fs snapshot <dir> v1
 dfscli fs materialize <dir> out --src <snapshot>
 ```
 
-## 非対応と将来
+## Unsupported Features and Future Work
 
-- Windows ReFS の block clone は実装済みだが、NTFS では使えない。
-  NTFS で CoW を得るには minifilter ドライバが必要で、dfs 本体としては配布しない。
-- btrfs subvolume / `btrfs send|receive` によるディレクトリ単位 CoW は未実装
-  (`fast_clone` の別実装として予約)。
-- 透過圧縮・重複排除は L3 の責務であり、この層では扱わない。
+- Windows ReFS block clone is implemented, but cannot be used on NTFS.
+  Supporting CoW on NTFS would require a minifilter driver, which is not distributed as part of `dfs`.
+- Directory-level CoW via btrfs subvolume / `btrfs send|receive` is not yet implemented
+  (reserved as an alternative implementation of `fast_clone`).
+- Transparent compression and deduplication are responsibilities of L3 and are not handled at this layer.

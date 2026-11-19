@@ -1,40 +1,42 @@
-# 平文圧縮の既定有効化 (`auto` ポリシー)
+# Enabling Plaintext Compression by Default (`auto` Policy)
 
-## 方針決定の経緯
+> **English** | [日本語](compression.ja.md)
 
-従来 `dfs` の既定の圧縮ポリシーは `"none"` であり、利用者が `--compression zstd` や `user.dfs.compression` xattr を明示的に指定した場合にのみ圧縮が有効になっていた。しかし、以下の理由から **既定値を `"auto"`（実質 ON）へ変更し、`zstandard>=0.22` を必須依存 (`dependencies`) へ昇格した**。
+## Rationale
 
-1. **通信制限環境・従量課金環境での不利**
-   - RunPod や vast.ai などのリモート GPU 環境では ingress / egress に課金が発生し、また狭帯域・高遅延回線では転送量がそのまま同期時間・コストに直結する。
-   - 圧縮設定を明示し忘れただけでログ・コード・JSONL・設定ファイル等の圧縮しやすいデータがすべて無圧縮で L3 OST を往復するのは、デフォルト挙動として不利が大きい。
+Previously, `dfs` defaulted to the `"none"` compression policy, enabling compression only when users explicitly specified `--compression zstd` or the `user.dfs.compression` xattr. However, for the following reasons, **the default was changed to `"auto"` (effectively ON), and `zstandard>=0.22` was promoted to a required dependency (`dependencies`)**.
 
-2. **L3 ストリーム圧縮ではなく「暗号化前（平文）圧縮」を採用する理由**
-   - L3 OST を流れるチャンク本体は [dfs/crypto.py](../dfs/crypto.py) の Convergent AEAD（ChaCha20-Poly1305）によって **すでに暗号化済み** である。
-   - 暗号文はエントロピーが最大（擬似ランダム列）であるため、HTTP の `gzip`/`zstd` 等でトランスポートストリームを圧縮してもサイズはほとんど縮まず、送受信双方の CPU 負荷だけが増える。
-   - 暗号化の前に平文を圧縮（Compress-then-Encrypt）しておけば、L3 転送量・サーバ側ストレージ容量の両方を削減でき、展開も受信側が `DFSB3` ヘッダを見て自動で行うため設定の引き継ぎミスが起きない。
-   - （補足: L2 の JSON-RPC 応答や `bootstrap_ro.sh` 等の平文テキストについては、リバースプロキシ側の `encode zstd gzip` で十分対応できる。）
+1. **Disadvantage in bandwidth-constrained and metered environments**
+   - In remote GPU environments such as RunPod and vast.ai, ingress and egress are billed, and on narrow-bandwidth or high-latency links, transfer volume directly translates into sync time and cost.
+   - Having easily compressible data such as logs, code, JSONL, and config files travel back and forth to the L3 OST uncompressed simply because compression wasn't explicitly configured is a major disadvantage as a default behavior.
 
-3. **サンプリング判定により非圧縮データへの悪影響がない**
-   - `_compress_if_beneficial` はすでに `4096` バイト未満のスキップ、先頭・中盤・後半のサンプリング圧縮判定、および最終圧縮率の閾値判定（`COMPRESSION_THRESHOLD`）を備えている。
-   - モデル重み（`.safetensors` 等）や画像・アーカイブ等の縮まないファイルでは自動で無圧縮（`CODEC_NONE`）へ切り替わるため、既定で有効にしても転送量の増加や過剰な CPU 消費を招かない。
+2. **Why pre-encryption (plaintext) compression is used instead of L3 stream compression**
+   - Chunk payloads flowing over the L3 OST are **already encrypted** by Convergent AEAD (ChaCha20-Poly1305) in [dfs/crypto.py](../dfs/crypto.py).
+   - Because ciphertext has maximum entropy (a pseudorandom byte stream), compressing the transport stream with HTTP `gzip`/`zstd` etc. barely reduces size and only increases CPU load on both sender and receiver.
+   - Compressing plaintext before encryption (Compress-then-Encrypt) reduces both L3 transfer volume and server-side storage usage, and decompression is handled automatically on the receiving side by inspecting the `DFSB3` header, preventing configuration mismatches.
+   - (Note: For plaintext responses such as L2 JSON-RPC replies or `bootstrap_ro.sh`, `encode zstd gzip` on the reverse proxy is sufficient.)
+
+3. **Sampling check prevents negative impact on incompressible data**
+   - `_compress_if_beneficial` already skips chunks under `4096` bytes, performs sampled compression checks at the start, middle, and end, and checks the final compression ratio against a threshold (`COMPRESSION_THRESHOLD`).
+   - Incompressible files such as model weights (`.safetensors`, etc.), images, and archives automatically switch to uncompressed (`CODEC_NONE`), so enabling it by default does not increase transfer volume or cause excessive CPU usage.
 
 ---
 
-## 仕様 (`auto` / `zstd` / `none`)
+## Specification (`auto` / `zstd` / `none`)
 
-- **`auto`（既定値）**:
-  - `zstandard` が利用可能であれば `zstd` として `_compress_if_beneficial` を実行し、閾値以上に縮むチャンクのみ `DFSB3` + `CODEC_ZSTD` で格納・転送する。
-  - `zstandard` が無い最小環境から書き込む場合でもエラーにせず、安全に無圧縮（`none`）へフォールバックする。
+- **`auto` (default)**:
+  - If `zstandard` is available, runs `_compress_if_beneficial` as `zstd`, storing and transferring only chunks that shrink past the threshold with `DFSB3` + `CODEC_ZSTD`.
+  - When writing from a minimal environment without `zstandard`, it safely falls back to uncompressed (`none`) instead of raising an error.
 - **`zstd`**:
-  - `_compress_if_beneficial` を実行する。`zstandard` が未導入の場合は `CompressionError` を送出する。
+  - Runs `_compress_if_beneficial`. Raises `CompressionError` if `zstandard` is not installed.
 - **`none`**:
-  - 圧縮を行わない。特定のディレクトリだけ圧縮を完全に止めたい場合は、`user.dfs.compression` xattr に `none` を設定するか `--compression none` を指定する。
+  - Performs no compression. To completely disable compression for a specific directory only, set the `user.dfs.compression` xattr to `none` or pass `--compression none`.
 
 ---
 
-## 関連ファイル
+## Related Files
 
-- 依存定義: [pyproject.toml](../pyproject.toml)（`zstandard>=0.22` を `dependencies` に追加）
-- 暗号化・圧縮判定: [dfs/crypto.py](../dfs/crypto.py)（`ContentAddressedCrypto.pack_chunk` / `_compress_if_beneficial`）
-- ポリシー定義・xattr: [dfs/compression.py](../dfs/compression.py)（`VALID_POLICIES = {"auto", "none", "zstd"}`）
-- 既定値参照: [dfs/l4_log.py](../dfs/l4_log.py)、[dfs/l5_fs.py](../dfs/l5_fs.py)、[dfs/remotes.py](../dfs/remotes.py)、[dfs/cli.py](../dfs/cli.py)、[dfs/cli_main.py](../dfs/cli_main.py)
+- Dependency definition: [pyproject.toml](../pyproject.toml) (added `zstandard>=0.22` to `dependencies`)
+- Encryption & compression decision: [dfs/crypto.py](../dfs/crypto.py) (`ContentAddressedCrypto.pack_chunk` / `_compress_if_beneficial`)
+- Policy definition & xattr: [dfs/compression.py](../dfs/compression.py) (`VALID_POLICIES = {"auto", "none", "zstd"}`)
+- Default value references: [dfs/l4_log.py](../dfs/l4_log.py), [dfs/l5_fs.py](../dfs/l5_fs.py), [dfs/remotes.py](../dfs/remotes.py), [dfs/cli.py](../dfs/cli.py), [dfs/cli_main.py](../dfs/cli_main.py)

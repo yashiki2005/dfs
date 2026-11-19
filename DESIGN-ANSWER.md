@@ -1,239 +1,203 @@
-# 事前検証結果と確定設計（Stage 0〜5 総括）
+# Pre-Verification Results and Finalized Design (Stages 0–5 Summary)
 
-本文書は、段階 0〜5 の検証で確定した **L0〜L5 の仕様および §10（未解決の問い）への回答**を記録するものである。
-性能の計測値のうち、生成スクリプトと生ログが残っていないものは §2.2 で削除した。
+> **English** | [日本語](DESIGN-ANSWER.ja.md)
+
+This document records the **L0–L5 specifications and answers to §10 (Open Questions)** finalized through Stages 0–5 of verification.
+Performance measurements whose generating scripts and raw logs no longer exist were removed from §2.2.
 
 ---
 
-## 1. 各層の確定仕様（L0〜L5）
+## 1. Finalized Specification per Layer (L0–L5)
 
-事前検証により、既存の資産（`clayfs`, `mini_lustre`, `dfs3` の Merkle 構造、evil 試験）を無改造または最小限の切り出しで結合できることが確認された。
+Pre-verification confirmed that existing assets (`clayfs`, `mini_lustre`, `dfs3` Merkle structure, evil tests) can be combined unmodified or with minimal extraction.
 
-| 層 | 役割 | 確定した方式・コンポーネント | 境界の不変条件（Invariants） |
+| Layer | Role | Finalized Approach / Component | Boundary Invariants |
 |---|---|---|---|
-| **L0 / L1** | 識別子と権威の委譲 | Canonical JSON (`jq -cnS`) + OpenSSH Ed25519 分離署名 (`ssh-keygen -Y`, 名前空間 `dfs-delegation-v1`) | 親子のパス前方一致・期限包含 (`child.expires_at <= parent.expires_at`)・`epoch` 単調増加による即時失効 (`specs/delegation.md`) |
-| **L2** | 所在地解決 | 署名付きロケータ (`dfs-l2-locator-v1`)。<br>初期実装は **名簿（MDSAnnouncer 型）** とし、将来 DHT を足す際は 2 段キャッシュとする | ロケータ内に L4 先頭版 (`head_version`, `head_hash`) を含め、解決と先頭確認を **1 RTT** で完結させる |
-| **L3** | データ平面 | 独自 TLS/TCP OST（`ChunkStoreServer`、`l3_store.py`）。`mini_lustre` の OST とはプロトコルが異なり、**無改造流用は不可**（`specs/l3_data_plane.md` §3）。<br>塊の暗号化は **標準 AEAD（ChaCha20-Poly1305、Nonce は毎回ランダム）** | 重複排除は暗号化の前に平文アドレス `plain_id = HMAC(K_addr, P)` で判定し、主体は書き手自身の索引（署名済み履歴から復元可能）。OST は `wire_id = SHA256(C)` のみを検証 |
-| **L4** | 一貫性と追記ログ | 部分木単位の単一書き手追記ログ (`dfs-l4-log-v1`) + ディレクトリ塊 (`dfs-dir-v1`) | 先頭版の **CAS（Compare-And-Swap）** による同時書き込み拒否（三方向マージの排除）、`HeadPin` による B6 防御、Read-after-Write による B7 防御 |
-| **L5** | ローカル実体化 | `dfs.fs`（`dfs/fs/`）が OS の CoW を自動検出して使い、無ければ実コピー。`ClayFSAdapter` はその薄い結線 | スナップショット (`/.clayfs/snapshots/<id>/`) を L4 の入出力境界とし、`.clayfs` 自身の再帰混入と OS 固有メタデータ（NFD/NFC 揺れ、`.DS_Store`）を境界で正規化・除外。CoW の有無に依存せずスナップショットを独立 inode にする |
+| **L0 / L1** | Identifiers & Authority Delegation | Canonical JSON (`jq -cnS`) + OpenSSH Ed25519 detached signatures (`ssh-keygen -Y`, namespace `dfs-delegation-v1`) | Parent-child path prefix match · expiration containment (`child.expires_at <= parent.expires_at`) · immediate revocation via monotonically increasing `epoch` (`specs/delegation.md`) |
+| **L2** | Location Resolution | Signed locators (`dfs-l2-locator-v1`).<br>Initial implementation is a **registry (MDSAnnouncer style)**, with a 2-tier cache when DHT is added later | Embed L4 head version (`head_version`, `head_hash`) in the locator so resolution and head check complete in **1 RTT** |
+| **L3** | Data Plane | Custom TLS/TCP OST (`ChunkStoreServer`, `l3_store.py`). Protocol differs from `mini_lustre`'s OST and **cannot be reused unmodified** (`specs/l3_data_plane.md` §3).<br>Chunk encryption uses **standard AEAD (ChaCha20-Poly1305, fresh random nonce)** | Deduplication is judged before encryption by plaintext address `plain_id = HMAC(K_addr, P)`, owned by the writer's own index (reconstructible from signed history). OST verifies only `wire_id = SHA256(C)` |
+| **L4** | Consistency & Append-Only Log | Per-subtree single-writer append-only log (`dfs-l4-log-v1`) + directory chunks (`dfs-dir-v1`) | Reject concurrent writes via **CAS (Compare-And-Swap)** on head version (eliminating three-way merge), B6 defense via `HeadPin`, B7 defense via Read-after-Write |
+| **L5** | Local Materialization | `dfs.fs` (`dfs/fs/`) auto-detects OS CoW and falls back to real copy if absent. `ClayFSAdapter` is a thin wrapper | Snapshots (`/.clayfs/snapshots/<id>/`) are the L4 I/O boundary; normalize/exclude recursive `.clayfs` inclusion and OS-specific metadata (NFD/NFC drift, `.DS_Store`) at the boundary. Snapshots use independent inodes regardless of CoW |
 
 ---
 
-## 2. 段階 0〜5 の検証・計測サマリ
+## 2. Verification & Measurement Summary for Stages 0–5
 
-### 2.0 実機統合（段階 5）
+### 2.0 Real-Device Integration (Stage 5)
 
-Mac と Pi5 の 2 台で、1 つのツリーを共有した（`specs/e2e_lan.md`、
-`bench/results/20261111-200812-e2e-lan.json`）。
+Shared one tree between two machines: Mac and Pi5 (`specs/e2e_lan.md`, `bench/results/20261111-200812-e2e-lan.json`).
 
-- L2（HTTP 9440）と L3（TLS 1.3、9443）が LAN 越しに動いた。RTT 平均 2.25ms。
-- Mac ↔ Pi5 の双方向で push / pull が成功し、内容が SHA-256 まで一致した。
-- 同じ親版からの同時 push は後着が `ConflictError` で拒否された。衝突コピーは 0 件。
-- 既存の mini_lustre（9001/9002）を止めずに、別ポートで試験した。
-- 未検証: 3 台以上、長時間運用、LAN 越しの 2 OST。
+- L2 (HTTP 9440) and L3 (TLS 1.3, 9443) ran over LAN. Average RTT 2.25ms.
+- Bidirectional push / pull between Mac ↔ Pi5 succeeded, with contents matching down to SHA-256.
+- Concurrent pushes from the same parent version had the later one rejected with `ConflictError`. 0 conflict copies.
+- Tested on separate ports without stopping existing `mini_lustre` (9001/9002).
+- Unverified: 3+ machines, long-running operation, 2 OSTs over LAN.
 
-#### 2.0.1 WAN（高遅延）実機（`specs/e2e_wan.md`）
+#### 2.0.1 WAN (High-Latency) Real Devices (`specs/e2e_wan.md`)
 
-WireGuard 上の 3 拠点（Mac / Scaleway / Sakura）で、RTT 20〜285ms の条件を測った。
+Measured across 3 sites over WireGuard (Mac / Scaleway / Sakura) with RTT 20–285ms.
 
-- **push の往復は 1 回に固定された。** 1 回の push は「HAS 1 往復 + PUT 1 往復」で終わる。
-  実測は RTT 278ms でも往復 1 回。2.13MB の送信が 3.9〜4.4 秒で完走した。
-- **pull の往復もファイル数から切り離した（batch 系）。** ディレクトリ塊は 1 階層 1 往復、
-  ファイル塊は store ごとに一括取得する。20 ファイルの平らな構造で **21〜23 → 2 往復**、
-  所要は **8,025 → 4,010ms**（285ms 経路）、**953 → 534ms**（22ms 経路）。ローカルでは
-  500 ファイルでも 2 往復。残るのは転送量そのもので、往復の回数はもう支配的でない。
-- **高遅延でも単一書き手が効く。** 3 経路すべてで、後着の push が `ConflictError` になり、
-  衝突コピーは 0 件だった。
-- **通信断でハングしない。** サーバ停止中の push は 138〜938ms で `ServiceUnavailableError` になった。
-- WAN 対応として、タイムアウトを環境変数化し（`DFS_L2_TIMEOUT` / `DFS_OST_SOCKET_TIMEOUT` /
-  `DFS_OST_CONNECT_TIMEOUT`）、往復削減（一括 HAS・`assume_absent`）を入れた。
-- 残る未検証: WAN での 100 塊以上の実測、実効スループット、3 台以上の同時参加、長時間運用。
+- **Push round trips fixed at 1.** One push completes in "1 HAS round trip + 1 PUT round trip." Measured 1 round trip even at RTT 278ms; sending 2.13MB finished in 3.9–4.4 seconds.
+- **Pull round trips also decoupled from file count (`batch` operations).** Directory chunks take 1 round trip per level; file chunks are fetched in bulk per store. For a flat 20-file structure: **21–23 → 2 round trips**, duration **8,025 → 4,010ms** (285ms path), **953 → 534ms** (22ms path). Locally, even 500 files take 2 round trips. What remains is transfer volume itself; round-trip count is no longer dominant.
+- **Single-writer works even under high latency.** Across all 3 paths, the later concurrent push hit `ConflictError`, with 0 conflict copies.
+- **Does not hang on network outage.** Pushing while the server was stopped failed with `ServiceUnavailableError` in 138–938ms.
+- For WAN support, added env-var timeouts (`DFS_L2_TIMEOUT` / `DFS_OST_SOCKET_TIMEOUT` / `DFS_OST_CONNECT_TIMEOUT`) and round-trip reductions (batch HAS, `assume_absent`).
+- Still unverified: 100+ chunks on WAN, effective throughput, 3+ concurrent participants, long-running operation.
 
-#### 2.0.2 ローカル CLI（`dfscli`、`specs/cli.md`）
+#### 2.0.2 Local CLI (`dfscli`, `specs/cli.md`)
 
-層の試験用 CLI（`dfs/cli.py`）とは別に、日常のファイル操作のための CLI を足した
-（`dfscli`）。`dfs/cli.py` の部品（L2 名簿クライアント、サーバ、ノード構築）をそのまま使い、
-リモート名で場所を指す操作体系を被せたものである。
+Separate from the layer-testing CLI (`dfs/cli.py`), added a CLI for daily file operations (`dfscli`). It reuses `dfs/cli.py` components (L2 registry client, server, node setup) and layers a remote-named operation model on top.
 
-- リモート = 書き込み境界（サブツリー）。核は L2 名簿だけで、**L3 OST とサブパスは
-  L2 に問い合わせて解決する**（ロケータの `endpoints` と、委譲レコードの書き手公開鍵）。
-  最小の登録は `--registry`（ホスト名だけでよい。既定ポート 9440 を補う）。
-  - 書き手の鍵は `--key` を省くとその場で作る（`~/.config/dfs/keys/<名前>_ed25519`、
-    OpenSSH 形式）。渡したパスが無ければ断る（打ち間違いで新規作成しない）。
-  - `tree_secret` はサーバに置かない共有秘密なので、`--secret` を省くと端末から
-    **エコーなしで 2 回**読む（Python の `getpass`。macOS に pinentry/dialog が無いため）。
-    打ち間違いは復号できないツリーになるので、確認用にもう一度聞いて一致したものだけ採る。
-    空のまま書こうとすると使い方の誤りとして止める。
-  - 登録は `dfscli create`（`config create` の短い入口）。
-  - `--path` は `/` で始まらなくてよい。
-- 読み出し（`ls` / `lsl` / `lsjson` / `size` / `cat` / `check`）は版を進めない。一覧は
-  ディレクトリ塊だけを辿り、ファイルの中身を取らない（`l4_log.py::list_tree`）。
-- 削除は `rm` / `rmdir` / `purge`、ディレクトリ作成は `mkdir`。dfs は**空のディレクトリも
-  版に残す**（`{"entries": []}` のディレクトリ塊）ので、`rm` は既定で空の階層を残し、
-  `--rmdirs` を付けたときだけ片付ける。`sync --delete` は一致させる操作なので常に片付ける。
-- 書き込み（`copy` / `copyto` / `sync`）は「写しを先頭版に合わせてから変更を載せ、1 版として
-  まとめて push」する。**変更が無ければ版を作らない**（冪等）。
-- 単一書き手の衝突は終了コードで区別する（7: CAS 失敗、8: B6、9: B7、6: 到達不能、2: 使い方の誤り）。
-- `--key` は OpenSSH 形式の Ed25519 秘密鍵（`crypto.py` の署名経路が OpenSSH 形式前提）。
-- 実測（Mac ローカル）: 4 ファイル 4,027B の copy が 69.9 ms。`--ost` / `--path` を省いて
-  `config create` → `touch` → `copy` → `cat` → `pull` が通り、`pull` の内容は `diff` で一致した。
-- 回帰は `tests/test_cli_main.py` の 31 件（冪等・dry-run・`--delete` の有無・終了コード・
-  一覧が直下だけであること・`--ost`/`--path` の省略・`tree_secret` 空の拒否・削除と空
-  ディレクトリの往復・ホスト名だけの registry・鍵の自動作成・`--no-prompt`・`create` の
-  短い入口・secret の 2 回入力）。
+- Remote = write boundary (subtree). The core is just the L2 registry; **L3 OST and subpath are resolved by querying L2** (locator `endpoints` and writer public key in delegation records). Minimal registration needs only `--registry` (hostname alone suffices; defaults to port 9440).
+  - If `--key` is omitted, a writer key is generated on the spot (`~/.config/dfs/keys/<name>_ed25519`, OpenSSH format). If a provided path does not exist, it errors out (does not silently create a new one on typo).
+  - `tree_secret` is a shared secret never stored on the server, so when `--secret` is omitted it is read **twice without echo** from the terminal (Python `getpass`, since macOS lacks `pinentry`/`dialog`). A typo would produce an undecryptable tree, so it prompts a second time for confirmation and accepts only matching inputs. Writing an empty secret stops as a usage error.
+  - Registration uses `dfscli create` (short alias for `config create`).
+  - `--path` does not need a leading `/`.
+- Reads (`ls` / `lsl` / `lsjson` / `size` / `cat` / `check`) do not advance versions. Listings traverse only directory chunks without fetching file contents (`l4_log.py::list_tree`).
+- Deletion uses `rm` / `rmdir` / `purge`, directory creation uses `mkdir`. Because `dfs` **preserves empty directories in versions** (`{"entries": []}` directory chunks), `rm` leaves empty directories by default and cleans them up only with `--rmdirs`. `sync --delete` always cleans them up since it mirrors state.
+- Writes (`copy` / `copyto` / `sync`) "align the copy to head, apply changes, and push as 1 version." **If there are no changes, no version is created** (idempotent).
+- Single-writer conflicts are distinguished by exit codes (7: CAS failure, 8: B6, 9: B7, 6: unreachable, 2: usage error).
+- `--key` expects an OpenSSH-format Ed25519 private key (`crypto.py`'s signing path assumes OpenSSH format).
+- Measured (Mac local): copying 4 files (4,027B) took 69.9 ms. Without `--ost` / `--path`, `config create` → `touch` → `copy` → `cat` → `pull` succeeded, and `pull` output matched via `diff`.
+- Regression suite: 31 cases in `tests/test_cli_main.py` (idempotency, dry-run, `--delete` on/off, exit codes, direct-children-only listing, omitting `--ost`/`--path`, rejecting empty `tree_secret`, delete + empty-dir round-trip, hostname-only registry, auto key creation, `--no-prompt`, `create` alias, double secret prompt).
 
-#### 2.0.3 ローカルにサーバを立てる（`dfssvc`）
+#### 2.0.3 Starting a Local Server (`dfssvc`)
 
-`dfs serve` は状態ディレクトリ・root 公開鍵・2 つのポートを自分で用意する。層を確かめる
-にはそれでよいが、ローカルで 1 つ試すには手数が多い。そこで `dfssvc`（`dfs/svc.py`）を
-足した。
+`dfs serve` requires manually preparing a state directory, root public key, and two ports. That is fine for testing layers, but tedious for quick local trials, so `dfssvc` (`dfs/svc.py`) was added.
 
-- **連続した空きポートを 2 つ探し**、1 つ目を L2、2 つ目を L3 に割り当てる。
-- root の Ed25519 鍵と**書き手の鍵**を用意し、状態ディレクトリを作って `dfs serve` を起動し、
-  書き手への委譲（途中の階層も含む）を登録する。`start` 1 回で `dfscli` が使える。
-  多段の委譲は有効期間を揃えると時刻のずれで Invariant 3 に落ちるため、中間を 1 日長くする。
-- 起動を待って L2 の応答を確かめ、接続に必要な値を `~/.config/dfs/services.json`（600）に記録する。
-- `stop` / `list` / `status` / `env` / `logs` で後始末と確認ができる。`stop` は SIGTERM →
-  10 秒 → SIGKILL。
-- 空きポートの判定は 2 段（接続を試す → `SO_REUSEADDR` 無しで bind）。macOS では
-  `SO_REUSEADDR` 付きの bind が `0.0.0.0:N` の待ち受けを素通りしてしまうため。
-- 実測（Mac ローカル）: launchd のサーバが 19440/19443 を使っている状態で `start` すると
-  19441/19442 の連続ペアを選び、委譲 → `dfscli` 登録（`--ost` 不要）→ `copy` → `cat` まで通った。
-- 回帰は `tests/test_svc_cli.py` の 12 件（ポート探索・記録・起動停止・委譲の自動登録・
-  書き込み前の `ls`・`--no-delegate`・`--path` の多段）。
+- **Finds 2 consecutive free ports**, assigning the first to L2 and the second to L3.
+- Prepares the root Ed25519 key and **writer key**, creates the state directory, starts `dfs serve`, and registers delegation to the writer (including intermediate levels). A single `start` makes `dfscli` ready to use. For multi-level delegation, identical expiration times can fail Invariant 3 due to clock skew, so intermediate levels are given +1 day.
+- Waits for startup, verifies L2 response, and records connection details in `~/.config/dfs/services.json` (mode 600).
+- `stop` / `list` / `status` / `env` / `logs` handle cleanup and inspection. `stop` sends SIGTERM → 10s → SIGKILL.
+- Free-port detection uses 2 steps (attempt connect → `bind` without `SO_REUSEADDR`), because on macOS `bind` with `SO_REUSEADDR` passes right through a `0.0.0.0:N` listener.
+- Measured (Mac local): with a `launchd` server already using 19440/19443, `start` selected the consecutive pair 19441/19442 and succeeded through delegation → `dfscli` registration (no `--ost`) → `copy` → `cat`.
+- Regression suite: 12 cases in `tests/test_svc_cli.py` (port discovery, recording, start/stop, auto-delegation, `ls` before writes, `--no-delegate`, multi-level `--path`).
 
-### 2.1 セキュリティ・一貫性検証（段階 1・2）
+### 2.1 Security & Consistency Verification (Stages 1 & 2)
 
-すべての evil 試験および境界試験において、三方向マージや履歴の巻き戻しを起こさず、意図した例外で確実に停止・拒否できることを確認した（`tests/test_evil_suite.py`、`tests/test_integration.py`）。
+Confirmed across all evil tests and boundary tests that three-way merges and history rollbacks never occur, and invalid operations halt cleanly with the intended exceptions (`tests/test_evil_suite.py`, `tests/test_integration.py`).
 
-| 検証項目 | 検証内容 | 結果 | 担保する仕組み |
+| Verification Item | What Was Tested | Result | Mechanism |
 |---|---|---|---|
-| **L1 権威の委譲** | 正当な委譲・偽造拒否・スコープ外拒否・期限切れ・再委譲の 5 ケース | **全合格** | `specs/delegation.md` の 5 不変条件 + `allowed_signers` 連鎖 |
-| **単一書き手排他** | 同一鍵を持つ 2 端末（Mac / Pi5）からの同時書き込み | **合格（衝突 0 件）** | `parent_version` と `parent_hash` の厳密一致（CAS）により後着を `ConflictError` で即座に拒否 |
-| **書き手の交代と失効** | `epoch` 更新による旧鍵の即時失効と、`base_version` からの履歴引き継ぎ | **合格** | L4 ログへの `delegation_epoch` 刻印と `version > base_version` 制約 |
-| **evil A2** | 保管庫（OST）上の塊データの改ざん・別データによる上書き | **合格（検知）** | 取得時の `wire_id` 照合および復号後の `plain_id` 再計算照合 |
-| **evil A5** | 盗聴した正当な署名付き書き込み要求の再送（リプレイ） | **合格（拒否）** | 版番号の厳密な単調増加（`head_ver + 1`）により拒否 |
-| **evil B6** | 中継者が古い索引（古い版）を最新と見せかける巻き戻し攻撃 | **合格（検知）** | クライアント手元の `HeadPin` (`local_head.json`) との版・ハッシュ比較 |
-| **evil B7** | 中継者が書き込み要求に成功と応答しつつ黙って捨てる攻撃 | **合格（検知）** | `commit` 直後の Read-after-Write 照合完了までローカルピンを進めない |
+| **L1 Authority Delegation** | 5 cases: valid delegation, forgery rejection, out-of-scope rejection, expiration, re-delegation | **All Passed** | 5 invariants in `specs/delegation.md` + `allowed_signers` chain |
+| **Single-Writer Exclusion** | Concurrent writes from 2 devices (Mac / Pi5) with the same key | **Passed (0 conflicts)** | Strict match of `parent_version` and `parent_hash` (CAS) immediately rejects later write with `ConflictError` |
+| **Writer Rotation & Revocation** | Immediate revocation of old key via `epoch` bump and history continuation from `base_version` | **Passed** | `delegation_epoch` stamped in L4 log + `version > base_version` constraint |
+| **evil A2** | Tampering or overwriting chunk data on storage (OST) with different content | **Passed (Detected)** | `wire_id` check on fetch and `plain_id` recomputation check after decryption |
+| **evil A5** | Replaying eavesdropped valid signed write requests | **Passed (Rejected)** | Rejected by strict monotonic version increase (`head_ver + 1`) |
+| **evil B6** | Relay presenting an old index (old version) as latest (rollback attack) | **Passed (Detected)** | Version & hash comparison against client's local `HeadPin` (`local_head.json`) |
+| **evil B7** | Relay responding success to a write request while silently dropping it | **Passed (Detected)** | Local pin is not advanced until Read-after-Write verification completes right after `commit` |
 
-### 2.2 計測結果について
+### 2.2 About Measurements
 
-段階 2〜5 の性能・往復回数・転送量を測った数値（所要時間、RTT 数、転送比率）は、
-**生成した計測スクリプトと生ログが残っていないため、本文書からは削除した。**
-再現できない数値は設計判断の根拠にならないためである。
+Performance, round-trip, and transfer-volume numbers from Stages 2–5 (elapsed times, RTT counts, transfer ratios) **were removed from this document because their generating scripts and raw logs no longer exist.** Unreproducible numbers cannot serve as evidence for design decisions.
 
-数値に依存しない設計判断だけを残す。
+Only design decisions independent of those numbers remain:
 
-- **L4 部分木の更新は、変わった部分木に閉じる。** ディレクトリ塊は内容で決まる名前を持つため、
-  変更のない部分木は再利用される（`dfs/l4_log.py::upload_directory`）。
-- **L2 は名簿を初期実装とする。** 往復回数の比較は `specs/l2_comparison.md` を参照。
-  DHT を足す場合も、エンドポイント解決と先頭版の取得を分ける 2 段構成とする。
-- **L3 は独自の TLS/TCP OST を使う。** mini_lustre の OST とはフレーム形式も塊の識別子も
-  異なるため、無改造では使えない（`specs/l3_data_plane.md` §3）。塊の数が少ないうちは
-  libtorrent の固定費が相対的に重いため、導入しない。
-- **重複排除は書き手側の索引で行う。** 無変更の部分木は再暗号化も再送もしない。
-  実測値ではなく、`tests/test_integration.py` が「無変更で暗号文本体の送信量が 0」を検証する。
+- **L4 subtree updates are confined to changed subtrees.** Because directory chunks are named by content, unchanged subtrees are reused (`dfs/l4_log.py::upload_directory`).
+- **L2 uses a registry as its initial implementation.** See `specs/l2_comparison.md` for round-trip comparisons. Even when DHT is added, use a 2-tier architecture separating endpoint resolution from head version retrieval.
+- **L3 uses a custom TLS/TCP OST.** Its framing and chunk identifiers differ from `mini_lustre`'s OST, so it cannot be reused unmodified (`specs/l3_data_plane.md` §3). While chunk counts remain small, libtorrent's fixed overhead is relatively heavy, so it is not introduced.
+- **Deduplication is performed by the writer's own index.** Unchanged subtrees are neither re-encrypted nor re-transmitted. Rather than raw measurements, `tests/test_integration.py` verifies "0 ciphertext payload bytes sent when unchanged."
 
 ---
 
-## 3. 未解決の問い（§10）への確定回答
+## 3. Finalized Answers to Open Questions (§10)
 
-### 問い 1: L1 を DNSSEC に乗せられるか？
-- **回答: 乗せられる。ただし DNS に置くのは「ルートアンカー公開鍵」のみとする。**
-- **詳細**: `/example.com` のルート公開鍵（および初期名簿 URL）のみを DNSSEC 保護下の TXT レコード（またはローカルのトラストアンカー設定）に置く。それ以下の階層（`/example.com/alice` 等）の委譲は DNS を介さず、`specs/delegation.md` で定義した Canonical JSON + Ed25519 署名チェーンとして L2/L4 上で配布・検証する。これにより DNS の TTL 遅延を受けずに即時の権限委譲・失効が可能となる。
+### Question 1: Can L1 ride on DNSSEC?
+- **Answer: Yes, but only the "root anchor public key" is placed in DNS.**
+- **Details**: Only `/example.com`'s root public key (and initial registry URL) is placed in a DNSSEC-protected TXT record (or local trust anchor config). Delegations below it (`/example.com/alice`, etc.) bypass DNS and are distributed/verified over L2/L4 as a Canonical JSON + Ed25519 signature chain defined in `specs/delegation.md`. This enables instant delegation and revocation without DNS TTL delays.
 
-### 問い 2: 書き込み境界の「境界」を誰が決めるか？
-- **回答: 親の部分木の書き手（Owner/Writer）が決める。**
-- **詳細**: 親が子パスに対する L1 委譲記録に署名し、自身の L4 ディレクトリ塊の中に `{"type": "delegated_mount", "mount_path": "..."}` を配置した箇所がそのまま単一書き手の境界となる。親と子の Merkle ツリーは暗号学的に切り離されており、子の書き込みが親のハッシュ計算やロックに波及することはない。
+### Question 2: Who decides the "boundaries" of write boundaries?
+- **Answer: The parent subtree's writer (Owner/Writer).**
+- **Details**: Wherever the parent signs an L1 delegation record for a child path and places `{"type": "delegated_mount", "mount_path": "..."}` inside its L4 directory chunk becomes the single-writer boundary. Parent and child Merkle trees are cryptographically decoupled; child writes never propagate to parent hash calculations or locks.
 
-### 問い 3: L2 のロケータをどこに置くか？
-- **回答: まず名簿（MDSAnnouncer 型）に置き、L2 インターフェースを `resolve` / `announce` の 2 操作に抽象化して後から DHT を足せる形にする。**
-- **詳細**: 名簿サーバを信頼する必要はなく、名簿が返すロケータ自体に書き手の Ed25519 署名（`dfs-l2-locator-v1`）を付与する。名簿は「署名付きロケータの配布」と「先頭版の CAS 調停」のみを担う。
+### Question 3: Where should L2 locators live?
+- **Answer: Start with a registry (MDSAnnouncer style), abstracting the L2 interface into `resolve` / `announce` so DHT can be added later.**
+- **Details**: There is no need to trust the registry server—locators returned by the registry carry the writer's Ed25519 signature (`dfs-l2-locator-v1`). The registry only handles "distributing signed locators" and "CAS arbitration of head versions."
 
-### 問い 4: 単一書き手の排他（同一人物の複数端末）をどう守るか？
-- **回答: 端末間のロック通信は行わず、L2/L4 先頭版に対する CAS（楽観的排他）で守る。**
-- **詳細**: 同一人物が Mac と Pi5 に同じ秘密鍵を置いていても、書き込み時に「自分が認識している親の版番号（`parent_version`）とハッシュ（`parent_hash`）」を提示させる。先着の書き込みが通った時点で先頭が進むため、後着の書き込みは CAS 不一致（`ConflictError`）で確実に弾かれる。弾かれた端末は、一度 `pull` してスナップショットを更新してから書き直す運用とする（自動三方向マージは一切行わない）。
+### Question 4: How to enforce single-writer exclusion across multiple devices of the same person?
+- **Answer: No inter-device lock communication; enforce via CAS (optimistic concurrency) on L2/L4 head versions.**
+- **Details**: Even if the same person keeps the same private key on Mac and Pi5, writes must present the expected parent version (`parent_version`) and hash (`parent_hash`). Once the first write succeeds, the head advances, so the later write is reliably rejected with CAS mismatch (`ConflictError`). The rejected device simply `pull`s to update its snapshot and retries (zero automatic three-way merging).
 
-### 問い 5: 内容アドレッシングと暗号化をどう両立するか？
-- **回答: 重複排除は暗号化の前に行う。内容アドレスは平文の keyed-hash（`plain_id`）、暗号は標準 AEAD（ChaCha20-Poly1305、Nonce は毎回ランダム）、`plain_id` の導出鍵は暗号化鍵のローテーションから分離する。**
-- **詳細**:
-  - 単一書き手なので、重複排除の主体は OST ではなく**書き手自身**である。書き手は `plain_id -> wire_id` の索引を持ち、同じ平文を再暗号化も再送もしない。索引は署名済み履歴（各版の `root_plain_id`/`root_wire_id` とディレクトリ塊の各エントリ）から再構築できる。
-  - `plain_id = HMAC-SHA256(K_addr, "dfs-plain-id-v1:" || plaintext)`。`K_addr` は長期的に固定し、暗号化鍵のローテーション（epoch）から切り離す。これを混ぜると鍵交代で過去との重複排除が全滅する。
-  - 暗号文 `C = ChaCha20Poly1305(K_enc(plain_id), nonce=os.urandom(12), plaintext)`。Nonce を毎回ランダムにしても、判定は平文の `plain_id` で先に行うため**重複排除率は 100% のまま**である。決定的暗号は不要。
-  - `wire_id = SHA256(C)` を OST の保管キーとする。`plain_id` は暗号文に埋め込んで AAD に含めるため、取り違えは AEAD タグで検出される。
-  - したがって、重複排除と機密性は直交する。Nonce の再利用は発生せず、既知平文の辞書攻撃も他人の部分木に対しては成立しない（`K_addr` を持つ書き手の範囲に閉じる）。
+### Question 5: How to reconcile content addressing and encryption?
+- **Answer: Deduplicate before encryption. Content addresses use a plaintext keyed-hash (`plain_id`), encryption uses standard AEAD (ChaCha20-Poly1305 with a fresh random nonce), and the `plain_id` derivation key is separated from encryption key rotation.**
+- **Details**:
+  - Because there is a single writer, deduplication is performed by **the writer itself**, not the OST. The writer maintains a `plain_id -> wire_id` index and neither re-encrypts nor re-sends identical plaintext. The index can be reconstructed from signed history (each version's `root_plain_id`/`root_wire_id` and directory chunk entries).
+  - `plain_id = HMAC-SHA256(K_addr, "dfs-plain-id-v1:" || plaintext)`. `K_addr` is long-lived and decoupled from encryption key rotation (`epoch`); mixing them would destroy deduplication across key rotations.
+  - Ciphertext `C = ChaCha20Poly1305(K_enc(plain_id), nonce=os.urandom(12), plaintext)`. Even with a fresh random nonce every time, deduplication occurs first on `plain_id`, so **deduplication remains 100% effective**. Deterministic encryption is unnecessary.
+  - `wire_id = SHA256(C)` is the OST storage key. `plain_id` is embedded in the ciphertext and included in AAD, so mismatches are caught by the AEAD tag.
+  - Thus, deduplication and confidentiality are orthogonal. Nonce reuse never occurs, and known-plaintext dictionary attacks cannot cross into other users' subtrees (confined to writers holding `K_addr`).
 
-### 問い 6: clayfs をそのまま使うか？
-- **回答: 本体は移植せず、スナップショット入出力だけを `dfs.fs` として再実装する。**
-- **理由**: `clayfs` 本体は Swift 製で macOS の APFS sparsebundle / Linux の Btrfs を前提にしている。Windows では動かず、かといって ReFS は一般 PC にほぼ普及していない（Windows 11 では Dev Drive 限定、block clone は 24H2 以降）。「Python さえ動けば動く」を満たすには、CoW を **最適化** として扱い、無い環境では実コピーへ落ちる必要がある。
-- **詳細**: `dfs/fs/core.py` が 1 ルートを `root/tree` と `root/.clayfs/snapshots` に分割し、`snapshot()` / `clone()` / `materialize()` を提供する。backend は `copy`（既定・どこでも動く）/ `reflink`（macOS `clonefile(2)`・Linux `FICLONE`）/ `fast_clone`（Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE`）。検出は実際に 1 ファイルを複製して確かめるため、NFS や exFAT では自動的に `copy` へ落ちる。`ClayFSAdapter` はこの `FileSystem` を呼ぶだけの薄い結線になった。
-- **旧実装の不具合**: スナップショットを `shutil.copytree(..., copy_function=os.link)` で作っていたため、作業ツリーとスナップショットが同じ inode を共有し、元ファイルを上書きするとスナップショットも書き換わっていた（ロールバックの安全性が崩れていた）。`copy` / `reflink` のどちらでも独立 inode になることを `tests/test_fs_cow.py` で固定した。
+### Question 6: Should `clayfs` be used as-is?
+- **Answer: Do not port `clayfs` itself; reimplement only snapshot I/O as `dfs.fs`.**
+- **Reason**: `clayfs` is written in Swift and assumes macOS APFS sparsebundle / Linux Btrfs. It does not run on Windows, and ReFS is barely deployed on consumer PCs (restricted to Dev Drive on Windows 11; block clone requires 24H2+). To satisfy "works anywhere Python runs," CoW must be treated as an **optimization**, falling back to real copies when absent.
+- **Details**: `dfs/fs/core.py` splits a root into `root/tree` and `root/.clayfs/snapshots`, providing `snapshot()` / `clone()` / `materialize()`. Backends are `copy` (default, works everywhere) / `reflink` (macOS `clonefile(2)`, Linux `FICLONE`) / `fast_clone` (Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE`). Detection tests cloning an actual file, so NFS and exFAT automatically fall back to `copy`. `ClayFSAdapter` became a thin wrapper calling this `FileSystem`.
+- **Bug in old implementation**: Snapshots previously used `shutil.copytree(..., copy_function=os.link)`, causing the working tree and snapshot to share inodes so overwriting a source file mutated the snapshot (breaking rollback safety). `tests/test_fs_cow.py` locks down that both `copy` and `reflink` produce independent inodes.
 
-### 問い 7: 経済・モデレーション・初回接触を範囲外でよいか？
-- **回答: 範囲外とする（設計として持ち込まない）。**
-- **詳細**: 不特定多数の野良ノードにストレージ提供を依存するトークンエコノミーや公開スワームを持ち込むと、違法データの混入（共同正犯リスク）や Sybil/DoS 攻撃、インセンティブ設計の肥大化を招く。`dfs` は「L1 の信頼チェーンで委譲された書き手」と「自前または信頼関係のあるピアの OST」の間でツリーを共有するプロトコルとして閉じることで、これらの問題をアーキテクチャ上発生させない。
+### Question 7: Is it okay to keep economics, moderation, and first-contact trust out of scope?
+- **Answer: Yes, keep them out of scope (do not introduce them into the design).**
+- **Details**: Introducing token economies or public swarms that rely on arbitrary untrusted nodes invites illegal data mixing (accomplice liability risks), Sybil/DoS attacks, and bloated incentive mechanisms. By closing `dfs` as a protocol for sharing trees between "writers delegated by an L1 trust chain" and "owned or trusted-peer OSTs," these problems do not arise in the architecture.
 
 ---
 
-## 4. 本実装（プロダクションコード）への移行指針
+## 4. Migration Guidelines to Production Code
 
-事前検証が完了したため、以下の構成で本実装のリポジトリ（`dfs`）を構築する。各層は独立した CLI / モジュールとして実装し、段階 0〜5 の検証スクリプトをそのまま CI（回帰試験）として維持する。
+With pre-verification complete, structure the production repository (`dfs`) as follows. Implement each layer as an independent CLI / module, and keep the Stage 0–5 verification scripts as CI regression tests.
 
 ```text
 dfs/
-├── DESIGN.md                  # 本設計書
-├── DESIGN-ANSWER.md           # 段階 0〜5 の検証結果と確定設計（本文書）
-├── PLAN.md                    # 段階ごとの計画と判定
-├── TODO.md                    # 再開用の状況メモ（未実装・未検証・次の手）
+├── DESIGN.md                  # Main design document
+├── DESIGN-ANSWER.md           # Stage 0–5 verification results & finalized design (this document)
+├── PLAN.md                    # Per-stage plan and criteria
+├── TODO.md                    # Resumption status notes (unimplemented, unverified, next steps)
 ├── specs/
-│   ├── delegation.md          # L1 権威の委譲仕様（root アンカー検証・TOFU を含む）
-│   ├── l2_comparison.md       # L2 3方式の計測比較表
-│   ├── fs-cow.md              # L5 CoW 抽象 (backend 選択と非対応環境)
-│   ├── l3_data_plane.md       # L3 の計測と判断（batch 系、WAN の往復）
-│   ├── e2e_lan.md             # Mac ↔ Pi5 の実機統合（LAN）
-│   ├── e2e_wan.md             # 3 拠点の WAN 実機と遅延耐性
-│   ├── cli.md                 # dfscli（ローカル CLI）
-│   └── svc.md                 # dfssvc（ローカルサーバの起動）
+│   ├── delegation.md          # L1 authority delegation spec (incl. root anchor verification & TOFU)
+│   ├── l2_comparison.md       # L2 3-way measurement comparison table
+│   ├── fs-cow.md              # L5 CoW abstraction (backend selection & unsupported environments)
+│   ├── l3_data_plane.md       # L3 measurements & decisions (batch ops, WAN round trips)
+│   ├── e2e_lan.md             # Mac ↔ Pi5 real-device integration (LAN)
+│   ├── e2e_wan.md             # 3-site WAN real devices & latency tolerance
+│   ├── cli.md                 # dfscli (local CLI)
+│   └── svc.md                 # dfssvc (local server launcher)
 ├── dfs/
-│   ├── crypto.py              # 署名 + 内容アドレス + 標準 AEAD + 指紋 (L1/L3/L4共通)
-│   ├── l1_delegation.py       # 委譲チェーン検証 (5 Invariants)
-│   ├── l2_registry.py         # 名簿サービス & 署名済みロケータ (root へのチェーン復元)
-│   ├── l3_ost_adapter.py      # 内容アドレス型のチャンク保管 (batch_has / batch_put / batch_get)
-│   ├── l4_log.py              # 単一書き手追記ログ・Merkle塊・HeadPin (B6/B7防御)
-│   ├── l5_clayfs.py           # clayfs スナップショット連携アダプタ (NFC正規化・非再帰)
-│   ├── fs/                    # CoW 抽象 (CoW があれば CoW、無ければ実コピー)
-│   ├── cli.py                 # サーバ側 CLI (serve / delegate / init / push / pull / status)
-│   ├── remotes.py             # dfscli のリモート定義（名前 -> 接続情報、root アンカー）
-│   ├── cli_main.py            # dfscli 本体（ls/cat/copy/sync/pull/rm/mkdir など）
-│   └── svc.py                 # ローカルにサーバを立てる（空きポート 2 つ + serve 起動）
-├── dfscli                      # dfscli のエントリポイント
-├── dfssvc                    # dfssvc のエントリポイント
-├── bench/                     # 計測ハーネス（l2_bench / l3_bench / e2e_lan / e2e_wan）と生データ
+│   ├── crypto.py              # Signatures + content addressing + standard AEAD + fingerprints (shared L1/L3/L4)
+│   ├── l1_delegation.py       # Delegation chain verification (5 Invariants)
+│   ├── l2_registry.py         # Registry service & signed locators (chain reconstruction to root)
+│   ├── l3_ost_adapter.py      # Content-addressed chunk storage (batch_has / batch_put / batch_get)
+│   ├── l4_log.py              # Single-writer append-only log, Merkle chunks, HeadPin (B6/B7 defense)
+│   ├── l5_clayfs.py           # clayfs snapshot integration adapter (NFC normalization, non-recursive)
+│   ├── fs/                    # CoW abstraction (CoW if available, real copy fallback)
+│   ├── cli.py                 # Server-side CLI (serve / delegate / init / push / pull / status)
+│   ├── remotes.py             # dfscli remote definitions (name -> connection info, root anchor)
+│   ├── cli_main.py            # dfscli core (ls/cat/copy/sync/pull/rm/mkdir, etc.)
+│   └── svc.py                 # Local server launcher (2 free ports + serve startup)
+├── dfscli                     # dfscli entry point
+├── dfssvc                     # dfssvc entry point
+├── bench/                     # Benchmark harness (l2_bench / l3_bench / e2e_lan / e2e_wan) & raw data
 └── tests/
-    ├── test_evil_suite.py     # A2, A5, B6, B7 + 単一書き手排他 + 委譲失効の回帰試験
-    ├── test_integration.py    # 2ノード共有・往復削減の回帰試験
-    ├── test_root_anchor.py    # root アンカーによるチェーン検証（名簿を信頼しない）
-    ├── test_cli_main.py       # dfscli の回帰試験
-    └── test_svc_cli.py        # dfssvc の回帰試験
+    ├── test_evil_suite.py     # Regression tests for A2, A5, B6, B7 + single-writer exclusion + revocation
+    ├── test_integration.py    # Regression tests for 2-node sharing & round-trip reduction
+    ├── test_root_anchor.py    # Chain verification via root anchor (without trusting registry)
+    ├── test_cli_main.py       # dfscli regression tests
+    └── test_svc_cli.py        # dfssvc regression tests
 ```
 dfs/
-├── DESIGN.md                  # 本設計書
+├── DESIGN.md                  # Main design document
 ├── specs/
-│   ├── delegation.md          # L1 権威の委譲仕様（確定版）
-│   └── l2_comparison.md       # L2 3方式の計測比較表
+│   ├── delegation.md          # L1 authority delegation spec (finalized)
+│   └── l2_comparison.md       # L2 3-way measurement comparison table
 ├── dfs/
-│   ├── crypto.py              # 署名（cryptography / ssh-keygen フォールバック）& 内容アドレス + 標準 AEAD (L1/L3/L4共通)
-│   ├── l1_delegation.py       # 委譲チェーン検証 (5 Invariants)
-│   ├── l2_registry.py         # 署名付きロケータ名簿クライアント & サーバ
-│   ├── l3_ost_adapter.py      # 内容アドレス型のチャンク保管 (batch_has / batch_put / batch_get)
-│   ├── l4_log.py              # 単一書き手追記ログ・Merkle塊・HeadPin (B6/B7防御)
-│   ├── l5_clayfs.py           # clayfs スナップショット連携アダプタ (NFC正規化・非再帰)
-│   ├── fs/                    # CoW 抽象 (CoW があれば CoW、無ければ実コピー)
-│   ├── remotes.py             # rclone ライク CLI のリモート定義（名前 -> 接続情報）
-│   ├── cli_main.py            # ローカル CLI（dfscli）本体（ls/cat/copy/sync/pull/rm など）
-│   └── svc.py                 # ローカルにサーバを立てる（空きポート 2 つ + serve 起動）
-├── dfscli                      # rclone ライク CLI のエントリポイント
-├── dfssvc                    # ローカルにサーバを立てる CLI のエントリポイント
+│   ├── crypto.py              # Signatures (cryptography / ssh-keygen fallback) & content addressing + standard AEAD (shared L1/L3/L4)
+│   ├── l1_delegation.py       # Delegation chain verification (5 Invariants)
+│   ├── l2_registry.py         # Signed locator registry client & server
+│   ├── l3_ost_adapter.py      # Content-addressed chunk storage (batch_has / batch_put / batch_get)
+│   ├── l4_log.py              # Single-writer append-only log, Merkle chunks, HeadPin (B6/B7 defense)
+│   ├── l5_clayfs.py           # clayfs snapshot integration adapter (NFC normalization, non-recursive)
+│   ├── fs/                    # CoW abstraction (CoW if available, real copy fallback)
+│   ├── remotes.py             # rclone-like CLI remote definitions (name -> connection info)
+│   ├── cli_main.py            # Local CLI (dfscli) core (ls/cat/copy/sync/pull/rm/mkdir, etc.)
+│   └── svc.py                 # Local server launcher (2 free ports + serve startup)
+├── dfscli                     # rclone-like CLI entry point
+├── dfssvc                     # Local server launcher CLI entry point
 └── tests/
-    ├── test_evil_suite.py     # A2, A5, B6, B7 + 単一書き手排他 + 委譲失効の回帰試験
-    └── test_integration.py    # 2ノード共有・最終5指標の自動計測テスト
+    ├── test_evil_suite.py     # Regression tests for A2, A5, B6, B7 + single-writer exclusion + revocation
+    └── test_integration.py    # 2-node sharing & automated measurement tests for final 5 metrics

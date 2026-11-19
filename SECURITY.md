@@ -1,38 +1,42 @@
-# セキュリティポリシー
+# Security Policy
 
-## サポート対象
+> **English** | [日本語](SECURITY.ja.md)
 
-セキュリティ修正は、原則として最新のリリース系列だけを対象にします。
-現在は `0.1.x` を初期リリース系列として扱います。
+## Supported Versions
 
-## 脆弱性の報告
+In principle, security fixes apply only to the latest release series.
+Currently, `0.1.x` is treated as the initial release series.
 
-セキュリティ上の問題は、公開Issueへ詳細を書かず、次のアドレスへ
-非公開で連絡してください。
+## Reporting a Vulnerability
+
+Please do not disclose security issues in public issues. Report them
+privately to the following address:
 
 **yashiki2005@gmail.com**
 
-可能であれば、次の情報を含めてください。
+If possible, please include the following information:
 
-- 影響するバージョンと利用環境
-- 問題の種類と想定される影響
-- 再現手順または最小限の検証コード
-- 既知の緩和策
-- 公開してよい連絡先
+- Affected version(s) and environment
+- Type of issue and expected impact
+- Reproduction steps or minimal proof-of-concept code
+- Known mitigations
+- Contact information that may be shared publicly
 
-`tree_secret`、秘密鍵、実際のユーザーデータは送らないでください。
-検証に必要な場合は、使い捨ての鍵と合成データで再現をお願いします。
+Do not send `tree_secret`, private keys, or real user data.
+If needed for verification, please reproduce using disposable keys and synthetic data.
 
-## 対応方針
+## Response Policy
 
-受領後、原則として7日以内に受領確認を返します。修正時期や公開時期は、
-影響範囲と再現性を確認したうえで調整します。未修正の脆弱性を事前に
-公開しないようお願いします。
+We aim to acknowledge receipt within 7 days. Fix and disclosure timelines
+will be coordinated after confirming impact and reproducibility. Please refrain
+from publicly disclosing unpatched vulnerabilities in advance.
 
-## 対象範囲
+## Scope
 
-暗号処理、署名・委譲検証、パス境界、アーカイブ展開、Web UIの認証、
-リレー認可、およびリモートからの入力処理を対象とします。
+In scope are cryptographic operations, signature and delegation verification,
+path boundaries, archive extraction, Web UI authentication, relay authorization,
+and handling of remote inputs.
 
-本プロジェクトは独立したセキュリティ監査を受けていません。本番導入時は、
-利用者自身による脅威モデルの確認と、必要に応じた外部レビューを行ってください。
+This project has not undergone an independent security audit. Before deploying
+in production, please review the threat model yourself and conduct an external
+review as needed.

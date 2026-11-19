@@ -1,17 +1,19 @@
-# Mac と Pi5 の実機統合（`specs/e2e_lan.md`）
+# Mac and Pi5 Hardware Integration (`specs/e2e_lan.md`)
 
-## 0. 目的と位置づけ
+> **English** | [日本語](e2e_lan.ja.md)
 
-`PLAN.md` 段階 5（2 台で 1 つのツリーを共有する）の実機結果を記録する。
+## 0. Purpose and Scope
 
-- ハーネス: `bench/e2e_lan.py`
-- 生データ: `bench/results/20261111-200812-e2e-lan.json`
-- 実行日: 2026-11-11
-- 接続: `ssh -i ~/.ssh/pi-mock-test operator@198.51.100.7`
+Records hardware test results for `PLAN.md` Phase 5 (sharing a single tree across two machines).
+
+- Harness: `bench/e2e_lan.py`
+- Raw data: `bench/results/20261111-200812-e2e-lan.json`
+- Execution date: 2026-11-11
+- Connection: `ssh -i ~/.ssh/pi-mock-test operator@198.51.100.7`
 
 ---
 
-## 1. 構成
+## 1. Setup
 
 ```text
 [Mac]                                         [Pi5 (Ubuntu 24.04, aarch64, 4 core, 16GB)]
@@ -22,46 +24,46 @@ clayfs (L5)                                     dfs serve
         └──── pull ◀── L4 追記ログ ◀── L2 名簿 (HTTP 9440)
 ```
 
-| 項目 | 値 |
+| Item | Value |
 |---|---|
-| Mac | macOS 27.3 arm64、Python 3.12 |
-| Pi5 | Ubuntu 24.04（Linux 7.0）、Python 3.14.4、`cryptography` 入り、pytest なし |
-| LAN RTT（ping 10 回） | **平均 2.25ms**（min 0.57 / max 6.04） |
-| L2 | `http://198.51.100.7:9440`（Symbolic Registry, HTTP） |
-| L3 | `tls://198.51.100.7:9443`（TLS 1.3） |
-| 部屋の既存サービス | mini_lustre が 9001/9002 を使用中。**別ポートで試験し、止めていない** |
+| Mac | macOS 27.3 arm64, Python 3.12 |
+| Pi5 | Ubuntu 24.04 (Linux 7.0), Python 3.14.4, `cryptography` installed, no pytest |
+| LAN RTT (10 pings) | **Avg 2.25ms** (min 0.57 / max 6.04) |
+| L2 | `http://198.51.100.7:9440` (Symbolic Registry, HTTP) |
+| L3 | `tls://198.51.100.7:9443` (TLS 1.3) |
+| Existing service on host | `mini_lustre` using 9001/9002. **Tested on separate ports without stopping it** |
 
 ---
 
-## 2. 手順
+## 2. Procedure
 
-1. `ssh-keygen` で root / alice の Ed25519 鍵を作る。
-2. Pi5 に root の公開鍵を置き、`dfs serve` を起動する（状態は `~/dfs_e2e/server_state`）。
-3. Mac から `dfs delegate` で `/example.com` → `/example.com/alice/notes` を委譲し、Pi5 の L2 に登録する。
-4. Mac と Pi5 で `dfs init` し、同じ `tree_secret` を使う。
-5. Mac で `push` → Pi5 で `pull` → 内容を SHA-256 で照合する。
-6. Pi5 で `push` → Mac で `pull`（逆方向）。
-7. 両方が同じ親版のまま同時に `push` し、片方が `ConflictError` で拒否されることを確認する。
-8. 衝突コピーが作られていないことを確認する。
+1. Generate Ed25519 keys for `root` / `alice` with `ssh-keygen`.
+2. Place `root`'s public key on Pi5 and start `dfs serve` (state in `~/dfs_e2e/server_state`).
+3. From Mac, delegate `/example.com` → `/example.com/alice/notes` via `dfs delegate` and register on Pi5's L2.
+4. Run `dfs init` on Mac and Pi5 using the same `tree_secret`.
+5. `push` from Mac → `pull` on Pi5 → verify contents with SHA-256.
+6. `push` from Pi5 → `pull` on Mac (reverse direction).
+7. Simultaneously `push` from both on the same parent version, and verify one is rejected with `ConflictError`.
+8. Verify no conflict copies are created.
 
 ---
 
-## 3. 結果
+## 3. Results
 
-| 手順 | 結果 | 所要時間（ハーネス計測） | 備考 |
+| Step | Result | Elapsed (harness) | Notes |
 |---|---|---|---|
-| L2 疎通（HTTP） | 成功 | 32.5 ms | `resolve` が委譲と先頭版を 1 往復で返す |
-| L3 疎通（TLS） | 成功 | 75.9 ms | TLS 1.3（初回のハンドシェイク込み） |
-| Mac push v1 | 成功 | 66.4 ms | 送信 1,624 B |
-| Pi5 pull v1 | 成功 | 39.9 ms | 受信 978 B、内容一致 |
-| Pi5 push v2 | 成功 | 60.4 ms | 送信 1,641 B |
-| Mac pull v2 | 成功 | 94.0 ms | 受信 995 B、内容一致 |
-| Mac push v3 | 成功 | 67.7 ms | 送信 1,661 B |
-| **Pi5 の同時 push** | **拒否** | — | `ConflictError`（CAS 不一致） |
-| 内容一致（SHA-256） | 成功 | — | 両端末 2 ファイルの digest が一致 |
-| 衝突コピー | **0 件** | — | `*conflict*` は無い |
+| L2 connectivity (HTTP) | Pass | 32.5 ms | `resolve` returns delegation and head version in 1 round trip |
+| L3 connectivity (TLS) | Pass | 75.9 ms | TLS 1.3 (including initial handshake) |
+| Mac push v1 | Pass | 66.4 ms | Sent 1,624 B |
+| Pi5 pull v1 | Pass | 39.9 ms | Received 978 B, contents match |
+| Pi5 push v2 | Pass | 60.4 ms | Sent 1,641 B |
+| Mac pull v2 | Pass | 94.0 ms | Received 995 B, contents match |
+| Mac push v3 | Pass | 67.7 ms | Sent 1,661 B |
+| **Pi5 concurrent push** | **Rejected** | — | `ConflictError` (CAS mismatch) |
+| Content match (SHA-256) | Pass | — | Digests of 2 files match on both devices |
+| Conflict copies | **0** | — | No `*conflict*` files |
 
-ハーネス実行時の集計（v4）:
+Harness summary (v4):
 
 ```text
 OK   L2 疎通（HTTP）          32.5 ms
@@ -75,34 +77,34 @@ OK   衝突コピー 0 件
 
 ---
 
-## 4. 何が確かめられたか
+## 4. What Was Verified
 
-- **L2 の署名付きロケータが LAN 越しに動く。** 名簿は 1 往復で委譲と先頭版を返す。
-- **L3 の TLS/TCP が LAN 越しに動く。** TLS 1.3、独自プロトコル。
-- **L4 の単一書き手が実機で効く。** 同じ親版からの同時 push は、後着が `ConflictError` になる。
-- **三方向マージが起きない。** 衝突コピーが 1 つも作られなかった。
-- **双方向の同期が成立する。** Mac ↔ Pi5 の両方向で内容が一致した。
-- **既存サービスを止めずに試験できる。** mini_lustre が 9001/9002 を使っている状態で、9440/9443 で動いた。
-
----
-
-## 5. 測れていないこと
-
-- **WAN 条件。** LAN の RTT は約 2ms。`PLAN.md` の想定（高遅延 200ms）は未検証。
-  ハーネスは `tc qdisc` やプロキシでの注入に対応していない。
-- **多数ノード。** 2 台のみ。3 台以上での委譲境界や名簿の競合は未検証。
-- **Pi5 での pytest。** 入れていないため、テストは Mac 側でのみ実行した。
-  Pi5 では CLI と暗号・署名を直接動かして確認した。
-- **長時間運用。** 数分の試験のみ。連続 push/pull の劣化は未計測。
-- **ストライピング。** 実機では 1 OST で動かした。2 OST はローカルで検証済み
-  （`TestL3Striping`）だが、LAN 越しの 2 OST は未実施。
+- **L2 signed locators work over LAN.** The registry returns delegation and head version in 1 round trip.
+- **L3 TLS/TCP works over LAN.** TLS 1.3, custom protocol.
+- **L4 single-writer semantics hold on real hardware.** Concurrent pushes from the same parent version result in `ConflictError` for the later arrival.
+- **No 3-way merge occurs.** Zero conflict copies were created.
+- **Bidirectional sync works.** Contents matched in both Mac ↔ Pi5 directions.
+- **Testable without stopping existing services.** Ran on 9440/9443 while `mini_lustre` was using 9001/9002.
 
 ---
 
-## 6. 再現方法
+## 5. What Was Not Measured
+
+- **WAN conditions.** LAN RTT is ~2ms. `PLAN.md` target (high latency 200ms) is untested here.
+  The harness does not support `tc qdisc` or proxy latency injection.
+- **Many nodes.** Only 2 machines. Delegation boundaries and registry contention with 3+ nodes are untested.
+- **pytest on Pi5.** Not installed, so tests were only run on Mac.
+  On Pi5, CLI, encryption, and signing were verified directly.
+- **Long-running stability.** Only a few minutes of testing. Degradation over continuous push/pull is unmeasured.
+- **Striping.** Tested with 1 OST on hardware. 2 OSTs are verified locally
+  (`TestL3Striping`), but 2 OSTs over LAN have not been tested.
+
+---
+
+## 6. Reproduction
 
 ```bash
-# Pi5 側
+# On Pi5
 ssh -i ~/.ssh/pi-mock-test operator@198.51.100.7
 cd ~/src/dfs
 python3 -m dfs.cli serve --bind 0.0.0.0 \
@@ -111,8 +113,8 @@ python3 -m dfs.cli serve --bind 0.0.0.0 \
   --root-pubkey ~/dfs_e2e/root.pub \
   --state-dir ~/dfs_e2e/server_state
 
-# Mac 側
+# On Mac
 python bench/e2e_lan.py
 ```
 
-生データは `bench/results/` に残る。環境や日時を含むため、比較するときは同じハーネスで取り直す。
+Raw data is saved in `bench/results/`. Because it includes environment and timestamp details, re-run with the same harness when comparing.
