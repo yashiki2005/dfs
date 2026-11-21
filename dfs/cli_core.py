@@ -489,6 +489,8 @@ def refresh_cache(node: DFSNode, force: bool = False) -> int:
             )
         node.clayfs.replace_work_tree(staging_dir)
     node.clayfs.take_snapshot(f"v{version}")
+    if hasattr(node.clayfs, "_auto_prune_snapshots"):
+        node.clayfs._auto_prune_snapshots()
     _save_cached_version(node, version)
     return version
 
@@ -500,6 +502,7 @@ def _require_writable(remote: Remote) -> None:
 
 def _push(node: DFSNode, remote: Remote, delegated_mounts: Optional[Dict[str, str]] = None) -> Tuple[dict, int]:
     _require_writable(remote)
+    _invalidate_cache(node)
     log_env, _snap, wire_bytes = node.push(
         delegation_epoch=int(remote.epoch),
         now=int(time.time()),

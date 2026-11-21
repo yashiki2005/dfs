@@ -2895,6 +2895,122 @@ class TestReviewRegressions(unittest.TestCase):
             with self.assertRaises(WebAppError):
                 web_backend.save_upload(".clayfs/evil.txt", b"bad")
 
+    def test_writer_quota_gc_parallel_persist_and_autodelegate_token_and_refresh_prune(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        from dfs.archive import create_archive
+        from dfs.crypto import sha256_hex
+        from dfs.l3_ost_adapter import ChunkStoreServer
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert = root / "ost.crt"
+            key = root / "ost.key"
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert),
+                    "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1",
+                ],
+                check=True, capture_output=True,
+            )
+
+            # 1a. GC releases writer quota
+            chunks_dir = root / "chunks1"
+            srv = ChunkStoreServer(
+                cert, key, host="127.0.0.1", port=0,
+                chunks_dir=chunks_dir, max_writer_bytes=10,
+            )
+            try:
+                b1 = b"0123456789"
+                w1 = sha256_hex(b1)
+                self.assertTrue(srv._put_chunk(w1, b1, writer_id="writer-a"))
+                srv.gc(max_bytes=0)
+                self.assertEqual(srv._writer_bytes, {})
+                b2 = b"abcdefghij"
+                w2 = sha256_hex(b2)
+                self.assertTrue(srv._put_chunk(w2, b2, writer_id="writer-a"))
+            finally:
+                srv.close()
+
+            # 1b. Restarting ChunkStoreServer restores _writer_bytes from disk
+            srv_restarted = ChunkStoreServer(
+                cert, key, host="127.0.0.1", port=0,
+                chunks_dir=chunks_dir, max_writer_bytes=10,
+            )
+            try:
+                self.assertEqual(srv_restarted._writer_bytes.get("writer-a"), 10)
+                b3 = b"x"
+                self.assertFalse(srv_restarted._put_chunk(sha256_hex(b3), b3, writer_id="writer-a"))
+            finally:
+                srv_restarted.close()
+
+            # 1c. Parallel disk writes respect reservation under max_writer_bytes
+            srv_par = ChunkStoreServer(
+                cert, key, host="127.0.0.1", port=0,
+                chunks_dir=root / "chunks_par", max_writer_bytes=6,
+            )
+            try:
+                p1, p2 = b"12345", b"67890"
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    f1 = pool.submit(srv_par._put_chunk, sha256_hex(p1), p1, "same-writer")
+                    f2 = pool.submit(srv_par._put_chunk, sha256_hex(p2), p2, "same-writer")
+                    results = sorted([f1.result(), f2.result()])
+                self.assertEqual(results, [False, True])
+                self.assertEqual(srv_par._writer_bytes.get("same-writer"), 5)
+            finally:
+                srv_par.close()
+
+            # 2. DFS_AUTO_DELEGATE_TOKEN works with RemoteRegistryClient.auto_delegate
+            priv_r = root / "root_ad"
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(priv_r)],
+                check=True, capture_output=True,
+            )
+            pub_r = priv_r.with_suffix(".pub").read_text(encoding="utf-8").strip()
+            priv_w = root / "writer_ad"
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(priv_w)],
+                check=True, capture_output=True,
+            )
+            pub_w = priv_w.with_suffix(".pub").read_text(encoding="utf-8").strip()
+            pstate = cli_mod.PersistentRegistryState(root / "ad_state", "/example.com", pub_r)
+            pstate.auto_delegate_key = priv_r
+            ad_httpd = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                cli_mod.make_registry_http_handler(pstate, None),  # type: ignore[arg-type]
+            )
+            t_ad = threading.Thread(target=ad_httpd.serve_forever, daemon=True)
+            t_ad.start()
+            try:
+                client = cli_mod.RemoteRegistryClient(f"http://127.0.0.1:{ad_httpd.server_port}")
+                with patch.dict(os.environ, {"DFS_AUTO_DELEGATE_TOKEN": "secret-ad-tok"}):
+                    res = client.auto_delegate("/example.com/node1", pub_w)
+                    self.assertTrue(res["ok"])
+                    with self.assertRaises(cli_mod.RegistryError):
+                        client.auto_delegate("/example.com/node2", pub_w, token="wrong")
+            finally:
+                ad_httpd.shutdown()
+                ad_httpd.server_close()
+
+            # 3. Invalid DFS_MAX_SNAPSHOTS does not raise
+            from dfs.l5_fs import ClayFSAdapter
+            clay = ClayFSAdapter(root / "clay_invalid", backend="copy")
+            (clay.work_tree / "a.txt").write_text("hi", encoding="utf-8")
+            clay.take_snapshot("v1")
+            with patch.dict(os.environ, {"DFS_MAX_SNAPSHOTS": "not-an-int"}):
+                clay._auto_prune_snapshots()
+
+            # 4. archive extract requires root trust unless --allow-embedded-root
+            bundle = root / "b"
+            bundle.mkdir()
+            with patch.dict(os.environ, {}, clear=False):
+                rc_fail = cli_main.main(
+                    ["archive", "extract", str(bundle), str(root / "out"), "--secret", "pw", "--no-prompt"]
+                )
+                self.assertNotEqual(rc_fail, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

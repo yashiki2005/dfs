@@ -94,6 +94,24 @@ def _archive_registry_context(
     )
 
 
+def _resolve_archive_trust_args(args: argparse.Namespace, action_label: str) -> Tuple[Optional[str], Optional[str]]:
+    from .. import cli_core as _cm
+
+    exp_pub = getattr(args, "root_pubkey", None)
+    exp_fp = getattr(args, "root_fingerprint", None)
+    allow_embedded = bool(getattr(args, "allow_embedded_root", False))
+    if exp_pub:
+        pub_p = Path(exp_pub).expanduser()
+        if pub_p.is_file():
+            exp_pub = pub_p.read_text(encoding="utf-8").strip()
+    if not exp_pub and not exp_fp and not allow_embedded:
+        raise _cm.UsageError(
+            f"archive {action_label} には --root-pubkey または --root-fingerprint が必要です"
+            "（自己整合性のみ確認する場合は --allow-embedded-root を指定してください）"
+        )
+    return exp_pub, exp_fp
+
+
 def cmd_archive(args: argparse.Namespace) -> int:
     """版単位の archive bundle / torrent を作成・公開・取得・復元する。"""
     from dfs import cli_main as _cm
@@ -228,18 +246,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
 
     bundle = Path(args.source).expanduser()
     if args.action == "verify":
-        exp_pub = getattr(args, "root_pubkey", None)
-        exp_fp = getattr(args, "root_fingerprint", None)
-        allow_embedded = bool(getattr(args, "allow_embedded_root", False))
-        if exp_pub:
-            pub_p = Path(exp_pub).expanduser()
-            if pub_p.is_file():
-                exp_pub = pub_p.read_text(encoding="utf-8").strip()
-        if not exp_pub and not exp_fp and not allow_embedded:
-            raise _cm.UsageError(
-                "archive verify には --root-pubkey または --root-fingerprint が必要です"
-                "（自己整合性のみ確認する場合は --allow-embedded-root を指定してください）"
-            )
+        exp_pub, exp_fp = _resolve_archive_trust_args(args, "verify")
         try:
             meta = _cm.verify_bundle(
                 bundle,
@@ -258,13 +265,20 @@ def cmd_archive(args: argparse.Namespace) -> int:
     if args.action == "extract":
         if not args.dest:
             raise _cm.UsageError("archive extract には出力先が必要です")
+        exp_pub, exp_fp = _resolve_archive_trust_args(args, "extract")
         secret = args.secret
         if not secret and not args.no_prompt:
             secret = _cm.prompt_secret("tree_secret: ", "tree_secret（確認）: ")
         if not secret:
             raise _cm.UsageError("archive extract には --secret が必要です")
         try:
-            out = _cm.extract_bundle(bundle, Path(args.dest).expanduser(), secret)
+            out = _cm.extract_bundle(
+                bundle,
+                Path(args.dest).expanduser(),
+                secret,
+                expected_root_pubkey=exp_pub,
+                expected_root_fingerprint=exp_fp,
+            )
         except _cm.ArchiveError as e:
             raise _cm.UsageError(f"archive extract に失敗しました: {e}") from e
         print(f"extracted   : {out}")

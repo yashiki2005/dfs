@@ -182,6 +182,7 @@ class RemoteRegistryClient:
         endpoint: str,
         payload: Dict[str, Any],
         timeout: Optional[float],
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """1 つの名簿へ POST する。タイムアウトは ``DFS_L2_TIMEOUT``（既定 10 秒）。
 
@@ -190,10 +191,13 @@ class RemoteRegistryClient:
         """
         full_url = f"{url}{endpoint}"
         data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
         req = urllib.request.Request(
             full_url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -233,6 +237,7 @@ class RemoteRegistryClient:
         *,
         timeout: Optional[float] = None,
         read_failover: bool = False,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """POST する。
 
@@ -242,7 +247,9 @@ class RemoteRegistryClient:
         effective_timeout = timeout if timeout is not None else self.default_timeout
         if not read_failover:
             try:
-                return self._post_one(self.registry_url, endpoint, payload, effective_timeout)
+                return self._post_one(
+                    self.registry_url, endpoint, payload, effective_timeout, extra_headers=extra_headers
+                )
             except ServiceUnavailableError as primary_err:
                 relay_urls = [u for u in self.registry_urls[1:] if "/relay/" in u]
                 if not relay_urls:
@@ -250,7 +257,9 @@ class RemoteRegistryClient:
                 last_err: ServiceUnavailableError = primary_err
                 for relay_url in relay_urls:
                     try:
-                        return self._post_one(relay_url, endpoint, payload, effective_timeout)
+                        return self._post_one(
+                            relay_url, endpoint, payload, effective_timeout, extra_headers=extra_headers
+                        )
                     except ServiceUnavailableError as e:
                         last_err = e
                 raise last_err
@@ -259,7 +268,9 @@ class RemoteRegistryClient:
         empty_candidate: Optional[Dict[str, Any]] = None
         for url in self.registry_urls:
             try:
-                result = self._post_one(url, endpoint, payload, effective_timeout)
+                result = self._post_one(
+                    url, endpoint, payload, effective_timeout, extra_headers=extra_headers
+                )
             except ServiceUnavailableError as e:
                 last_error = e
                 continue
@@ -284,9 +295,17 @@ class RemoteRegistryClient:
         res = self._post("/v1/delegate", {"envelope": envelope, "now": int(now)})
         return res["verified"]
 
-    def auto_delegate(self, path: str, writer_pubkey: str) -> Dict[str, Any]:
+    def auto_delegate(
+        self, path: str, writer_pubkey: str, *, token: Optional[str] = None
+    ) -> Dict[str, Any]:
         """初回参加時に root アンカー直下の未使用サブツリーを自動委譲してもらう。"""
-        return self._post("/v1/auto-delegate", {"path": path, "writer_pubkey": writer_pubkey})
+        tok = (token if token is not None else os.environ.get("DFS_AUTO_DELEGATE_TOKEN", "")).strip()
+        extra = {"X-DFS-Auto-Delegate-Token": tok} if tok else None
+        return self._post(
+            "/v1/auto-delegate",
+            {"path": path, "writer_pubkey": writer_pubkey},
+            extra_headers=extra,
+        )
 
     def announce_and_append(
         self,
@@ -1122,11 +1141,6 @@ def make_registry_http_handler(
                             )
                         if pstate.auto_delegate_key is None or not pstate.auto_delegate_key.is_file():
                             raise RegistryError("Auto-delegation is not enabled on this registry")
-                        expected_ad_tok = os.environ.get("DFS_AUTO_DELEGATE_TOKEN", "").strip()
-                        if expected_ad_tok:
-                            got_ad_tok = (self.headers.get("X-DFS-Auto-Delegate-Token") or "").strip()
-                            if not got_ad_tok or not hmac.compare_digest(got_ad_tok, expected_ad_tok):
-                                raise RegistryError("Invalid auto-delegate token")
                         peer_ip = str(self.client_address[0]) if self.client_address else ""
                         if peer_ip and not self._is_loopback_direct():
                             now_m = time.monotonic()
@@ -1136,6 +1150,11 @@ def make_registry_http_handler(
                                     raise RegistryError("Auto-delegate rate limit exceeded")
                                 hits.append(now_m)
                                 auto_delegate_hits[peer_ip] = hits
+                        expected_ad_tok = os.environ.get("DFS_AUTO_DELEGATE_TOKEN", "").strip()
+                        if expected_ad_tok:
+                            got_ad_tok = (self.headers.get("X-DFS-Auto-Delegate-Token") or "").strip()
+                            if not got_ad_tok or not hmac.compare_digest(got_ad_tok, expected_ad_tok):
+                                raise RegistryError("Invalid auto-delegate token")
                         sub_path = str(req.get("path") or "").strip().rstrip("/")
                         writer_pub = str(req.get("writer_pubkey") or "").strip()
                         if not writer_pub.startswith("ssh-"):

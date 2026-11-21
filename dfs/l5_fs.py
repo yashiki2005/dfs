@@ -168,9 +168,24 @@ class ClayFSAdapter:
     def _auto_prune_snapshots(self) -> None:
         env_keep = os.environ.get("DFS_MAX_SNAPSHOTS", "").strip()
         if env_keep:
-            keep = int(env_keep)
+            try:
+                keep = int(env_keep)
+            except ValueError:
+                print(
+                    f"[dfs] warning: ignoring invalid DFS_MAX_SNAPSHOTS={env_keep!r}",
+                    file=sys.stderr,
+                )
+                return
         elif not self.is_cow:
-            keep = int(os.environ.get("DFS_MAX_SNAPSHOTS_NON_COW", "3") or "3")
+            raw_nc = os.environ.get("DFS_MAX_SNAPSHOTS_NON_COW", "3").strip() or "3"
+            try:
+                keep = int(raw_nc)
+            except ValueError:
+                print(
+                    f"[dfs] warning: invalid DFS_MAX_SNAPSHOTS_NON_COW={raw_nc!r}; using 3",
+                    file=sys.stderr,
+                )
+                keep = 3
         else:
             return
         if keep > 0:

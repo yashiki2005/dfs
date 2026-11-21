@@ -393,10 +393,31 @@ def cmd_import(args: argparse.Namespace) -> int:
             raise _cm.UsageError(f"ファイルまたはディレクトリではありません: {archive}")
 
         if bundle_dir is not None:
+            exp_pub = getattr(args, "root_pubkey", None)
+            exp_fp = getattr(args, "root_fingerprint", None)
+            allow_embedded = bool(getattr(args, "allow_embedded_root", False))
+            if exp_pub:
+                pub_p = Path(exp_pub).expanduser()
+                if pub_p.is_file():
+                    exp_pub = pub_p.read_text(encoding="utf-8").strip()
+            if not exp_pub and not exp_fp and not allow_embedded:
+                if getattr(remote, "root_pubkey", ""):
+                    exp_pub = str(remote.root_pubkey).strip()
+                else:
+                    raise _cm.UsageError(
+                        "DFS archive bundle の import には --root-pubkey または --root-fingerprint が必要です"
+                        "（自己整合性のみ確認する場合は --allow-embedded-root を指定してください）"
+                    )
             secret = _resolve_import_bundle_secret(args, remote)
             restored = tmp_path / "restored"
             try:
-                _cm.extract_bundle(bundle_dir, restored, secret)
+                _cm.extract_bundle(
+                    bundle_dir,
+                    restored,
+                    secret,
+                    expected_root_pubkey=exp_pub,
+                    expected_root_fingerprint=exp_fp,
+                )
             except Exception as e:  # noqa: BLE001
                 raise _cm.UsageError(
                     f"DFS archive bundle の展開・検証に失敗しました: {e}"

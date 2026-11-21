@@ -62,7 +62,7 @@ dfs pull ./restored
 - **Easy Sharing & Web UI**:
   - `dfs web`: Start a browser-accessible file sharing & Web CLI UI (great for phones or quick transfers).
   - `dfs share` / `dfscli invite`: Generate read-only invite tokens or one-line `curl | bash` bootstrap scripts for ephemeral workers (e.g., RunPod).
-- **NAT Traversal & Flexible Transport**: Connects directly over LAN/ICE when possible, supports multi-seed libp2p/QUIC chunk distribution out of the box (required core dependency due to ~4x multi-seed throughput gains in 512 MiB benchmarks), and falls back to an encrypted WebSocket/HTTP relay across strict NATs.
+- **NAT Traversal & Flexible Transport**: Connects directly over LAN/ICE, falls back to an encrypted WebSocket/HTTP relay across strict NATs, and optionally supports multi-seed libp2p/QUIC chunk distribution when the `libp2p` extra is installed (~4x multi-seed throughput gains in 512 MiB benchmarks).
 - **Archive & Offline Bundles**: Export/import portable `tar.gz` bundles (with optional PAR2 recovery blocks or BitTorrent metadata) via `dfscli archive` and `dfscli import`.
 - **Copy-on-Write Snapshots**: Integrates with APFS (`clonefile`) on macOS and Btrfs subvolumes on Linux for fast local snapshots (`dfscli fs`).
 
@@ -76,10 +76,10 @@ dfs pull ./restored
 - Core Python libraries:
   - [cryptography](https://github.com/pyca/cryptography) (ChaCha20-Poly1305 AEAD, HKDF, scrypt, TLS/X.509)
   - [dnspython](https://github.com/rthalley/dnspython) (DNS / DNSSEC record lookup)
-  - [py-libp2p](https://github.com/libp2p/py-libp2p) (QUIC/TCP P2P chunk distribution & DHT; promoted to a required dependency after multi-seed benchmarks showed ~4x speedup)
   - [python-zstandard](https://github.com/indygreg/python-zstandard) (Zstandard compression)
 - Optional:
-  - **FUSE mount (`dfscli mount`)**: [fusepy](https://github.com/fusepy/fusepy) + [macFUSE](https://github.com/macfuse/macfuse) / [FUSE-T](https://github.com/macos-fuse-t/fuse-t) (macOS) or [libfuse](https://github.com/libfuse/libfuse) (Linux)
+  - **P2P multi-seed distribution (`libp2p` extra)**: [py-libp2p](https://github.com/libp2p/py-libp2p) (`uv sync --extra libp2p` / `pip install 'dfs[libp2p]'`; attempted automatically by the one-line installer)
+  - **FUSE mount (`dfs mount` / `dfscli mount`)**: [fusepy](https://github.com/fusepy/fusepy) + [macFUSE](https://github.com/macfuse/macfuse) / [FUSE-T](https://github.com/macos-fuse-t/fuse-t) (macOS) or [libfuse](https://github.com/libfuse/libfuse) (Linux)
   - [par2cmdline](https://github.com/Parchive/par2cmdline) (`par2`) for PAR2 parity in `dfscli archive`
   - [libqrencode](https://github.com/fukuchi/libqrencode) (`qrencode`) for terminal QR codes in `dfscli web`
 
@@ -255,6 +255,19 @@ Wraps `dfscli` and `dfssvc` into single-command workflows (use `./cli` inside th
 | `dfssvc env` | Print `dfscli config create` command for the service |
 | `dfssvc dnssec` | Generate `_dfs.<domain>` TXT record JSON for DNSSEC discovery |
 | `dfssvc logs` | Tail service logs |
+
+---
+
+## Environment Variables (Operations & Public Hubs)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DFS_OST_MAX_BYTES` | 80% of free disk (1–50 GiB) | Total L3 OST storage quota in bytes (`0` for unlimited) |
+| `DFS_OST_MAX_WRITER_BYTES` | `10737418240` (10 GiB) | Per-writer current-usage quota on L3 OST (`0` for unlimited) |
+| `DFS_AUTO_DELEGATE_TOKEN` | unset | Shared token protecting `/v1/auto-delegate` on public hubs (sent automatically by clients when set) |
+| `DFS_AUTO_DELEGATE_RATE_LIMIT` | `10` | Max `/v1/auto-delegate` requests per 60s per non-loopback IP |
+| `DFS_MAX_SNAPSHOTS` | unset | Max retained local snapshots (applies to CoW too; `0` for unlimited) |
+| `DFS_MAX_SNAPSHOTS_NON_COW` | `3` | Max retained local snapshots on non-CoW filesystems such as ext4 |
 
 ---
 

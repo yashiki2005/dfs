@@ -56,11 +56,11 @@ dfscli archive create scw: --out ./scw-v1
 # 過去の版を指定してアーカイブする
 dfscli archive create scw: --version 3 --out ./scw-v3
 
-# bundle の署名・chunk hash・サイズを検証する
-dfscli archive verify ./scw-v1
+# bundle の署名・chunk hash・サイズを検証する（期待する root 公開鍵または指紋を指定）
+dfscli archive verify ./scw-v1 --root-pubkey ~/.config/dfs/dfssvc/local/keys/root.pub
 
-# ローカルに復元する（tree_secret が必要）
-dfscli archive extract ./scw-v1 ./restored
+# ローカルに復元する（tree_secret と期待 root 鍵が必要）
+dfscli archive extract ./scw-v1 ./restored --root-pubkey ~/.config/dfs/dfssvc/local/keys/root.pub
 
 # descriptor から archive 一覧を表示する
 dfscli archive catalog .

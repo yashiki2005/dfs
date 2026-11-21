@@ -298,7 +298,10 @@ def _normalize_intermixed_archive_argv(argv: List[str]) -> List[str]:
     non_opts = []
     opts = []
     i = 0
-    val_options = {"--out", "--announce", "--version", "--secret", "--recovery", "--torrent-client", "--torrent-timeout"}
+    val_options = {
+        "--out", "--announce", "--version", "--secret", "--recovery",
+        "--torrent-client", "--torrent-timeout", "--root-pubkey", "--root-fingerprint",
+    }
     while i < len(rest):
         arg = rest[i]
         if arg.startswith("-"):
@@ -533,6 +536,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--source-secret",
         help="DFS archive bundle の復号に使う tree_secret（省略時は宛先リモートと同じ secret）",
+    )
+    p.add_argument(
+        "--root-pubkey",
+        help="DFS archive bundle 展開時に照合する期待 root 公開鍵（文字列または .pub ファイル）",
+    )
+    p.add_argument(
+        "--root-fingerprint",
+        help="DFS archive bundle 展開時に照合する期待 root 公開鍵指紋 (SHA256:...)",
+    )
+    p.add_argument(
+        "--allow-embedded-root",
+        action="store_true",
+        help="DFS archive bundle 展開時に埋め込み root 公開鍵での検証を許可する",
     )
     p.add_argument("-n", "--dry-run", action="store_true")
     p.set_defaults(func=cmd_import)

@@ -1196,9 +1196,20 @@ def locate_downloaded_bundle(
     return candidates[0]
 
 
-def extract_bundle(bundle: Path | str, dest: Path | str, tree_secret: str) -> Path:
+def extract_bundle(
+    bundle: Path | str,
+    dest: Path | str,
+    tree_secret: str,
+    *,
+    expected_root_pubkey: Optional[str] = None,
+    expected_root_fingerprint: Optional[str] = None,
+) -> Path:
     """archive bundle を復号してローカルディレクトリへ展開する。"""
-    meta = verify_bundle(bundle)
+    meta = verify_bundle(
+        bundle,
+        expected_root_pubkey=expected_root_pubkey,
+        expected_root_fingerprint=expected_root_fingerprint,
+    )
     root = Path(bundle).expanduser()
     out = Path(dest).expanduser()
     local_ost = _BundleOST(root)

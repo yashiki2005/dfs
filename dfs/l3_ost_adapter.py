@@ -462,6 +462,8 @@ class ChunkStoreServer:
             else (int(env_max_writer) if env_max_writer and int(env_max_writer) > 0 else None)
         )
         self._writer_bytes: Dict[str, int] = {}
+        self._reserved_writer_bytes: Dict[str, int] = {}
+        self._chunk_owners: Dict[str, str] = {}
         self.store: Dict[str, bytes] = OrderedDict()
         self._dirty_wire_ids: set[str] = set()
         self._store_lock = threading.RLock()
@@ -533,6 +535,7 @@ class ChunkStoreServer:
             self._disk_bytes = sum(
                 p.stat().st_size for p in self.chunks_dir.glob("*.blk") if p.is_file()
             )
+            self._load_writer_owners()
         max_conns = max(1, int(os.environ.get("DFS_OST_MAX_CONNS", "64")))
         self._conn_sem = threading.BoundedSemaphore(max_conns)
         self.online: bool = True
@@ -571,10 +574,13 @@ class ChunkStoreServer:
         freed = 0
         if max_bytes is not None and max_bytes >= 0:
             while self.store and self._ram_bytes > max_bytes:
-                _wid, old_blob = self.store.popitem(last=False)
+                old_wid, old_blob = self.store.popitem(last=False)
                 self._ram_bytes -= len(old_blob)
+                self._release_writer_bytes_locked(old_wid, len(old_blob))
                 evicted += 1
                 freed += len(old_blob)
+        if evicted > 0:
+            self._save_writer_owners_locked()
         return evicted, freed
 
     def _gc_disk_locked(
@@ -616,6 +622,7 @@ class ChunkStoreServer:
                         remaining.append((mtime, size, wid, p))
                         continue
                     self._disk_bytes = max(0, self._disk_bytes - size)
+                    self._release_writer_bytes_locked(wid, size)
                     old = self.store.pop(wid, None)
                     if old is not None:
                         self._ram_bytes -= len(old)
@@ -636,11 +643,14 @@ class ChunkStoreServer:
                 except OSError:
                     continue
                 self._disk_bytes = max(0, self._disk_bytes - size)
+                self._release_writer_bytes_locked(wid, size)
                 old = self.store.pop(wid, None)
                 if old is not None:
                     self._ram_bytes -= len(old)
                 evicted += 1
                 freed += size
+        if evicted > 0:
+            self._save_writer_owners_locked()
         return evicted, freed
 
     def gc(
@@ -798,14 +808,90 @@ class ChunkStoreServer:
             return blob
         return None
 
+    def _load_writer_owners(self) -> None:
+        if self.chunks_dir is None:
+            return
+        owners_json = self.chunks_dir / ".writer_owners.json"
+        owners_log = self.chunks_dir / ".writer_owners.log"
+        raw_owners: Dict[str, str] = {}
+        if owners_json.is_file():
+            try:
+                data = json.loads(owners_json.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    raw_owners = {str(k): str(v) for k, v in data.items()}
+            except (OSError, ValueError):
+                pass
+        if owners_log.is_file():
+            try:
+                for line in owners_log.read_text(encoding="utf-8").splitlines():
+                    if "\t" in line:
+                        wid, owner = line.split("\t", 1)
+                        raw_owners[wid.strip()] = owner.strip()
+            except OSError:
+                pass
+        if not raw_owners:
+            return
+        for p in self.chunks_dir.glob("*.blk"):
+            if not p.is_file():
+                continue
+            wid = p.stem
+            owner = raw_owners.get(wid)
+            if owner:
+                try:
+                    sz = p.stat().st_size
+                except OSError:
+                    continue
+                self._chunk_owners[wid] = owner
+                self._writer_bytes[owner] = self._writer_bytes.get(owner, 0) + sz
+        self._save_writer_owners_locked()
+
+    def _save_writer_owners_locked(self) -> None:
+        if self.chunks_dir is None:
+            return
+        owners_json = self.chunks_dir / ".writer_owners.json"
+        owners_log = self.chunks_dir / ".writer_owners.log"
+        try:
+            fd, tmp_name = tempfile.mkstemp(prefix=".owners_", suffix=".tmp", dir=str(self.chunks_dir))
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self._chunk_owners, f, separators=(",", ":"))
+                os.replace(tmp, owners_json)
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+            owners_log.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _check_writer_quota_locked(self, writer_id: str, size: int) -> bool:
         if self.max_writer_bytes is None or not writer_id:
             return True
-        return self._writer_bytes.get(writer_id, 0) + size <= self.max_writer_bytes
+        used = self._writer_bytes.get(writer_id, 0) + self._reserved_writer_bytes.get(writer_id, 0)
+        return used + size <= self.max_writer_bytes
 
-    def _record_writer_bytes_locked(self, writer_id: str, size: int) -> None:
-        if writer_id:
-            self._writer_bytes[writer_id] = self._writer_bytes.get(writer_id, 0) + size
+    def _record_writer_bytes_locked(self, wid: str, writer_id: str, size: int) -> None:
+        if not writer_id or wid in self._chunk_owners:
+            return
+        self._chunk_owners[wid] = writer_id
+        self._writer_bytes[writer_id] = self._writer_bytes.get(writer_id, 0) + size
+        if self.chunks_dir is not None:
+            try:
+                with (self.chunks_dir / ".writer_owners.log").open("a", encoding="utf-8") as f:
+                    f.write(f"{wid}\t{writer_id}\n")
+            except OSError:
+                pass
+
+    def _release_writer_bytes_locked(self, wid: str, size: int) -> None:
+        owner = self._chunk_owners.pop(wid, "")
+        if owner:
+            rem = max(0, self._writer_bytes.get(owner, 0) - size)
+            if rem == 0:
+                self._writer_bytes.pop(owner, None)
+            else:
+                self._writer_bytes[owner] = rem
 
     def _put_chunk(self, wid: str, blob: bytes, writer_id: str = "") -> bool:
         if self.chunks_dir is None:
@@ -830,7 +916,7 @@ class ChunkStoreServer:
                         return False
                 self.store[wid] = blob
                 self._ram_bytes += len(blob)
-                self._record_writer_bytes_locked(writer_id, len(blob))
+                self._record_writer_bytes_locked(wid, writer_id, len(blob))
                 self._dirty_wire_ids.add(wid)
                 return True
 
@@ -870,6 +956,10 @@ class ChunkStoreServer:
                 if self._disk_bytes + self._reserved_bytes + len(blob) > self.max_store_bytes:
                     return False
             self._reserved_bytes += len(blob)
+            if writer_id:
+                self._reserved_writer_bytes[writer_id] = (
+                    self._reserved_writer_bytes.get(writer_id, 0) + len(blob)
+                )
             self._inflight_puts.add(wid)
 
         wrote_new = False
@@ -902,12 +992,18 @@ class ChunkStoreServer:
             with self._store_lock:
                 if wrote_new:
                     self._disk_bytes += len(blob)
-                    self._record_writer_bytes_locked(writer_id, len(blob))
+                    self._record_writer_bytes_locked(wid, writer_id, len(blob))
                 self._cache_ram(wid, blob)
             return True
         finally:
             with self._store_lock:
                 self._reserved_bytes -= len(blob)
+                if writer_id:
+                    rem_res = max(0, self._reserved_writer_bytes.get(writer_id, 0) - len(blob))
+                    if rem_res == 0:
+                        self._reserved_writer_bytes.pop(writer_id, None)
+                    else:
+                        self._reserved_writer_bytes[writer_id] = rem_res
                 self._inflight_puts.discard(wid)
                 self._put_cond.notify_all()
 
