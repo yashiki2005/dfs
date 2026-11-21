@@ -606,13 +606,24 @@ class Harness:
                    f"printf 'chunk-%s-' $i > {qpath(tree)}/chunk$i.bin; done")
             desc = f"{args.chunk_count} 個の小ファイル"
         else:
-            gen = (
-                f"mkdir -p {qpath(tree)} && "
-                f"for i in $(seq 0 {args.files - 1}); do "
-                f"{self.client_py()} -c \"import sys;open(sys.argv[1],'wb').write((b'file-%d'%int(sys.argv[2]))*"
-                f"({args.file_size}//8+1))\" {qpath(tree)}/file$i.bin $i; done"
-            )
-            desc = f"{args.files} × {args.file_size} B"
+            if getattr(args, "random_data", False):
+                gen = (
+                    f"mkdir -p {qpath(tree)} && "
+                    f"for i in $(seq 0 {args.files - 1}); do "
+                    f"{self.client_py()} -c \"import os,sys;rem=int(sys.argv[2]);"
+                    f"f=open(sys.argv[1],'wb')\n"
+                    f"while rem>0: n=min(rem,4194304); f.write(os.urandom(n)); rem-=n\n"
+                    f"f.close()\" {qpath(tree)}/file$i.bin {args.file_size}; done"
+                )
+                desc = f"{args.files} × {args.file_size} B (random)"
+            else:
+                gen = (
+                    f"mkdir -p {qpath(tree)} && "
+                    f"for i in $(seq 0 {args.files - 1}); do "
+                    f"{self.client_py()} -c \"import sys;open(sys.argv[1],'wb').write((b'file-%d'%int(sys.argv[2]))*"
+                    f"({args.file_size}//8+1))\" {qpath(tree)}/file$i.bin $i; done"
+                )
+                desc = f"{args.files} × {args.file_size} B"
         rc, out, ms = self.client_exec(gen, timeout=120)
         ok = rc == 0
         self.step(f"試験データ生成（{desc}）", ok, out[:200] if not ok else desc, ms)
@@ -738,6 +749,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--state-dir", default="~/dfs_wan/server_state")
     ap.add_argument("--files", type=int, default=20)
     ap.add_argument("--file-size", type=int, default=128 * 1024)
+    ap.add_argument("--random-data", action="store_true", help="圧縮不能なランダムデータ (os.urandom) を使う")
     ap.add_argument("--chunk-count", type=int, default=0,
                     help="0 より大きいとき、往復回数の検証用小ファイルを指定数だけ作る")
     ap.add_argument("--reset", action="store_true", help="サーバ状態を消してから始める")

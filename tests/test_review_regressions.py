@@ -3042,6 +3042,55 @@ class TestReviewRegressions(unittest.TestCase):
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
 
+    def test_hashed_relay_node_and_writer_scoped_subtree_name(self) -> None:
+        from unittest.mock import patch
+        from dfs import svc as svc_mod
+        from dfs.commands.remote import default_subtree_name
+        from dfs.relay import validate_node_id
+
+        # 1. default_subtree_name separates distinct writers even on same IP + hostname
+        s1 = default_subtree_name("203.0.113.10", "shared-host", writer_pubkey="ssh-ed25519 AAAA_ONE")
+        s2 = default_subtree_name("203.0.113.10", "shared-host", writer_pubkey="ssh-ed25519 AAAA_TWO")
+        self.assertEqual(len(s1), 16)
+        self.assertEqual(len(s2), 16)
+        self.assertNotEqual(s1, s2)
+
+        # 2. dfssvc start with --join generates unique hashed relay_node (not plain hostname/'local')
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            seen_cmds: list[list[str]] = []
+
+            class DummyProc:
+                pid = 42424
+                returncode = None
+                def poll(self):
+                    return None
+
+            orig_popen = svc_mod.subprocess.Popen
+
+            def fake_popen(cmd, **kwargs):
+                if isinstance(cmd, (list, tuple)) and any("dfs.cli" in str(x) for x in cmd):
+                    seen_cmds.append(list(cmd))
+                    return DummyProc()
+                return orig_popen(cmd, **kwargs)
+
+            with patch.dict(
+                os.environ,
+                {"HOME": str(root), "USERPROFILE": str(root), "DFS_CONFIG": str(root / "remotes.json")},
+            ), \
+                 patch.object(svc_mod.subprocess, "Popen", side_effect=fake_popen), \
+                 patch.object(svc_mod, "wait_for_l2", return_value=True), \
+                 patch.object(svc_mod, "register_delegation"):
+                rc = svc_mod.main(["start", "--name", "local", "--join", "https://l2.yashiki.top"])
+                self.assertEqual(rc, 0)
+            self.assertTrue(seen_cmds)
+            relay_args = [a for a in seen_cmds[0] if a.startswith("--relay-node=")]
+            self.assertEqual(len(relay_args), 1)
+            node_id = relay_args[0].split("=", 1)[1]
+            self.assertTrue(node_id.startswith("n-"))
+            self.assertEqual(validate_node_id(node_id), node_id)
+            self.assertNotEqual(node_id, "local")
+
 
 if __name__ == "__main__":
     unittest.main()

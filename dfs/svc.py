@@ -700,7 +700,12 @@ def cmd_start(args: argparse.Namespace) -> int:
         or str(saved_cfg.get("relay_node") or "")
     )
     if join_url and not relay_node:
-        relay_node = name if name != DEFAULT_NAME else socket.gethostname().split(".")[0]
+        import base64
+        import hashlib
+
+        seed = f"{socket.gethostname()}\n{name}\n{base}\n{secrets.token_hex(16)}".encode("utf-8")
+        digest = hashlib.sha256(seed).digest()
+        relay_node = "n-" + base64.urlsafe_b64encode(digest[:12]).decode("ascii").rstrip("=")
 
     sync_id = str(saved_cfg.get("sync_id") or "").strip()
     if join_url and not sync_id:

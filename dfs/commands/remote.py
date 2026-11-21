@@ -929,13 +929,15 @@ def _detect_external_ip(timeout: float = 0.8) -> str:
 def default_subtree_name(
     external_ip: Optional[str] = None,
     hostname: Optional[str] = None,
+    writer_pubkey: str = "",
 ) -> str:
-    """外部 IP とホスト名から決定的な URL-safe Base64 部分木名を生成する。"""
+    """外部 IP・ホスト名（および任意で書き手公開鍵）から URL-safe Base64 部分木名を生成する。"""
     import base64
 
     ext_ip = (external_ip if external_ip is not None else _cm._detect_external_ip()).strip()
     host = (hostname if hostname is not None else socket.gethostname()).strip()
-    digest = hashlib.sha256(f"{ext_ip}\n{host}".encode("utf-8")).digest()
+    raw = f"{ext_ip}\n{host}\n{writer_pubkey.strip()}" if writer_pubkey.strip() else f"{ext_ip}\n{host}"
+    digest = hashlib.sha256(raw.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest[:12]).decode("ascii").rstrip("=")
 
 
@@ -1096,7 +1098,11 @@ def cmd_join(args: argparse.Namespace) -> int:
             remote_path = str(args.path)
         elif key_value:
             anchor_clean = base_anchor.rstrip("/")
-            subtree_label = default_subtree_name()
+            try:
+                wpub_for_name = _cm.public_key_of(Path(key_value).expanduser())
+            except _cm.UsageError:
+                wpub_for_name = ""
+            subtree_label = default_subtree_name(writer_pubkey=wpub_for_name)
             if anchor_clean.endswith(f"/{subtree_label}"):
                 remote_path = anchor_clean or f"/{subtree_label}"
             else:
