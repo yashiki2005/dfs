@@ -38,7 +38,14 @@ from .archive import (
     verify_archive_descriptor,
     verify_bundle,
 )
-from .crypto import KDF_DEFAULT, KDF_LEGACY_SHA256, ssh_key_fingerprint
+from .crypto import (
+    KDF_DEFAULT,
+    KDF_LEGACY_SHA256,
+    CryptoError,
+    extract_ssh_pubkey,
+    generate_ed25519_keypair,
+    ssh_key_fingerprint,
+)
 from .discovery import (
     CandidacyError,
     create_candidacy_envelope,
@@ -89,15 +96,13 @@ def _ensure_keypair(priv_key: Path) -> None:
         return
     if not priv_key.exists():
         raise UsageError(f"Writer key does not exist: {priv_key}")
-    import subprocess
+    from .crypto import CryptoError, extract_ssh_pubkey
 
-    res = subprocess.run(
-        ["ssh-keygen", "-y", "-f", str(priv_key)],
-        capture_output=True, text=True,
-    )
-    if res.returncode != 0:
-        raise UsageError(f"Cannot read public key from {priv_key}: {res.stderr.strip()}")
-    pub.write_text(res.stdout.strip() + "\n", encoding="utf-8")
+    try:
+        pub_line = extract_ssh_pubkey(priv_key)
+    except CryptoError as e:
+        raise UsageError(str(e)) from e
+    pub.write_text(pub_line + "\n", encoding="utf-8")
     print(f"[dfscli] 公開鍵を作成しました: {pub}", file=sys.stderr)
 
 
@@ -159,21 +164,12 @@ def public_key_of(priv_key: Path) -> str:
     pub = Path(f"{priv_key}.pub")
     if pub.is_file():
         return pub.read_text(encoding="utf-8").strip()
-    import subprocess
+    from .crypto import CryptoError, extract_ssh_pubkey
 
     try:
-        res = subprocess.run(
-            ["ssh-keygen", "-y", "-f", str(priv_key)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise UsageError(f"Timed out reading public key from {priv_key}") from e
-    if res.returncode != 0:
-        raise UsageError(f"Cannot read public key from {priv_key}: {res.stderr.strip()}")
-    return res.stdout.strip()
+        return extract_ssh_pubkey(priv_key)
+    except CryptoError as e:
+        raise UsageError(str(e)) from e
 
 
 def _ensure_remote_secret(
@@ -1261,18 +1257,13 @@ def _create_invite_token(args: argparse.Namespace, remote: Remote) -> str:
             )
 
             with tempfile.TemporaryDirectory(prefix="dfs_inv_key_") as tmpdir:
+                from .crypto import CryptoError, generate_ed25519_keypair
+
                 eph_key = Path(tmpdir) / "ephemeral_ed25519"
-                res = subprocess.run(
-                    [
-                        "ssh-keygen", "-t", "ed25519", "-N", "",
-                        "-C", f"dfs-ephemeral@{norm_write_path}",
-                        "-f", str(eph_key),
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
-                if res.returncode != 0:
-                    raise UsageError(f"一時鍵の生成に失敗しました: {res.stderr.strip()}")
+                try:
+                    generate_ed25519_keypair(eph_key, comment=f"dfs-ephemeral@{norm_write_path}")
+                except CryptoError as e:
+                    raise UsageError(f"一時鍵の生成に失敗しました: {e}") from e
                 eph_priv_text = eph_key.read_text(encoding="utf-8")
                 eph_pub_text = Path(f"{eph_key}.pub").read_text(encoding="utf-8").strip()
 

@@ -1407,17 +1407,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
     cert = state_dir / "ost_cert.pem"
     key = state_dir / "ost_key.pem"
     if not cert.exists() or not key.exists():
-        subprocess.run(
-            [
-                "openssl", "req", "-x509", "-newkey", "rsa:2048",
-                "-keyout", str(key), "-out", str(cert),
-                "-days", "365", "-nodes", "-subj", "/CN=dfs-ost",
-            ],
-            check=True,
-            capture_output=True,
-            stdin=subprocess.DEVNULL,
-            timeout=60,
-        )
+        from .crypto import generate_self_signed_tls_cert
+
+        generate_self_signed_tls_cert(cert, key, cn="dfs-ost", days=365)
 
     print("[dfs serve] startup: opening L3 OST", file=sys.stderr, flush=True)
     env_ost_max = os.environ.get("DFS_OST_MAX_BYTES", "").strip()

@@ -70,8 +70,9 @@ dfs pull ./restored
 ## 動作要件
 
 - Python `3.11` 以上
-- [OpenSSH](https://www.openssh.com/)（`ssh-keygen`）— Ed25519 鍵の生成および署名に使用
-- [OpenSSL](https://github.com/openssl/openssl)（`openssl`）— TLS 証明書の生成に使用
+- オプション外部ツール（未導入時は `cryptography` による内蔵処理へ自動フォールバック）:
+  - [OpenSSH](https://www.openssh.com/)（`ssh-keygen`）— 導入済みなら Ed25519 鍵生成・パスフレーズ付き鍵の署名に優先使用
+  - [OpenSSL](https://github.com/openssl/openssl)（`openssl`）— 導入済みなら TLS 証明書生成に優先使用
 - 主要 Python ライブラリ:
   - [cryptography](https://github.com/pyca/cryptography)（ChaCha20-Poly1305 AEAD・HKDF・scrypt・TLS/X.509）
   - [dnspython](https://github.com/rthalley/dnspython)（DNS / DNSSEC レコード参照）

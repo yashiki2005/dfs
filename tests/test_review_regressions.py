@@ -3011,6 +3011,37 @@ class TestReviewRegressions(unittest.TestCase):
                 )
                 self.assertNotEqual(rc_fail, 0)
 
+    def test_cryptography_fallbacks_when_external_binaries_missing(self) -> None:
+        import ssl
+        from unittest.mock import patch
+        from dfs.crypto import (
+            extract_ssh_pubkey,
+            generate_ed25519_keypair,
+            generate_self_signed_tls_cert,
+            ssh_sign,
+            ssh_verify,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            priv = root / "id_ed25519"
+            cert = root / "ost.crt"
+            key = root / "ost.key"
+            with patch("dfs.crypto.shutil.which", return_value=None):
+                generate_ed25519_keypair(priv, comment="test@internal")
+                self.assertTrue(priv.is_file())
+                self.assertTrue(Path(f"{priv}.pub").is_file())
+                pub = extract_ssh_pubkey(priv)
+                self.assertTrue(pub.startswith("ssh-ed25519 "))
+                sig = ssh_sign(priv, "dfs-test-ns", b"hello-crypto")
+                self.assertTrue(ssh_verify(pub, "signer", "dfs-test-ns", b"hello-crypto", sig))
+
+                generate_self_signed_tls_cert(cert, key, cn="dfs-internal", days=7)
+                self.assertTrue(cert.is_file())
+                self.assertTrue(key.is_file())
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+
 
 if __name__ == "__main__":
     unittest.main()

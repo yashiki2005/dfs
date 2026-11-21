@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -158,6 +159,165 @@ def _ssh_keygen_sign(priv_key_path: Path, namespace: str, payload: bytes) -> str
         if not sig_file.is_file():
             raise SignatureVerificationError("ssh-keygen -Y sign produced no signature file")
         return sig_file.read_text(encoding="utf-8")
+
+
+def generate_ed25519_keypair(priv_path: Path | str, comment: str = "") -> Path:
+    """Ed25519 OpenSSH 鍵ペアを生成する（``ssh-keygen`` があれば優先、無ければ ``cryptography``）。"""
+    priv = Path(priv_path).expanduser()
+    priv.parent.mkdir(parents=True, exist_ok=True)
+    pub = Path(f"{priv}.pub")
+    ssh_keygen = shutil.which("ssh-keygen")
+    if ssh_keygen:
+        try:
+            res = subprocess.run(
+                [ssh_keygen, "-t", "ed25519", "-N", "", "-C", comment or "dfs", "-f", str(priv)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if res.returncode == 0 and priv.is_file() and pub.is_file():
+                try:
+                    os.chmod(priv, 0o600)
+                except OSError:
+                    pass
+                return priv
+            raise CryptoError(f"ssh-keygen failed: {res.stderr.strip()}")
+        except FileNotFoundError:
+            pass
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    sk = Ed25519PrivateKey.generate()
+    priv_pem = sk.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_line = sk.public_key().public_bytes(
+        encoding=serialization.Encoding.OpenSSH,
+        format=serialization.PublicFormat.OpenSSH,
+    ).decode("utf-8")
+    if comment:
+        pub_line = f"{pub_line} {comment}"
+    fd = os.open(priv, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        f = os.fdopen(fd, "wb")
+    except Exception:
+        os.close(fd)
+        raise
+    with f:
+        f.write(priv_pem)
+    try:
+        os.chmod(priv, 0o600)
+    except OSError:
+        pass
+    pub.write_text(pub_line + "\n", encoding="utf-8")
+    return priv
+
+
+def extract_ssh_pubkey(priv_path: Path | str) -> str:
+    """秘密鍵から OpenSSH 公開鍵 1 行を取り出す（``ssh-keygen`` 優先、無ければ ``cryptography``）。"""
+    priv = Path(priv_path).expanduser()
+    ssh_keygen = shutil.which("ssh-keygen")
+    if ssh_keygen:
+        try:
+            res = subprocess.run(
+                [ssh_keygen, "-y", "-f", str(priv)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+            raise CryptoError(f"Cannot read public key from {priv}: {res.stderr.strip()}")
+        except FileNotFoundError:
+            pass
+        except subprocess.TimeoutExpired as e:
+            raise CryptoError(f"Timed out reading public key from {priv}") from e
+
+    from cryptography.hazmat.primitives import serialization
+
+    try:
+        key_obj = serialization.load_ssh_private_key(priv.read_bytes(), password=None)
+        return key_obj.public_key().public_bytes(
+            encoding=serialization.Encoding.OpenSSH,
+            format=serialization.PublicFormat.OpenSSH,
+        ).decode("utf-8").strip()
+    except Exception as e:
+        raise CryptoError(f"Cannot read public key from {priv}: {e}") from e
+
+
+def generate_self_signed_tls_cert(
+    cert_path: Path | str,
+    key_path: Path | str,
+    *,
+    cn: str = "dfs-ost",
+    days: int = 365,
+) -> None:
+    """自己署名 X.509 TLS 証明書を生成する（``openssl`` 優先、無ければ ``cryptography``）。"""
+    cert = Path(cert_path).expanduser()
+    key = Path(key_path).expanduser()
+    cert.parent.mkdir(parents=True, exist_ok=True)
+    key.parent.mkdir(parents=True, exist_ok=True)
+    openssl_bin = shutil.which("openssl")
+    if openssl_bin:
+        try:
+            subprocess.run(
+                [
+                    openssl_bin, "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert),
+                    "-days", str(int(days)), "-nodes", "-subj", f"/CN={cn}",
+                ],
+                check=True,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=60,
+            )
+            return
+        except FileNotFoundError:
+            pass
+
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    cert_obj = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(priv_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now_dt - datetime.timedelta(minutes=5))
+        .not_valid_after(now_dt + datetime.timedelta(days=int(days)))
+        .sign(priv_key, hashes.SHA256())
+    )
+    key_pem = priv_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    cert_pem = cert_obj.public_bytes(serialization.Encoding.PEM)
+    fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        f = os.fdopen(fd, "wb")
+    except Exception:
+        os.close(fd)
+        raise
+    with f:
+        f.write(key_pem)
+    try:
+        os.chmod(key, 0o600)
+    except OSError:
+        pass
+    cert.write_bytes(cert_pem)
 
 
 def _ssh_string(data: bytes) -> bytes:

@@ -347,38 +347,28 @@ class ServiceStore:
 # --------------------------------------------------------------------------
 def ensure_root_key(path: Path) -> Path:
     """root の Ed25519 鍵を用意する（無ければ作る）。"""
+    from .crypto import CryptoError, generate_ed25519_keypair
+
     if path.exists() and Path(f"{path}.pub").exists():
         return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    res = subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"dfssvc-root@{socket.gethostname()}",
-         "-f", str(path)],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if res.returncode != 0:
-        raise ServiceError(f"root 鍵を作れませんでした: {res.stderr.strip()}")
+    try:
+        generate_ed25519_keypair(path, comment=f"dfssvc-root@{socket.gethostname()}")
+    except CryptoError as e:
+        raise ServiceError(f"root 鍵を作れませんでした: {e}") from e
     restrict_to_owner(path)
     return path
 
 
 def ensure_writer_key(path: Path) -> Path:
     """書き手（L4 のログに署名する人）の Ed25519 鍵を用意する。"""
+    from .crypto import CryptoError, generate_ed25519_keypair
+
     if path.exists() and Path(f"{path}.pub").exists():
         return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    res = subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"dfssvc-writer@{socket.gethostname()}",
-         "-f", str(path)],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if res.returncode != 0:
-        raise ServiceError(f"書き手の鍵を作れませんでした: {res.stderr.strip()}")
+    try:
+        generate_ed25519_keypair(path, comment=f"dfssvc-writer@{socket.gethostname()}")
+    except CryptoError as e:
+        raise ServiceError(f"書き手の鍵を作れませんでした: {e}") from e
     restrict_to_owner(path)
     return path
 

@@ -487,13 +487,14 @@ def cmd_config(args: argparse.Namespace) -> int:
             key_dir.mkdir(parents=True, exist_ok=True)
             key_path = key_dir / f"{args.name}_ed25519"
             if not key_path.is_file():
-                res = subprocess.run(
-                    ["ssh-keygen", "-t", "ed25519", "-N", "",
-                     "-C", f"dfscli-{args.name}@{socket.gethostname()}", "-f", str(key_path)],
-                    capture_output=True, text=True,
-                )
-                if res.returncode != 0:
-                    raise _cm.UsageError(f"鍵を作れませんでした: {res.stderr.strip()}")
+                from ..crypto import CryptoError, generate_ed25519_keypair
+
+                try:
+                    generate_ed25519_keypair(
+                        key_path, comment=f"dfscli-{args.name}@{socket.gethostname()}"
+                    )
+                except CryptoError as e:
+                    raise _cm.UsageError(f"鍵を作れませんでした: {e}") from e
                 restrict_to_owner(key_path)
                 created_key = True
 

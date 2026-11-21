@@ -71,8 +71,9 @@ dfs pull ./restored
 ## Requirements
 
 - Python `3.11+`
-- [OpenSSH](https://www.openssh.com/) (`ssh-keygen`) for Ed25519 key generation and signing
-- [OpenSSL](https://github.com/openssl/openssl) (`openssl`) for TLS certificate generation
+- Optional external tools (automatically falls back to in-process `cryptography` when absent):
+  - [OpenSSH](https://www.openssh.com/) (`ssh-keygen`) — preferred when installed for Ed25519 keygen and passphrase-protected keys
+  - [OpenSSL](https://github.com/openssl/openssl) (`openssl`) — preferred when installed for self-signed TLS certificate generation
 - Core Python libraries:
   - [cryptography](https://github.com/pyca/cryptography) (ChaCha20-Poly1305 AEAD, HKDF, scrypt, TLS/X.509)
   - [dnspython](https://github.com/rthalley/dnspython) (DNS / DNSSEC record lookup)
