@@ -594,7 +594,7 @@ class Harness:
     def _init_mount(self, name: str, mount: str, node_name: str) -> None:
         sub = (f"init --mount {qpath(mount)} --name {node_name} --path {self.sub_path} "
                f"--key {self._client_key_path()} --secret {self.secret} "
-               f"--registry {self.registry_url} --ost {self.ost_endpoint} --epoch 1")
+               f"--registry {self.registry_url} --ost {self.ost_endpoint} --epoch 1 --allow-tofu")
         self.client_run(name, sub, expect="Initialized")
 
     def _generate_data(self, client_mount: str) -> None:

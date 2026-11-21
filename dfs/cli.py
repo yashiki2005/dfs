@@ -1991,6 +1991,12 @@ def cmd_init(args: argparse.Namespace) -> None:
         "tree_secret": args.secret,
         "kdf": KDF_DEFAULT,
     }
+    raw_root_pub = getattr(args, "root_pubkey", None)
+    if raw_root_pub:
+        rp = Path(raw_root_pub).expanduser()
+        cfg["root_pubkey"] = rp.read_text(encoding="utf-8").strip() if rp.is_file() else str(raw_root_pub).strip()
+    if getattr(args, "allow_tofu", False):
+        cfg["allow_tofu"] = True
     cfg_path = clayfs_dir / CONFIG_FILENAME
     write_private_json(cfg_path, cfg)
     print(f"[dfs init] Initialized mount at {mount_root}")
@@ -2223,6 +2229,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--registry", required=True, help="L2 Registry URL (e.g. http://raspi5.local:9440)")
     p_init.add_argument("--ost", required=True, help="L3 OST host:port (e.g. raspi5.local:9443)")
     p_init.add_argument("--epoch", type=int, default=1, help="Initial delegation epoch")
+    p_init.add_argument("--root-pubkey", help="Trusted root OpenSSH public key (or .pub file)")
+    p_init.add_argument("--allow-tofu", action="store_true", help="Allow TOFU when root_pubkey is omitted")
     p_init.set_defaults(func=cmd_init)
 
     # push
