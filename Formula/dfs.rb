@@ -23,11 +23,13 @@ class Dfs < Formula
   end
 
   def install
+    bin.install "dfs"
     bin.install "dfscli"
     bin.install "dfssvc"
   end
 
   test do
+    assert_match "dfs", shell_output("#{bin}/dfs --help")
     assert_match "dfscli", shell_output("#{bin}/dfscli --help")
     assert_match "dfssvc", shell_output("#{bin}/dfssvc --help")
   end

@@ -60,29 +60,54 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
         with:
           python-version: "3.12"
+          channels: conda-forge
+          auto-activate-base: true
 
-      - name: Install runtime and PyInstaller
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install runtime (with libp2p via Miniconda) and PyInstaller
+        shell: bash -l {0}
         run: |
-          uv sync
-          uv pip install pyinstaller
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            conda install -y -c conda-forge gmp
+          fi
+          PY_BIN="$(python -c 'import sys; print(sys.executable)')"
+          uv pip install --python "$PY_BIN" pyinstaller
+          if ! uv pip install --python "$PY_BIN" --overrides fastecdsa-overrides.txt ".[libp2p]"; then
+            echo "[release] libp2p extra failed on ${{ matrix.target }}; falling back to core dependencies" >&2
+            uv pip install --python "$PY_BIN" .
+          fi
 
       - name: Build standalone binaries
-        shell: bash
+        shell: bash -l {0}
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then DATA_SEP=";"; else DATA_SEP=":"; fi
-          uv run pyinstaller --onefile --clean --name dfscli \
+          EXTRA_ARGS=()
+          if python -c "import libp2p" 2>/dev/null; then
+            EXTRA_ARGS+=(--collect-submodules libp2p --collect-submodules multiaddr)
+          fi
+          python -m PyInstaller --onefile --clean --name dfs \
             --add-data "dfs/i18n/catalogs.json${DATA_SEP}dfs/i18n" \
+            "${EXTRA_ARGS[@]}" \
+            scripts/pyinstaller_dfs.py
+          python -m PyInstaller --onefile --clean --name dfscli \
+            --add-data "dfs/i18n/catalogs.json${DATA_SEP}dfs/i18n" \
+            "${EXTRA_ARGS[@]}" \
             scripts/pyinstaller_cli.py
-          uv run pyinstaller --onefile --clean --name dfssvc \
+          python -m PyInstaller --onefile --clean --name dfssvc \
             --add-data "dfs/i18n/catalogs.json${DATA_SEP}dfs/i18n" \
+            "${EXTRA_ARGS[@]}" \
             scripts/pyinstaller_svc.py
+          "./dist/dfs${{ matrix.ext }}" --help >/dev/null
           "./dist/dfscli${{ matrix.ext }}" --help >/dev/null
           "./dist/dfssvc${{ matrix.ext }}" --help >/dev/null
           mkdir -p stage
+          cp "dist/dfs${{ matrix.ext }}" "stage/dfs${{ matrix.ext }}"
           cp "dist/dfscli${{ matrix.ext }}" "stage/dfscli${{ matrix.ext }}"
           cp "dist/dfssvc${{ matrix.ext }}" "stage/dfssvc${{ matrix.ext }}"
           cp README.md LICENSE stage/
@@ -149,6 +174,7 @@ jobs:
             --overrides fastecdsa-overrides.txt \
             "$WHEEL"
           DFS_LANG=fr .wheel-venv/bin/python -c 'from dfs.i18n import _; key="巻き戻しを検出しました（B6）"; assert _(key) != key'
+          .wheel-venv/bin/dfs --help >/dev/null
           .wheel-venv/bin/dfscli --help >/dev/null
           .wheel-venv/bin/dfssvc --help >/dev/null
 
