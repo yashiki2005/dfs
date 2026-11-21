@@ -89,6 +89,14 @@ jobs:
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then DATA_SEP=";"; else DATA_SEP=":"; fi
           EXTRA_ARGS=()
+          if [ "${{ runner.os }}" = "Linux" ] && [ -n "${CONDA_PREFIX:-}" ]; then
+            export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+            for lib in libcrypto.so.3 libssl.so.3 libgmp.so.10; do
+              if [ -f "${CONDA_PREFIX}/lib/${lib}" ]; then
+                EXTRA_ARGS+=(--add-binary "${CONDA_PREFIX}/lib/${lib}:.")
+              fi
+            done
+          fi
           if python -c "import libp2p" 2>/dev/null; then
             EXTRA_ARGS+=(--collect-submodules libp2p --collect-submodules multiaddr)
           fi
