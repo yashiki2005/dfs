@@ -15,9 +15,11 @@ Mac と raspi5 のターミナルから直接実行できる dfs CLI エント�
 from __future__ import annotations
 
 import argparse
+import base64
 import ipaddress
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -131,6 +133,23 @@ def l2_timeout() -> float:
 # ==========================================
 # リモート L2 名簿 (HTTP JSON RPC) クライアント & サーバ
 # ==========================================
+def _read_bounded_http_body(resp: Any, max_bytes: int = MAX_REGISTRY_BODY_BYTES) -> bytes:
+    """HTTP 応答本文を ``max_bytes`` までに制限して読み込む。"""
+    headers = getattr(resp, "headers", None)
+    raw_cl = headers.get("Content-Length") if headers is not None else None
+    if raw_cl is not None:
+        try:
+            cl = int(raw_cl)
+        except (TypeError, ValueError) as e:
+            raise RegistryError(f"Invalid Content-Length from L2 registry: {raw_cl!r}") from e
+        if cl < 0 or cl > max_bytes:
+            raise RegistryError(f"L2 response Content-Length exceeds {max_bytes} bytes: {cl}")
+    body = resp.read(max_bytes + 1)
+    if len(body) > max_bytes:
+        raise RegistryError(f"L2 response body exceeds {max_bytes} bytes")
+    return body
+
+
 class RemoteRegistryClient:
     """
     DirectoryRegistryService と同じメソッドシグネチャを持ち、
@@ -178,10 +197,10 @@ class RemoteRegistryClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout or l2_timeout()) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                return json.loads(_read_bounded_http_body(resp).decode("utf-8"))
         except urllib.error.HTTPError as e:
             try:
-                err_body = json.loads(e.read().decode("utf-8"))
+                err_body = json.loads(_read_bounded_http_body(e).decode("utf-8"))
                 err_type = err_body.get("error_type", "")
                 err_msg = err_body.get("message", str(e))
             except Exception:
@@ -570,6 +589,7 @@ def make_registry_http_handler(
     ost: ChunkStoreServer,
     relay_hub: Optional[RelayHub] = None,
     status_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+    ost_auth_verifier: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ):
     ost_load_lock = threading.Lock()
     ost_inflight = [0]
@@ -973,6 +993,20 @@ def make_registry_http_handler(
                 elif self.path == "/v1/ost/batch_get":
                     self._send_binary(200, ost.batch_get_raw(raw_body))
                 elif self.path == "/v1/ost/batch_put":
+                    if ost_auth_verifier is not None:
+                        raw_tok = (self.headers.get("X-DFS-OST-Auth") or "").strip()
+                        if not raw_tok:
+                            self._send_binary(403, b"Eunauthorized OST write")
+                            return
+                        try:
+                            padded = raw_tok + "=" * (-len(raw_tok) % 4)
+                            env = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+                            if not ost_auth_verifier(env):
+                                self._send_binary(403, b"Eunauthorized OST write")
+                                return
+                        except Exception:
+                            self._send_binary(403, b"Eunauthorized OST write")
+                            return
                     ost.batch_put_raw(raw_body)
                     self._send_binary(200, b"O")
             except ServiceUnavailableError:
@@ -1332,13 +1366,53 @@ def cmd_serve(args: argparse.Namespace) -> None:
         )
 
     print("[dfs serve] startup: opening L3 OST", file=sys.stderr, flush=True)
+    env_ost_max = os.environ.get("DFS_OST_MAX_BYTES", "").strip()
+    if env_ost_max:
+        ost_max_bytes: Optional[int] = int(env_ost_max) if int(env_ost_max) > 0 else None
+    else:
+        try:
+            free_disk = shutil.disk_usage(str(chunks_dir)).free
+            ost_max_bytes = min(50 * 1024**3, max(1 * 1024**3, int(free_disk * 0.8)))
+        except OSError:
+            ost_max_bytes = 10 * 1024**3
+
+    pstate_holder: List[Optional[PersistentRegistryState]] = [None]
+
+    def _verify_ost_write(envelope: Dict[str, Any]) -> bool:
+        from .l3_ost_adapter import verify_ost_auth_envelope
+
+        cur_pstate = pstate_holder[0]
+        if cur_pstate is None:
+            return False
+        payload = verify_ost_auth_envelope(envelope)
+        req_path = payload["path"]
+        req_writer = payload["writer"]
+        now_ts = int(time.time())
+        with cur_pstate.lock:
+            for d_path, d_env in cur_pstate.service.delegations.items():
+                dp = d_env.get("payload", {})
+                if str(dp.get("writer") or "").strip() != req_writer:
+                    continue
+                if now_ts < int(dp.get("issued_at", 0)) or now_ts >= int(dp.get("expires_at", 0)):
+                    continue
+                if req_path == d_path or req_path.startswith(d_path + "/"):
+                    return True
+        return False
+
     ost = ChunkStoreServer(
-        cert, key, host=args.bind, port=args.ost_port, chunks_dir=chunks_dir
+        cert,
+        key,
+        host=args.bind,
+        port=args.ost_port,
+        chunks_dir=chunks_dir,
+        max_store_bytes=ost_max_bytes,
+        auth_verifier=_verify_ost_write,
     )
     print("[dfs serve] startup: loading registry state", file=sys.stderr, flush=True)
     pstate = PersistentRegistryState(
         state_dir, args.root_anchor, root_pubkey, chunks_dir=chunks_dir
     )
+    pstate_holder[0] = pstate
     if getattr(args, "role", None):
         pstate.role = str(args.role)
     if getattr(args, "role_epoch", None) is not None:
@@ -1419,7 +1493,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
         }
 
     handler = make_registry_http_handler(
-        pstate, ost, relay_hub=relay_hub, status_provider=_get_p2p_status
+        pstate,
+        ost,
+        relay_hub=relay_hub,
+        status_provider=_get_p2p_status,
+        ost_auth_verifier=_verify_ost_write,
     )
     print("[dfs serve] startup: binding L2 HTTP", file=sys.stderr, flush=True)
     httpd = BoundedThreadingHTTPServer((args.bind, args.registry_port), handler)

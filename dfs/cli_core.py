@@ -657,6 +657,12 @@ def _is_zstd_file(path: Path) -> bool:
     return 0x184D2A50 <= magic_le <= 0x184D2A5F
 
 
+MAX_TAR_ENTRIES = 50_000
+MAX_TAR_FILE_BYTES = 1024 * 1024 * 1024  # 1 GiB
+MAX_TAR_TOTAL_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB
+MAX_TAR_COMPRESSION_RATIO = 100.0
+
+
 def _extract_tar_safely(
     archive_path: Path,
     staging: Path,
@@ -664,14 +670,28 @@ def _extract_tar_safely(
 ) -> Tuple[Dict[str, Path], set]:
     """tar を検証しながら staging に展開する。
 
-    symlink / hardlink / device / FIFO は拒否する。通常ファイルとディレクトリだけを
-    許可し、作成したファイルと明示的なディレクトリを返す。
+    symlink / hardlink / device / FIFO は拒否し、エントリ数・単体サイズ・
+    合計展開サイズ・圧縮率の上限も検証する。
     """
     files: Dict[str, Path] = {}
     dirs = set()
+    max_entries = int(os.environ.get("DFS_MAX_TAR_ENTRIES", str(MAX_TAR_ENTRIES)))
+    max_file_bytes = int(os.environ.get("DFS_MAX_TAR_FILE_BYTES", str(MAX_TAR_FILE_BYTES)))
+    max_total_bytes = int(os.environ.get("DFS_MAX_TAR_TOTAL_BYTES", str(MAX_TAR_TOTAL_BYTES)))
+    archive_size = max(1, archive_path.stat().st_size)
+    try:
+        free_bytes = shutil.disk_usage(str(staging)).free
+    except OSError:
+        free_bytes = max_total_bytes
+    entry_count = 0
+    total_extracted = 0
 
     def _consume(archive: tarfile.TarFile) -> None:
+        nonlocal entry_count, total_extracted
         for member in archive:
+            entry_count += 1
+            if entry_count > max_entries:
+                raise UsageError(f"tar のエントリ数が上限 ({max_entries}) を超えています")
             rel = _tar_member_path(member.name, strip_components)
             if not rel:
                 continue
@@ -686,12 +706,31 @@ def _extract_tar_safely(
             if member.isdir():
                 dirs.add(rel)
                 continue
+            if member.size < 0 or member.size > max_file_bytes:
+                raise UsageError(
+                    f"tar エントリ {member.name!r} のサイズ ({member.size}) が上限 ({max_file_bytes}) を超えています"
+                )
             target = safe_target(staging, rel, create_parents=True)
             source = archive.extractfile(member)
             if source is None:
                 raise UsageError(f"tar member を読めません: {member.name!r}")
+            file_written = 0
             with source, target.open("wb") as dest:
-                shutil.copyfileobj(source, dest, length=1024 * 1024)
+                while True:
+                    buf = source.read(1024 * 1024)
+                    if not buf:
+                        break
+                    file_written += len(buf)
+                    total_extracted += len(buf)
+                    if file_written > max_file_bytes:
+                        raise UsageError(f"tar エントリ {member.name!r} が単体サイズ上限を超えました")
+                    if total_extracted > max_total_bytes:
+                        raise UsageError(f"tar の合計展開サイズが上限 ({max_total_bytes}) を超えました")
+                    if total_extracted > free_bytes:
+                        raise UsageError("tar 展開先のディスク空き容量が不足しています")
+                    if archive_size >= 1024 * 1024 and (total_extracted / archive_size) > MAX_TAR_COMPRESSION_RATIO:
+                        raise UsageError("tar の圧縮率が異常に高いため展開を中止しました")
+                    dest.write(buf)
             files[rel] = target
 
     try:

@@ -210,8 +210,15 @@ def fetch_candidacy(
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError, ValueError) as e:
+                max_bytes = 8 * 1024 * 1024
+                raw_cl = resp.headers.get("Content-Length") if getattr(resp, "headers", None) is not None else None
+                if raw_cl is not None and int(raw_cl) > max_bytes:
+                    raise CandidacyError(f"Candidacy response exceeds {max_bytes} bytes")
+                raw_body = resp.read(max_bytes + 1)
+                if len(raw_body) > max_bytes:
+                    raise CandidacyError(f"Candidacy response exceeds {max_bytes} bytes")
+                data = json.loads(raw_body.decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError, ValueError, CandidacyError) as e:
             last_error = e
             continue
         envelope = data.get("candidacy") if isinstance(data, dict) else None

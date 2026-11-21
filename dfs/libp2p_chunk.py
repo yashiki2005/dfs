@@ -249,18 +249,22 @@ class Libp2pChunkServer:
             wire_ids = _parse_wire_ids(frame[5:], count)
             if op == b"H":
                 body = b"O" + bytes(1 if wid in self.store else 0 for wid in wire_ids)
+                await stream.write(struct.pack(">I", len(body)) + body)
             elif op == b"G":
-                parts = [b"O"]
+                total_len = 1
                 for wid in wire_ids:
                     blob = self.store.get(wid, b"")
                     if len(blob) > MAX_BLOB_BYTES:
                         raise ValueError("Chunk too large")
-                    parts.append(struct.pack(">I", len(blob)))
-                    parts.append(blob)
-                body = b"".join(parts)
+                    total_len += 4 + len(blob)
+                    if total_len > MAX_FRAME_BYTES:
+                        raise ValueError("Response frame too large")
+                await stream.write(struct.pack(">I", total_len) + b"O")
+                for wid in wire_ids:
+                    blob = self.store.get(wid, b"")
+                    await stream.write(struct.pack(">I", len(blob)) + blob)
             else:
                 raise ValueError(f"Unknown opcode: {op!r}")
-            await stream.write(struct.pack(">I", len(body)) + body)
         except Exception:
             try:
                 await stream.reset()
@@ -898,18 +902,23 @@ class Libp2pHostManager:
             wire_ids = _parse_wire_ids(frame[5:], count)
             if op == b"H":
                 body = b"O" + bytes(1 if _store_contains(self.store, wid) else 0 for wid in wire_ids)
+                await stream.write(struct.pack(">I", len(body)) + body)
             elif op == b"G":
-                parts = [b"O"]
+                blobs: List[bytes] = []
+                total_len = 1
                 for wid in wire_ids:
                     blob = _store_get(self.store, wid)
                     if len(blob) > MAX_BLOB_BYTES:
                         raise ValueError("Chunk too large")
-                    parts.append(struct.pack(">I", len(blob)))
-                    parts.append(blob)
-                body = b"".join(parts)
+                    total_len += 4 + len(blob)
+                    if total_len > MAX_FRAME_BYTES:
+                        raise ValueError("Response frame too large")
+                    blobs.append(blob)
+                await stream.write(struct.pack(">I", total_len) + b"O")
+                for blob in blobs:
+                    await stream.write(struct.pack(">I", len(blob)) + blob)
             else:
                 raise ValueError(f"Unknown opcode: {op!r}")
-            await stream.write(struct.pack(">I", len(body)) + body)
         except Exception:
             try:
                 await stream.reset()

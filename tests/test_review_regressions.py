@@ -2636,6 +2636,131 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertTrue(p2p_c.closed)
         self.assertEqual(swarm.clients, [http_c])
 
+    def test_ost_write_auth_and_striped_replication_and_tar_bounds(self) -> None:
+        import tarfile
+        import io
+        from unittest.mock import patch
+        from dfs.crypto import ContentAddressedCrypto, sha256_hex
+        from dfs.l3_ost_adapter import (
+            ChunkStoreServer as OSTServer,
+            OSTClient,
+            verify_ost_auth_envelope,
+        )
+        from dfs.l4_log import MerkleTreeBuilder
+        from dfs.cli_core import UsageError, _extract_tar_safely
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            priv_w = root / "writer"
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(priv_w)],
+                check=True, capture_output=True,
+            )
+            pub_w = priv_w.with_suffix(".pub").read_text(encoding="utf-8").strip()
+            cert = root / "ost.crt"
+            key = root / "ost.key"
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert),
+                    "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1",
+                ],
+                check=True, capture_output=True,
+            )
+
+            def verifier(env):
+                p = verify_ost_auth_envelope(env)
+                return p["writer"] == pub_w.strip() and p["path"] == "/example.com/w"
+
+            srv = OSTServer(cert, key, host="127.0.0.1", port=0, auth_verifier=verifier)
+            try:
+                blob = b"hello-ost-auth"
+                wid = sha256_hex(blob)
+                unauth = OSTClient("127.0.0.1", srv.port)
+                with self.assertRaises(Exception):
+                    unauth.put_if_absent(wid, blob)
+
+                authed = OSTClient(
+                    "127.0.0.1",
+                    srv.port,
+                    writer_priv_key=priv_w,
+                    writer_pubkey=pub_w,
+                    writer_path="/example.com/w",
+                )
+                self.assertTrue(authed.put_if_absent(wid, blob))
+                self.assertEqual(authed.get(wid), blob)
+            finally:
+                srv.close()
+
+            # Multi-OST striping + replica OST replication
+            ost0 = OSTServer(cert, key, host="127.0.0.1", port=0)
+            ost1 = OSTServer(cert, key, host="127.0.0.1", port=0)
+            rep = OSTServer(cert, key, host="127.0.0.1", port=0)
+            try:
+                c0 = OSTClient("127.0.0.1", ost0.port)
+                c1 = OSTClient("127.0.0.1", ost1.port)
+                cr = OSTClient("127.0.0.1", rep.port)
+                src_dir = root / "src"
+                src_dir.mkdir()
+                (src_dir / "a.txt").write_bytes(b"aaa" * 100)
+                (src_dir / "b.txt").write_bytes(b"bbb" * 100)
+                builder = MerkleTreeBuilder(
+                    ContentAddressedCrypto("sec"),
+                    c0,
+                    stores={"ost0": c0, "ost1": c1},
+                    replicas=[cr],
+                )
+                builder.upload_directory(src_dir)
+                self.assertEqual(builder.warnings, [])
+                presence = cr.batch_has(list(builder._last_wire_ids))
+                for wid in builder._last_wire_ids:
+                    self.assertTrue(presence.get(wid, False))
+            finally:
+                ost0.close()
+                ost1.close()
+                rep.close()
+
+            # Bounded tar extraction
+            tar_path = root / "many.tar"
+            with tarfile.open(tar_path, "w") as tf:
+                for i in range(5):
+                    data = b"x" * 10
+                    ti = tarfile.TarInfo(name=f"f{i}.txt")
+                    ti.size = len(data)
+                    tf.addfile(ti, io.BytesIO(data))
+            with patch.dict(os.environ, {"DFS_MAX_TAR_ENTRIES": "3"}):
+                with self.assertRaises(UsageError):
+                    _extract_tar_safely(tar_path, root / "staging1", 0)
+            with patch.dict(os.environ, {"DFS_MAX_TAR_TOTAL_BYTES": "25"}):
+                with self.assertRaises(UsageError):
+                    _extract_tar_safely(tar_path, root / "staging2", 0)
+
+    def test_l2_bounded_response_and_web_server_503(self) -> None:
+        from http.server import BaseHTTPRequestHandler
+        from dfs.web import BoundedWebHTTPServer
+
+        class HugeHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = b'{"ok": "' + (b"a" * (9 * 1024 * 1024)) + b'"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        httpd = BoundedWebHTTPServer(("127.0.0.1", 0), HugeHandler, max_connections=1)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            client = cli_mod.RemoteRegistryClient(f"http://127.0.0.1:{httpd.server_port}")
+            with self.assertRaises(cli_mod.RegistryError):
+                client._post_one(f"http://127.0.0.1:{httpd.server_port}", "/v1/paths", {}, 5.0)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

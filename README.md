@@ -19,7 +19,7 @@
 1. **One-Line Cloud GPU / Ephemeral Worker Sync (RunPod, Lambda, Colab)**
    - Stop `scp`-ing tarballs or leaving your personal SSH/S3 keys on rented GPUs.
    - Run `dfscli share mydata --write-path out` on your laptop to generate a one-line `curl | bash` bootstrap command (hosted on `raw.githubusercontent.com`, cloning and syncing via `uv`).
-   - Run `dfssvc start` on your own VPS/server when syncing across NAT—no third-party hub or central account is ever required.
+   - For NAT traversal, `dfs start` uses the `yashiki.top` relay hub by default (zero-trust: the relay never sees your keys or plaintext), and you can disable it with `--no-hub` or self-host your own hub on a VPS with `dfssvc start --hub ...`.
    - The GPU worker pulls the dataset read-only (over direct LAN/ICE, multi-seed libp2p/QUIC, or encrypted relay) and can only write results back to the delegated `out` subpath.
 2. **Zero-Trust `rclone`-Style Sync Across Mac, Linux, and Windows**
    - Keep a home server / Raspberry Pi / VPS as an untrusted encrypted chunk store (`dfssvc start`) and sync from your laptop with `dfscli sync`, `dfscli pull`, or `dfscli mount`.

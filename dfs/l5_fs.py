@@ -203,7 +203,15 @@ class DFSNode:
                 continue
             seen.add(canonical)
             pin = self.ost_cert_sha256 if (idx == 0 and not canonical.startswith("http://")) else None
-            ost_clients.append(make_ost_client(canonical, expected_cert_sha256=pin))  # type: OSTClientProtocol
+            ost_clients.append(
+                make_ost_client(
+                    canonical,
+                    expected_cert_sha256=pin,
+                    writer_priv_key=priv_key_path,
+                    writer_pubkey=pub_key_str,
+                    writer_path=sub_path,
+                )
+            )  # type: OSTClientProtocol
             self.ost_endpoints.append(canonical)
         relay_write_fallbacks: List[OSTClientProtocol] = [
             c

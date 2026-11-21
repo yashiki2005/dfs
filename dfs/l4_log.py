@@ -342,6 +342,7 @@ class MerkleTreeBuilder:
         # 書き込み後にチャンクを複製する読み取り専用 OST。
         self.replicas: List[OSTClientProtocol] = list(replicas or [])
         self._last_wire_ids: set[str] = set()
+        self._last_wire_stores: Dict[str, str] = {}
         # (plain_id -> (wire_id, store_id, codec)) の書き手側索引。
         self.index: MutableMapping[str, Any] = dict(index or {})
         self.index_file = Path(index_file).expanduser() if index_file else None
@@ -466,6 +467,7 @@ class MerkleTreeBuilder:
             # 同じ走査中の重複排除。同一内容の 2 ファイル目以降は再暗号化しない。
             staged: Dict[str, Tuple[str, str, str]] = {}
             all_wire_ids: set[str] = set()
+            all_wire_stores: Dict[str, str] = {}
 
             def _flush(store_id: str) -> None:
                 chunks = pending.get(store_id) or {}
@@ -488,6 +490,7 @@ class MerkleTreeBuilder:
                     reused[plain_id] = (known_wire, store_id, known_codec)
                     staged[plain_id] = (known_wire, store_id, known_codec)
                     all_wire_ids.add(known_wire)
+                    all_wire_stores[known_wire] = store_id
                     return plain_id, known_wire, store_id, known_codec
                 store_id = self._store_for_new_chunk()
                 pack_pid, wire_id, blob = self.crypto.pack_chunk(
@@ -498,6 +501,7 @@ class MerkleTreeBuilder:
                 packed[plain_id] = (wire_id, store_id, codec)
                 staged[plain_id] = (wire_id, store_id, codec)
                 all_wire_ids.add(wire_id)
+                all_wire_stores[wire_id] = store_id
                 pending.setdefault(store_id, {})[wire_id] = blob
                 pending_bytes[store_id] = (
                     pending_bytes.get(store_id, 0) + len(blob)
@@ -601,6 +605,7 @@ class MerkleTreeBuilder:
 
             root = _walk(source_dir, delegated_mounts)
             self._last_wire_ids = set(all_wire_ids)
+            self._last_wire_stores = dict(all_wire_stores)
             for store_id in list(pending):
                 _flush(store_id)
             return pending, reused, packed, root
@@ -659,10 +664,22 @@ class MerkleTreeBuilder:
             try:
                 presence = replica.batch_has(wire_ids)
                 missing = [wid for wid in wire_ids if not presence.get(wid, False)]
-                for start in range(0, len(missing), 256):
-                    group = missing[start : start + 256]
-                    blobs = self.ost.batch_get(group)
-                    replica.batch_put_if_absent(blobs, assume_absent=True)
+                by_store: Dict[str, List[str]] = {}
+                for wid in missing:
+                    sid = self._last_wire_stores.get(wid, self.default_store)
+                    by_store.setdefault(sid, []).append(wid)
+                for sid, store_wids in by_store.items():
+                    src_client = self._client(sid)
+                    for start in range(0, len(store_wids), 256):
+                        group = store_wids[start : start + 256]
+                        blobs = src_client.batch_get(group)
+                        still_missing = [wid for wid in group if wid not in blobs]
+                        if still_missing:
+                            self.warnings.append(
+                                f"replica {replica.host}:{replica.port} missing {len(still_missing)} chunk(s) on source {sid}"
+                            )
+                        if blobs:
+                            replica.batch_put_if_absent(blobs, assume_absent=True)
             except Exception as e:  # noqa: BLE001 - 複製失敗で主の push を落とさない
                 self.warnings.append(
                     f"replica {replica.host}:{replica.port} failed: {type(e).__name__}: {e}"

@@ -26,6 +26,7 @@ EMPTY_SHA256: str = hashlib.sha256(b"").hexdigest()
 
 NS_L1_DELEGATION: str = "dfs-delegation-v1"
 NS_L2_LOCATOR: str = "dfs-l2-locator-v1"
+NS_L3_OST: str = "dfs-l3-ost-v1"
 NS_L4_LOG: str = "dfs-l4-log-v1"
 NS_ARCHIVE: str = "dfs-archive-descriptor-v1"
 NS_CANDIDACY: str = "dfs-candidacy-v1"

@@ -236,6 +236,27 @@ class DFSWebBackend:
             self._current_version = int(self._push_fn())
             return {"path": norm, "size": len(data), "version": self._current_version}
 
+    def save_upload_file(self, rel_path: str, src_path: Path, size: int) -> Dict[str, Any]:
+        with self._lock:
+            self._ensure_writable()
+            norm = normalize_rel_path(rel_path)
+            if not norm:
+                raise WebAppError(400, "Target file path is required")
+            target = self._resolve_target(norm)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(f".upload_{secrets.token_hex(6)}_{target.name}")
+            try:
+                shutil.move(str(src_path), str(tmp))
+                tmp.replace(target)
+            finally:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+            self._current_version = int(self._push_fn())
+            return {"path": norm, "size": int(size), "version": self._current_version}
+
     def make_dir(self, rel_path: str) -> Dict[str, Any]:
         with self._lock:
             self._ensure_writable()
@@ -1392,6 +1413,45 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                     return False
             return True
 
+        def _stream_body_to_temp(self, limit: int) -> Optional[Tuple[Path, int]]:
+            if self.headers.get("Transfer-Encoding"):
+                self.close_connection = True
+                self._send_json(400, {"error": "Transfer-Encoding is not supported"})
+                return None
+            raw_len = self.headers.get("Content-Length", "0")
+            try:
+                length = int(raw_len)
+            except (TypeError, ValueError):
+                self.close_connection = True
+                self._send_json(400, {"error": "Invalid Content-Length"})
+                return None
+            if length < 0 or length > limit:
+                self.close_connection = True
+                self._send_json(413, {"error": f"Payload exceeds limit ({limit} bytes)"})
+                return None
+            import tempfile
+
+            fd, tmp_name = tempfile.mkstemp(prefix=".dfs_web_up_")
+            tmp_path = Path(tmp_name)
+            remaining = length
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(remaining, 1024 * 1024))
+                        if not chunk:
+                            raise EOFError("Unexpected EOF while reading upload body")
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                return tmp_path, length
+            except Exception:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+                self.close_connection = True
+                self._send_json(400, {"error": "Incomplete or timed-out upload body"})
+                return None
+
         def _read_body(self, limit: int) -> Optional[bytes]:
             if self.headers.get("Transfer-Encoding"):
                 self.close_connection = True
@@ -1573,10 +1633,18 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
             try:
                 if route == "/api/upload":
                     rel = (qs.get("path") or [""])[0]
-                    body = self._read_body(config.max_upload_bytes)
-                    if body is None:
+                    streamed = self._stream_body_to_temp(config.max_upload_bytes)
+                    if streamed is None:
                         return
-                    self._send_json(200, backend.save_upload(rel, body))
+                    tmp_path, size = streamed
+                    try:
+                        self._send_json(200, backend.save_upload_file(rel, tmp_path, size))
+                    finally:
+                        if tmp_path.exists():
+                            try:
+                                tmp_path.unlink()
+                            except OSError:
+                                pass
                     return
 
                 if route == "/api/sync":
@@ -1637,6 +1705,34 @@ def find_free_port(bind: str = "0.0.0.0", start_port: int = 8080, attempts: int 
     return 0
 
 
+class BoundedWebHTTPServer(ThreadingHTTPServer):
+    """同時接続数を制限する Web サーバー。"""
+
+    daemon_threads = True
+
+    def __init__(self, server_address: Tuple[str, int], RequestHandlerClass: Any, max_connections: int = 64):
+        self._conn_sem = threading.BoundedSemaphore(max(1, int(max_connections)))
+        super().__init__(server_address, RequestHandlerClass)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._conn_sem.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_sem.release()
+
+
 def start_web_server(
     backend: DFSWebBackend,
     config: WebConfig,
@@ -1647,4 +1743,4 @@ def start_web_server(
     if config.started_at <= 0:
         config.started_at = time.time()
     handler = make_web_handler(backend, config)
-    return ThreadingHTTPServer((bind, int(port)), handler)
+    return BoundedWebHTTPServer((bind, int(port)), handler)

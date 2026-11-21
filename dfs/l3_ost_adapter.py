@@ -7,6 +7,7 @@ macOS / Linux 両対応・デッドロック完全排除版 L3 OST サーバ & �
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import ctypes.util
 import http.client
@@ -24,10 +25,19 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union, Protocol
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
-from .crypto import ChunkIntegrityError, sha256_hex
+from .crypto import (
+    NS_L3_OST,
+    ChunkIntegrityError,
+    SignatureVerificationError,
+    canonical_json,
+    normalize_path,
+    sha256_hex,
+    ssh_sign,
+    ssh_verify,
+)
 from .l2_registry import ServiceUnavailableError
 
 
@@ -94,7 +104,67 @@ class OSTClientProtocol(Protocol):
 ZERO_WIRE_ID = b"0" * 64
 QUIT_FRAME = b"Q" + ZERO_WIRE_ID + struct.pack(">I", 0)
 WIRE_ID_HEX = frozenset(b"0123456789abcdef")
-VALID_OPCODES = frozenset(b"HGPBMFQ")
+VALID_OPCODES = frozenset(b"HGPBMFQA")
+MAX_AUTH_ENVELOPE_BYTES = 65_536
+
+
+def create_ost_auth_envelope(
+    writer_priv_key: Path | str,
+    writer_pubkey: str,
+    path: str,
+    *,
+    now: Optional[int] = None,
+    ttl: int = 300,
+) -> Dict[str, Any]:
+    """L3 OST 書き込み認証用の署名付きエンベロープを生成する。"""
+    ts = int(time.time()) if now is None else int(now)
+    norm_path = normalize_path(path)
+    payload = {
+        "expires_at": ts + max(30, int(ttl)),
+        "issued_at": ts,
+        "path": norm_path,
+        "writer": writer_pubkey.strip(),
+    }
+    sig = ssh_sign(writer_priv_key, NS_L3_OST, canonical_json(payload))
+    return {"payload": payload, "signature": sig}
+
+
+def verify_ost_auth_envelope(
+    envelope: Any,
+    *,
+    now: Optional[int] = None,
+) -> Dict[str, Any]:
+    """L3 OST 書き込み認証エンベロープを検証し、payload を返す。"""
+    if not isinstance(envelope, dict) or "payload" not in envelope or "signature" not in envelope:
+        raise OSTProtocolError("Malformed OST auth envelope")
+    p = envelope["payload"]
+    if not isinstance(p, dict):
+        raise OSTProtocolError("Malformed OST auth payload")
+    required = {"expires_at", "issued_at", "path", "writer"}
+    if set(p.keys()) != required:
+        raise OSTProtocolError("Invalid OST auth payload keys")
+    if isinstance(p["issued_at"], bool) or not isinstance(p["issued_at"], int):
+        raise OSTProtocolError("Invalid issued_at in OST auth payload")
+    if isinstance(p["expires_at"], bool) or not isinstance(p["expires_at"], int):
+        raise OSTProtocolError("Invalid expires_at in OST auth payload")
+    for k in ("path", "writer"):
+        if not isinstance(p[k], str) or not p[k].strip():
+            raise OSTProtocolError(f"Invalid {k} in OST auth payload")
+    sig = envelope["signature"]
+    if not isinstance(sig, str) or not sig.strip():
+        raise OSTProtocolError("Invalid signature in OST auth envelope")
+    try:
+        norm_path = normalize_path(p["path"])
+    except ValueError as e:
+        raise OSTProtocolError(f"Invalid path in OST auth payload: {e}") from e
+    if norm_path != p["path"]:
+        raise OSTProtocolError("Unnormalized path in OST auth payload")
+    ts = int(time.time()) if now is None else int(now)
+    if not (p["issued_at"] - 60 <= ts < p["expires_at"]):
+        raise OSTProtocolError("OST auth envelope expired or not yet valid")
+    if not ssh_verify(p["writer"], norm_path, NS_L3_OST, canonical_json(p), sig):
+        raise OSTProtocolError("Invalid OST auth signature")
+    return p
 
 
 class OSTProtocolError(Exception):
@@ -258,6 +328,7 @@ def _decode_wire_ids(raw: bytes, count: int) -> List[str]:
 MAX_BATCH_ITEMS = 65_536
 MAX_BLOB_BYTES = 256 * 1024 * 1024
 MAX_OST_HTTP_BODY_BYTES = MAX_BLOB_BYTES + 4 * 1024 * 1024
+MAX_BATCH_PUT_BYTES = MAX_OST_HTTP_BODY_BYTES
 # クライアント側ではサーバ上限より小さく区切り、1 回の送受信が
 # メモリ上で無制限に膨らまないようにする。
 CLIENT_BATCH_ITEMS = 1024
@@ -380,7 +451,9 @@ class ChunkStoreServer:
         max_ram_bytes: Optional[int] = None,
         chunk_ttl_seconds: Optional[float] = None,
         evict_on_full: Optional[bool] = None,
+        auth_verifier: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ):
+        self.auth_verifier = auth_verifier
         self.store: Dict[str, bytes] = OrderedDict()
         self._dirty_wire_ids: set[str] = set()
         self._store_lock = threading.RLock()
@@ -817,6 +890,7 @@ class ChunkStoreServer:
 
     def _handle_client(self, raw_conn: socket.socket) -> None:
         ssl_conn: Optional[ssl.SSLSocket] = None
+        authenticated = self.auth_verifier is None
         try:
             ssl_conn = self.ctx.wrap_socket(raw_conn, server_side=True)
             while self.running:
@@ -833,6 +907,26 @@ class ChunkStoreServer:
                     ssl_conn.sendall(b"U")
                     break
 
+                if op == "A":
+                    val = struct.unpack(">I", hdr[65:69])[0]
+                    if val > MAX_AUTH_ENVELOPE_BYTES:
+                        ssl_conn.sendall(b"E")
+                        break
+                    raw_auth = self._recv_exact(ssl_conn, val)
+                    ok = False
+                    try:
+                        env = json.loads(raw_auth.decode("utf-8"))
+                        ok = True if self.auth_verifier is None else bool(self.auth_verifier(env))
+                    except Exception:
+                        ok = False
+                    if ok:
+                        authenticated = True
+                        ssl_conn.sendall(b"O")
+                    else:
+                        ssl_conn.sendall(b"E")
+                        break
+                    continue
+
                 wire_id = _decode_wire_id(hdr[1:65])
                 val = struct.unpack(">I", hdr[65:69])[0]
 
@@ -840,6 +934,9 @@ class ChunkStoreServer:
                     exists = self._has_chunk(wire_id)
                     ssl_conn.sendall(b"1" if exists else b"0")
                 elif op == "P":
+                    if not authenticated:
+                        ssl_conn.sendall(b"E")
+                        break
                     if val > MAX_BLOB_BYTES:
                         ssl_conn.sendall(b"E")
                         break
@@ -870,16 +967,21 @@ class ChunkStoreServer:
                     ssl_conn.sendall(bytes(bitmap))
 
                 elif op == "M":  # Multi-PUT
+                    if not authenticated:
+                        ssl_conn.sendall(b"E")
+                        break
                     if val > MAX_BATCH_ITEMS:
                         ssl_conn.sendall(b"E")
                         break
                     ok = True
                     staged: Dict[str, bytes] = {}
+                    total_staged_bytes = 0
                     for _ in range(val):
                         item_hdr = self._recv_exact(ssl_conn, 68)
                         wid = _decode_wire_id(item_hdr[:64])
                         blen = struct.unpack(">I", item_hdr[64:68])[0]
-                        if blen > MAX_BLOB_BYTES:
+                        total_staged_bytes += blen
+                        if blen > MAX_BLOB_BYTES or total_staged_bytes > MAX_BATCH_PUT_BYTES:
                             ssl_conn.sendall(b"E")
                             return
                         blob = self._recv_exact(ssl_conn, blen)
@@ -1023,12 +1125,20 @@ class OSTClient:
         port: int = 0,
         *,
         expected_cert_sha256: Optional[str] = None,
+        writer_priv_key: Optional[Path | str] = None,
+        writer_pubkey: Optional[str] = None,
+        writer_path: Optional[str] = None,
     ):
         self.host = host
         self.port = port
         self.expected_cert_sha256 = (
             (expected_cert_sha256 or "").strip().lower() or None
         )
+        self.writer_priv_key: Optional[Path | str] = writer_priv_key
+        self.writer_pubkey: Optional[str] = writer_pubkey.strip() if writer_pubkey else None
+        self.writer_path: Optional[str] = writer_path
+        self._cached_auth_bytes: Optional[bytes] = None
+        self._cached_auth_exp: float = 0.0
         self.bytes_sent: int = 0
         self.blob_bytes_sent: int = 0  # 暗号文本体の送信量（HAS などの固定費を除く）
         self.bytes_received: int = 0
@@ -1118,7 +1228,39 @@ class OSTClient:
         if timeout is None:
             ssl_conn.settimeout(ost_socket_timeout())
         self.tls_handshakes += 1
+        if timeout is None and self.writer_priv_key and self.writer_pubkey and self.writer_path:
+            try:
+                self._authenticate_conn(ssl_conn)
+            except Exception:
+                try:
+                    ssl_conn.close()
+                except Exception:
+                    pass
+                raise
         return ssl_conn
+
+    def _get_auth_bytes(self) -> bytes:
+        now = time.time()
+        if self._cached_auth_bytes is not None and now + 30 < self._cached_auth_exp:
+            return self._cached_auth_bytes
+        assert self.writer_priv_key and self.writer_pubkey and self.writer_path
+        env = create_ost_auth_envelope(
+            self.writer_priv_key, self.writer_pubkey, self.writer_path, now=int(now), ttl=300
+        )
+        raw = json.dumps(env, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self._cached_auth_bytes = raw
+        self._cached_auth_exp = now + 300
+        return raw
+
+    def _authenticate_conn(self, conn: ssl.SSLSocket) -> None:
+        raw_auth = self._get_auth_bytes()
+        frame = b"A" + ZERO_WIRE_ID + struct.pack(">I", len(raw_auth)) + raw_auth
+        self._send_all(conn, frame)
+        status = self._recv_exact(conn, 1)
+        if status == b"U":
+            raise ServiceUnavailableError("L3 OST is offline")
+        if status != b"O":
+            raise ChunkIntegrityError("L3 OST write authentication rejected")
 
     @staticmethod
     def _graceful_close(conn: ssl.SSLSocket, send_quit: bool = True) -> None:
@@ -1334,6 +1476,9 @@ class HttpOSTClient:
         base_url: str,
         *,
         expected_cert_sha256: Optional[str] = None,
+        writer_priv_key: Optional[Path | str] = None,
+        writer_pubkey: Optional[str] = None,
+        writer_path: Optional[str] = None,
     ):
         host, port, canonical = parse_ost_endpoint(base_url)
         parts = urlsplit(canonical)
@@ -1348,6 +1493,11 @@ class HttpOSTClient:
         self.port: int = port
         self.base_path: str = parts.path.rstrip("/")
         self.expected_cert_sha256: Optional[str] = pin
+        self.writer_priv_key: Optional[Path | str] = writer_priv_key
+        self.writer_pubkey: Optional[str] = writer_pubkey.strip() if writer_pubkey else None
+        self.writer_path: Optional[str] = writer_path
+        self._cached_auth_header: Optional[str] = None
+        self._cached_auth_exp: float = 0.0
 
         self.bytes_sent: int = 0
         self.blob_bytes_sent: int = 0
@@ -1499,6 +1649,21 @@ class HttpOSTClient:
             "Content-Length": str(len(body)),
             "Connection": "keep-alive" if self._session_depth > 0 else "close",
         }
+        if (
+            path == "/v1/ost/batch_put"
+            and self.writer_priv_key
+            and self.writer_pubkey
+            and self.writer_path
+        ):
+            now = time.time()
+            if self._cached_auth_header is None or now + 30 >= self._cached_auth_exp:
+                env = create_ost_auth_envelope(
+                    self.writer_priv_key, self.writer_pubkey, self.writer_path, now=int(now), ttl=300
+                )
+                raw = json.dumps(env, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                self._cached_auth_header = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+                self._cached_auth_exp = now + 300
+            headers["X-DFS-OST-Auth"] = self._cached_auth_header
         # 転送フェーズは接続確立より長いソケットタイムアウトを使う
         if conn.sock is not None:
             conn.sock.settimeout(ost_socket_timeout())
@@ -1672,13 +1837,31 @@ class HttpOSTClient:
 
 
 def make_ost_client(
-    endpoint: str, *, expected_cert_sha256: Optional[str] = None
+    endpoint: str,
+    *,
+    expected_cert_sha256: Optional[str] = None,
+    writer_priv_key: Optional[Path | str] = None,
+    writer_pubkey: Optional[str] = None,
+    writer_path: Optional[str] = None,
 ) -> Union[OSTClient, HttpOSTClient]:
     """エンドポイント文字列から ``OSTClient`` または ``HttpOSTClient`` を生成する。"""
     host, port, canonical = parse_ost_endpoint(endpoint)
     if canonical.startswith("http://") or canonical.startswith("https://"):
-        return HttpOSTClient(canonical, expected_cert_sha256=expected_cert_sha256)
-    return OSTClient(host=host, port=port, expected_cert_sha256=expected_cert_sha256)
+        return HttpOSTClient(
+            canonical,
+            expected_cert_sha256=expected_cert_sha256,
+            writer_priv_key=writer_priv_key,
+            writer_pubkey=writer_pubkey,
+            writer_path=writer_path,
+        )
+    return OSTClient(
+        host=host,
+        port=port,
+        expected_cert_sha256=expected_cert_sha256,
+        writer_priv_key=writer_priv_key,
+        writer_pubkey=writer_pubkey,
+        writer_path=writer_path,
+    )
 
 
 class FailoverOSTClient:

@@ -25,6 +25,7 @@ from .crypto import (
     normalize_path,
 )
 from .paths import cache_dir, config_dir, restrict_to_owner
+from .private_io import write_private_json
 
 CONFIG_ENV = "DFS_CONFIG"
 DEFAULT_CONFIG = "~/.config/dfs/remotes.json"
@@ -196,23 +197,11 @@ class RemoteStore:
             self.remotes[name] = Remote.from_dict(data)
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema": "dfs-remotes-v1",
             "remotes": {name: r.to_dict() for name, r in sorted(self.remotes.items())},
         }
-        tmp = self.path.with_suffix(".tmp")
-        content = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            f = os.fdopen(fd, "wb")
-        except Exception:
-            os.close(fd)
-            raise
-        with f:
-            f.write(content)
-        restrict_to_owner(tmp)
-        tmp.replace(self.path)
+        write_private_json(self.path, payload)
 
     def get(self, name: str) -> Remote:
         if name not in self.remotes:
