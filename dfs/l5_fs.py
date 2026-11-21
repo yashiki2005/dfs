@@ -139,6 +139,43 @@ class ClayFSAdapter:
         """``SnapshotResult`` ごと返す（skipped / warnings を呼び出し側で見るため）。"""
         return self.fs.take_snapshot(snap_id)
 
+    def prune_snapshots(self, keep: int = 3) -> int:
+        """古いスナップショットを削除し、新しい方から ``keep`` 件だけ残す。"""
+        if keep <= 0 or not self.snap_root.is_dir():
+            return 0
+        snaps = [p for p in self.snap_root.iterdir() if p.is_dir()]
+        if len(snaps) <= keep:
+            return 0
+        def _sort_key(p: Path) -> Tuple[int, float, str]:
+            name = p.name
+            ver = int(name[1:]) if name.startswith("v") and name[1:].isdigit() else -1
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            return (ver, mtime, name)
+
+        snaps.sort(key=_sort_key, reverse=True)
+        removed = 0
+        for old in snaps[keep:]:
+            try:
+                remove_tree(old)
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    def _auto_prune_snapshots(self) -> None:
+        env_keep = os.environ.get("DFS_MAX_SNAPSHOTS", "").strip()
+        if env_keep:
+            keep = int(env_keep)
+        elif not self.is_cow:
+            keep = int(os.environ.get("DFS_MAX_SNAPSHOTS_NON_COW", "3") or "3")
+        else:
+            return
+        if keep > 0:
+            self.prune_snapshots(keep=keep)
+
     def replace_work_tree(self, source_dir: Path) -> None:
         source_dir = Path(source_dir)
         if self.work_tree.exists() or self.work_tree.is_symlink():
@@ -481,6 +518,7 @@ class DFSNode:
             role_epoch=self.role_epoch,
         )
         wire_bytes = self.ost.bytes_sent
+        self.clayfs._auto_prune_snapshots()
         return log_env, snap_dir, wire_bytes
 
     def pull(self, expected_writer_pubkey: Optional[str] = None) -> Path:
@@ -509,6 +547,7 @@ class DFSNode:
             self.clayfs.replace_work_tree(staging_dir)
 
         snap = self.clayfs.take_snapshot(f"v{p['version']}")
+        self.clayfs._auto_prune_snapshots()
         seed_ep = os.environ.get("DFS_SEED_ENDPOINT", "").strip()
         registry_urls = getattr(self.registry, "registry_urls", None)
         if (seed_ep or self.libp2p_manager is not None) and registry_urls:

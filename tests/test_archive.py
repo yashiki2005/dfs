@@ -185,7 +185,15 @@ class TestArchive(unittest.TestCase):
     def test_verify_cli(self) -> None:
         bundle = self.base / "bundle_cli"
         create_archive(self.node, bundle)
-        self.assertEqual(cli_main.main(["archive", "verify", str(bundle)]), 0)
+        self.assertNotEqual(cli_main.main(["archive", "verify", str(bundle)]), 0)
+        self.assertEqual(
+            cli_main.main(["archive", "verify", str(bundle), "--root-pubkey", self.root_pub]),
+            0,
+        )
+        self.assertEqual(
+            cli_main.main(["archive", "verify", str(bundle), "--allow-embedded-root"]),
+            0,
+        )
 
     def test_history_and_specific_version_archive(self) -> None:
         (self.node.clayfs.work_tree / "note.txt").write_text(

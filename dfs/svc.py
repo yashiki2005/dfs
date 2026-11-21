@@ -776,8 +776,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         if args.writer_key
         else (Path(existing.writer_key).expanduser() if existing and existing.writer_key else base / "keys" / "writer")
     )
-    # サービス状態と一緒に消えないよう、ログはdfsのトップレベルへ固定する。
-    log_path = _repo_root() / "serve.log"
+    log_path = base / "logs" / "serve.log"
 
     ensure_private_dir(base)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -845,11 +844,11 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if is_hub:
         cmd.append("--relay-hub")
-        if (
-            service_role == "primary"
-            and root_key.is_file()
-            and not getattr(args, "no_auto_delegate", False)
-        ):
+        auto_delegate_enabled = (
+            bool(getattr(args, "auto_delegate", False))
+            or os.environ.get("DFS_AUTO_DELEGATE", "").strip() in ("1", "true", "yes")
+        ) and not getattr(args, "no_auto_delegate", False)
+        if service_role == "primary" and root_key.is_file() and auto_delegate_enabled:
             cmd.extend(["--auto-delegate-key", str(root_key)])
     if join_url:
         cmd.extend(["--relay", join_url])
@@ -889,6 +888,12 @@ def cmd_start(args: argparse.Namespace) -> int:
         print("[dfssvc] 前面で起動します（Ctrl-C で停止）")
         proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL)
     else:
+        try:
+            if log_path.is_file() and log_path.stat().st_size > 10 * 1024 * 1024:
+                rotated = log_path.with_name("serve.log.1")
+                log_path.replace(rotated)
+        except OSError:
+            pass
         with open(log_path, "ab") as log:
             proc = subprocess.Popen(
                 cmd, env=env, stdout=log, stderr=log,
@@ -1582,6 +1587,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--writer-key", help=argparse.SUPPRESS)
     p.add_argument("--path", help=argparse.SUPPRESS)
     p.add_argument("--no-delegate", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--auto-delegate", action="store_true", help="公開ハブで /v1/auto-delegate を有効化する")
     p.add_argument("--no-auto-delegate", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--wait", type=float, default=30.0, help=argparse.SUPPRESS)
     p.add_argument("--replica", action="append", default=[], help=argparse.SUPPRESS)

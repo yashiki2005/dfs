@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hmac
 import ipaddress
 import json
 import os
@@ -596,6 +597,9 @@ def make_registry_http_handler(
     ost_overload_threshold = max(
         1, int(os.environ.get("DFS_OST_OVERLOAD_INFLIGHT", "8") or "8")
     )
+    auto_delegate_lock = threading.Lock()
+    auto_delegate_hits: Dict[str, List[float]] = {}
+    auto_delegate_limit = max(1, int(os.environ.get("DFS_AUTO_DELEGATE_RATE_LIMIT", "10") or "10"))
 
     class RegistryHTTPHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -815,15 +819,15 @@ def make_registry_http_handler(
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return True
-                frame = encode_relay_frame(
-                    {
-                        "id": req.id,
-                        "method": req.method,
-                        "path": req.path,
-                        "content_type": req.content_type,
-                    },
-                    req.body,
-                )
+                frame_hdr: Dict[str, Any] = {
+                    "id": req.id,
+                    "method": req.method,
+                    "path": req.path,
+                    "content_type": req.content_type,
+                }
+                if req.headers:
+                    frame_hdr["headers"] = req.headers
+                frame = encode_relay_frame(frame_hdr, req.body)
                 self._send_binary(200, frame)
                 return True
             if parsed.path == "/_relay/reply":
@@ -872,14 +876,28 @@ def make_registry_http_handler(
             if body is None:
                 return True
             self.connection.settimeout(45.0)
+            fwd_headers: Dict[str, str] = {}
+            ost_auth_hdr = self.headers.get("X-DFS-OST-Auth")
+            if ost_auth_hdr:
+                fwd_headers["X-DFS-OST-Auth"] = ost_auth_hdr
             try:
-                status, ct, resp_body = relay_hub.forward(
-                    node_id=node_id,
-                    method=method,
-                    sub_path=target_path,
-                    content_type=self.headers.get("Content-Type", "application/octet-stream"),
-                    body=body,
-                )
+                if fwd_headers:
+                    status, ct, resp_body = relay_hub.forward(
+                        node_id=node_id,
+                        method=method,
+                        sub_path=target_path,
+                        content_type=self.headers.get("Content-Type", "application/octet-stream"),
+                        body=body,
+                        headers=fwd_headers,
+                    )
+                else:
+                    status, ct, resp_body = relay_hub.forward(
+                        node_id=node_id,
+                        method=method,
+                        sub_path=target_path,
+                        content_type=self.headers.get("Content-Type", "application/octet-stream"),
+                        body=body,
+                    )
                 self._send_binary(status, resp_body, content_type=ct)
             except RelayNodeOfflineError as e:
                 self._send_json(503, {"error_type": "ServiceUnavailableError", "message": str(e)})
@@ -993,6 +1011,7 @@ def make_registry_http_handler(
                 elif self.path == "/v1/ost/batch_get":
                     self._send_binary(200, ost.batch_get_raw(raw_body))
                 elif self.path == "/v1/ost/batch_put":
+                    ost_writer_id = ""
                     if ost_auth_verifier is not None:
                         raw_tok = (self.headers.get("X-DFS-OST-Auth") or "").strip()
                         if not raw_tok:
@@ -1004,10 +1023,12 @@ def make_registry_http_handler(
                             if not ost_auth_verifier(env):
                                 self._send_binary(403, b"Eunauthorized OST write")
                                 return
+                            if isinstance(env, dict) and isinstance(env.get("payload"), dict):
+                                ost_writer_id = str(env["payload"].get("writer") or "").strip()
                         except Exception:
                             self._send_binary(403, b"Eunauthorized OST write")
                             return
-                    ost.batch_put_raw(raw_body)
+                    ost.batch_put_raw(raw_body, writer_id=ost_writer_id)
                     self._send_binary(200, b"O")
             except ServiceUnavailableError:
                 self._send_binary(503, b"U")
@@ -1101,6 +1122,20 @@ def make_registry_http_handler(
                             )
                         if pstate.auto_delegate_key is None or not pstate.auto_delegate_key.is_file():
                             raise RegistryError("Auto-delegation is not enabled on this registry")
+                        expected_ad_tok = os.environ.get("DFS_AUTO_DELEGATE_TOKEN", "").strip()
+                        if expected_ad_tok:
+                            got_ad_tok = (self.headers.get("X-DFS-Auto-Delegate-Token") or "").strip()
+                            if not got_ad_tok or not hmac.compare_digest(got_ad_tok, expected_ad_tok):
+                                raise RegistryError("Invalid auto-delegate token")
+                        peer_ip = str(self.client_address[0]) if self.client_address else ""
+                        if peer_ip and not self._is_loopback_direct():
+                            now_m = time.monotonic()
+                            with auto_delegate_lock:
+                                hits = [t for t in auto_delegate_hits.get(peer_ip, []) if now_m - t < 60.0]
+                                if len(hits) >= auto_delegate_limit:
+                                    raise RegistryError("Auto-delegate rate limit exceeded")
+                                hits.append(now_m)
+                                auto_delegate_hits[peer_ip] = hits
                         sub_path = str(req.get("path") or "").strip().rstrip("/")
                         writer_pub = str(req.get("writer_pubkey") or "").strip()
                         if not writer_pub.startswith("ssh-"):
@@ -1399,6 +1434,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
                     return True
         return False
 
+    env_writer_max = os.environ.get("DFS_OST_MAX_WRITER_BYTES", "").strip()
+    if env_writer_max:
+        ost_writer_max_bytes: Optional[int] = int(env_writer_max) if int(env_writer_max) > 0 else None
+    else:
+        ost_writer_max_bytes = 10 * 1024**3
+
     ost = ChunkStoreServer(
         cert,
         key,
@@ -1406,6 +1447,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         port=args.ost_port,
         chunks_dir=chunks_dir,
         max_store_bytes=ost_max_bytes,
+        max_writer_bytes=ost_writer_max_bytes,
         auth_verifier=_verify_ost_write,
     )
     print("[dfs serve] startup: loading registry state", file=sys.stderr, flush=True)

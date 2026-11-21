@@ -56,11 +56,11 @@ dfs pull ./restored
 
 - **エンドツーエンド暗号化 & 重複排除**: ファイルは端末側でチャンク分割・Zstandard 圧縮されたのち、収束暗号（ChaCha20-Poly1305）で暗号化してから送信されます。
 - **単一ライターによる改ざん防止**: サブツリーごとにドメインルート鍵から署名付き委譲を受けた 1 つのライター鍵のみが書き込み可能で、すべての更新は署名付き追記ログと Merkle ツリーで検証されます。
-- **親しみやすい `rclone` 風 CLI (`dfscli`)**: `ls`、`cat`、`copy`、`sync`、`pull`、`mv`、`rm`、`check`、`mount`（FUSE / FUSE-T）など直感的なコマンドで操作できます。
-- **1 コマンドでサーバー起動 (`dfssvc`)**: ローカルの名簿（L2）＋チャンク保管庫（L3）サービスを 1 コマンドで立ち上げ、接続設定や DNSSEC 用レコードも出力できます。
+- **親しみやすい統合 CLI (`dfs` / `./cli`) と `rclone` 風詳細 CLI (`dfscli`)**: `dfs start` / `push` / `pull` / `ls` / `share` / `join` / `web` / `mount` のシンプルな統合コマンドに加え、`dfscli` で `copy`、`sync`、`mv`、`rm`、`check` などの細かな操作も行えます。
+- **1 コマンドでサーバー起動 (`dfs start` / `dfssvc`)**: ローカルの名簿（L2）＋チャンク保管庫（L3）とリモート設定を `dfs start` 1 回で立ち上げられ、`dfssvc` でポートや DNSSEC レコード等の詳細制御も可能です。
 - **手軽な共有とブラウザ UI**:
-  - `dfscli web`: スマホやブラウザから直接閲覧・操作できるファイル共有 & Web CLI サーバーを起動します。
-  - `dfscli invite` / `dfscli share`: RunPod などの一時的なクラウド環境向けに、読み取り専用招待トークンや 1 行の `curl | bash` ブートストラップコマンドを発行します。
+  - `dfs web`: スマホやブラウザから直接閲覧・操作できるファイル共有 & Web CLI サーバーを起動します。
+  - `dfs share` / `dfscli invite`: RunPod などの一時的なクラウド環境向けに、読み取り専用招待トークンや 1 行の `curl | bash` ブートストラップコマンドを発行します。
 - **NAT 越え・柔軟なトランスポート**: LAN/ICE での直接接続と libp2p/QUIC による複数シード分散配信を標準装備（512 MiB 実測で 1 シード比約 4 倍の高速化を確認したため必須依存化）しつつ、厳格な NAT 環境では暗号化 WebSocket/HTTP リレーへ自動フォールバックします。
 - **アーカイブ & オフライン配布**: `dfscli archive` / `dfscli import` で、可搬な `tar.gz` バンドル（PAR2 リカバリブロックや BitTorrent 対応）を作成・展開できます。
 - **Copy-on-Write スナップショット**: macOS の APFS（`clonefile`）や Linux の Btrfs サブボリュームを活用した高速なローカルスナップショット（`dfscli fs`）に対応しています。
@@ -129,55 +129,63 @@ DFSが要求する4.0.0と衝突します。py-libp2p側でこの宣言が更新
 通常の`pip`では解決できません。wheelと一緒に配布するoverrideファイルを
 指定してuvでインストールしてください。
 
-### 2. ローカルサーバーの起動 (`dfssvc`)
+### 2. ローカルサーバー起動＆初期設定 (`dfs` / `./cli`)
+
+リポジトリをクローンして直接動かす場合は `dfs` の代わりに `./cli`（Windows では `.\cli.cmd`）をそのまま使えます。
 
 ```bash
-# ローカルに L2（名簿）+ L3（暗号化チャンク保管庫）を起動
-dfssvc start
+# ローカル L2 + L3 サーバーを起動し、リモート 'local' を自動設定
+dfs start
 
-# 状態と接続先を確認
-dfssvc status
+# 状態やサービス・リモート一覧を確認
+dfs status
+dfs list
 
-# dfscli 用の設定コマンドを表示
-dfssvc env
+# 停止したいとき
+dfs stop
 ```
 
-### 3. リモート設定とファイル同期 (`dfscli`)
+> 既定では NAT 越え用に `yashiki.top` リレーハブへ自動参加します（E2E 暗号化のためハブに鍵や平文は渡りません）。ローカル完結にしたい場合は `dfs start --no-hub` を指定してください。
 
-`dfssvc env` が表示した `dfscli config create ...` コマンドを実行してリモートを登録します（任意の `tree_secret` を指定してください）。
+### 3. ファイル同期・一覧・復元 (`dfs push` / `ls` / `pull`)
+
+`dfs push` は `'local'` 未起動時に自動起動まで行うため、最小構成では `dfs push` から始めることもできます。
 
 ```bash
-# 登録済みリモートの一覧
-dfscli listremotes
+# ローカルディレクトリをリモート（既定: local:）へ同期
+dfs push ./dataset
 
-# ローカルのファイルやディレクトリをリモートへコピー
-dfscli copy ./my-notes local:notes
-
-# ローカルディレクトリをリモートへ同期
-dfscli sync ./dataset local:dataset
+# 変更点だけ確認（ドライラン） / リモート側の余分なファイルを削除して同期
+dfs push ./dataset --dry-run
+dfs push ./dataset --delete
 
 # リモートのファイル一覧
-dfscli ls local:dataset
+dfs ls
 
-# 別ディレクトリへ取り出す
-dfscli pull local:dataset ./restored-dataset
+# 別ディレクトリへ復元
+dfs pull ./restored-dataset
 ```
 
-### 4. 別端末・ブラウザでの共有
+`remote:path` を明示して別リモートやサブパスへ操作することも可能です（例: `dfs push ./notes local:notes`、`dfs pull local:notes ./out`）。より細かなファイル操作（`copy`、`cat`、`mv`、`rm`、`check` 等）には `dfscli` を使用します。
+
+### 4. 別端末・ブラウザ・GPU ワーカーでの共有
 
 - **Web UI**（スマホやブラウザからアクセス）:
   ```bash
-  dfscli web local:
+  dfs web
   ```
-- **読み取り専用招待トークン**（チームメンバーやクラウド GPU 向け）:
+- **別マシン / RunPod 等への 1 行共有**（`dfs share`）:
   ```bash
-  dfscli invite create local:dataset
-  # 参加側:
-  dfscli invite join <token>
+  # 読み取り専用 + out サブパスへの書き戻し許可つきブートストラップコマンドを生成
+  dfs share --write-path out
+
+  # 参加側（トークンまたは URL で参加して同期・監視）:
+  dfs join <token_or_url>
+  dfs join <token_or_url> --watch
   ```
-- **ドメインハブへの参加**（リレー / NAT 越え対応）:
+- **FUSE マウント**（`dfs mount`）:
   ```bash
-  dfscli join https://hub.example.com --name team --path /example.com/alice --key ~/.ssh/id_ed25519 --secret <tree_secret>
+  dfs mount ./mnt
   ```
 
 ---
@@ -196,7 +204,7 @@ dfscli pull local:dataset ./restored-dataset
   - **Linux（Btrfs / XFS / ZFS 等）**: `ioctl(FICLONE)` を自動プローブし、ブロック単位のクローン（Reflink）を行います。
   - **Linux（ext4）**: **完全に動作します。** ext4 のように Reflink 非対応のファイルシステムでは、自動的に標準の実コピー（`CopyBackend`）へフォールバックします。暗号化・同期・圧縮・FUSE マウントなど全機能が 100% 同様に動作します（スナップショット作成時に通常コピーが行われる点のみ異なります）。
   - **Windows（ReFS）**: `FSCTL_DUPLICATE_EXTENTS_TO_FILE` によるブロッククローンを利用します。
-- **FUSE マウント (`dfscli mount`)**:
+- **FUSE マウント (`dfs mount` / `dfscli mount`)**:
   - **Linux**: 標準のカーネル FUSE（[libfuse](https://github.com/libfuse/libfuse)、`libfuse.so`）で直接マウントします。
   - **macOS**: **[macFUSE](https://github.com/macfuse/macfuse) (FSKit バックエンド)** → **[FUSE-T](https://github.com/macos-fuse-t/fuse-t)**（NFS/SMB ループバック） → **[macFUSE](https://github.com/macfuse/macfuse)（通常）** の順で安全に自動試行・フォールバックします（`--backend` で固定も可能）。
 - **拡張属性（xattr）**:
@@ -207,7 +215,25 @@ dfscli pull local:dataset ./restored-dataset
 
 ## コマンド概要
 
-### `dfscli`（クライアント）
+### `dfs` / `./cli`（統合 CLI・通常利用向け）
+
+`dfscli` と `dfssvc` をラップし、日常操作を 1 コマンドにまとめたエントリポイントです（リポジトリ内からは `./cli`、Windows では `.\cli.cmd`）。
+
+| コマンド | 説明 |
+|---|---|
+| `dfs start` (`serve`) | ローカル L2 + L3 サーバーを起動し、リモート `local` を自動設定（`--no-hub`, `--bind`, `--port`, `--advertise` 指定可） |
+| `dfs stop` | ローカルサーバーを停止（`--forget` で設定削除） |
+| `dfs status` | ローカルサーバーの稼働状態を表示 |
+| `dfs list` | 登録済みのローカルサービスとリモート一覧を表示 |
+| `dfs push` | ローカルのファイル/ディレクトリをリモートへ同期（`local:` 未起動時は自動起動、`--dry-run` / `--delete` 対応） |
+| `dfs pull` | リモートからローカルディレクトリへ復元 |
+| `dfs ls` | リモートのファイル一覧を表示 |
+| `dfs share` | 別マシン・RunPod 向けの 1 行ブートストラップコマンド／トークンを生成（`--write-path` / `--token-only` 対応） |
+| `dfs join` | 招待トークン（`dfs-ro-v1:` / `dfs-rw-v1:`）またはレジストリ URL から参加・同期（`--watch` 対応） |
+| `dfs web` | ブラウザから閲覧・操作できる Web UI を起動 |
+| `dfs mount` | FUSE 経由でリモートをローカルへマウント |
+
+### `dfscli`（詳細クライアント・上級者向け）
 
 | 分類 | コマンド |
 |---|---|
@@ -217,7 +243,7 @@ dfscli pull local:dataset ./restored-dataset
 | 共有・アーカイブ | `web`, `invite`, `share`, `archive`, `import` |
 | サーバー・権限管理 | `serve`, `delegate`, `promote`, `candidacy`, `libp2p-serve` |
 
-### `dfssvc`（ローカルサービス管理）
+### `dfssvc`（詳細サービス管理・上級者向け）
 
 | コマンド | 説明 |
 |---|---|

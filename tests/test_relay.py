@@ -205,9 +205,9 @@ def test_direct_first_and_relay_fallback(tmp_path: Path) -> None:
     forward_calls: list[str] = []
     orig_forward = hub.forward
 
-    def counted_forward(node_id: str, method: str, sub_path: str, content_type: str, body: bytes, timeout: float = 35.0):
+    def counted_forward(node_id: str, method: str, sub_path: str, content_type: str, body: bytes, timeout: float = 35.0, **kwargs):
         forward_calls.append(sub_path)
-        return orig_forward(node_id, method, sub_path, content_type, body, timeout=timeout)
+        return orig_forward(node_id, method, sub_path, content_type, body, timeout=timeout, **kwargs)
 
     hub.forward = counted_forward  # type: ignore[method-assign]
 

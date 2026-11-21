@@ -32,6 +32,7 @@ from .crypto import (
     normalize_kdf_version,
     normalize_path,
     sha256_hex,
+    ssh_key_fingerprint,
     ssh_sign,
     ssh_verify,
 )
@@ -935,7 +936,12 @@ def _load_meta(bundle: Path) -> Dict[str, Any]:
     return meta
 
 
-def verify_bundle(bundle: Path | str) -> Dict[str, Any]:
+def verify_bundle(
+    bundle: Path | str,
+    *,
+    expected_root_pubkey: Optional[str] = None,
+    expected_root_fingerprint: Optional[str] = None,
+) -> Dict[str, Any]:
     """bundle のチャンクと、含まれる L1/L2/L4 署名を検証する。"""
     root = Path(bundle).expanduser()
     meta = _load_meta(root)
@@ -944,7 +950,7 @@ def verify_bundle(bundle: Path | str) -> Dict[str, Any]:
     except ValueError as e:
         raise ArchiveError(f"Invalid archive path: {e}") from e
     root_anchor = str(meta.get("root_anchor", ""))
-    root_pubkey = str(meta.get("root_pubkey", "")).strip()
+    root_pubkey = " ".join(str(meta.get("root_pubkey", "")).split())
     if not root_anchor:
         raise ArchiveError("Archive has no root_anchor")
     delegation = meta.get("delegation")
@@ -952,6 +958,18 @@ def verify_bundle(bundle: Path | str) -> Dict[str, Any]:
     locator = meta.get("locator")
     if not root_pubkey:
         raise ArchiveError("Archive has no root_pubkey; cannot verify trust")
+    root_fp = ssh_key_fingerprint(root_pubkey)
+    if expected_root_pubkey is not None:
+        exp_pub = " ".join(str(expected_root_pubkey).split())
+        if exp_pub != root_pubkey:
+            raise ArchiveError(
+                f"Archive root_pubkey mismatch: expected {ssh_key_fingerprint(exp_pub)}, got {root_fp}"
+            )
+    if expected_root_fingerprint is not None:
+        exp_fp = str(expected_root_fingerprint).strip()
+        if exp_fp != root_fp:
+            raise ArchiveError(f"Archive root fingerprint mismatch: expected {exp_fp}, got {root_fp}")
+    meta["root_fingerprint"] = root_fp
     if not isinstance(delegation, dict) or not isinstance(head, dict):
         raise ArchiveError("Archive is missing delegation or head_log")
     chain = delegation.get("chain") or []

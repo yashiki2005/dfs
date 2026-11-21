@@ -395,6 +395,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="create の bundle 出力先、または fetch のダウンロード先",
     )
     p_arch.add_argument(
+        "--root-pubkey",
+        help="verify 時に照合する期待 root 公開鍵（文字列または .pub ファイルパス）",
+    )
+    p_arch.add_argument(
+        "--root-fingerprint",
+        help="verify 時に照合する期待 root 公開鍵指紋 (SHA256:...)",
+    )
+    p_arch.add_argument(
+        "--allow-embedded-root",
+        action="store_true",
+        help="verify 時にアーカイブ埋め込みの root 公開鍵での自己整合性検証のみを許可する",
+    )
+    p_arch.add_argument(
         "--format",
         choices=["zstd:chunked", "tar.zst", "tar.gz"],
         default="zstd:chunked",
@@ -484,9 +497,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("src", help="ローカルのファイルまたはディレクトリ")
     p.add_argument("dest", help="remote:path")
     p.add_argument(
-        "--checksum", nargs="?", const="plain_id", default="size",
+        "--checksum", nargs="?", const="plain_id", default="plain_id",
         choices=CHECKSUM_MODES,
-        help="変更検出: size / crc32 / sha1 / plain_id（単独指定は plain_id）",
+        help="変更検出: plain_id (既定) / size / crc32 / sha1",
     )
     p.add_argument("--include", action="append", default=[], metavar="PATTERN",
                    help="含める相対パターン（複数指定可）")
@@ -499,9 +512,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("src")
     p.add_argument("dest", help="remote:path/file")
     p.add_argument(
-        "--checksum", nargs="?", const="plain_id", default="size",
+        "--checksum", nargs="?", const="plain_id", default="plain_id",
         choices=CHECKSUM_MODES,
-        help="変更検出: size / crc32 / sha1 / plain_id（単独指定は plain_id）",
+        help="変更検出: plain_id (既定) / size / crc32 / sha1",
     )
     p.add_argument("-n", "--dry-run", action="store_true")
     p.set_defaults(func=cmd_copyto)
@@ -537,9 +550,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("dest", help="remote:path")
     p.add_argument("--delete", action="store_true", help="リモートにしかないものを消す")
     p.add_argument(
-        "--checksum", nargs="?", const="plain_id", default="size",
+        "--checksum", nargs="?", const="plain_id", default="plain_id",
         choices=CHECKSUM_MODES,
-        help="変更検出: size / crc32 / sha1 / plain_id（単独指定は plain_id）",
+        help="変更検出: plain_id (既定) / size / crc32 / sha1",
     )
     p.add_argument("--include", action="append", default=[], metavar="PATTERN",
                    help="含める相対パターン（複数指定可）")

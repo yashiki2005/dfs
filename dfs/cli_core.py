@@ -447,6 +447,17 @@ def _save_cached_version(node: DFSNode, version: int) -> None:
     marker.write_text(str(int(version)) + "\n", encoding="utf-8")
 
 
+def _invalidate_cache(node: DFSNode) -> None:
+    """作業ツリーの変更前にキャッシュ済み版番号を無効化する（push 失敗時の pull 汚染防止）。"""
+    clayfs = getattr(node, "clayfs", None)
+    if clayfs is None or not hasattr(clayfs, "clayfs_meta"):
+        return
+    try:
+        _cache_marker(node).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def refresh_cache(node: DFSNode, force: bool = False) -> int:
     """作業ディレクトリの写しをリモートの先頭版に合わせ、その版番号を返す。
 
@@ -781,7 +792,7 @@ def plan_changes(
     node: DFSNode,
     prefix: str,
     local: Dict[str, Path],
-    checksum: str = "size",
+    checksum: str = "plain_id",
     path_filter: Optional[PathFilter] = None,
 ) -> Tuple[List[Tuple[str, Path, str]], List[str], List[str]]:
     """ローカルとリモートを比べ、(書くもの, 消すもの, 変わらないもの) を返す。
@@ -795,9 +806,9 @@ def plan_changes(
     返り値の「書くもの」は ``(リモートのパス, ローカルの実ファイル, "add"|"update")``。
     ``path_filter`` が指定された場合、削除候補もフィルタの内側だけに限定する。
     """
-    if checksum is True:
+    if checksum is True or checksum is None:
         checksum = "plain_id"
-    elif checksum is False or checksum is None:
+    elif checksum is False:
         checksum = "size"
     if checksum not in CHECKSUM_MODES:
         raise UsageError(f"unknown checksum mode: {checksum!r}")
@@ -879,6 +890,8 @@ def plan_changes(
 
 def apply_writes(node: DFSNode, writes: List[Tuple[str, Path, str]]) -> None:
     """``plan_changes`` の「書くもの」を、作業ツリーへ反映する。"""
+    if writes:
+        _invalidate_cache(node)
     for path, src, _kind in writes:
         relative = path
         try:
@@ -898,6 +911,8 @@ def apply_deletes(node: DFSNode, paths: List[str], prune_empty: bool = True) -> 
     `sync --delete` と同じで、ローカルの見た目に合わせる）。``rm`` / ``rmdir`` では
     消した階層だけを片付けたいので、呼び出し側で範囲を決める。
     """
+    if paths:
+        _invalidate_cache(node)
     for path in paths:
         victim = _tree_path(node, path)
         if victim.exists():

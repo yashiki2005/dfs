@@ -228,13 +228,30 @@ def cmd_archive(args: argparse.Namespace) -> int:
 
     bundle = Path(args.source).expanduser()
     if args.action == "verify":
+        exp_pub = getattr(args, "root_pubkey", None)
+        exp_fp = getattr(args, "root_fingerprint", None)
+        allow_embedded = bool(getattr(args, "allow_embedded_root", False))
+        if exp_pub:
+            pub_p = Path(exp_pub).expanduser()
+            if pub_p.is_file():
+                exp_pub = pub_p.read_text(encoding="utf-8").strip()
+        if not exp_pub and not exp_fp and not allow_embedded:
+            raise _cm.UsageError(
+                "archive verify には --root-pubkey または --root-fingerprint が必要です"
+                "（自己整合性のみ確認する場合は --allow-embedded-root を指定してください）"
+            )
         try:
-            meta = _cm.verify_bundle(bundle)
+            meta = _cm.verify_bundle(
+                bundle,
+                expected_root_pubkey=exp_pub,
+                expected_root_fingerprint=exp_fp,
+            )
         except _cm.ArchiveError as e:
             raise _cm.UsageError(f"archive verify に失敗しました: {e}") from e
         print(f"archive     : {bundle}")
         print(f"version     : v{meta['version']}")
         print(f"chunks      : {len(meta['chunks'])}")
+        print(f"root_fp     : {meta.get('root_fingerprint') or '(unknown)'}")
         print("signatures  : OK")
         return 0
 

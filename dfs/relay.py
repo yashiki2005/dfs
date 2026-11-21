@@ -82,6 +82,7 @@ class RelayRequest:
     path: str
     content_type: str
     body: bytes
+    headers: Dict[str, str] = field(default_factory=dict)
     event: threading.Event = field(default_factory=threading.Event)
     status: int = 502
     resp_content_type: str = "application/json"
@@ -211,6 +212,7 @@ class RelayHub:
         content_type: str,
         body: bytes,
         timeout: float = DEFAULT_FORWARD_TIMEOUT,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Tuple[int, str, bytes]:
         validate_node_id(node_id)
         with self._lock:
@@ -228,6 +230,7 @@ class RelayHub:
                 path=sub_path,
                 content_type=content_type or "application/octet-stream",
                 body=body,
+                headers=dict(headers or {}),
             )
             slot.inflight[req.id] = req
             slot.pending.put(req)
@@ -624,7 +627,12 @@ class RelayAgent:
         return http.client.HTTPConnection(self.relay_host, self.relay_port, timeout=timeout)
 
     def _forward_local(
-        self, method: str, path: str, content_type: str, body: bytes
+        self,
+        method: str,
+        path: str,
+        content_type: str,
+        body: bytes,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Tuple[int, str, bytes]:
         conn = http.client.HTTPConnection(self.local_host, self.local_port, timeout=30.0)
         try:
@@ -633,6 +641,10 @@ class RelayAgent:
                 "Content-Length": str(len(body)),
                 "Connection": "close",
             }
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    if k.lower() in ("x-dfs-ost-auth",) and v:
+                        headers[k] = str(v)
             conn.request(method, path, body=body, headers=headers)
             resp = conn.getresponse()
             resp_body = resp.read()
@@ -680,10 +692,11 @@ class RelayAgent:
                 method = str(header.get("method", "POST"))
                 sub_path = str(header.get("path", "/"))
                 req_ct = str(header.get("content_type", "application/octet-stream"))
+                req_headers = header.get("headers") if isinstance(header.get("headers"), dict) else None
 
                 try:
                     status, resp_ct, resp_body = self._forward_local(
-                        method, sub_path, req_ct, req_body
+                        method, sub_path, req_ct, req_body, extra_headers=req_headers
                     )
                 except Exception as e:
                     status = 502

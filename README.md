@@ -57,11 +57,11 @@ dfs pull ./restored
 
 - **End-to-End Encrypted & Deduplicated**: Files are chunked, compressed with Zstandard, and encrypted on the client using convergent ChaCha20-Poly1305 before leaving your machine.
 - **Single-Writer Integrity**: Each subtree has one authorized writer key backed by a signed delegation chain from a domain root key. Every update is recorded in a signed append-only log and Merkle tree.
-- **Familiar `rclone`-like CLI (`dfscli`)**: Manage remote trees with commands you already know—`ls`, `cat`, `copy`, `sync`, `pull`, `mv`, `rm`, `check`, and `mount` (FUSE / FUSE-T).
-- **One-Command Local Service (`dfssvc`)**: Spin up a local registry and storage server in one command, inspect status, and export connection settings or DNSSEC records.
+- **Unified Beginner-Friendly CLI (`dfs` / `./cli`) + `rclone`-like `dfscli`**: Use `dfs start` / `push` / `pull` / `ls` / `share` / `join` / `web` / `mount` for everyday workflows, or drop down to `dfscli` for fine-grained commands (`copy`, `sync`, `mv`, `rm`, `check`, etc.).
+- **One-Command Local Server (`dfs start` / `dfssvc`)**: Start a local registry + encrypted chunk store and auto-configure the `local` remote in one step (`dfs start`), with `dfssvc` available for custom ports, hub hosting, and DNSSEC record generation.
 - **Easy Sharing & Web UI**:
-  - `dfscli web`: Start a browser-accessible file sharing & Web CLI UI (great for phones or quick transfers).
-  - `dfscli invite` / `dfscli share`: Generate read-only invite tokens or one-line `curl | bash` bootstrap scripts for ephemeral workers (e.g., RunPod).
+  - `dfs web`: Start a browser-accessible file sharing & Web CLI UI (great for phones or quick transfers).
+  - `dfs share` / `dfscli invite`: Generate read-only invite tokens or one-line `curl | bash` bootstrap scripts for ephemeral workers (e.g., RunPod).
 - **NAT Traversal & Flexible Transport**: Connects directly over LAN/ICE when possible, supports multi-seed libp2p/QUIC chunk distribution out of the box (required core dependency due to ~4x multi-seed throughput gains in 512 MiB benchmarks), and falls back to an encrypted WebSocket/HTTP relay across strict NATs.
 - **Archive & Offline Bundles**: Export/import portable `tar.gz` bundles (with optional PAR2 recovery blocks or BitTorrent metadata) via `dfscli archive` and `dfscli import`.
 - **Copy-on-Write Snapshots**: Integrates with APFS (`clonefile`) on macOS and Btrfs subvolumes on Linux for fast local snapshots (`dfscli fs`).
@@ -130,55 +130,63 @@ conflicts with the DFS-required 4.0.0 pin. Plain `pip` therefore cannot
 resolve the wheel until py-libp2p updates that declaration. Use the
 override file shipped with the wheel with uv.
 
-### 2. Start a Local Server (`dfssvc`)
+### 2. Start & Auto-Configure Local Server (`dfs` / `./cli`)
+
+When running directly from a cloned repository, you can use `./cli` (`.\cli.cmd` on Windows) instead of `dfs`.
 
 ```bash
-# Start a local registry + encrypted object store (L2 + L3)
-dfssvc start
+# Start a local L2 + L3 server and auto-configure the 'local' remote
+dfs start
 
-# Check status and connection details
-dfssvc status
+# Check status and list local services / remotes
+dfs status
+dfs list
 
-# Print ready-to-run dfscli configuration command
-dfssvc env
+# Stop the local server
+dfs stop
 ```
 
-### 3. Configure a Remote & Sync Files (`dfscli`)
+> By default, `dfs start` joins the `yashiki.top` relay hub for NAT traversal (zero-trust: the hub never sees your keys or plaintext). Pass `dfs start --no-hub` to keep it strictly local.
 
-Run the `dfscli config create ...` command printed by `dfssvc env` (using the generated writer key and your chosen tree secret), or create a remote directly:
+### 3. Sync, List, and Restore Files (`dfs push` / `ls` / `pull`)
+
+`dfs push` automatically starts `'local'` if it is not already running, so you can start directly with `dfs push`.
 
 ```bash
-# List configured remotes
-dfscli listremotes
+# Sync a local directory to the default remote (local:)
+dfs push ./dataset
 
-# Copy local files or a directory to the remote
-dfscli copy ./my-notes local:notes
-
-# Sync a local directory to the remote
-dfscli sync ./dataset local:dataset
+# Preview changes (dry-run) or delete remote files missing locally
+dfs push ./dataset --dry-run
+dfs push ./dataset --delete
 
 # List remote files
-dfscli ls local:dataset
+dfs ls
 
 # Pull remote files to another directory
-dfscli pull local:dataset ./restored-dataset
+dfs pull ./restored-dataset
 ```
 
-### 4. Share with Another Machine or Browser
+You can also target another remote or subpath explicitly (e.g., `dfs push ./notes local:notes`, `dfs pull local:notes ./out`). Use `dfscli` for fine-grained operations such as `copy`, `cat`, `mv`, `rm`, and `check`.
+
+### 4. Share with Another Machine, Browser, or GPU Worker
 
 - **Web UI** (for phones or browsers):
   ```bash
-  dfscli web local:
+  dfs web
   ```
-- **Read-only invite** (for a teammate or cloud GPU instance):
+- **One-line sharing to another machine / RunPod** (`dfs share`):
   ```bash
-  dfscli invite create local:dataset
-  # On the target machine:
-  dfscli invite join <token>
+  # Generate a bootstrap command with read-only access + scoped write-back to 'out'
+  dfs share --write-path out
+
+  # On the target machine (join via invite token or registry URL):
+  dfs join <token_or_url>
+  dfs join <token_or_url> --watch
   ```
-- **Join a domain hub** (with optional relay / NAT traversal):
+- **FUSE mount** (`dfs mount`):
   ```bash
-  dfscli join https://hub.example.com --name team --path /example.com/alice --key ~/.ssh/id_ed25519 --secret <tree_secret>
+  dfs mount ./mnt
   ```
 
 ---
@@ -197,7 +205,7 @@ dfscli pull local:dataset ./restored-dataset
   - **Linux (Btrfs / XFS / ZFS)**: Automatically probes and uses `ioctl(FICLONE)` for block-level reflinks.
   - **Linux (ext4)**: **Fully supported.** When CoW is unavailable on ext4, `dfs` automatically falls back to standard file copying (`CopyBackend`). All synchronization, encryption, and CLI features work 100% identically, with standard copying during snapshot staging.
   - **Windows (ReFS)**: Leverages `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block cloning where supported.
-- **FUSE Mount (`dfscli mount`)**:
+- **FUSE Mount (`dfs mount` / `dfscli mount`)**:
   - **Linux**: Mounts directly via kernel FUSE ([libfuse](https://github.com/libfuse/libfuse), `libfuse.so`).
   - **macOS**: Probes and falls back in order: **[macFUSE](https://github.com/macfuse/macfuse) (FSKit backend)** → **[FUSE-T](https://github.com/macos-fuse-t/fuse-t)** (NFS/SMB loopback) → **[macFUSE](https://github.com/macfuse/macfuse) (legacy)**, selectable via `--backend`.
 - **Extended Attributes (xattr)**:
@@ -208,7 +216,25 @@ dfscli pull local:dataset ./restored-dataset
 
 ## Command Overview
 
-### `dfscli` (Client)
+### `dfs` / `./cli` (Unified CLI — Recommended)
+
+Wraps `dfscli` and `dfssvc` into single-command workflows (use `./cli` inside the repo, or `.\cli.cmd` on Windows).
+
+| Command | Description |
+|---|---|
+| `dfs start` (`serve`) | Start local L2 + L3 server and auto-configure the `local` remote (supports `--no-hub`, `--bind`, `--port`, `--advertise`) |
+| `dfs stop` | Stop the local server (`--forget` removes the service record) |
+| `dfs status` | Show local server status |
+| `dfs list` | List configured local services and remotes |
+| `dfs push` | Sync a local file/directory to a remote (auto-starts `local:` if needed; supports `--dry-run`, `--delete`) |
+| `dfs pull` | Pull files from a remote into a local directory |
+| `dfs ls` | List remote files |
+| `dfs share` | Generate a 1-line bootstrap command or invite token for another machine / RunPod (`--write-path`, `--token-only`) |
+| `dfs join` | Join from an invite token (`dfs-ro-v1:` / `dfs-rw-v1:`) or registry URL (`--sync`, `--watch`) |
+| `dfs web` | Start the browser file-sharing & Web CLI UI |
+| `dfs mount` | Mount a remote locally via FUSE |
+
+### `dfscli` (Detailed Client — Advanced)
 
 | Category | Commands |
 |---|---|
@@ -218,7 +244,7 @@ dfscli pull local:dataset ./restored-dataset
 | Sharing & Bundles | `web`, `invite`, `share`, `archive`, `import` |
 | Server & Authority | `serve`, `delegate`, `promote`, `candidacy`, `libp2p-serve` |
 
-### `dfssvc` (Local Service Manager)
+### `dfssvc` (Detailed Service Manager — Advanced)
 
 | Command | Description |
 |---|---|

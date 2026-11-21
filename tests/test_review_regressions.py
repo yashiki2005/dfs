@@ -1108,6 +1108,7 @@ class TestReviewRegressions(unittest.TestCase):
             self.assertEqual(node.l4.pin.version, 0)
 
     def test_auto_delegate_registers_new_leaf_and_blocks_hijack(self) -> None:
+        import time
         from http.server import ThreadingHTTPServer
 
         with tempfile.TemporaryDirectory() as td:
@@ -1544,6 +1545,7 @@ class TestReviewRegressions(unittest.TestCase):
         import threading
         import urllib.error
         import urllib.request
+        import time
         from http.server import ThreadingHTTPServer
         from dfs.web import WebConfig, make_web_handler
 
@@ -1745,6 +1747,7 @@ class TestReviewRegressions(unittest.TestCase):
         import threading
         import urllib.error
         import urllib.request
+        import time
         from http.server import ThreadingHTTPServer
         from dfs.web import WebConfig, make_web_handler
 
@@ -1852,6 +1855,7 @@ class TestReviewRegressions(unittest.TestCase):
 
     def test_join_url_populates_root_pubkey_and_pulls(self) -> None:
         import time
+        import time
         from http.server import ThreadingHTTPServer
         from dfs.l5_fs import DFSNode
 
@@ -1934,6 +1938,7 @@ class TestReviewRegressions(unittest.TestCase):
 
     def test_open_remote_clears_stale_ost_pin_on_endpoint_change(self) -> None:
         import time
+        import time
         from http.server import ThreadingHTTPServer
 
         with tempfile.TemporaryDirectory() as td:
@@ -1995,6 +2000,7 @@ class TestReviewRegressions(unittest.TestCase):
     def test_join_validates_root_pubkey_and_prints_fingerprint(self) -> None:
         import contextlib
         import io
+        import time
         import time
         from http.server import ThreadingHTTPServer
 
@@ -2187,6 +2193,7 @@ class TestReviewRegressions(unittest.TestCase):
                     proc.wait(timeout=5)
 
     def test_join_and_quit_use_dfs_home_for_dfssvc(self) -> None:
+        import time
         from http.server import ThreadingHTTPServer
 
         with tempfile.TemporaryDirectory() as td:
@@ -2368,6 +2375,7 @@ class TestReviewRegressions(unittest.TestCase):
     def test_ice_candidates_requires_token_and_ignores_invalid_xff(self) -> None:
         import urllib.error
         import urllib.request
+        import time
         from http.server import ThreadingHTTPServer
         from dfs.relay import RelayHub
 
@@ -2522,6 +2530,7 @@ class TestReviewRegressions(unittest.TestCase):
 
     def test_p2p_status_endpoint_and_fetch(self) -> None:
         import threading
+        import time
         from http.server import ThreadingHTTPServer
         from dfs.cli import PersistentRegistryState, make_registry_http_handler
         from dfs.svc import _fetch_runtime_status
@@ -2760,6 +2769,131 @@ class TestReviewRegressions(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+    def test_relay_ost_auth_and_plain_id_default_and_writer_quota_and_web_clayfs(self) -> None:
+        import time
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import MagicMock
+        from dfs.crypto import ContentAddressedCrypto, sha256_hex
+        from dfs.l3_ost_adapter import (
+            ChunkStoreServer,
+            HttpOSTClient,
+            OSTProtocolError,
+            verify_ost_auth_envelope,
+        )
+        from dfs.l5_fs import ClayFSAdapter
+        from dfs.relay import RelayAgent, RelayHub
+        from dfs.web import DFSWebBackend, WebAppError
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            priv_w = root / "writer"
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(priv_w)],
+                check=True, capture_output=True,
+            )
+            pub_w = priv_w.with_suffix(".pub").read_text(encoding="utf-8").strip()
+            cert = root / "ost.crt"
+            key = root / "ost.key"
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert),
+                    "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1",
+                ],
+                check=True, capture_output=True,
+            )
+
+            # 1. Relay forwarding preserves X-DFS-OST-Auth
+            pstate = cli_mod.PersistentRegistryState(root / "state", "/example.com", pub_w)
+            ost = ChunkStoreServer(cert, key, host="127.0.0.1", port=0, max_writer_bytes=16)
+
+            def _verify_ost(env):
+                p = verify_ost_auth_envelope(env)
+                return p["writer"] == pub_w.strip() and p["path"] == "/example.com/w"
+
+            hub = RelayHub()
+            hub_handler = cli_mod.make_registry_http_handler(
+                pstate, ost, relay_hub=hub, ost_auth_verifier=_verify_ost
+            )
+            hub_httpd = ThreadingHTTPServer(("127.0.0.1", 0), hub_handler)
+            t_hub = threading.Thread(target=hub_httpd.serve_forever, daemon=True)
+            t_hub.start()
+            agent = RelayAgent(
+                f"http://127.0.0.1:{hub_httpd.server_port}",
+                "nat1",
+                hub_httpd.server_port,
+            )
+            agent.start()
+            try:
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    snap = hub.status_snapshot()
+                    nodes = snap.get("nodes", []) if isinstance(snap, dict) else snap
+                    if any(isinstance(n, dict) and n.get("node_id") == "nat1" and n.get("online") for n in nodes):
+                        break
+                    time.sleep(0.05)
+                relay_url = f"http://127.0.0.1:{hub_httpd.server_port}/relay/nat1"
+                c_authed = HttpOSTClient(
+                    relay_url,
+                    writer_priv_key=priv_w,
+                    writer_pubkey=pub_w,
+                    writer_path="/example.com/w",
+                )
+                blob_ok = b"0123456789"
+                wid_ok = sha256_hex(blob_ok)
+                self.assertEqual(c_authed.batch_put_if_absent({wid_ok: blob_ok}, assume_absent=True), 1)
+
+                # Per-writer quota (16 B) rejects second write exceeding quota
+                blob_big = b"abcdefghij"
+                wid_big = sha256_hex(blob_big)
+                with self.assertRaises(Exception):
+                    c_authed.batch_put_if_absent({wid_big: blob_big}, assume_absent=True)
+            finally:
+                agent.close()
+                hub_httpd.shutdown()
+                hub_httpd.server_close()
+                ost.close()
+
+            # 2. Default checksum=plain_id detects same-size content changes
+            src_file = root / "same-size.txt"
+            src_file.write_text("900\n", encoding="utf-8")
+            crypto = ContentAddressedCrypto("sec")
+            old_pid = crypto.compute_plain_id(b"100\n").hex()
+            fake_node = MagicMock()
+            fake_node.crypto = crypto
+            from unittest.mock import patch
+            with patch(
+                "dfs.cli_core._all_entries",
+                return_value=[{"type": "file", "path": "same-size.txt", "size": 4, "plain_id": old_pid}],
+            ):
+                to_write, _dels, unchanged = cli_main.plan_changes(
+                    fake_node, "", {"same-size.txt": src_file}
+                )
+            self.assertEqual(len(to_write), 1)
+            self.assertEqual(to_write[0][2], "update")
+            self.assertEqual(unchanged, [])
+
+            # 3. ClayFSAdapter prune_snapshots keeps latest N
+            clay = ClayFSAdapter(root / "clay", backend="copy")
+            (clay.work_tree / "f.txt").write_text("x", encoding="utf-8")
+            for i in range(1, 6):
+                clay.take_snapshot(f"v{i}")
+            removed = clay.prune_snapshots(keep=2)
+            self.assertEqual(removed, 3)
+            remaining = sorted(p.name for p in clay.snap_root.iterdir() if p.is_dir())
+            self.assertEqual(remaining, ["v4", "v5"])
+
+            # 4. Web UI rejects .clayfs uploads
+            web_backend = DFSWebBackend(
+                work_tree=clay.work_tree,
+                remote_name="local",
+                read_only=False,
+                sync_fn=lambda force: 1,
+                push_fn=lambda: 1,
+            )
+            with self.assertRaises(WebAppError):
+                web_backend.save_upload(".clayfs/evil.txt", b"bad")
 
 
 if __name__ == "__main__":

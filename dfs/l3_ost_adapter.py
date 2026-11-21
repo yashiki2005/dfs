@@ -451,9 +451,17 @@ class ChunkStoreServer:
         max_ram_bytes: Optional[int] = None,
         chunk_ttl_seconds: Optional[float] = None,
         evict_on_full: Optional[bool] = None,
+        max_writer_bytes: Optional[int] = None,
         auth_verifier: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ):
         self.auth_verifier = auth_verifier
+        env_max_writer = os.environ.get("DFS_OST_MAX_WRITER_BYTES", "").strip()
+        self.max_writer_bytes: Optional[int] = (
+            max_writer_bytes
+            if max_writer_bytes is not None
+            else (int(env_max_writer) if env_max_writer and int(env_max_writer) > 0 else None)
+        )
+        self._writer_bytes: Dict[str, int] = {}
         self.store: Dict[str, bytes] = OrderedDict()
         self._dirty_wire_ids: set[str] = set()
         self._store_lock = threading.RLock()
@@ -790,11 +798,22 @@ class ChunkStoreServer:
             return blob
         return None
 
-    def _put_chunk(self, wid: str, blob: bytes) -> bool:
+    def _check_writer_quota_locked(self, writer_id: str, size: int) -> bool:
+        if self.max_writer_bytes is None or not writer_id:
+            return True
+        return self._writer_bytes.get(writer_id, 0) + size <= self.max_writer_bytes
+
+    def _record_writer_bytes_locked(self, writer_id: str, size: int) -> None:
+        if writer_id:
+            self._writer_bytes[writer_id] = self._writer_bytes.get(writer_id, 0) + size
+
+    def _put_chunk(self, wid: str, blob: bytes, writer_id: str = "") -> bool:
         if self.chunks_dir is None:
             with self._store_lock:
                 if wid in self.store:
                     return True
+                if not self._check_writer_quota_locked(writer_id, len(blob)):
+                    return False
                 if self.max_store_bytes is not None and self._ram_bytes + len(blob) > self.max_store_bytes:
                     if self.evict_on_full or (self.chunk_ttl_seconds and self.chunk_ttl_seconds > 0):
                         target_cap = (
@@ -811,6 +830,7 @@ class ChunkStoreServer:
                         return False
                 self.store[wid] = blob
                 self._ram_bytes += len(blob)
+                self._record_writer_bytes_locked(writer_id, len(blob))
                 self._dirty_wire_ids.add(wid)
                 return True
 
@@ -823,6 +843,8 @@ class ChunkStoreServer:
             if dest.is_file():
                 self._cache_ram(wid, blob)
                 return True
+            if not self._check_writer_quota_locked(writer_id, len(blob)):
+                return False
             if self._storage_min_free_bytes > 0:
                 try:
                     free_bytes = shutil.disk_usage(str(self.chunks_dir)).free
@@ -880,6 +902,7 @@ class ChunkStoreServer:
             with self._store_lock:
                 if wrote_new:
                     self._disk_bytes += len(blob)
+                    self._record_writer_bytes_locked(writer_id, len(blob))
                 self._cache_ram(wid, blob)
             return True
         finally:
@@ -891,6 +914,7 @@ class ChunkStoreServer:
     def _handle_client(self, raw_conn: socket.socket) -> None:
         ssl_conn: Optional[ssl.SSLSocket] = None
         authenticated = self.auth_verifier is None
+        conn_writer_id = ""
         try:
             ssl_conn = self.ctx.wrap_socket(raw_conn, server_side=True)
             while self.running:
@@ -921,6 +945,8 @@ class ChunkStoreServer:
                         ok = False
                     if ok:
                         authenticated = True
+                        if isinstance(env, dict) and isinstance(env.get("payload"), dict):
+                            conn_writer_id = str(env["payload"].get("writer") or "").strip()
                         ssl_conn.sendall(b"O")
                     else:
                         ssl_conn.sendall(b"E")
@@ -943,7 +969,7 @@ class ChunkStoreServer:
                     data = self._recv_exact(ssl_conn, val)
                     if sha256_hex(data) != wire_id:
                         ssl_conn.sendall(b"E")
-                    elif not self._put_chunk(wire_id, data):
+                    elif not self._put_chunk(wire_id, data, writer_id=conn_writer_id):
                         ssl_conn.sendall(b"E")
                     else:
                         ssl_conn.sendall(b"O")
@@ -991,7 +1017,7 @@ class ChunkStoreServer:
                             staged[wid] = blob
                     if ok:
                         for wid, blob in staged.items():
-                            if not self._put_chunk(wid, blob):
+                            if not self._put_chunk(wid, blob, writer_id=conn_writer_id):
                                 ok = False
                                 break
                     ssl_conn.sendall(b"O" if ok else b"E")
@@ -1073,7 +1099,7 @@ class ChunkStoreServer:
             out.extend(struct.pack(">I", len(blob)) + blob)
         return bytes(out)
 
-    def batch_put_raw(self, raw_payload: bytes) -> None:
+    def batch_put_raw(self, raw_payload: bytes, *, writer_id: str = "") -> None:
         """HTTP / バイナリ共通の Multi-PUT 処理。"""
         if not self.online:
             raise ServiceUnavailableError("L3 OST is offline")
@@ -1100,7 +1126,7 @@ class ChunkStoreServer:
         if offset != len(raw_payload):
             raise OSTProtocolError("trailing bytes in batch_put payload")
         for wid, blob in staged.items():
-            if not self._put_chunk(wid, blob):
+            if not self._put_chunk(wid, blob, writer_id=writer_id):
                 raise OSTProtocolError("L3 OST storage quota exceeded")
 
     def close(self) -> None:

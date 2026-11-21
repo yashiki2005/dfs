@@ -154,7 +154,7 @@ class DFSWebBackend:
         norm = normalize_rel_path(rel_path)
         if not norm:
             return self.work_tree
-        if any(part == ".dfs" or part.startswith("._") for part in Path(norm).parts):
+        if any(part in (".dfs", ".clayfs", ".DS_Store") or part.startswith("._") for part in Path(norm).parts):
             raise WebAppError(403, f"Reserved path: /{norm}")
         try:
             return safe_target(self.work_tree, norm)
@@ -180,7 +180,7 @@ class DFSWebBackend:
                 raise WebAppError(400, f"Not a directory: /{norm}")
             entries: List[Dict[str, Any]] = []
             for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
-                if item.name.startswith("._") or item.name == ".dfs":
+                if item.name.startswith("._") or item.name in (".dfs", ".clayfs", ".DS_Store"):
                     continue
                 if item.is_symlink():
                     continue
