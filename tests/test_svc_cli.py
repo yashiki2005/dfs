@@ -386,7 +386,8 @@ class StartStopTests(unittest.TestCase):
             any(r["path"] == service.sub_path and r["writer"].strip() == pub for r in rows),
             f"委譲が見つからない: {rows}",
         )
-        self.assertEqual(service.sub_path, "/example.com/d")
+        self.assertRegex(service.root_anchor, r"^/k-[0-9a-f]{16}$")
+        self.assertEqual(service.sub_path, f"{service.root_anchor}/d")
 
     def test_ls_works_before_any_write(self) -> None:
         """まだ何も書いていないリモートでも ls が通る（初期化を先に求めない）。"""

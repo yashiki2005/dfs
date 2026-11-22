@@ -513,12 +513,12 @@ def register_delegation_chain_step(
         )
 
 
-def wait_for_l2(registry_url: str, timeout: float = 30.0) -> bool:
+def wait_for_l2(registry_url: str, timeout: float = 30.0, path: str = DEFAULT_ROOT_ANCHOR) -> bool:
     """L2 が resolve に答えるようになるまで待つ。"""
     import urllib.error
     import urllib.request
 
-    body = json.dumps({"path": DEFAULT_ROOT_ANCHOR}).encode("utf-8")
+    body = json.dumps({"path": path}).encode("utf-8")
     req = urllib.request.Request(
         f"{registry_url}/v1/resolve", data=body,
         headers={"Content-Type": "application/json"}, method="POST",
@@ -563,6 +563,27 @@ def _read_serve_pid(state_dir: Path, timeout: float = 5.0) -> int:
             return int(raw)
         time.sleep(0.1)
     return 0
+
+
+def default_root_anchor_for_pubkey(pubkey_str: str) -> str:
+    """ルート公開鍵の短縮ハッシュから自己認証型 root_anchor (``/k-<16hex>``) を生成する。"""
+    import hashlib
+
+    clean = " ".join(str(pubkey_str or "").split())
+    if not clean:
+        return DEFAULT_ROOT_ANCHOR
+    digest = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:16]
+    return f"/k-{digest}"
+
+
+def generate_relay_node_id(name: str, base: Path | str) -> str:
+    """他端末と衝突しない ``n-<hash>`` 形式のリレーノード ID を生成する。"""
+    import base64
+    import hashlib
+
+    seed = f"{socket.gethostname()}\n{name}\n{base}\n{secrets.token_hex(16)}".encode("utf-8")
+    digest = hashlib.sha256(seed).digest()
+    return "n-" + base64.urlsafe_b64encode(digest[:12]).decode("ascii").rstrip("=")
 
 
 def _normalize_hub_url(raw: str) -> str:
@@ -726,12 +747,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         or str(saved_cfg.get("relay_node") or "")
     )
     if join_url and not relay_node:
-        import base64
-        import hashlib
-
-        seed = f"{socket.gethostname()}\n{name}\n{base}\n{secrets.token_hex(16)}".encode("utf-8")
-        digest = hashlib.sha256(seed).digest()
-        relay_node = "n-" + base64.urlsafe_b64encode(digest[:12]).decode("ascii").rstrip("=")
+        relay_node = generate_relay_node_id(name, base)
 
     sync_id = str(saved_cfg.get("sync_id") or "").strip()
     if join_url and not sync_id:
@@ -771,11 +787,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     if not effective_advertise:
         effective_advertise = "127.0.0.1" if effective_host in ("0.0.0.0", "::") else effective_host
 
-    effective_root_anchor = (
-        args.root_anchor
-        if getattr(args, "root_anchor", None) is not None
-        else (existing.root_anchor if existing and existing.root_anchor else DEFAULT_ROOT_ANCHOR)
-    )
     state_dir = (
         Path(args.state_dir).expanduser()
         if args.state_dir
@@ -803,6 +814,25 @@ def cmd_start(args: argparse.Namespace) -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     ost_dir.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_root_key(root_key)
+    ensure_writer_key(writer_key)
+    root_pub = Path(f"{root_key}.pub")
+    writer_pub = Path(f"{writer_key}.pub")
+
+    if getattr(args, "root_anchor", None) is not None:
+        effective_root_anchor = args.root_anchor
+    elif existing and existing.root_anchor:
+        effective_root_anchor = existing.root_anchor
+    else:
+        raw_path_arg = (getattr(args, "path", None) or "").strip()
+        path_parts = [p for p in raw_path_arg.strip("/").split("/") if p]
+        if raw_path_arg.startswith("/") and len(path_parts) >= 2:
+            effective_root_anchor = f"/{path_parts[0]}"
+        else:
+            effective_root_anchor = default_root_anchor_for_pubkey(
+                root_pub.read_text(encoding="utf-8")
+            )
+
     cfg_payload = (
         json.dumps(
             {
@@ -831,10 +861,6 @@ def cmd_start(args: argparse.Namespace) -> int:
         os.close(fd)
     restrict_to_owner(cfg_tmp)
     os.replace(cfg_tmp, cfg_file)
-    ensure_root_key(root_key)
-    ensure_writer_key(writer_key)
-    root_pub = Path(f"{root_key}.pub")
-    writer_pub = Path(f"{writer_key}.pub")
 
     advertised = effective_advertise
     advertised_host = f"[{advertised}]" if ":" in advertised else advertised
@@ -929,7 +955,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     local_host_fmt = f"[{local_host}]" if ":" in local_host else local_host
     local_registry_url = f"http://{local_host_fmt}:{registry_port}"
 
-    if not wait_for_l2(local_registry_url, timeout=args.wait):
+    if not wait_for_l2(local_registry_url, timeout=args.wait, path=effective_root_anchor):
         tail = ""
         if not args.foreground and log_path.is_file():
             tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]

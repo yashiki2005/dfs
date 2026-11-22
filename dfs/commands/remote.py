@@ -1058,15 +1058,15 @@ def cmd_join(args: argparse.Namespace) -> int:
                 cfg = {}
         cfg["join"] = base_url
         if not cfg.get("relay_node"):
-            import socket as _sock
-
-            cfg["relay_node"] = svc_name if svc_name != "local" else _sock.gethostname().split(".")[0]
+            cfg["relay_node"] = svc_mod.generate_relay_node_id(svc_name, svc_dir)
         if clone_id:
             subs = [str(s).strip() for s in (cfg.get("subscribe") or []) if str(s).strip()]
             if clone_id not in subs:
                 subs.append(clone_id)
             cfg["subscribe"] = subs
-        cfg_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        from dfs.private_io import write_private_json
+
+        write_private_json(cfg_file, cfg)
         print(f"[dfscli] dfssvc ({svc_name}) の参加先を {base_url} に設定しました: {cfg_file}")
         if clone_id:
             start_ns = svc_mod.build_parser().parse_args([
