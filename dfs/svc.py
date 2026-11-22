@@ -736,11 +736,19 @@ def cmd_start(args: argparse.Namespace) -> int:
     is_hub = bool(hub_arg) or bool(saved_cfg.get("hub"))
     join_urls = _normalize_hub_urls(join_arg) if join_arg else _normalize_hub_urls(saved_cfg.get("join"))
     join_url = join_urls[0] if join_urls else ""
-    relay_token = (
-        getattr(args, "relay_token", None)
-        or str(saved_cfg.get("relay_token") or "")
+    allow_unauth_relay = os.environ.get("DFS_RELAY_ALLOW_UNAUTH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
     )
-    if is_hub and not relay_token:
+    relay_token_arg = getattr(args, "relay_token", None)
+    if relay_token_arg is not None:
+        relay_token = str(relay_token_arg)
+    elif allow_unauth_relay:
+        relay_token = ""
+    else:
+        relay_token = str(saved_cfg.get("relay_token") or "")
+    if is_hub and not relay_token and not allow_unauth_relay:
         relay_token = secrets.token_urlsafe(24)
     relay_node = (
         getattr(args, "relay_node", None)

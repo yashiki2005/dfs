@@ -55,6 +55,8 @@ Environment=HOME=/home/ubuntu
 Environment=PYTHONUNBUFFERED=1
 # Set to 0 for a relay-only hub so no L3 chunks are stored on disk
 Environment=DFS_OST_MAX_BYTES=0
+# Set to 1 to allow unauthenticated public relay connections (no relay_token)
+Environment=DFS_RELAY_ALLOW_UNAUTH=1
 ExecStart=/home/ubuntu/dfs/dfssvc start \
   --name myhub \
   --hub \

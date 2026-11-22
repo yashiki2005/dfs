@@ -57,6 +57,8 @@ Environment=HOME=/home/ubuntu
 Environment=PYTHONUNBUFFERED=1
 # パターン A（リレー専任）でディスクを使わせない場合は 0 を指定
 Environment=DFS_OST_MAX_BYTES=0
+# トークン無しで誰でも参加できるパブリックリレーハブにする場合は 1 を指定
+Environment=DFS_RELAY_ALLOW_UNAUTH=1
 ExecStart=/home/ubuntu/dfs/dfssvc start \
   --name myhub \
   --hub \
