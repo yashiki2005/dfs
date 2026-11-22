@@ -172,7 +172,10 @@ class RemoteRegistryClient:
                 self.registry_urls.append(value)
         if not self.registry_urls:
             raise ValueError("At least one L2 registry URL is required")
-        # 書き込み先は先頭（主名簿）に固定する。
+        from .relay import rank_relay_endpoints_by_rtt
+
+        self.registry_urls = rank_relay_endpoints_by_rtt(self.registry_urls)
+        # 書き込み先は先頭（主名簿または最速の生存リレー）に固定する。
         self.registry_url = self.registry_urls[0]
         self.default_timeout = timeout
 
@@ -1514,10 +1517,14 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if relay_urls and not relay_node:
         raise SystemExit("--relay requires --relay-node")
     if relay_urls and relay_node:
+        from .relay import rank_relay_endpoints_by_rtt
+
         for r_url in relay_urls:
             ep = f"{r_url}/relay/{relay_node}"
             if ep not in pstate.relay_endpoints:
                 pstate.relay_endpoints.append(ep)
+        pstate.relay_endpoints = rank_relay_endpoints_by_rtt(pstate.relay_endpoints)
+        for ep in pstate.relay_endpoints:
             if ep not in pstate.ost_alternates:
                 pstate.ost_alternates.append(ep)
         pstate.relay_endpoint = pstate.relay_endpoints[0]
@@ -1639,20 +1646,24 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 if relay_urls:
                     from .relay import register_p2p_peer
 
-                    info = register_p2p_peer(
-                        relay_urls[0],
-                        p2p_manager.peer_id,
-                        node_id=relay_node or pstate.role,
-                        p2p_addrs=p2p_manager.effective_addrs(),
-                        role=pstate.role,
-                        sync_id=sync_id_arg,
-                        sub_path=sub_path_arg,
-                        token=relay_token,
-                        timeout=1.5,
-                    )
-                    peer_ids = info.get("peer_ids")
-                    if isinstance(peer_ids, list) and peer_ids:
-                        p2p_manager.set_allowed_peer_ids(peer_ids)
+                    for r_url in relay_urls:
+                        try:
+                            info = register_p2p_peer(
+                                r_url,
+                                p2p_manager.peer_id,
+                                node_id=relay_node or pstate.role,
+                                p2p_addrs=p2p_manager.effective_addrs(),
+                                role=pstate.role,
+                                sync_id=sync_id_arg,
+                                sub_path=sub_path_arg,
+                                token=relay_token,
+                                timeout=1.5,
+                            )
+                            peer_ids = info.get("peer_ids")
+                            if isinstance(peer_ids, list) and peer_ids:
+                                p2p_manager.set_allowed_peer_ids(peer_ids)
+                        except Exception:
+                            pass
                 if root_pubkey:
                     p2p_manager.provide_domain(root_pubkey, timeout=5.0, background=True)
         except Exception:

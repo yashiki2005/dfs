@@ -599,7 +599,7 @@ def test_dfssvc_simple_flags_and_dfscli_join(tmp_path: Path, monkeypatch: pytest
     assert _normalize_hub_url("192.0.2.254:19100") == "http://192.0.2.254:19100"
 
     ns_join = parser.parse_args(["start", "--join", "https://dfs.example.com"])
-    assert ns_join.join == "https://dfs.example.com"
+    assert ns_join.join == ["https://dfs.example.com"]
 
     # dfscli join で既存ローカルサービス設定と RemoteStore が更新されること
     hub = RelayHub()
@@ -787,3 +787,56 @@ def test_open_remote_preserves_relay_ost_fallback(tmp_path: Path, monkeypatch: p
             h.server_close()
         for o in (peer_ost, hub_ost):
             o.close()
+
+
+def test_rank_relay_endpoints_prefers_alive_and_low_rtt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dfs.cli import RemoteRegistryClient
+    from dfs.relay import clear_hub_probe_cache, rank_relay_endpoints_by_rtt
+
+    clear_hub_probe_cache()
+    hub = RelayHub()
+    ost, _pstate, httpd = _start_server(tmp_path, "rtt_hub", relay_hub=hub)
+    alive_url = f"http://127.0.0.1:{httpd.server_port}"
+    dead_url = "http://127.0.0.1:1"
+    direct_url = "http://198.51.100.10:9440"
+    try:
+        ranked = rank_relay_endpoints_by_rtt(
+            [
+                direct_url,
+                f"{dead_url}/relay/node1",
+                f"{alive_url}/relay/node1",
+            ],
+            timeout=0.5,
+            cache_ttl=0.0,
+        )
+        assert ranked == [
+            direct_url,
+            f"{alive_url}/relay/node1",
+            f"{dead_url}/relay/node1",
+        ]
+
+        # すべてリレー URL の場合、死んでいる先頭ではなく生きているハブが主 URL になる
+        client = RemoteRegistryClient(
+            [f"{dead_url}/relay/node1", f"{alive_url}/relay/node1"]
+        )
+        assert client.registry_url == f"{alive_url}/relay/node1"
+
+        # 生存ハブ同士では RTT が低い方が先頭になる
+        monkeypatch.setattr(
+            "dfs.relay.probe_hub_rtt",
+            lambda url, timeout=2.0, cache_ttl=None: 0.12 if "slow" in url else 0.01,
+        )
+        ranked_rtts = rank_relay_endpoints_by_rtt(
+            ["https://slow.example/relay/n", "https://fast.example/relay/n"]
+        )
+        assert ranked_rtts == [
+            "https://fast.example/relay/n",
+            "https://slow.example/relay/n",
+        ]
+    finally:
+        clear_hub_probe_cache()
+        httpd.shutdown()
+        httpd.server_close()
+        ost.close()

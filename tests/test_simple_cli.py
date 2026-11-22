@@ -101,7 +101,30 @@ class SimpleCliTests(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 self.assertIn("--join", seen_argv[0])
                 self.assertIn("https://l2.yashiki.top", seen_argv[0])
+                self.assertIn("https://eu.yashiki.top", seen_argv[0])
                 self.assertIn(expected_sub, buf.getvalue())
+
+    def test_resolve_hub_urls_supports_multi_and_env(self) -> None:
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DFS_DEFAULT_HUB", None)
+            self.assertEqual(
+                simple_cli._resolve_hub_urls(None, False),
+                ["https://l2.yashiki.top", "https://eu.yashiki.top"],
+            )
+            self.assertEqual(simple_cli._resolve_hub_urls(None, True), [])
+            self.assertEqual(
+                simple_cli._resolve_hub_urls(["https://a.example, https://b.example"], False),
+                ["https://a.example", "https://b.example"],
+            )
+        with patch.dict(os.environ, {"DFS_DEFAULT_HUB": "https://eu.yashiki.top,https://l2.yashiki.top"}):
+            self.assertEqual(
+                simple_cli._resolve_hub_urls(None, False),
+                ["https://eu.yashiki.top", "https://l2.yashiki.top"],
+            )
+        with patch.dict(os.environ, {"DFS_DEFAULT_HUB": ""}):
+            self.assertEqual(simple_cli._resolve_hub_urls(None, False), [])
 
 
 if __name__ == "__main__":

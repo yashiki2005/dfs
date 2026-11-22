@@ -22,11 +22,38 @@ import os
 import secrets
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 
-DEFAULT_PUBLIC_HUB = "https://l2.yashiki.top"
+DEFAULT_PUBLIC_HUBS = (
+    "https://l2.yashiki.top",
+    "https://eu.yashiki.top",
+)
+DEFAULT_PUBLIC_HUB = DEFAULT_PUBLIC_HUBS[0]
 _NAT_HUB_MSG = "NAT を突破するために yashiki.top を利用します（--no-hub で無効化できます）"
+
+
+def _resolve_hub_urls(hub: Optional[str | Sequence[str]], no_hub: bool) -> List[str]:
+    if no_hub:
+        return []
+    if hub is not None:
+        items = [hub] if isinstance(hub, str) else list(hub)
+    elif "DFS_DEFAULT_HUB" in os.environ:
+        raw_env = os.environ.get("DFS_DEFAULT_HUB", "").strip()
+        if not raw_env:
+            return []
+        items = [raw_env]
+    else:
+        items = list(DEFAULT_PUBLIC_HUBS)
+    urls: List[str] = []
+    seen = set()
+    for item in items:
+        for part in str(item or "").split(","):
+            val = part.strip()
+            if val and val not in seen:
+                seen.add(val)
+                urls.append(val)
+    return urls
 
 
 def _ensure_local_ready(
@@ -55,10 +82,11 @@ def _ensure_local_ready(
             start_argv.extend(["--port", str(port)])
         if advertise:
             start_argv.extend(["--advertise", advertise])
-        effective_hub = "" if no_hub else (hub if hub is not None else os.environ.get("DFS_DEFAULT_HUB", DEFAULT_PUBLIC_HUB)).strip()
-        if effective_hub:
+        effective_hubs = _resolve_hub_urls(hub, no_hub)
+        if effective_hubs:
             print(f"[dfs] {_(_NAT_HUB_MSG)}", file=sys.stderr)
-            start_argv.extend(["--join", effective_hub])
+            for hub_url in effective_hubs:
+                start_argv.extend(["--join", hub_url])
         rc = svc_mod.main(start_argv)
         if rc != 0:
             raise SystemExit(rc)
@@ -257,7 +285,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--secret", help="Tree secret (auto-generated if omitted)")
     p.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     p.add_argument("--advertise", help="Advertised host/IP for remote clients")
-    p.add_argument("--hub", default=None, help=f"NAT traversal hub URL (default: {DEFAULT_PUBLIC_HUB})")
+    p.add_argument(
+        "--hub",
+        action="append",
+        default=None,
+        help=f"NAT traversal hub URL (default: {', '.join(DEFAULT_PUBLIC_HUBS)})",
+    )
     p.add_argument("--no-hub", action="store_true", help="Disable automatic join to yashiki.top")
     p.set_defaults(func=_cmd_start)
 

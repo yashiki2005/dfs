@@ -17,7 +17,10 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode, urlsplit
@@ -762,3 +765,136 @@ class RelayAgent:
 
     def close(self) -> None:
         self._running = False
+
+
+_HUB_PROBE_CACHE: Dict[str, Tuple[float, Optional[float]]] = {}
+_HUB_PROBE_LOCK = threading.Lock()
+_HUB_PROBE_TTL_DEFAULT = 60.0
+
+
+def clear_hub_probe_cache() -> None:
+    """ハブ RTT プローブ結果のキャッシュをクリアする。"""
+    with _HUB_PROBE_LOCK:
+        _HUB_PROBE_CACHE.clear()
+
+
+def _hub_base_url(url: str) -> str:
+    parts = urlsplit(str(url or "").strip())
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _probe_ttl_seconds(override: Optional[float]) -> float:
+    if override is not None:
+        return max(0.0, float(override))
+    raw = os.environ.get("DFS_HUB_PROBE_TTL", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return _HUB_PROBE_TTL_DEFAULT
+
+
+def probe_hub_rtt(
+    url: str,
+    *,
+    timeout: float = 2.0,
+    cache_ttl: Optional[float] = None,
+) -> Optional[float]:
+    """ハブの ``/_p2p/peers`` へ軽量 GET を行い、生存時の RTT（秒）を返す。
+
+    200/401/403/404 はハブが応答しているため生存とみなし、5xx や接続失敗・
+    タイムアウト時は ``None`` を返す。
+    """
+    base = _hub_base_url(url)
+    if not base:
+        return None
+    ttl = _probe_ttl_seconds(cache_ttl)
+    now = time.monotonic()
+    if ttl > 0.0:
+        with _HUB_PROBE_LOCK:
+            cached = _HUB_PROBE_CACHE.get(base)
+            if cached is not None and (now - cached[0]) < ttl:
+                return cached[1]
+
+    target = f"{base}/_p2p/peers"
+    req = urllib.request.Request(target, method="GET")
+    rtt: Optional[float] = None
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+            if resp.status in (200, 401, 403, 404):
+                rtt = time.monotonic() - start
+    except urllib.error.HTTPError as e:
+        if e.code in (200, 401, 403, 404):
+            rtt = time.monotonic() - start
+    except Exception:
+        rtt = None
+
+    if ttl > 0.0:
+        with _HUB_PROBE_LOCK:
+            _HUB_PROBE_CACHE[base] = (time.monotonic(), rtt)
+    return rtt
+
+
+def rank_relay_endpoints_by_rtt(
+    urls: Sequence[str],
+    *,
+    timeout: float = 2.0,
+    cache_ttl: Optional[float] = None,
+) -> List[str]:
+    """直接接続 URL を先頭に保ったまま、``/relay/`` URL 群を生存かつ低 RTT 順に並べる。
+
+    ``/relay/`` URL が 1 つ以下の場合はプローブを行わず元の順序を返す。
+    """
+    deduped: List[str] = []
+    seen = set()
+    for raw in urls:
+        val = str(raw or "").strip().rstrip("/")
+        if val and val not in seen:
+            seen.add(val)
+            deduped.append(val)
+
+    direct: List[str] = []
+    relays: List[Tuple[int, str]] = []
+    for idx, val in enumerate(deduped):
+        if "/relay/" in val:
+            relays.append((idx, val))
+        else:
+            direct.append(val)
+
+    if len(relays) <= 1:
+        return deduped
+
+    bases: List[str] = []
+    seen_bases = set()
+    for _, rurl in relays:
+        b = _hub_base_url(rurl)
+        if b and b not in seen_bases:
+            seen_bases.add(b)
+            bases.append(b)
+
+    rtts: Dict[str, Optional[float]] = {}
+    if bases:
+        with ThreadPoolExecutor(max_workers=min(8, len(bases))) as pool:
+            futs = {
+                pool.submit(probe_hub_rtt, b, timeout=timeout, cache_ttl=cache_ttl): b
+                for b in bases
+            }
+            for fut, b in futs.items():
+                try:
+                    rtts[b] = fut.result()
+                except Exception:
+                    rtts[b] = None
+
+    def _sort_key(item: Tuple[int, str]) -> Tuple[int, float, int]:
+        orig_idx, rurl = item
+        rtt = rtts.get(_hub_base_url(rurl))
+        if rtt is None:
+            return (1, 0.0, orig_idx)
+        return (0, rtt, orig_idx)
+
+    sorted_relays = [rurl for _, rurl in sorted(relays, key=_sort_key)]
+    return [*direct, *sorted_relays]

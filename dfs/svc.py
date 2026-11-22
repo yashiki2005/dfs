@@ -568,6 +568,22 @@ def _normalize_hub_url(raw: str) -> str:
     return f"https://{value}"
 
 
+def _normalize_hub_urls(raw: Any) -> List[str]:
+    """文字列・カンマ区切り・シーケンスから重複なしの正規化済みハブ URL リストを作る。"""
+    if not raw:
+        return []
+    items = [raw] if isinstance(raw, str) else list(raw)
+    result: List[str] = []
+    seen = set()
+    for item in items:
+        for part in str(item or "").split(","):
+            norm = _normalize_hub_url(part)
+            if norm and norm not in seen:
+                seen.add(norm)
+                result.append(norm)
+    return result
+
+
 def _resolve_service_name(args: argparse.Namespace) -> str:
     """位置引数と ``--name`` のどちらからでもサービス名を解決する。"""
     opt_name = getattr(args, "name_opt", None)
@@ -688,7 +704,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     hub_arg = getattr(args, "hub", None)
     join_arg = getattr(args, "join", None)
     is_hub = bool(hub_arg) or bool(saved_cfg.get("hub"))
-    join_url = _normalize_hub_url(join_arg) if join_arg else str(saved_cfg.get("join") or "")
+    join_urls = _normalize_hub_urls(join_arg) if join_arg else _normalize_hub_urls(saved_cfg.get("join"))
+    join_url = join_urls[0] if join_urls else ""
     relay_token = (
         getattr(args, "relay_token", None)
         or str(saved_cfg.get("relay_token") or "")
@@ -781,7 +798,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "hub": is_hub,
-                "join": join_url,
+                "join": join_urls,
                 "relay_node": relay_node,
                 "relay_token": relay_token,
                 "advertise": effective_advertise,
@@ -845,8 +862,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         ) and not getattr(args, "no_auto_delegate", False)
         if service_role == "primary" and root_key.is_file() and auto_delegate_enabled:
             cmd.extend(["--auto-delegate-key", str(root_key)])
-    if join_url:
-        cmd.extend(["--relay", join_url])
+    for jurl in join_urls:
+        cmd.extend(["--relay", jurl])
     if relay_node:
         cmd.append(f"--relay-node={relay_node}")
     if sync_id:
@@ -1544,7 +1561,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--join",
-        help="指定した root ハブへ参加する（例: --join https://dfs.example.com）",
+        action="append",
+        default=None,
+        help="指定した root ハブへ参加する（複数指定可。例: --join https://dfs.example.com）",
     )
     p.add_argument(
         "--subscribe",
