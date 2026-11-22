@@ -679,26 +679,33 @@ class ChunkStoreServer:
         while self.running:
             try:
                 conn, _ = self.sock.accept()
-                if not self._conn_sem.acquire(blocking=False):
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    continue
-                try:
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    conn.settimeout(ost_socket_timeout())
-                    threading.Thread(
-                        target=self._handle_client_guarded, args=(conn,), daemon=True
-                    ).start()
-                except Exception:
-                    try:
-                        conn.close()
-                    finally:
-                        self._conn_sem.release()
-                    raise
+            except OSError:
+                if not self.running:
+                    break
+                continue
             except Exception:
-                break
+                if not self.running:
+                    break
+                continue
+            if not self._conn_sem.acquire(blocking=False):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                continue
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.settimeout(ost_socket_timeout())
+                threading.Thread(
+                    target=self._handle_client_guarded, args=(conn,), daemon=True
+                ).start()
+            except Exception:
+                try:
+                    conn.close()
+                finally:
+                    self._conn_sem.release()
+                if not self.running:
+                    break
 
     def _handle_client_guarded(self, conn: socket.socket) -> None:
         try:
@@ -782,7 +789,17 @@ class ChunkStoreServer:
                 pass
         return sorted(ids)
 
+    @staticmethod
+    def _is_valid_wire_id(wid: str) -> bool:
+        return (
+            isinstance(wid, str)
+            and len(wid) == 64
+            and all(ch in "0123456789abcdef" for ch in wid)
+        )
+
     def _has_chunk(self, wid: str) -> bool:
+        if not self._is_valid_wire_id(wid):
+            return False
         with self._store_lock:
             if wid in self.store:
                 return True
@@ -791,6 +808,8 @@ class ChunkStoreServer:
         return False
 
     def _get_chunk(self, wid: str) -> Optional[bytes]:
+        if not self._is_valid_wire_id(wid):
+            return None
         with self._store_lock:
             blob = self.store.get(wid)
             if blob is not None:
@@ -934,7 +953,7 @@ class ChunkStoreServer:
             if self._storage_min_free_bytes > 0:
                 try:
                     free_bytes = shutil.disk_usage(str(self.chunks_dir)).free
-                    if free_bytes < len(blob) + self._storage_min_free_bytes:
+                    if free_bytes - self._reserved_bytes < len(blob) + self._storage_min_free_bytes:
                         return False
                 except OSError:
                     pass
@@ -1570,6 +1589,8 @@ class OSTClient:
                         )
                     blob = self._recv_exact(conn, blen)
                     self.bytes_received += blen
+                    if sha256_hex(blob) != wid:
+                        raise ChunkIntegrityError(f"Chunk hash mismatch during batch_get: {wid}")
                     self.get_count += 1
                     result[wid] = blob
 
@@ -1823,7 +1844,12 @@ class HttpOSTClient:
         self.round_trips += 1
         if self._session_depth > 0:
             for attempt in range(2):
-                if self._pooled_conn is None:
+                if self._pooled_conn is None or self._pooled_conn.sock is None:
+                    if self._pooled_conn is not None:
+                        try:
+                            self._pooled_conn.close()
+                        except Exception:
+                            pass
                     self._pooled_conn = self._open_new_conn()
                 try:
                     status, resp_body = self._request_once(self._pooled_conn, path, body)
@@ -1944,6 +1970,8 @@ class HttpOSTClient:
                     )
                 blob = resp[offset : offset + blen]
                 offset += blen
+                if sha256_hex(blob) != wid:
+                    raise ChunkIntegrityError(f"L3 HTTP response chunk hash mismatch: {wid}")
                 self.get_count += 1
                 result[wid] = blob
             if offset != len(resp):

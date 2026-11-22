@@ -99,8 +99,8 @@ def _ensure_local_ready(
     remote_store = RemoteStore()
     if name not in remote_store.remotes:
         chosen_secret = secret or os.environ.get("DFS_SECRET") or secrets.token_urlsafe(24)
-        pub_path = Path(existing_svc.writer_key).expanduser().with_suffix(".pub")
-        root_pub = Path(existing_svc.root_key).expanduser().with_suffix(".pub")
+        root_key_path = Path(existing_svc.root_key).expanduser()
+        root_pub = Path(f"{root_key_path}.pub")
         cfg_argv = [
             "config",
             "create",
@@ -167,9 +167,13 @@ def _cmd_push(args: argparse.Namespace) -> int:
     target = _normalize_remote_target(args.target)
     remote_name = target.split(":", 1)[0]
     if target.startswith("dfs://"):
-        remote_name = target[len("dfs://") :].split("/", 1)[0]
-    if remote_name == "local" and "local" not in RemoteStore().remotes:
-        _ensure_local_ready("local", no_hub=args.no_hub)
+        remote_name = target[len("dfs://") :].split("/", 1)[0].split(":", 1)[0]
+    if remote_name == "local":
+        from . import svc as svc_mod
+
+        svc_rec = svc_mod.ServiceStore().services.get("local")
+        if "local" not in RemoteStore().remotes or svc_rec is None or not svc_rec.is_running():
+            _ensure_local_ready("local", no_hub=args.no_hub)
     argv = ["sync", args.src, target]
     if args.dry_run:
         argv.append("--dry-run")

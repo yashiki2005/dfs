@@ -309,8 +309,9 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
             cfg["ost_port"] = int(desired_port)
             changed = True
             ost_changed = True
+    registry_changed = cfg.get("registry_url") != remote.registry
     if (
-        cfg.get("registry_url") != remote.registry
+        registry_changed
         or list(cfg.get("registry_alternates") or []) != list(remote.registry_alternates)
     ):
         cfg["registry_url"] = remote.registry
@@ -343,12 +344,13 @@ def open_remote(remote: Remote, create: bool = False) -> DFSNode:
         changed = True
         tree_identity_changed = True
     elif not remote.path and (
-        cfg.get("registry_url") != remote.registry
+        registry_changed
         or (remote.root_pubkey and cfg.get("root_pubkey") != remote.root_pubkey)
         or getattr(node.l4.pin, "version", 0) == 0
     ):
         try:
-            resolved_sub = resolve_path(remote, node.registry)
+            fresh_reg = cli_mod.RemoteRegistryClient(remote.registry_urls())
+            resolved_sub = resolve_path(remote, fresh_reg)
         except Exception:
             resolved_sub = ""
         if resolved_sub and cfg.get("sub_path") != resolved_sub:

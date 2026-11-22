@@ -836,6 +836,13 @@ def _pull_once(
         raise _cm.UsageError(f"Remote path does not exist: {remote.name}:{prefix}")
 
     dest.mkdir(parents=True, exist_ok=True)
+    if src_root.is_file():
+        rel_text = src_root.name
+        if path_filter.allows(rel_text) and not src_root.is_symlink():
+            target = _cm.safe_target(dest, rel_text, create_parents=True)
+            _cm.copyfile_no_follow(src_root, target)
+            return version, 1
+        return version, 0
     count = 0
     for item in sorted(src_root.rglob("*")):
         rel = item.relative_to(src_root)
@@ -888,15 +895,15 @@ def cmd_pull(args: argparse.Namespace) -> int:
             time.sleep(poll)
             try:
                 latest = node.remote_version()
+                if latest > last_version:
+                    version, count = _pull_once(
+                        node, remote, prefix, dest, path_filter, force=False
+                    )
+                    last_version = version
+                    print(f"[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}")
             except Exception as e:  # noqa: BLE001 - 一時的な通信断では終了しない
                 print(f"[dfscli] watch poll failed: {e}", file=_cm.sys.stderr)
                 continue
-            if latest > last_version:
-                version, count = _pull_once(
-                    node, remote, prefix, dest, path_filter, force=False
-                )
-                last_version = version
-                print(f"[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}")
     except KeyboardInterrupt:
         print("\n[dfscli] watch を終了します", file=_cm.sys.stderr)
     return 0

@@ -1406,11 +1406,21 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
 
         def _check_fetch_metadata(self) -> bool:
             site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
-            if site == "cross-site":
+            if site in ("cross-site", "same-site"):
                 mode = (self.headers.get("Sec-Fetch-Mode") or "").strip().lower()
                 if not (self.command == "GET" and mode == "navigate"):
                     self._send_json(403, {"error": "Cross-site request blocked"})
                     return False
+            if self.command not in ("GET", "HEAD", "OPTIONS"):
+                origin = (self.headers.get("Origin") or "").strip()
+                host = (self.headers.get("Host") or "").strip().lower()
+                if origin and host:
+                    from urllib.parse import urlsplit as _urlsplit
+
+                    origin_netloc = _urlsplit(origin).netloc.lower()
+                    if origin_netloc and origin_netloc != host:
+                        self._send_json(403, {"error": "Origin mismatch blocked"})
+                        return False
             return True
 
         def _stream_body_to_temp(self, limit: int) -> Optional[Tuple[Path, int]]:
@@ -1572,6 +1582,8 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                 self._send_json(404, {"error": f"Unknown path {route}"})
             except WebAppError as e:
                 self._send_json(e.status, {"error": e.message})
+            except OSError as e:
+                self._send_json(500, {"error": f"Internal error: {e}"})
 
         def do_POST(self) -> None:
             if not self._check_fetch_metadata():
@@ -1599,7 +1611,7 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                     self._send_json(400, {"error": "Invalid JSON"})
                     return
                 presented = str(data.get("token") or "")
-                if not hmac.compare_digest(presented, config.token):
+                if not config.token or not presented or not hmac.compare_digest(presented, config.token):
                     _record_auth_failure(client_ip)
                     self._send_json(401, {"error": "Invalid token"})
                     return
@@ -1687,6 +1699,8 @@ def make_web_handler(backend: DFSWebBackend, config: WebConfig):
                 self._send_json(404, {"error": f"Unknown path {route}"})
             except WebAppError as e:
                 self._send_json(e.status, {"error": e.message})
+            except OSError as e:
+                self._send_json(500, {"error": f"Internal error: {e}"})
 
     return DFSWebHandler
 
@@ -1724,7 +1738,11 @@ class BoundedWebHTTPServer(ThreadingHTTPServer):
                 pass
             self.shutdown_request(request)
             return
-        super().process_request(request, client_address)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_sem.release()
+            raise
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
         try:

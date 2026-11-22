@@ -330,10 +330,19 @@ class ServiceStore:
             "schema": "dfs-services-v1",
             "services": {n: asdict(s) for n, s in sorted(self.services.items())},
         }
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        raw = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            view = memoryview(raw)
+            written = 0
+            while written < len(raw):
+                written += os.write(fd, view[written:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         restrict_to_owner(tmp)
-        tmp.replace(self.path)
+        os.replace(tmp, self.path)
 
     def get(self, name: str) -> Service:
         if name not in self.services:
@@ -810,10 +819,14 @@ def cmd_start(args: argparse.Namespace) -> int:
         )
         + "\n"
     ).encode("utf-8")
-    cfg_tmp = cfg_file.with_suffix(".tmp")
+    cfg_tmp = cfg_file.with_name(f".{cfg_file.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     fd = os.open(cfg_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, cfg_payload)
+        view = memoryview(cfg_payload)
+        written = 0
+        while written < len(cfg_payload):
+            written += os.write(fd, view[written:])
+        os.fsync(fd)
     finally:
         os.close(fd)
     restrict_to_owner(cfg_tmp)
@@ -912,7 +925,11 @@ def cmd_start(args: argparse.Namespace) -> int:
                 stdin=subprocess.DEVNULL, start_new_session=True,
             )
 
-    if not wait_for_l2(registry_url, timeout=args.wait):
+    local_host = "127.0.0.1" if effective_host in ("0.0.0.0", "::", "") else effective_host
+    local_host_fmt = f"[{local_host}]" if ":" in local_host else local_host
+    local_registry_url = f"http://{local_host_fmt}:{registry_port}"
+
+    if not wait_for_l2(local_registry_url, timeout=args.wait):
         tail = ""
         if not args.foreground and log_path.is_file():
             tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
@@ -946,36 +963,36 @@ def cmd_start(args: argparse.Namespace) -> int:
             if not sub_path.startswith("/"):
                 sub_path = "/" + sub_path
             # 根の直下でなければ、親のパスも委譲が要る（L1 は多段）
-            _ensure_parent_delegations(root_key, root_pub, effective_root_anchor, sub_path, registry_url)
-            register_delegation(root_key, writer_pub, sub_path, registry_url)
+            _ensure_parent_delegations(root_key, root_pub, effective_root_anchor, sub_path, local_registry_url)
+            register_delegation(root_key, writer_pub, sub_path, local_registry_url)
             print(f"[dfssvc] 委譲を登録: {sub_path}（書き手 {writer_key.name}）")
+
+        service = Service(
+            name=name,
+            state_dir=str(state_dir),
+            root_key=str(root_key),
+            root_pub=str(root_pub),
+            writer_key=str(writer_key),
+            writer_pub=str(writer_pub),
+            sub_path=sub_path,
+            registry_port=registry_port,
+            ost_port=ost_port,
+            bind=effective_host,
+            advertise=advertised,
+            root_anchor=effective_root_anchor,
+            pid=server_pid,
+            started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            config_path=str(store.path),
+            log_path=str(log_path),
+            role=service_role,
+            role_epoch=service_role_epoch,
+            ost_dir=str(ost_dir),
+        )
+        store.services[name] = service
+        store.save()
     except BaseException:
         _terminate(proc)
         raise
-
-    service = Service(
-        name=name,
-        state_dir=str(state_dir),
-        root_key=str(root_key),
-        root_pub=str(root_pub),
-        writer_key=str(writer_key),
-        writer_pub=str(writer_pub),
-        sub_path=sub_path,
-        registry_port=registry_port,
-        ost_port=ost_port,
-        bind=effective_host,
-        advertise=advertised,
-        root_anchor=effective_root_anchor,
-        pid=server_pid,
-        started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        config_path=str(store.path),
-        log_path=str(log_path),
-        role=service_role,
-        role_epoch=service_role_epoch,
-        ost_dir=str(ost_dir),
-    )
-    store.services[name] = service
-    store.save()
 
     if args.json:
         print(json.dumps(service.to_dict(), ensure_ascii=False, indent=2))
@@ -1199,11 +1216,13 @@ def _purge_targets(service: Service) -> List[Path]:
     for value in raw:
         if not value:
             continue
-        path = Path(value).expanduser().resolve(strict=False)
+        raw_p = Path(value).expanduser()
+        path = raw_p if raw_p.is_symlink() else (raw_p.parent.resolve(strict=False) / raw_p.name)
         if path not in seen:
             seen.add(path)
             targets.append(path)
-    base = _base_dir(service.name).resolve(strict=False)
+    base_raw = _base_dir(service.name)
+    base = base_raw if base_raw.is_symlink() else (base_raw.parent.resolve(strict=False) / base_raw.name)
     if base not in seen:
         targets.append(base)
     return targets
@@ -1377,6 +1396,31 @@ def _request_stop(state_dir: Path) -> bool:
         return False
 
 
+def _process_matches_dfs(pid: int) -> bool:
+    """POSIX で対象 PID が dfs プロセスであることを確認し、PID 再利用による誤殺を防ぐ。"""
+    if sys.platform == "win32" or pid <= 0:
+        return True
+    proc_cmd = Path(f"/proc/{pid}/cmdline")
+    if proc_cmd.is_file():
+        try:
+            cmdline = proc_cmd.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            return "dfs" in cmdline
+        except OSError:
+            return False
+    try:
+        res = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return "dfs" in res.stdout
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return False
+
+
 def _recorded_server_is_alive(service: Service) -> bool:
     """PID と serve.pid の一致を確認し、記録されたサーバプロセスかを判定する。"""
     if not _process_alive(service.pid):
@@ -1387,7 +1431,9 @@ def _recorded_server_is_alive(service: Service) -> bool:
         )
     except (OSError, ValueError):
         return False
-    return recorded == service.pid
+    if recorded != service.pid:
+        return False
+    return _process_matches_dfs(service.pid)
 
 
 def _stop_process(s: Service) -> bool:
@@ -1400,10 +1446,11 @@ def _stop_process(s: Service) -> bool:
             return not _process_alive(s.pid)
         # POSIXではdetached serverが親に回収されず、ゾンビの間は
         # _process_alive()が真を返すため、待受終了かつポート解放を停止完了とする。
+        check_host = "127.0.0.1" if s.bind in ("0.0.0.0", "::", "") else s.bind
         return (
             not s.is_running()
-            and is_port_free(s.registry_port, allow_reuse=True)
-            and is_port_free(s.ost_port, allow_reuse=True)
+            and is_port_free(s.registry_port, host=check_host, allow_reuse=True)
+            and is_port_free(s.ost_port, host=check_host, allow_reuse=True)
         )
 
     # まずは穏当に。サーバは stop.request を見て httpd.shutdown() し、

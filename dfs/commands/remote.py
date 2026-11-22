@@ -6,6 +6,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import shlex
 import socket
@@ -94,7 +95,7 @@ def _probe_remote_status(remote: _cm.Remote) -> Dict[str, Any]:
                 status["role"] = "root"
             elif anchor:
                 status["role"] = "domain"
-            status["paths_count"] = len(paths) if isinstance(paths, dict) else 0
+            status["paths_count"] = len(paths) if isinstance(paths, (list, dict)) else 0
             if remote.root_pubkey and server_pub:
                 status["pubkey_match"] = (remote.root_pubkey == server_pub)
         except Exception as e:  # noqa: BLE001
@@ -164,7 +165,7 @@ def _probe_root_dfs_domain(domain: str) -> Dict[str, Any]:
                 paths = info.get("paths")
                 status["l2_ok"] = True
                 status["root_anchor"] = str(info.get("root_anchor") or status["path"])
-                status["paths_count"] = len(paths) if isinstance(paths, dict) else 0
+                status["paths_count"] = len(paths) if isinstance(paths, (list, dict)) else 0
             except Exception as e:  # noqa: BLE001
                 status["l2_ok"] = False
                 status["l2_error"] = str(e)
@@ -774,7 +775,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
 
         registries = list(info["registries"])
         role_epoch = int(info["role_epoch"])
-        if info.get("use_candidacy"):
+        if info.get("use_candidacy") or getattr(args, "candidacy", False):
             try:
                 disc = fetch_candidacy(
                     registries,
@@ -842,7 +843,14 @@ def cmd_invite(args: argparse.Namespace) -> int:
                 raise _cm.UsageError(
                     f"既存の鍵ファイルが既に存在するため上書きを拒否しました: {eph_key_path}"
                 )
-            eph_key_path.write_text(write_info["priv_key"], encoding="utf-8")
+            fd = os.open(eph_key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                raw_k = write_info["priv_key"].encode("utf-8")
+                written = 0
+                while written < len(raw_k):
+                    written += os.write(fd, raw_k[written:])
+            finally:
+                os.close(fd)
             restrict_to_owner(eph_key_path)
             eph_pub_path.write_text(write_info["pub_key"] + "\n", encoding="utf-8")
             write_workdir = (
@@ -1254,13 +1262,12 @@ def cmd_quit(args: argparse.Namespace) -> int:
         if isinstance(cfg, dict):
             prev_join = str(cfg.get("join") or "")
             if prev_join or cfg.get("relay_node") or cfg.get("relay_token"):
+                from dfs.private_io import write_private_json
+
                 cfg["join"] = ""
                 cfg["relay_node"] = ""
                 cfg["relay_token"] = ""
-                cfg_file.write_text(
-                    json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
+                write_private_json(cfg_file, cfg)
                 cleared_svc = True
                 print(f"[dfscli] dfssvc ({svc_name}) の参加設定 ({prev_join or 'relay'}) を解除しました")
 
@@ -1280,13 +1287,12 @@ def cmd_quit(args: argparse.Namespace) -> int:
         if rname not in store.names():
             continue
         r = store.get(rname)
-        if r.workdir:
-            cache_file = Path(r.workdir).expanduser() / ".clayfs" / "transport_cache.json"
-            if cache_file.is_file():
-                try:
-                    cache_file.unlink()
-                except OSError:
-                    pass
+        cache_file = r.resolved_workdir() / ".clayfs" / "transport_cache.json"
+        if cache_file.is_file():
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
         if store.delete(rname):
             removed_remotes.append(rname)
             print(f"[dfscli] リモート {rname!r} と接続キャッシュを削除しました")

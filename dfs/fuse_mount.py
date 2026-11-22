@@ -254,11 +254,11 @@ class LocalTreeFuse:
         offset: int,
         fh: int | None = None,
     ) -> bytes:
-        fd = self._get_fd(fh)
-        if fd is not None:
-            if hasattr(os, "pread"):
-                return os.pread(fd, size, offset)
-            with self._lock:
+        with self._lock:
+            fd = self._get_fd(fh)
+            if fd is not None:
+                if hasattr(os, "pread"):
+                    return os.pread(fd, size, offset)
                 os.lseek(fd, offset, os.SEEK_SET)
                 return os.read(fd, size)
         target = self._path(path)
@@ -281,9 +281,14 @@ class LocalTreeFuse:
             target = self._path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             no_follow = getattr(os, "O_NOFOLLOW", 0)
+            open_flags = os.O_CREAT | os.O_RDWR | no_follow
+            if flags & os.O_EXCL:
+                open_flags |= os.O_EXCL
+            else:
+                open_flags |= os.O_TRUNC
             fd = os.open(
                 target,
-                os.O_CREAT | os.O_RDWR | os.O_TRUNC | no_follow,
+                open_flags,
                 mode & 0o777,
             )
             return self._alloc_fh(fd)
@@ -298,10 +303,9 @@ class LocalTreeFuse:
         with self._lock:
             self._mark_dirty()
             fd = self._get_fd(fh)
-        if fd is not None:
-            if hasattr(os, "pwrite"):
-                return os.pwrite(fd, data, offset)
-            with self._lock:
+            if fd is not None:
+                if hasattr(os, "pwrite"):
+                    return os.pwrite(fd, data, offset)
                 os.lseek(fd, offset, os.SEEK_SET)
                 return os.write(fd, data)
         with self._lock:
@@ -317,14 +321,18 @@ class LocalTreeFuse:
             finally:
                 os.close(temp_fd)
 
+    def _schedule_meta_flush(self) -> None:
+        if self.sync_delay > 0:
+            self._schedule_flush()
+
     def truncate(self, path: str, length: int, fh: int | None = None) -> None:
         with self._lock:
             self._mark_dirty()
             fd = self._get_fd(fh)
-        if fd is not None:
-            os.ftruncate(fd, length)
-            return
-        with self._lock:
+            if fd is not None:
+                os.ftruncate(fd, length)
+                self._schedule_meta_flush()
+                return
             target = self._path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             no_follow = getattr(os, "O_NOFOLLOW", 0)
@@ -333,6 +341,7 @@ class LocalTreeFuse:
                 os.ftruncate(temp_fd, length)
             finally:
                 os.close(temp_fd)
+            self._schedule_meta_flush()
 
     def unlink(self, path: str) -> None:
         with self._lock:
@@ -341,16 +350,19 @@ class LocalTreeFuse:
                 self._path(path).unlink()
             except FileNotFoundError:
                 raise OSError(errno.ENOENT, os.strerror(errno.ENOENT))
+            self._schedule_meta_flush()
 
     def mkdir(self, path: str, mode: int) -> None:
         with self._lock:
             self._mark_dirty()
             self._path(path).mkdir(mode=mode)
+            self._schedule_meta_flush()
 
     def rmdir(self, path: str) -> None:
         with self._lock:
             self._mark_dirty()
             self._path(path).rmdir()
+            self._schedule_meta_flush()
 
     def rename(self, old: str, new: str) -> None:
         with self._lock:
@@ -359,6 +371,7 @@ class LocalTreeFuse:
             dst = self._path(new)
             dst.parent.mkdir(parents=True, exist_ok=True)
             src.rename(dst)
+            self._schedule_meta_flush()
 
     def chmod(self, path: str, mode: int) -> None:
         with self._lock:
@@ -367,15 +380,19 @@ class LocalTreeFuse:
             if target.is_symlink():
                 raise OSError(errno.ENOENT, os.strerror(errno.ENOENT))
             os.chmod(target, mode & 0o777)
+            self._schedule_meta_flush()
 
     def utimens(self, path: str, times: Optional[tuple[float, float]] = None) -> None:
         with self._lock:
             self._mark_dirty()
             target = self._path(path)
+            if target.is_symlink():
+                raise OSError(errno.ENOENT, os.strerror(errno.ENOENT))
             if times is None:
                 os.utime(target, None)
             else:
                 os.utime(target, (times[0], times[1]))
+            self._schedule_meta_flush()
 
     def getxattr(self, path: str, name: str, position: int = 0) -> bytes:
         value = get_raw_xattr(self._path(path), name)
@@ -395,9 +412,11 @@ class LocalTreeFuse:
             self._mark_dirty()
             if not set_raw_xattr(self._path(path), name, value):
                 raise OSError(errno.ENOTSUP, "xattr is not supported")
+            self._schedule_meta_flush()
 
     def removexattr(self, path: str, name: str) -> None:
         with self._lock:
             self._mark_dirty()
             if not remove_raw_xattr(self._path(path), name):
                 raise OSError(errno.ENODATA, os.strerror(errno.ENODATA))
+            self._schedule_meta_flush()

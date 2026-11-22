@@ -86,6 +86,8 @@ class RelayRequest:
     content_type: str
     body: bytes
     headers: Dict[str, str] = field(default_factory=dict)
+    expires_at: float = 0.0
+    cancelled: bool = False
     event: threading.Event = field(default_factory=threading.Event)
     status: int = 502
     resp_content_type: str = "application/json"
@@ -142,17 +144,20 @@ class RelayHub:
         for nid in expired:
             del self._nodes[nid]
 
-    def _get_or_create_slot(self, node_id: str) -> _NodeSlot:
+    def _get_or_create_slot_locked(self, node_id: str) -> _NodeSlot:
         validate_node_id(node_id)
+        self._prune_expired_locked()
+        slot = self._nodes.get(node_id)
+        if slot is None:
+            if len(self._nodes) >= self.max_nodes:
+                raise RelayError("Relay hub node capacity exceeded")
+            slot = _NodeSlot()
+            self._nodes[node_id] = slot
+        return slot
+
+    def _get_or_create_slot(self, node_id: str) -> _NodeSlot:
         with self._lock:
-            self._prune_expired_locked()
-            slot = self._nodes.get(node_id)
-            if slot is None:
-                if len(self._nodes) >= self.max_nodes:
-                    raise RelayError("Relay hub node capacity exceeded")
-                slot = _NodeSlot()
-                self._nodes[node_id] = slot
-            return slot
+            return self._get_or_create_slot_locked(node_id)
 
     def pull_next(
         self,
@@ -161,8 +166,8 @@ class RelayHub:
         observed_ip: str = "",
         direct_endpoints: Optional[Sequence[str]] = None,
     ) -> Optional[RelayRequest]:
-        slot = self._get_or_create_slot(node_id)
         with self._lock:
+            slot = self._get_or_create_slot_locked(node_id)
             slot.last_seen = time.monotonic()
             slot.active_pullers += 1
             if observed_ip:
@@ -171,15 +176,25 @@ class RelayHub:
                 cleaned = [str(ep).strip() for ep in direct_endpoints if str(ep).strip()]
                 if cleaned:
                     slot.direct_endpoints = cleaned
+        deadline = time.monotonic() + max(0.1, float(wait_seconds))
         try:
-            req = slot.pending.get(timeout=max(0.1, float(wait_seconds)))
-            with self._lock:
-                slot.last_seen = time.monotonic()
-            return req
-        except queue.Empty:
-            with self._lock:
-                slot.last_seen = time.monotonic()
-            return None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    with self._lock:
+                        slot.last_seen = time.monotonic()
+                    return None
+                try:
+                    req = slot.pending.get(timeout=remaining)
+                except queue.Empty:
+                    with self._lock:
+                        slot.last_seen = time.monotonic()
+                    return None
+                if req.cancelled or (req.expires_at > 0 and time.monotonic() >= req.expires_at):
+                    continue
+                with self._lock:
+                    slot.last_seen = time.monotonic()
+                return req
         finally:
             with self._lock:
                 slot.active_pullers = max(0, slot.active_pullers - 1)
@@ -227,6 +242,7 @@ class RelayHub:
                 raise RelayNodeOfflineError(f"Relay node {node_id!r} is offline")
             if slot.pending.qsize() >= self.max_pending_per_node:
                 raise RelayError(f"Relay node {node_id!r} pending queue is full")
+            eff_timeout = max(0.5, float(timeout))
             req = RelayRequest(
                 id=uuid.uuid4().hex,
                 method=method.upper(),
@@ -234,11 +250,13 @@ class RelayHub:
                 content_type=content_type or "application/octet-stream",
                 body=body,
                 headers=dict(headers or {}),
+                expires_at=time.monotonic() + eff_timeout,
             )
             slot.inflight[req.id] = req
             slot.pending.put(req)
 
-        if not req.event.wait(timeout=max(0.5, float(timeout))):
+        if not req.event.wait(timeout=eff_timeout):
+            req.cancelled = True
             with self._lock:
                 if slot is not None:
                     slot.inflight.pop(req.id, None)
@@ -319,10 +337,15 @@ class RelayHub:
                 seen.add(ep)
                 candidates.append({"type": "host", "endpoint": ep, "priority": 100})
         if observed_ip:
+            obs_host = (
+                f"[{observed_ip}]"
+                if ":" in observed_ip and not observed_ip.startswith("[")
+                else observed_ip
+            )
             for ep in direct_eps:
                 parts = urlsplit(ep)
                 if parts.scheme in ("http", "https") and parts.port:
-                    srflx_ep = f"{parts.scheme}://{observed_ip}:{parts.port}{parts.path.rstrip('/')}"
+                    srflx_ep = f"{parts.scheme}://{obs_host}:{parts.port}{parts.path.rstrip('/')}"
                     if srflx_ep not in seen:
                         seen.add(srflx_ep)
                         candidates.append({"type": "srflx", "endpoint": srflx_ep, "priority": 50})
@@ -643,14 +666,17 @@ class RelayAgent:
                 "Content-Type": content_type or "application/octet-stream",
                 "Content-Length": str(len(body)),
                 "Connection": "close",
+                "X-Forwarded-For": f"relay:{self.node_id}",
             }
             if extra_headers:
                 for k, v in extra_headers.items():
-                    if k.lower() in ("x-dfs-ost-auth",) and v:
+                    if k.lower() in ("x-dfs-ost-auth", "x-forwarded-for") and v:
                         headers[k] = str(v)
             conn.request(method, path, body=body, headers=headers)
             resp = conn.getresponse()
-            resp_body = resp.read()
+            resp_body = resp.read(64 * 1024 * 1024 + 1)
+            if len(resp_body) > 64 * 1024 * 1024:
+                raise RelayError("Local forwarded response exceeds 64 MiB")
             resp_ct = resp.getheader("Content-Type") or "application/octet-stream"
             return resp.status, resp_ct, resp_body
         finally:
@@ -723,9 +749,20 @@ class RelayAgent:
                 }
                 if self.token:
                     reply_headers["X-DFS-Relay-Token"] = self.token
-                relay_conn.request("POST", reply_path, body=reply_frame, headers=reply_headers)
-                reply_resp = relay_conn.getresponse()
-                reply_resp.read()
+                try:
+                    relay_conn.request("POST", reply_path, body=reply_frame, headers=reply_headers)
+                    reply_resp = relay_conn.getresponse()
+                    reply_resp.read(1024 * 1024)
+                except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException):
+                    # Hub keep-alive が切れていた場合は新しい接続で 1 回再送する
+                    try:
+                        relay_conn.close()
+                    except Exception:
+                        pass
+                    relay_conn = self._open_relay_conn(max(self.pull_timeout, 30.0))
+                    relay_conn.request("POST", reply_path, body=reply_frame, headers=reply_headers)
+                    reply_resp = relay_conn.getresponse()
+                    reply_resp.read(1024 * 1024)
             except (
                 OSError,
                 TimeoutError,
@@ -782,7 +819,11 @@ def _hub_base_url(url: str) -> str:
     parts = urlsplit(str(url or "").strip())
     if not parts.scheme or not parts.netloc:
         return ""
-    return f"{parts.scheme}://{parts.netloc}"
+    path = parts.path or ""
+    idx = path.find("/relay/")
+    prefix = path[:idx] if idx >= 0 else path
+    prefix = prefix.rstrip("/")
+    return f"{parts.scheme}://{parts.netloc}{prefix}"
 
 
 def _probe_ttl_seconds(override: Optional[float]) -> float:
@@ -825,10 +866,10 @@ def probe_hub_rtt(
     start = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
-            if resp.status in (200, 401, 403, 404):
+            if resp.status in (200, 401, 403):
                 rtt = time.monotonic() - start
     except urllib.error.HTTPError as e:
-        if e.code in (200, 401, 403, 404):
+        if e.code in (200, 401, 403):
             rtt = time.monotonic() - start
     except Exception:
         rtt = None

@@ -735,6 +735,9 @@ def make_registry_http_handler(
                 except ValueError as e:
                     self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
                     return True
+                except RelayError as e:
+                    self._send_json(503, {"error_type": "ServiceUnavailableError", "message": str(e)})
+                    return True
                 self._send_json(200, payload)
                 return True
             if parsed.path == "/_ice/announce":
@@ -760,6 +763,9 @@ def make_registry_http_handler(
                     )
                 except (ValueError, TypeError) as e:
                     self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+                except RelayError as e:
+                    self._send_json(503, {"error_type": "ServiceUnavailableError", "message": str(e)})
                     return True
                 self._send_json(200, payload)
                 return True
@@ -797,6 +803,9 @@ def make_registry_http_handler(
                 except (ValueError, TypeError) as e:
                     self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
                     return True
+                except RelayError as e:
+                    self._send_json(503, {"error_type": "ServiceUnavailableError", "message": str(e)})
+                    return True
                 self._send_json(200, relay_hub.get_allowed_peers())
                 return True
             return False
@@ -833,6 +842,9 @@ def make_registry_http_handler(
                     )
                 except ValueError as e:
                     self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
+                    return True
+                except RelayError as e:
+                    self._send_json(503, {"error_type": "ServiceUnavailableError", "message": str(e)})
                     return True
                 finally:
                     self.connection.settimeout(self.request_timeout)
@@ -889,6 +901,9 @@ def make_registry_http_handler(
                 self._send_json(404, {"error_type": "RegistryError", "message": "Malformed relay path"})
                 return True
             target_path = "/" + sub_path
+            if target_path.startswith("/_"):
+                self._send_json(403, {"error_type": "RegistryError", "message": "Internal endpoints cannot be accessed via relay"})
+                return True
             max_bytes = (
                 MAX_OST_HTTP_BODY_BYTES
                 if target_path.startswith("/v1/ost/")
@@ -898,33 +913,28 @@ def make_registry_http_handler(
             if body is None:
                 return True
             self.connection.settimeout(45.0)
-            fwd_headers: Dict[str, str] = {}
+            fwd_headers: Dict[str, str] = {
+                "X-Forwarded-For": self._client_observed_ip() or "relay",
+            }
             ost_auth_hdr = self.headers.get("X-DFS-OST-Auth")
             if ost_auth_hdr:
                 fwd_headers["X-DFS-OST-Auth"] = ost_auth_hdr
             try:
-                if fwd_headers:
-                    status, ct, resp_body = relay_hub.forward(
-                        node_id=node_id,
-                        method=method,
-                        sub_path=target_path,
-                        content_type=self.headers.get("Content-Type", "application/octet-stream"),
-                        body=body,
-                        headers=fwd_headers,
-                    )
-                else:
-                    status, ct, resp_body = relay_hub.forward(
-                        node_id=node_id,
-                        method=method,
-                        sub_path=target_path,
-                        content_type=self.headers.get("Content-Type", "application/octet-stream"),
-                        body=body,
-                    )
+                status, ct, resp_body = relay_hub.forward(
+                    node_id=node_id,
+                    method=method,
+                    sub_path=target_path,
+                    content_type=self.headers.get("Content-Type", "application/octet-stream"),
+                    body=body,
+                    headers=fwd_headers,
+                )
                 self._send_binary(status, resp_body, content_type=ct)
             except RelayNodeOfflineError as e:
                 self._send_json(503, {"error_type": "ServiceUnavailableError", "message": str(e)})
             except RelayTimeoutError as e:
                 self._send_json(504, {"error_type": "ServiceUnavailableError", "message": str(e)})
+            except RelayError as e:
+                self._send_json(429, {"error_type": "ServiceUnavailableError", "message": str(e)})
             except ValueError as e:
                 self._send_json(400, {"error_type": "RegistryError", "message": str(e)})
             finally:
@@ -1064,16 +1074,26 @@ def make_registry_http_handler(
                 self.connection.settimeout(self.request_timeout)
 
         def _read_json_body(self) -> Optional[Dict[str, Any]]:
+            te = (self.headers.get("Transfer-Encoding") or "").strip().lower()
+            if te:
+                self.close_connection = True
+                self._send_json(
+                    400,
+                    {"error_type": "RegistryError", "message": "Transfer-Encoding is not supported"},
+                )
+                return None
             raw_length = self.headers.get("Content-Length", "0")
             try:
                 length = int(raw_length)
             except (TypeError, ValueError):
+                self.close_connection = True
                 self._send_json(
                     400,
                     {"error_type": "RegistryError", "message": "Invalid Content-Length"},
                 )
                 return None
             if length < 0 or length > MAX_REGISTRY_BODY_BYTES:
+                self.close_connection = True
                 self._send_json(
                     413,
                     {
@@ -1144,10 +1164,19 @@ def make_registry_http_handler(
                             )
                         if pstate.auto_delegate_key is None or not pstate.auto_delegate_key.is_file():
                             raise RegistryError("Auto-delegation is not enabled on this registry")
-                        peer_ip = str(self.client_address[0]) if self.client_address else ""
+                        peer_ip = self._client_observed_ip() or (
+                            str(self.client_address[0]) if self.client_address else ""
+                        )
                         if peer_ip and not self._is_loopback_direct():
                             now_m = time.monotonic()
                             with auto_delegate_lock:
+                                if len(auto_delegate_hits) > 1024:
+                                    stale_ips = [
+                                        ip for ip, ts in auto_delegate_hits.items()
+                                        if not any(now_m - t < 60.0 for t in ts)
+                                    ]
+                                    for ip in stale_ips:
+                                        del auto_delegate_hits[ip]
                                 hits = [t for t in auto_delegate_hits.get(peer_ip, []) if now_m - t < 60.0]
                                 if len(hits) >= auto_delegate_limit:
                                     raise RegistryError("Auto-delegate rate limit exceeded")
@@ -1560,7 +1589,14 @@ def cmd_serve(args: argparse.Namespace) -> None:
         ost_auth_verifier=_verify_ost_write,
     )
     print("[dfs serve] startup: binding L2 HTTP", file=sys.stderr, flush=True)
-    httpd = BoundedThreadingHTTPServer((args.bind, args.registry_port), handler)
+    max_http_workers = (
+        int(os.environ.get("DFS_MAX_HTTP_CONNECTIONS", "512") or "512")
+        if relay_hub is not None
+        else MAX_REGISTRY_CONNECTIONS
+    )
+    httpd = BoundedThreadingHTTPServer(
+        (args.bind, args.registry_port), handler, max_workers=max_http_workers
+    )
 
     relay_agents: List[RelayAgent] = []
     if relay_urls and relay_node:
@@ -1646,6 +1682,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 if relay_urls:
                     from .relay import register_p2p_peer
 
+                    merged_init_pids: set[str] = set()
                     for r_url in relay_urls:
                         try:
                             info = register_p2p_peer(
@@ -1660,10 +1697,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                 timeout=1.5,
                             )
                             peer_ids = info.get("peer_ids")
-                            if isinstance(peer_ids, list) and peer_ids:
-                                p2p_manager.set_allowed_peer_ids(peer_ids)
+                            if isinstance(peer_ids, list):
+                                merged_init_pids.update(str(x).strip() for x in peer_ids if str(x).strip())
                         except Exception:
                             pass
+                    if merged_init_pids:
+                        p2p_manager.set_allowed_peer_ids(sorted(merged_init_pids))
                 if root_pubkey:
                     p2p_manager.provide_domain(root_pubkey, timeout=5.0, background=True)
         except Exception:
@@ -1749,6 +1788,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                         cur_addrs = p2p_manager.effective_addrs(relay_addrs=hub_relays)
                         if tuple(cur_addrs) != last_registered_addrs:
                             any_ok = False
+                            merged_reg_pids: set[str] = set(peer_ids)
                             for rurl in relay_urls:
                                 try:
                                     reg_info = register_p2p_peer(
@@ -1764,10 +1804,14 @@ def cmd_serve(args: argparse.Namespace) -> None:
                                     )
                                     any_ok = True
                                     reg_peer_ids = reg_info.get("peer_ids")
-                                    if isinstance(reg_peer_ids, list) and reg_peer_ids:
-                                        p2p_manager.set_allowed_peer_ids(reg_peer_ids)
+                                    if isinstance(reg_peer_ids, list):
+                                        merged_reg_pids.update(
+                                            str(x).strip() for x in reg_peer_ids if str(x).strip()
+                                        )
                                 except Exception:
                                     pass
+                            if merged_reg_pids:
+                                p2p_manager.set_allowed_peer_ids(sorted(merged_reg_pids))
                             if any_ok:
                                 last_registered_addrs = tuple(cur_addrs)
                                 disc = getattr(getattr(p2p_manager, "_relay_discovery", None), "_discovered_relays", {}) or {}
@@ -1909,6 +1953,15 @@ def cmd_serve(args: argparse.Namespace) -> None:
         print(f"[dfs serve] libp2p P2P  : {p2p_manager.peer_id} ({len(p2p_manager.addrs)} addrs)")
     if subscribe_ids:
         print(f"[dfs serve] P2P Sub     : {', '.join(sorted(subscribe_ids))}")
+    import signal
+
+    def _on_sigterm(_signum, _frame) -> None:
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        pass
     try:
         httpd_thread.join()
     except KeyboardInterrupt:

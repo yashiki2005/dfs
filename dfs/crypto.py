@@ -264,18 +264,20 @@ def generate_self_signed_tls_cert(
     key.parent.mkdir(parents=True, exist_ok=True)
     openssl_bin = shutil.which("openssl")
     if openssl_bin:
+        safe_cn = str(cn or "dfs-ost").replace("/", "_")
         try:
             subprocess.run(
                 [
                     openssl_bin, "req", "-x509", "-newkey", "rsa:2048",
                     "-keyout", str(key), "-out", str(cert),
-                    "-days", str(int(days)), "-nodes", "-subj", f"/CN={cn}",
+                    "-days", str(int(days)), "-nodes", "-subj", f"/CN={safe_cn}",
                 ],
                 check=True,
                 capture_output=True,
                 stdin=subprocess.DEVNULL,
                 timeout=60,
             )
+            os.chmod(key, 0o600)
             return
         except FileNotFoundError:
             pass
@@ -401,7 +403,17 @@ def _ssh_verify_ed25519(
     try:
         from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError:
+        return None
 
+    parts = pubkey_str.strip().split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        # OpenSSH allowed_signers オプション付きや別鍵形式は in-process 非対応
+        if parts and parts[0].startswith(("ssh-rsa", "ecdsa-sha2-", "sk-")):
+            return None
+        return False
+
+    try:
         expected_key = _read_ed25519_public_key(pubkey_str)
         signed_key, sig_bytes = _read_sshsig_signature(signature, namespace)
         if not hmac.compare_digest(expected_key, signed_key):
@@ -412,10 +424,8 @@ def _ssh_verify_ed25519(
         except InvalidSignature:
             return False
         return True
-    except ImportError:
-        return None
     except (ValueError, TypeError, binascii.Error):
-        return None
+        return False
 
 
 def sshenc_encode(payload: bytes, namespace: str, signature: bytes, pubkey_blob: bytes) -> str:
@@ -501,7 +511,7 @@ def ssh_verify(
     フォールバックする。
     """
     clean_pub = pubkey_str.strip()
-    if not clean_pub or "\n" in clean_pub:
+    if not clean_pub or "\n" in clean_pub or "\r" in clean_pub:
         return False
     if not identity or any(ch in "\r\n\x00" or ord(ch) < 32 or ord(ch) == 127 for ch in identity):
         return False
@@ -777,6 +787,8 @@ class ContentAddressedCrypto:
             raise ChunkIntegrityError(f"AEAD authentication failed (A2 or wrong key): {e}") from e
 
         if codec == self.CODEC_ZSTD:
+            if plain_size > 256 * 1024 * 1024:
+                raise CompressionError(f"zstd plain_size exceeds limit: {plain_size}")
             try:
                 import zstandard as zstd
 

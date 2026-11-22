@@ -155,7 +155,13 @@ def _handle_list_frame(frame: bytes, store: Any) -> bytes:
 def _parse_wire_ids(raw: bytes, count: int) -> List[str]:
     if count > MAX_BATCH_ITEMS or len(raw) != count * 64:
         raise ValueError("Invalid wire_id frame")
-    return [raw[i * 64 : (i + 1) * 64].decode("ascii") for i in range(count)]
+    wids: List[str] = []
+    for i in range(count):
+        wid = raw[i * 64 : (i + 1) * 64].decode("ascii")
+        if any(ch not in "0123456789abcdef" for ch in wid):
+            raise ValueError(f"Invalid wire_id hex: {wid!r}")
+        wids.append(wid)
+    return wids
 
 
 class Libp2pChunkServer:
@@ -1074,7 +1080,8 @@ class Libp2pHostManager:
                 return await _read_exact(stream, frame_len)
             finally:
                 try:
-                    await stream.close()
+                    with trio.CancelScope(shield=True):
+                        await stream.close()
                 except Exception:
                     pass
         if cs.cancelled_caught:
@@ -1283,8 +1290,8 @@ class Libp2pPeerClient:
         _require_libp2p()
         self.manager = manager
         self.peer_id = str(peer_id).strip()
-        self.addrs = [str(a).strip() for a in addrs if str(a).strip()]
-        self.relay_addrs = [str(a).strip() for a in relay_addrs if str(a).strip()]
+        self.addrs = [str(a).strip() for a in (addrs or ()) if str(a).strip()]
+        self.relay_addrs = [str(a).strip() for a in (relay_addrs or ()) if str(a).strip()]
         self.owns_manager = bool(owns_manager)
         self.timeout = float(timeout)
         self.endpoint_uri = f"libp2p://{self.peer_id}"

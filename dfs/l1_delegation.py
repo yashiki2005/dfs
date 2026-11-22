@@ -158,11 +158,16 @@ def verify_delegation_chain(
     名簿が別サブツリーのチェーンを返しても、クライアントがそれを要求パスとして
     受け入れないための束縛になる。
     """
-    if not chain:
+    if not isinstance(chain, (list, tuple)) or not chain:
         raise DelegationError("Delegation chain cannot be empty (Invariant 5)")
+    if not isinstance(chain[0], dict) or not isinstance(chain[0].get("payload"), dict):
+        raise DelegationError("Malformed delegation envelope in chain (Invariant 5)")
 
-    norm_root = normalize_path(root_anchor_path)
-    first_parent = chain[0].get("payload", {}).get("parent")
+    try:
+        norm_root = normalize_path(root_anchor_path)
+    except ValueError as e:
+        raise DelegationError(f"Invalid root_anchor_path: {e}") from e
+    first_parent = chain[0]["payload"].get("parent")
     if first_parent != norm_root:
         raise DelegationError(
             f"Chain does not start at root anchor (Invariant 5): expected {norm_root!r}, got {first_parent!r}"
@@ -174,7 +179,9 @@ def verify_delegation_chain(
     last_payload: Optional[Dict[str, Any]] = None
 
     for idx, env in enumerate(chain):
-        parent_in_env = env.get("payload", {}).get("parent")
+        if not isinstance(env, dict) or not isinstance(env.get("payload"), dict):
+            raise DelegationError(f"Malformed delegation envelope at step {idx} (Invariant 5)")
+        parent_in_env = env["payload"].get("parent")
         if parent_in_env != curr_path:
             raise DelegationError(
                 f"Broken delegation chain at step {idx} (Invariant 5): expected parent {curr_path!r}, got {parent_in_env!r}"

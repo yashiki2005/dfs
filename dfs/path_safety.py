@@ -23,6 +23,10 @@ def _relative_parts(rel: str | os.PathLike[str]) -> tuple[str, ...]:
     raw = raw.replace("\\", "/")
     if raw.startswith("/"):
         raise UnsafePathError(f"Absolute path is not allowed here: {raw!r}")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        raise UnsafePathError(f"Path contains control character: {raw!r}")
+    if ":" in raw:
+        raise UnsafePathError(f"Path contains ':' (invalid/drive-relative): {raw!r}")
     parts = tuple(raw.split("/"))
     if not parts or any(part in ("", ".", "..") for part in parts):
         raise UnsafePathError(f"Invalid relative path: {raw!r}")

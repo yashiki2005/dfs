@@ -299,7 +299,7 @@ def _normalize_intermixed_archive_argv(argv: List[str]) -> List[str]:
     opts = []
     i = 0
     val_options = {
-        "--out", "--announce", "--version", "--secret", "--recovery",
+        "--out", "--announce", "--version", "--secret", "--recovery", "--format",
         "--torrent-client", "--torrent-timeout", "--root-pubkey", "--root-fingerprint",
     }
     while i < len(rest):

@@ -22,6 +22,11 @@ def _archive_registry_context(
     registry = cli_mod.RemoteRegistryClient(remote.registry_urls())
     path = _cm.resolve_path(remote, registry)
     if not remote.root_pubkey:
+        if not remote.allow_tofu:
+            raise _cm.UsageError(
+                f"Remote {remote.name!r} has no root_pubkey and allow_tofu=False; "
+                "pass --root-pubkey or --allow-tofu when creating the remote"
+            )
         info = registry.root_anchor_info()
         root_pubkey = str(info.get("root_pubkey", "") or "").strip()
         if not root_pubkey:
@@ -218,7 +223,13 @@ def cmd_archive(args: argparse.Namespace) -> int:
         store = _cm.RemoteStore()
         remote = store.get(args.remote_name)
         bundle = Path(args.source).expanduser()
-        descriptor_path = bundle.with_suffix(".archive.json")
+        base_str = str(bundle)
+        for ext in (".tar.zst", ".tar.gz", ".tgz", ".tar"):
+            if base_str.endswith(ext):
+                descriptor_path = Path(base_str[: -len(ext)] + ".archive.json")
+                break
+        else:
+            descriptor_path = bundle.with_suffix(".archive.json")
         try:
             descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
@@ -318,7 +329,10 @@ def cmd_archive(args: argparse.Namespace) -> int:
                 timeout=int(args.torrent_timeout),
             )
             bundle = _cm.locate_downloaded_bundle(out, descriptor)
-            meta = _cm.verify_bundle(bundle)
+            meta = _cm.verify_bundle(
+                bundle,
+                expected_root_pubkey=remote.root_pubkey or None,
+            )
         except _cm.ArchiveError as e:
             raise _cm.UsageError(f"archive fetch に失敗しました: {e}") from e
         print(f"archive     : {bundle}")
@@ -331,7 +345,10 @@ def cmd_archive(args: argparse.Namespace) -> int:
                 raise _cm.UsageError("archive fetch --dest には tree_secret が必要です")
             try:
                 restored = _cm.extract_bundle(
-                    bundle, Path(args.dest).expanduser(), secret
+                    bundle,
+                    Path(args.dest).expanduser(),
+                    secret,
+                    expected_root_pubkey=remote.root_pubkey or None,
                 )
             except _cm.ArchiveError as e:
                 raise _cm.UsageError(

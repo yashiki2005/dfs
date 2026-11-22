@@ -859,7 +859,10 @@ class MerkleTreeBuilder:
                 with os.fdopen(fd, "r+b") as existing_fh:
                     existing_fh.seek(0, os.SEEK_END)
                     existing_len = existing_fh.tell()
-                    if file_entry["size"] is not None and existing_len > int(file_entry["size"]):
+                    if file_entry["size"] is None and existing_len > 0:
+                        existing_fh.truncate(0)
+                        existing_len = 0
+                    elif file_entry["size"] is not None and existing_len > int(file_entry["size"]):
                         existing_fh.truncate(int(file_entry["size"]))
                         existing_len = int(file_entry["size"])
                     for chunk in file_entry["chunks"]:
@@ -889,6 +892,9 @@ class MerkleTreeBuilder:
                 for wire_id, blob in got.items():
                     for file_entry, chunk in refs_by_wire.get(wire_id, []):
                         target = file_entry["target"]
+                        offset = int(chunk.get("offset", 0))
+                        if (target, offset) in received_refs:
+                            continue
                         data = self.crypto.unpack_chunk(
                             chunk["plain_id"], wire_id, blob
                         )
@@ -896,7 +902,6 @@ class MerkleTreeBuilder:
                             raise ChunkIntegrityError(
                                 f"File chunk size mismatch for {target.name}"
                             )
-                        offset = int(chunk.get("offset", 0))
                         fd = _open_no_follow(target, os.O_RDWR)
                         with os.fdopen(fd, "r+b") as output:
                             output.seek(offset)
@@ -1221,16 +1226,10 @@ class L4LogClient:
         if self.pin_file:
             self.pin.save(self.pin_file)
 
-    def _verified_writer(self, del_env: Optional[Dict[str, Any]]) -> str:
-        """末端の委譲が root まで連鎖することを検証し、確定した writer を返す。
-
-        ``del_env`` には名簿が ``chain``（root 直下から末端まで）と ``root_anchor`` を
-        足して返す。root アンカー公開鍵は**手元の記録**（リモート定義）を使う。名簿が
-        返した値は使わない（相手から信頼の根を取ると、偽の root を作られて通る）。
-
-        root 公開鍵が未設定（TOFU 前）のときは、chain が 1 段でも root を名乗る場合は
-        検証できないため、名簿の主張をそのまま使う（互換のため）。設定済みなら必ず検証する。
-        """
+    def _verified_delegation(
+        self, del_env: Optional[Dict[str, Any]], *, now: Optional[int] = None
+    ) -> Tuple[str, Optional[int], Optional[int]]:
+        """末端の委譲が root まで連鎖することを検証し、``(writer, epoch, base_version)`` を返す。"""
         if del_env is None:
             if self.root_pubkey:
                 raise DelegationError(f"Missing delegation for {self.sub_path!r}")
@@ -1239,30 +1238,40 @@ class L4LogClient:
                     f"root_pubkey is not configured for {self.sub_path!r} (allow_tofu=False)"
                 )
             # TOFU 明示時のみ、未登録の間は自分の鍵で検証する。
-            return self.pub_key_str
+            return self.pub_key_str, None, None
 
         chain = del_env.get("chain") or []
         if not chain:
             # 名簿がチェーンを返さない（古い名簿）ときは、末端 1 つで検証を試みる。
             chain = [del_env]
-        root_anchor = del_env.get("root_anchor") or "/"
+        root_anchor = del_env.get("root_anchor")
+        if not isinstance(root_anchor, str) or not root_anchor.strip() or root_anchor.strip() == "/":
+            if self.root_pubkey:
+                raise DelegationError(f"Missing or invalid root_anchor for {self.sub_path!r}")
+            root_anchor = "/"
 
         if self.root_pubkey:
             leaf = verify_delegation_chain(
                 root_anchor_path=root_anchor,
                 root_anchor_pubkey=self.root_pubkey,
                 chain=chain,
-                now=int(time.time()),
+                now=int(time.time()) if now is None else int(now),
                 requested_path=self.sub_path,
             )
-            return str(leaf["writer"])
+            return str(leaf["writer"]), int(leaf["epoch"]), int(leaf["base_version"])
 
         if not self.allow_tofu:
             raise DelegationError(
                 f"root_pubkey is not configured for {self.sub_path!r}; refusing unverified registry writer"
             )
         # TOFU 明示時のみ: 検証できないので名簿の主張を使う（初回のみ通る経路）。
-        return str(del_env.get("payload", {}).get("writer") or self.pub_key_str)
+        raw_payload = del_env.get("payload")
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
+        return str(payload.get("writer") or self.pub_key_str), None, None
+
+    def _verified_writer(self, del_env: Optional[Dict[str, Any]]) -> str:
+        writer, _, _ = self._verified_delegation(del_env)
+        return writer
 
     def sync_head(
         self,
@@ -1299,11 +1308,22 @@ class L4LogClient:
         # 検証する。署名を検証する鍵は「名簿が名乗った writer」ではなく、この検証で
         # 確定した writer でなければならない（さもないと偽の委譲が通る）。
         writer_pub = expected_writer_pubkey
+        leaf_epoch: Optional[int] = None
+        leaf_base_version: Optional[int] = None
         if writer_pub is None:
-            writer_pub = self._verified_writer(del_env)
+            writer_pub, leaf_epoch, leaf_base_version = self._verified_delegation(del_env)
 
         if not ssh_verify(writer_pub, self.sub_path, NS_L4_LOG, raw_p, head_env["signature"]):
             raise ChunkIntegrityError("Remote head signature verification failed")
+
+        if leaf_epoch is not None and int(p["delegation_epoch"]) != leaf_epoch:
+            raise DelegationError(
+                f"Remote head delegation_epoch mismatch: expected {leaf_epoch}, got {p['delegation_epoch']}"
+            )
+        if leaf_base_version is not None and int(p["version"]) <= leaf_base_version:
+            raise DelegationError(
+                f"Remote head version {p['version']} is at or below delegation base_version {leaf_base_version}"
+            )
 
         # B6: 版番号の巻き戻し検出
         if p["version"] < self.pin.version:
@@ -1381,13 +1401,25 @@ class L4LogClient:
             verified_at = int(p["timestamp"])
         except (KeyError, TypeError, ValueError) as e:
             raise ChunkIntegrityError(f"Head has invalid timestamp: {e}") from e
+        root_anchor = (del_env or {}).get("root_anchor")
+        if not isinstance(root_anchor, str) or not root_anchor.strip() or root_anchor.strip() == "/":
+            raise DelegationError(f"Missing or invalid root_anchor for {self.sub_path!r}")
+        verify_now = int(time.time()) if version is None else verified_at
         leaf = verify_delegation_chain(
-            root_anchor_path=(del_env or {}).get("root_anchor") or "/",
+            root_anchor_path=root_anchor,
             root_anchor_pubkey=self.root_pubkey,
             chain=chain,
-            now=verified_at,
+            now=verify_now,
             requested_path=self.sub_path,
         )
+        if int(p.get("delegation_epoch", -1)) != int(leaf["epoch"]):
+            raise DelegationError(
+                f"Head delegation_epoch mismatch: expected {leaf['epoch']}, got {p.get('delegation_epoch')}"
+            )
+        if int(p.get("version", -1)) <= int(leaf["base_version"]):
+            raise DelegationError(
+                f"Head version {p.get('version')} is at or below delegation base_version {leaf['base_version']}"
+            )
         raw = canonical_json(p)
         if sha256_hex(raw) != head_env.get("entry_hash"):
             raise ChunkIntegrityError("Head entry_hash mismatch")
@@ -1397,13 +1429,15 @@ class L4LogClient:
             raise ChunkIntegrityError("Head signature verification failed")
         if loc_env is not None:
             loc_p = verify_locator_envelope(
-                loc_env, self.sub_path, leaf["writer"], verified_at
+                loc_env, self.sub_path, leaf["writer"], verify_now
             )
             if (
                 int(loc_p["head_version"]) != int(p["version"])
                 or loc_p["head_hash"] != head_env["entry_hash"]
             ):
                 raise ChunkIntegrityError("Locator does not match historical head")
+            if int(loc_p.get("delegation_epoch", -1)) != int(p["delegation_epoch"]):
+                raise ChunkIntegrityError("Locator delegation_epoch does not match historical head")
         self.last_delegation = del_env
         self.last_locator = loc_env
         return head_env, del_env, loc_env

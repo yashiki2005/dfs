@@ -82,15 +82,19 @@ def verify_locator_envelope(
     writer_pubkey: str,
     now: int,
 ) -> Dict[str, Any]:
-    if "payload" not in envelope or "signature" not in envelope:
+    if not isinstance(envelope, dict) or "payload" not in envelope or "signature" not in envelope:
         raise RegistryError("Malformed locator envelope")
     p = envelope["payload"]
+    sig = envelope["signature"]
+    if not isinstance(p, dict) or not isinstance(sig, str):
+        raise RegistryError("Malformed locator envelope")
     if p.get("path") != expected_path:
         raise RegistryError(f"Locator path mismatch: expected {expected_path!r}, got {p.get('path')!r}")
-    if now >= p.get("expires_at", 0):
+    exp = p.get("expires_at")
+    if not isinstance(exp, int) or isinstance(exp, bool) or now >= exp:
         raise RegistryError("Locator has expired")
     raw_bytes = canonical_json(p)
-    if not ssh_verify(writer_pubkey, expected_path, NS_L2_LOCATOR, raw_bytes, envelope["signature"]):
+    if not ssh_verify(writer_pubkey, expected_path, NS_L2_LOCATOR, raw_bytes, sig):
         raise RegistryError("Invalid L2 locator signature")
     return p
 
@@ -162,9 +166,7 @@ class DirectoryRegistryService:
                 parent_pub = self.root_anchor_pubkey
                 parent_exp = None
             elif parent in self.delegations:
-                parent_del = self.delegations[parent]["payload"]
-                if not (parent_del["issued_at"] <= now < parent_del["expires_at"]):
-                    raise DelegationError(f"Parent delegation {parent!r} has expired")
+                parent_del = self._verify_active_chain(parent, now)
                 parent_pub = parent_del["writer"]
                 parent_exp = parent_del["expires_at"]
             else:
@@ -204,13 +206,8 @@ class DirectoryRegistryService:
         with self._lock:
             self._ensure_online()
             norm_path = normalize_path(path)
-            del_env = self.delegations.get(norm_path)
-            if not del_env:
-                raise DelegationError(f"No active delegation registered for {norm_path!r}")
-
-            del_p = del_env["payload"]
-            if not (del_p["issued_at"] <= now < del_p["expires_at"]):
-                raise DelegationError(f"Active delegation for {norm_path!r} has expired")
+            del_p = self._verify_active_chain(norm_path, now)
+            del_env = self.delegations[norm_path]
 
             log_p = log_envelope["payload"]
             try:
@@ -310,12 +307,7 @@ class DirectoryRegistryService:
             except (KeyError, TypeError, ValueError) as e:
                 raise RegistryError(f"Invalid archive descriptor: {e}") from e
 
-            del_env = self.delegations.get(norm_path)
-            if not del_env:
-                raise DelegationError(f"No active delegation registered for {norm_path!r}")
-            del_payload = del_env["payload"]
-            if not (del_payload["issued_at"] <= now < del_payload["expires_at"]):
-                raise DelegationError(f"Active delegation for {norm_path!r} has expired")
+            del_payload = self._verify_active_chain(norm_path, now)
 
             selected = next(
                 (
@@ -549,10 +541,20 @@ class DirectoryRegistryService:
                 )
                 archives[version] = envelope
 
+            if prev_epoch > int(leaf["epoch"]):
+                raise DelegationError(
+                    f"Replication log epoch {prev_epoch} exceeds active chain epoch {leaf['epoch']}"
+                )
+
             existing = self.logs.get(norm_path, [])
             if len(existing) > len(logs):
                 # 複製名簿の方が進んでいる。古いバンドルで巻き戻さない。
                 return False
+            existing_del = self.delegations.get(norm_path)
+            if len(existing) == len(logs) and existing_del is not None:
+                existing_epoch = int(existing_del.get("payload", {}).get("epoch", 0))
+                if int(leaf["epoch"]) < existing_epoch:
+                    return False
             for i, old_env in enumerate(existing):
                 if old_env.get("entry_hash") != logs[i].get("entry_hash"):
                     raise ConflictError("Replication fork detected")
@@ -578,10 +580,29 @@ class DirectoryRegistryService:
                 self.archives.setdefault(norm_path, {}).update(archives)
             return True
 
+    def _verify_active_chain(self, path: str, now: int) -> Dict[str, Any]:
+        norm_path = normalize_path(path)
+        if norm_path not in self.delegations:
+            raise DelegationError(f"No active delegation registered for {norm_path!r}")
+        chain = self.delegation_chain(norm_path)
+        return verify_delegation_chain(
+            root_anchor_path=self.root_anchor_path,
+            root_anchor_pubkey=self.root_anchor_pubkey,
+            chain=chain,
+            now=now,
+            requested_path=norm_path,
+        )
+
     def _store_replica_chain(self, chain: List[Dict[str, Any]]) -> None:
         for env in chain:
             p = env.get("payload", {})
-            self.delegations[normalize_path(p["path"])] = env
+            anc_path = normalize_path(p["path"])
+            existing = self.delegations.get(anc_path)
+            if existing is not None:
+                existing_epoch = int(existing.get("payload", {}).get("epoch", 0))
+                if int(p.get("epoch", 0)) < existing_epoch:
+                    continue
+            self.delegations[anc_path] = env
 
     def resolve(
         self,

@@ -118,6 +118,10 @@ def _query_rrset(resolver: Any, name: Any, rdtype: str):
     except Exception as e:  # noqa: BLE001 - dnspython の例外型は環境で揺れる
         raise DiscoveryError(f"Cannot resolve {name} {rdtype}: {e}") from e
 
+    if answer.qname != answer.canonical_name:
+        raise DiscoveryError(
+            f"DNSSEC CNAME redirect rejected for {name} {rdtype}: {answer.canonical_name}"
+        )
     want = dns.rdatatype.from_text(rdtype)
     rrset = None
     sigset = None
@@ -217,7 +221,7 @@ def _validated_zone_keys(
         raise DiscoveryError(f"DNSKEY validation failed for {zone}: {e}") from e
 
     expires_at = now + int(dnskey_rrset.ttl or 0)
-    if ds_rrset is not None:
+    if zone != dns.name.root and ds_rrset is not None:
         expires_at = min(expires_at, now + int(ds_rrset.ttl or 0))
     for sigset in (dnskey_rrsig, ds_rrsig if zone != dns.name.root else None):
         if sigset is None:

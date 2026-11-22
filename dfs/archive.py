@@ -336,15 +336,15 @@ def repair_with_par2(
 
 def magnet_for_descriptor(payload: Dict[str, Any]) -> str:
     """署名済みdescriptorから、外部BTクライアントへ渡すmagnet linkを作る。"""
+    from urllib.parse import quote
+
     infohash = str(payload.get("infohash", ""))
     if not _valid_infohash(infohash):
         raise ArchiveError(f"Invalid archive infohash: {infohash!r}")
     name = str(payload.get("bundle_name", "dfs-archive"))
-    magnet = f"magnet:?xt=urn:btih:{infohash}&dn={name}"
+    magnet = f"magnet:?xt=urn:btih:{infohash}&dn={quote(name, safe='')}"
     announce = str(payload.get("announce", "") or "")
     if announce:
-        from urllib.parse import quote
-
         magnet += f"&tr={quote(announce, safe='')}"
     return magnet
 
@@ -647,6 +647,8 @@ def read_zstd_chunked_toc(archive_path: Path | str) -> Dict[str, Any]:
         toc_magic, toc_len = struct.unpack("<II", hdr)
         if toc_magic != ZSTD_SKIPPABLE_TOC_MAGIC or toc_offset + 8 + toc_len != size - 16:
             raise ArchiveError(f"Invalid zstd:chunked TOC frame: {path}")
+        if toc_len > 64 * 1024 * 1024:
+            raise ArchiveError(f"zstd:chunked TOC exceeds 64 MiB limit: {toc_len}")
         raw_toc = fh.read(toc_len)
     try:
         toc = json.loads(raw_toc.decode("utf-8"))
@@ -721,7 +723,9 @@ def extract_zstd_chunked_member(archive_path: Path | str, member_name: str) -> b
     with path.open("rb") as fh:
         fh.seek(off)
         compressed = fh.read(clen)
-    max_frame_bytes = max(poff + psize, 64 * 1024 * 1024)
+    if poff + psize > 256 * 1024 * 1024:
+        raise ArchiveError(f"zstd:chunked member size exceeds 256 MiB limit: {member_name}")
+    max_frame_bytes = min(256 * 1024 * 1024, max(poff + psize, 64 * 1024 * 1024))
     raw_frame = zstd.ZstdDecompressor().decompress(compressed, max_output_size=max_frame_bytes)
     if len(raw_frame) < poff + psize:
         raise ArchiveError(f"Truncated zstd:chunked frame for {member_name}")
@@ -977,6 +981,19 @@ def verify_bundle(
         raise ArchiveError("Archive delegation has no chain")
     head_payload = head.get("payload", {})
     try:
+        head_path = normalize_path(str(head_payload.get("path", "")))
+    except ValueError as e:
+        raise ArchiveError(f"Archive head has invalid path: {e}") from e
+    if head_path != path:
+        raise ArchiveError(f"Archive head path mismatch: expected {path!r}, got {head_path!r}")
+    try:
+        meta_ver = int(meta.get("version", -1))
+        head_ver = int(head_payload.get("version", -2))
+    except (TypeError, ValueError) as e:
+        raise ArchiveError(f"Archive version is invalid: {e}") from e
+    if meta_ver != head_ver:
+        raise ArchiveError(f"Archive version mismatch: meta={meta_ver}, head={head_ver}")
+    try:
         historical_now = int(head_payload["timestamp"])
     except (KeyError, TypeError, ValueError) as e:
         raise ArchiveError("Archive head has no valid timestamp") from e
@@ -990,6 +1007,10 @@ def verify_bundle(
         )
     except Exception as e:  # noqa: BLE001 - L1/L2 の例外型をまとめて扱う
         raise ArchiveError(f"Archive delegation verification failed: {e}") from e
+    if int(head_payload.get("delegation_epoch", -1)) != int(leaf["epoch"]):
+        raise ArchiveError("Archive head delegation_epoch mismatch")
+    if head_ver <= int(leaf["base_version"]):
+        raise ArchiveError("Archive head version is at or below delegation base_version")
     raw = canonical_json(head_payload)
     if sha256_hex(raw) != head.get("entry_hash"):
         raise ArchiveError("Archive head entry_hash mismatch")
@@ -1031,6 +1052,8 @@ def verify_bundle(
             raise ArchiveError(f"Invalid or duplicate archive chunk: {wid!r}")
         seen.add(wid)
         chunk_path = root / "chunks" / wid
+        if chunk_path.is_symlink():
+            raise ArchiveError(f"Refusing symlink archive chunk: {wid}")
         try:
             blob = chunk_path.read_bytes()
         except OSError as e:
@@ -1039,6 +1062,9 @@ def verify_bundle(
             raise ArchiveError(f"Archive chunk size mismatch: {wid}")
         if sha256_hex(blob) != wid:
             raise ArchiveError(f"Archive chunk hash mismatch: {wid}")
+    root_wire = str(meta.get("root_wire_id", ""))
+    if root_wire not in seen:
+        raise ArchiveError(f"Archive root_wire_id missing from verified chunks: {root_wire!r}")
     return meta
 
 
@@ -1070,14 +1096,32 @@ class _BundleOST:
     def session(self) -> Iterator["_BundleOST"]:
         yield self
 
+    @staticmethod
+    def _chunk_path(bundle: Path, wid: str) -> Path:
+        if not isinstance(wid, str) or len(wid) != 64 or any(c not in "0123456789abcdef" for c in wid):
+            raise ArchiveError(f"Invalid archive wire_id: {wid!r}")
+        p = bundle / "chunks" / wid
+        if p.is_symlink():
+            raise ArchiveError(f"Refusing symlink archive chunk: {wid}")
+        return p
+
     def batch_has(self, wire_ids: Sequence[str]) -> Dict[str, bool]:
-        return {wid: (self.bundle / "chunks" / wid).is_file() for wid in wire_ids}
+        out: Dict[str, bool] = {}
+        for wid in wire_ids:
+            try:
+                out[wid] = self._chunk_path(self.bundle, wid).is_file()
+            except ArchiveError:
+                out[wid] = False
+        return out
 
     def batch_get(self, wire_ids: Sequence[str]) -> Dict[str, bytes]:
         result = {}
         for wid in wire_ids:
-            result[wid] = (self.bundle / "chunks" / wid).read_bytes()
-            self.bytes_received += len(result[wid])
+            blob = self._chunk_path(self.bundle, wid).read_bytes()
+            if sha256_hex(blob) != wid:
+                raise ArchiveError(f"Archive chunk hash mismatch: {wid}")
+            result[wid] = blob
+            self.bytes_received += len(blob)
             self.get_count += 1
         return result
 
@@ -1119,6 +1163,8 @@ def download_torrent(
     DFS自身はDHTやピア交換を実装しない。取得先の決定と実データ転送だけを
     aria2c / transmission-cliへ委ね、後段でDFS署名を再検証する。
     """
+    if not isinstance(magnet, str) or not magnet.startswith("magnet:?"):
+        raise ArchiveError(f"Invalid magnet URI: {magnet!r}")
     out = Path(download_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     executable = _resolve_torrent_client(torrent_client)
@@ -1130,10 +1176,11 @@ def download_torrent(
             "--seed-time=0",
             "--summary-interval=0",
             "--enable-dht=true",
+            "--",
             magnet,
         ]
     elif "transmission-cli" in name:
-        cmd = [executable, "--download-dir", str(out), magnet]
+        cmd = [executable, "--download-dir", str(out), "--", magnet]
     else:
         raise ArchiveError(
             f"Unsupported torrent client {executable!r}; use aria2c or transmission-cli"
@@ -1172,16 +1219,19 @@ def locate_downloaded_bundle(
     expected_head = str(payload.get("head_hash", ""))
     candidates: List[Path] = []
     for meta_path in sorted(root.rglob("meta.json")):
+        if meta_path.is_symlink():
+            continue
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            if not isinstance(meta, dict) or meta.get("schema") != ARCHIVE_SCHEMA:
+                continue
+            head = meta.get("head_log", {})
+            meta_ver = int(meta.get("version", -1))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
             continue
-        if not isinstance(meta, dict) or meta.get("schema") != ARCHIVE_SCHEMA:
-            continue
-        head = meta.get("head_log", {})
         if (
             str(meta.get("path", "")) == expected_path
-            and int(meta.get("version", -1)) == expected_version
+            and meta_ver == expected_version
             and str(head.get("entry_hash", "")) == expected_head
         ):
             candidates.append(meta_path.parent)

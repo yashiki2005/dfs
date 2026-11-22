@@ -192,8 +192,11 @@ def fetch_candidacy(
     urls: List[str] = []
     seen = set()
     for raw in candidate_urls:
-        value = str(raw or "").strip().rstrip("/")
-        if value and value not in seen:
+        raw_str = str(raw or "").strip().rstrip("/")
+        if not raw_str:
+            continue
+        value = _validate_registry_url(raw_str)
+        if value not in seen:
             seen.add(value)
             urls.append(value)
     if not urls:

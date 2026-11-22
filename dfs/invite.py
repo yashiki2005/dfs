@@ -123,10 +123,16 @@ def decode_ro_invite(token: str) -> Dict[str, Any]:
     raw_regs = data.get("registries")
     if not isinstance(raw_regs, list) or not raw_regs:
         raise InviteError("Invite token has no registries")
-    urls = [_validate_registry_url(str(u)) for u in raw_regs]
+    try:
+        urls = [_validate_registry_url(str(u)) for u in raw_regs]
+    except DiscoveryError as e:
+        raise InviteError(f"Invalid registry URL in invite token: {e}") from e
 
     raw_path = str(data.get("path", "") or "")
-    norm_path = normalize_path(raw_path) if raw_path else ""
+    try:
+        norm_path = normalize_path(raw_path) if raw_path else ""
+    except ValueError as e:
+        raise InviteError(f"Invalid path in invite token: {e}") from e
 
     try:
         kdf_version = normalize_kdf_version(
@@ -135,6 +141,16 @@ def decode_ro_invite(token: str) -> Dict[str, Any]:
         )
     except CryptoError as e:
         raise InviteError(str(e)) from e
+
+    ost_cert_sha256 = str(data.get("ost_cert_sha256", "") or "").strip().lower()
+    if ost_cert_sha256 and (len(ost_cert_sha256) != 64 or any(c not in "0123456789abcdef" for c in ost_cert_sha256)):
+        raise InviteError("Invalid ost_cert_sha256 in invite token")
+
+    try:
+        role_epoch = max(1, int(data.get("role_epoch", 1)))
+        poll_seconds = max(1, int(data.get("poll_seconds", 30)))
+    except (TypeError, ValueError) as e:
+        raise InviteError(f"Invalid numeric field in invite token: {e}") from e
 
     return {
         "schema": INVITE_RO_SCHEMA,
@@ -148,11 +164,11 @@ def decode_ro_invite(token: str) -> Dict[str, Any]:
             for u in (data.get("ost_alternates") or [])
             if str(u).strip()
         ],
-        "ost_cert_sha256": str(data.get("ost_cert_sha256", "") or "").strip().lower(),
+        "ost_cert_sha256": ost_cert_sha256,
         "root_pubkey": clean_pub,
         "tree_secret": tree_secret,
-        "role_epoch": max(1, int(data.get("role_epoch", 1))),
-        "poll_seconds": max(1, int(data.get("poll_seconds", 30))),
+        "role_epoch": role_epoch,
+        "poll_seconds": poll_seconds,
         "use_candidacy": bool(data.get("use_candidacy", False)),
         "kdf": kdf_version,
     }

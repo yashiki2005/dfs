@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from .crypto import KDF_DEFAULT, ContentAddressedCrypto
+from .crypto import KDF_DEFAULT, ContentAddressedCrypto, sha256_hex
 from .l2_registry import DirectoryRegistryService, ServiceUnavailableError
 from .l3_ost_adapter import (
     FailoverOSTClient,
@@ -57,6 +57,8 @@ class _LocalChunkCache:
     def put_chunk(self, wire_id: str, data: bytes) -> None:
         p = self._path_for(wire_id)
         if p is None or not data:
+            return
+        if sha256_hex(data) != wire_id:
             return
         self.root.mkdir(parents=True, exist_ok=True)
         if not p.exists():
@@ -193,17 +195,42 @@ class ClayFSAdapter:
 
     def replace_work_tree(self, source_dir: Path) -> None:
         source_dir = Path(source_dir)
-        if self.work_tree.exists() or self.work_tree.is_symlink():
-            if self.work_tree.is_symlink() or self.work_tree.is_file():
-                self.work_tree.unlink()
-            else:
-                remove_tree(self.work_tree)
-        shutil.copytree(
-            source_dir,
-            self.work_tree,
-            ignore=shutil.ignore_patterns(".clayfs", ".DS_Store", "._*"),
-            symlinks=True,
-        )
+        parent = self.work_tree.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        staged = Path(tempfile.mkdtemp(prefix=f".{self.work_tree.name}_stage_", dir=str(parent)))
+        remove_tree(staged)
+        backup = parent / f".{self.work_tree.name}_old_{os.getpid()}"
+        try:
+            shutil.copytree(
+                source_dir,
+                staged,
+                ignore=shutil.ignore_patterns(".clayfs", ".DS_Store", "._*"),
+                symlinks=True,
+            )
+            if backup.exists() or backup.is_symlink():
+                if backup.is_symlink() or backup.is_file():
+                    backup.unlink()
+                else:
+                    remove_tree(backup)
+            moved_old = False
+            if self.work_tree.exists() or self.work_tree.is_symlink():
+                os.replace(self.work_tree, backup)
+                moved_old = True
+            try:
+                os.replace(staged, self.work_tree)
+            except Exception:
+                if moved_old and not (self.work_tree.exists() or self.work_tree.is_symlink()):
+                    os.replace(backup, self.work_tree)
+                raise
+            if moved_old and (backup.exists() or backup.is_symlink()):
+                if backup.is_symlink() or backup.is_file():
+                    backup.unlink()
+                else:
+                    remove_tree(backup)
+        except Exception:
+            if staged.exists():
+                remove_tree(staged)
+            raise
 
 
 class DFSNode:
@@ -356,8 +383,22 @@ class DFSNode:
             _ACTIVE_NODES.add(self)
 
     def switch_credentials(self, new_priv_key: Path | str, new_pub_key_str: str) -> None:
-        self.l4.priv_key_path = Path(new_priv_key)
-        self.l4.pub_key_str = new_pub_key_str.strip()
+        new_priv = Path(new_priv_key)
+        new_pub = new_pub_key_str.strip()
+        self.l4.priv_key_path = new_priv
+        self.l4.pub_key_str = new_pub
+        targets = [self.ost, *getattr(self, "ost_clients", [])]
+        for client in targets:
+            if client is None:
+                continue
+            if hasattr(client, "writer_priv_key"):
+                client.writer_priv_key = new_priv
+            if hasattr(client, "writer_pubkey"):
+                client.writer_pubkey = new_pub
+            if hasattr(client, "_cached_auth_header"):
+                client._cached_auth_header = None
+            if hasattr(client, "_cached_auth_exp"):
+                client._cached_auth_exp = 0.0
 
     def close(self) -> None:
         if self._closed:
@@ -537,29 +578,35 @@ class DFSNode:
         return log_env, snap_dir, wire_bytes
 
     def pull(self, expected_writer_pubkey: Optional[str] = None) -> Path:
+        old_pin = self.l4.pin
         head_env = self.l4.sync_head(self.registry, expected_writer_pubkey=expected_writer_pubkey)
         if head_env is None:
             raise RuntimeError(f"No versions available on registry for {self.sub_path}")
-        self.refresh_read_ost()
-        self.read_ost.reset_metrics()
+        try:
+            self.refresh_read_ost()
+            self.read_ost.reset_metrics()
 
-        p = head_env["payload"]
-        dl_builder = (
-            MerkleTreeBuilder(self.crypto, _CachingOSTProxy(self.read_ost, self.p2p_chunk_store))
-            if self.p2p_chunk_store is not None
-            else self.read_builder
-        )
-        with tempfile.TemporaryDirectory(prefix="dfs_stage_") as staging:
-            staging_dir = Path(staging)
-            try:
-                with self.read_ost.session():
-                    dl_builder.download_directory(
-                        p["root_plain_id"], p["root_wire_id"], staging_dir
-                    )
-            finally:
-                if dl_builder is not self.read_builder:
-                    dl_builder.close()
-            self.clayfs.replace_work_tree(staging_dir)
+            p = head_env["payload"]
+            dl_builder = (
+                MerkleTreeBuilder(self.crypto, _CachingOSTProxy(self.read_ost, self.p2p_chunk_store))
+                if self.p2p_chunk_store is not None
+                else self.read_builder
+            )
+            with tempfile.TemporaryDirectory(prefix="dfs_stage_") as staging:
+                staging_dir = Path(staging)
+                try:
+                    with self.read_ost.session():
+                        dl_builder.download_directory(
+                            p["root_plain_id"], p["root_wire_id"], staging_dir
+                        )
+                finally:
+                    if dl_builder is not self.read_builder:
+                        dl_builder.close()
+                self.clayfs.replace_work_tree(staging_dir)
+        except Exception:
+            self.l4.pin = old_pin
+            self.l4._save_pin()
+            raise
 
         snap = self.clayfs.take_snapshot(f"v{p['version']}")
         self.clayfs._auto_prune_snapshots()
