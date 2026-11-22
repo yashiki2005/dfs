@@ -2179,7 +2179,8 @@ class TestReviewRegressions(unittest.TestCase):
                 self.assertIsNotNone(svc_rec)
                 paths_info = RemoteRegistryClient([svc_rec.registry_url]).list_paths()
                 registered_paths = [row["path"] for row in paths_info.get("paths", [])]
-                self.assertIn("/example.com/fgsvc", registered_paths)
+                self.assertRegex(svc_rec.root_anchor, r"^/k-[0-9a-f]{16}$")
+                self.assertIn(f"{svc_rec.root_anchor}/fgsvc", registered_paths)
             finally:
                 with patch.dict("os.environ", {"DFS_HOME": str(dfs_home_dir)}):
                     try:
