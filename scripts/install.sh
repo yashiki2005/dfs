@@ -11,6 +11,29 @@ TARBALL_URL="${DFS_TARBALL_URL:-https://github.com/yashiki2005/dfs/archive/refs/
 TARBALL_SHA256="${DFS_TARBALL_SHA256:-}"
 INSTALL_DIR="${DFS_INSTALL_DIR:-$HOME/.local/share/dfs}"
 
+_dir_supports_venv() {
+  local probe_parent="$1"
+  local probe_dir
+  mkdir -p "$probe_parent" 2>/dev/null || return 1
+  probe_dir="$(mktemp -d "$probe_parent/.dfs-probe.XXXXXX" 2>/dev/null)" || return 1
+  local rc=1
+  if printf '#!/bin/sh\nexit 0\n' > "$probe_dir/run" 2>/dev/null \
+    && chmod +x "$probe_dir/run" 2>/dev/null \
+    && "$probe_dir/run" 2>/dev/null \
+    && ln -s "$probe_dir/run" "$probe_dir/link" 2>/dev/null; then
+    rc=0
+  fi
+  rm -rf "$probe_dir" 2>/dev/null || true
+  return "$rc"
+}
+
+if [ -z "${DFS_INSTALL_DIR:-}" ]; then
+  if ! _dir_supports_venv "$(dirname "$INSTALL_DIR")"; then
+    echo "[dfs] $(dirname "$INSTALL_DIR") cannot host a runnable venv; falling back to /tmp/dfs" >&2
+    INSTALL_DIR="/tmp/dfs"
+  fi
+fi
+
 _in_path() {
   case ":$PATH:" in
     *":$1:"*) return 0 ;;
@@ -96,8 +119,12 @@ if ! _uv_sync --extra libp2p; then
   _uv_sync
 fi
 
-mkdir -p "$BIN_DIR"
-ln -sf "$INSTALL_DIR/.venv/bin/dfs" "$BIN_DIR/dfs"
+if ! mkdir -p "$BIN_DIR" 2>/dev/null || ! ln -sf "$INSTALL_DIR/.venv/bin/dfs" "$BIN_DIR/dfs" 2>/dev/null; then
+  BIN_DIR="/tmp/dfs-bin"
+  mkdir -p "$BIN_DIR"
+  WAS_IN_PATH=0
+  ln -sf "$INSTALL_DIR/.venv/bin/dfs" "$BIN_DIR/dfs"
+fi
 ln -sf "$INSTALL_DIR/.venv/bin/dfscli" "$BIN_DIR/dfscli"
 ln -sf "$INSTALL_DIR/.venv/bin/dfssvc" "$BIN_DIR/dfssvc"
 
