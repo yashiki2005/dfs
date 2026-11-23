@@ -462,21 +462,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("remote", nargs="?", default="", help="remote:path（--remote 指定時は省略可）")
     p.set_defaults(func=cmd_lsd)
 
-    p = sub.add_parser("mount", help="リモートを fuse-t / FUSE でマウントする")
+    p = sub.add_parser("mount", help="リモートを FUSE / Dokan (Windows) でマウントする")
     p.add_argument("remote", help="remote:path")
-    p.add_argument("mountpoint", help="ローカルのマウントポイント")
+    p.add_argument("mountpoint", help="ローカルのマウントポイント（Windows は Z: 等も可）")
     p.add_argument("--read-only", action="store_true", help="読み取り専用でマウントする")
     p.add_argument("--allow-other", action="store_true", help="allow_other を FUSE に渡す")
-    p.add_argument("--debug", action="store_true", help="FUSE のデバッグログを出す")
+    p.add_argument("--debug", action="store_true", help="マウントのデバッグログを出す")
     p.add_argument(
         "--fuse-library",
-        help="fusepy が使う FUSE ライブラリ（macOS の fuse-t など）",
+        help="FUSE / Dokan ライブラリパス（macOS の fuse-t、Windows の dokan2.dll 等）",
     )
     p.add_argument(
         "--backend",
-        choices=["auto", "fskit", "fuse-t", "macfuse"],
+        choices=["auto", "fskit", "fuse-t", "macfuse", "dokan"],
         default="auto",
-        help="FUSE マウントのバックエンド（既定: auto = macfuse-fskit -> fuse-t -> macfuse）",
+        help="マウントバックエンド（既定: auto。Windows は dokan、macOS は macfuse-fskit -> fuse-t -> macfuse）",
     )
     p.set_defaults(func=cmd_mount)
 

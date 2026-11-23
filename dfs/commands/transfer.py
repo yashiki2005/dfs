@@ -595,11 +595,16 @@ def cmd_mount(args: argparse.Namespace) -> int:
     store = _cm.RemoteStore()
     name, sub = _cm.split_remote_spec(args.remote, args.remote_name)
     remote = store.get(name)
-    mountpoint = Path(args.mountpoint).expanduser()
-    if not mountpoint.exists():
-        mountpoint.mkdir(parents=True, exist_ok=True)
-    if not mountpoint.is_dir():
-        raise _cm.UsageError(f"マウントポイントがディレクトリではありません: {mountpoint}")
+    from dfs.dokan_mount import is_windows_drive_mountpoint
+
+    raw_mountpoint = str(args.mountpoint).strip()
+    is_win_drive = _cm.sys.platform == "win32" and is_windows_drive_mountpoint(raw_mountpoint)
+    mountpoint = Path(raw_mountpoint).expanduser()
+    if not is_win_drive:
+        if not mountpoint.exists():
+            mountpoint.mkdir(parents=True, exist_ok=True)
+        if not mountpoint.is_dir():
+            raise _cm.UsageError(f"マウントポイントがディレクトリではありません: {mountpoint}")
 
     node = _cm.open_remote(remote, create=True)
     _cm.refresh_cache(node)
@@ -611,6 +616,29 @@ def cmd_mount(args: argparse.Namespace) -> int:
             f"| sent={sent} B",
             file=_cm.sys.stderr,
         )
+
+    effective_read_only = bool(args.read_only or remote.read_only)
+    backend_pref = getattr(args, "backend", "auto") or "auto"
+    if _cm.sys.platform == "win32" and backend_pref in ("auto", "dokan"):
+        from dfs.dokan_mount import DOKAN_SUCCESS, mount_dokan
+
+        target_mp = raw_mountpoint.rstrip("\\/") + "\\" if is_win_drive else str(mountpoint)
+        try:
+            rc = mount_dokan(
+                node.clayfs.work_tree,
+                target_mp,
+                flush_to_dfs,
+                volname=f"dfs-{name}",
+                read_only=effective_read_only,
+                debug=bool(args.debug),
+                sync_delay=0.5,
+                dokan_library=getattr(args, "fuse_library", None),
+            )
+        except (FileNotFoundError, OSError, RuntimeError) as e:
+            raise _cm.UsageError(f"Dokan マウントに失敗しました: {e}") from e
+        if rc != DOKAN_SUCCESS:
+            raise _cm.UsageError(f"Dokan マウントがエラー終了しました (code={rc})")
+        return 0
 
     try:
         from dfs.fuse_mount import LocalTreeFuse
