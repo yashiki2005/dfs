@@ -31,6 +31,8 @@
 
 ## Try It in 60 Seconds
 
+![dfs quickstart demo](assets/dfs-quickstart.gif)
+
 ```bash
 # 0. One-line install (macOS / Linux)
 curl -sSL https://raw.githubusercontent.com/yashiki2005/dfs/main/scripts/install.sh | bash
@@ -89,6 +91,8 @@ dfs pull ./restored
 ## Quick Start
 
 ### 1. Install
+
+For detailed installation instructions (including why standalone binaries are distributed, `gmp.h` build caveats, and one-line installers), see [INSTALL.md](INSTALL.md).
 
 Using [`uv`](https://docs.astral.sh/uv/) (recommended):
 
