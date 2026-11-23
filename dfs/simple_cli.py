@@ -172,7 +172,11 @@ def _cmd_push(args: argparse.Namespace) -> int:
         from . import svc as svc_mod
 
         svc_rec = svc_mod.ServiceStore().services.get("local")
-        if "local" not in RemoteStore().remotes or svc_rec is None or not svc_rec.is_running():
+        if (
+            "local" not in RemoteStore().remotes
+            or svc_rec is None
+            or not (svc_rec.is_running() or svc_mod._recorded_server_is_alive(svc_rec))
+        ):
             _ensure_local_ready("local", no_hub=args.no_hub)
     argv = ["sync", args.src, target]
     if args.dry_run:
