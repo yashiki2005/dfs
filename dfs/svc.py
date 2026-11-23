@@ -237,6 +237,9 @@ def _port_in_use_by_us(pid: int, port: int) -> bool:
     except (OSError, subprocess.SubprocessError):
         # lsof が無い環境向けの保険。ポートが生きていれば掴んでいるとみなす。
         return _port_listening(port)
+    if res.returncode != 0 and res.stderr.strip():
+        # BusyBox lsof 等が GNU/BSD lsof オプションを拒否した場合もフォールバックする。
+        return _port_listening(port)
     return res.returncode == 0 and str(port) in res.stdout
 
 
