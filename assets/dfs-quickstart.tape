@@ -9,7 +9,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 40ms
 
 Hide
-Type "export PATH=/tmp/dfs-demo-b/bin:$PATH HOME=/tmp/dfs-demo-b/home PS1='$ '" Enter
+Type "export PATH=/tmp/dfs-demo-b/bin:$PATH HOME=/tmp/dfs-demo-b/home DFS_LANG=en PS1='$ '" Enter
 Type "cd /tmp/dfs-demo-b && clear" Enter
 Sleep 500ms
 Show

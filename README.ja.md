@@ -30,6 +30,8 @@
 
 ## 60 秒で試す
 
+![dfs クイックスタートデモ](assets/dfs-quickstart-ja.gif)
+
 ```bash
 # 0. 1 行インストール（macOS / Linux）
 curl -sSL https://raw.githubusercontent.com/yashiki2005/dfs/main/scripts/install.sh | bash
@@ -88,6 +90,8 @@ dfs pull ./restored
 ## クイックスタート
 
 ### 1. インストール
+
+詳細なインストール手順（リリースバイナリの配布理由、`gmp.h` などのビルド注意点、ワンライナー導入など）は [INSTALL.ja.md](INSTALL.ja.md) を参照してください。
 
 [`uv`](https://docs.astral.sh/uv/) を使う場合（推奨）:
 

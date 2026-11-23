@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dfs.commands import _cm
+from dfs.i18n import _
 from dfs.discovery import (
     CandidacyError,
     create_candidacy_envelope,
@@ -578,39 +579,39 @@ def cmd_config(args: argparse.Namespace) -> int:
             kdf=existing_remote.kdf if existing_remote is not None else _cm.KDF_DEFAULT,
         )
         store.set(remote)
-        print(f"[dfscli] リモート {remote.name!r} を保存しました: {store.path}")
+        print(_("[dfscli] リモート {name!r} を保存しました: {path}").format(name=remote.name, path=store.path))
         print(f"  registry    : {remote.registry}")
         if remote.registry_alternates:
             print(f"  代替名簿    : {', '.join(remote.registry_alternates)}")
         if created_key:
-            print(f"  書き手の鍵  : {key_path}（作った。OpenSSH 形式の Ed25519）")
+            print(_("  書き手の鍵  : {key_path}（作った。OpenSSH 形式の Ed25519）").format(key_path=key_path))
         else:
-            print(f"  書き手の鍵  : {key_path}")
-        print(f"  作業ディレクトリ: {remote.resolved_workdir()}")
+            print(_("  書き手の鍵  : {key_path}").format(key_path=key_path))
+        print(_("  作業ディレクトリ: {workdir}").format(workdir=remote.resolved_workdir()))
         if remote.ost:
             print(f"  L3 OST      : {remote.ost}")
         else:
-            print("  L3 OST      : （未指定。使うときに L2 のロケータから解決します）")
+            print(_("  L3 OST      : （未指定。使うときに L2 のロケータから解決します）"))
         if remote.ost_alternates:
             print(f"  複製 OST    : {', '.join(remote.ost_alternates)}")
         if remote.libp2p_peers:
             print(f"  libp2p peer : {', '.join(remote.libp2p_peers)}")
         if remote.path:
-            print(f"  サブツリー  : {remote.path}")
+            print(_("  サブツリー  : {path}").format(path=remote.path))
         else:
-            print("  サブツリー  : （未指定。使うときに L2 で書き手鍵から探します）")
+            print(_("  サブツリー  : （未指定。使うときに L2 で書き手鍵から探します）"))
         if remote.secret:
-            how = "端末から読みました" if secret_from_prompt else "指定どおり"
+            how = _("端末から読みました") if secret_from_prompt else _("指定どおり")
             print(f"  tree_secret : *** （{how}）")
         else:
-            print("  tree_secret : （未指定。書く前に設定してください）")
+            print(_("  tree_secret : （未指定。書く前に設定してください）"))
         if ost_cert_sha256:
-            print(f"  OST 証明書ピン: {ost_cert_sha256}")
+            print(_("  OST 証明書ピン: {sha256}").format(sha256=ost_cert_sha256))
         if root_pubkey:
-            print(f"  root アンカー: {root_fingerprint} （{root_source}）")
-            print("                 これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）")
+            print(_("  root アンカー: {fingerprint} （{source}）").format(fingerprint=root_fingerprint, source=root_source))
+            print(_("                 これ以降この指紋だけを信頼します（違う値を返す名簿は拒否）"))
         else:
-            print("  root アンカー: （取得できませんでした。--root-pubkey で指定するか --allow-tofu を明示してください）")
+            print(_("  root アンカー: （取得できませんでした。--root-pubkey で指定するか --allow-tofu を明示してください）"))
         return 0
 
     if args.action == "delete":

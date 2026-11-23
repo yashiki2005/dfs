@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from dfs.commands import _cm
+from dfs.i18n import _
 
 
 def cmd_history(args: argparse.Namespace) -> int:
@@ -153,7 +154,7 @@ def cmd_cat(args: argparse.Namespace) -> int:
 
 def _print_plan(action: str, items: List[str], dry_run: bool) -> None:
     head = "[dfscli] " + ("(dry-run) " if dry_run else "")
-    print(f"{head}{action}: {len(items)} 件", file=_cm.sys.stderr)
+    print(_("{head}{action}: {count} 件").format(head=head, action=action, count=len(items)), file=_cm.sys.stderr)
     if dry_run:
         for i in items[:40]:
             print(f"  {i}", file=_cm.sys.stderr)
@@ -912,7 +913,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     version, count = _pull_once(
         node, remote, prefix, dest, path_filter, force=args.force
     )
-    print(f"[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}")
+    print(_("[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}").format(version=version, count=count, dest=dest))
     if not getattr(args, "watch", False):
         return 0
 
@@ -928,7 +929,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
                         node, remote, prefix, dest, path_filter, force=False
                     )
                     last_version = version
-                    print(f"[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}")
+                    print(_("[dfscli] pull OK <- v{version} | {count} ファイル -> {dest}").format(version=version, count=count, dest=dest))
             except Exception as e:  # noqa: BLE001 - 一時的な通信断では終了しない
                 print(f"[dfscli] watch poll failed: {e}", file=_cm.sys.stderr)
                 continue

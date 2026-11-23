@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .dnssec import DEFAULT_RECORD_PREFIX, parse_discovery_text
+from .i18n import _
 from .paths import config_dir, dfs_home, restrict_to_owner
 from .private_io import ensure_private_dir, write_private_json
 
@@ -924,11 +925,11 @@ def cmd_start(args: argparse.Namespace) -> int:
     if getattr(args, "role_epoch", None) is not None:
         cmd.extend(["--role-epoch", str(args.role_epoch)])
 
-    print(f"[dfssvc] 空きポート: L2={registry_port} / L3={ost_port}（連続した組）")
-    print(f"[dfssvc] 状態      : {state_dir}")
-    print(f"[dfssvc] OST       : {ost_dir}")
-    print(f"[dfssvc] root 鍵   : {root_key}")
-    print(f"[dfssvc] ログ      : {log_path}")
+    print(_("[dfssvc] 空きポート: L2={registry_port} / L3={ost_port}（連続した組）").format(registry_port=registry_port, ost_port=ost_port))
+    print(_("[dfssvc] 状態      : {state_dir}").format(state_dir=state_dir))
+    print(_("[dfssvc] OST       : {ost_dir}").format(ost_dir=ost_dir))
+    print(_("[dfssvc] root 鍵   : {root_key}").format(root_key=root_key))
+    print(_("[dfssvc] ログ      : {log_path}").format(log_path=log_path))
 
     # 前回強制終了時などに残留した stop.request / serve.pid を掃除してから起動する
     for stale_name in ("stop.request", "serve.pid"):
@@ -999,7 +1000,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             # 根の直下でなければ、親のパスも委譲が要る（L1 は多段）
             _ensure_parent_delegations(root_key, root_pub, effective_root_anchor, sub_path, local_registry_url)
             register_delegation(root_key, writer_pub, sub_path, local_registry_url)
-            print(f"[dfssvc] 委譲を登録: {sub_path}（書き手 {writer_key.name}）")
+            print(_("[dfssvc] 委譲を登録: {sub_path}（書き手 {writer_name}）").format(sub_path=sub_path, writer_name=writer_key.name))
 
         service = Service(
             name=name,
@@ -1031,7 +1032,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(service.to_dict(), ensure_ascii=False, indent=2))
     else:
-        print(f"[dfssvc] 起動しました: {name}（PID {proc.pid}）")
+        print(_("[dfssvc] 起動しました: {name}（PID {pid}）").format(name=name, pid=proc.pid))
         print(f"  L2 Registry : {service.registry_url}")
         print(f"  L3 OST      : tls://{service.ost_endpoint}")
         if sync_id:
@@ -1039,16 +1040,16 @@ def cmd_start(args: argparse.Namespace) -> int:
         if subscribe_list:
             print(f"  購読 ID     : {', '.join(subscribe_list)}")
         print()
-        print("[dfssvc] dfscli につなぐには:")
-        key_hint = service.writer_key or "<書き手の Ed25519 秘密鍵>"
+        print(_("[dfssvc] dfscli につなぐには:"))
+        key_hint = service.writer_key or _("<書き手の Ed25519 秘密鍵>")
         print(
             f"  dfscli config create {name} --registry {service.registry_url} "
             f"--key {key_hint} --secret <tree_secret>"
         )
-        print("  # L3 の場所もサブツリーも L2 が知っているので --ost も --path も不要です")
+        print(_("  # L3 の場所もサブツリーも L2 が知っているので --ost も --path も不要です"))
         if service.sub_path:
-            print(f"  # このサーバのサブツリー: {service.sub_path}")
-        print(f"  # 書き手の鍵: {key_hint}" if service.writer_key else "")
+            print(_("  # このサーバのサブツリー: {sub_path}").format(sub_path=service.sub_path))
+        print(_("  # 書き手の鍵: {key_hint}").format(key_hint=key_hint) if service.writer_key else "")
     if args.foreground:
         try:
             return int(proc.wait() or 0)
