@@ -72,9 +72,28 @@ else
   mv "$SRC_DIR" "$INSTALL_DIR"
 fi
 
-if ! uv sync --project "$INSTALL_DIR" --extra libp2p; then
+export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
+case "${UV_CACHE_DIR:-}" in
+  /workspace|/workspace/*)
+    export UV_CACHE_DIR="/tmp/dfs-uv-cache"
+    ;;
+esac
+
+_uv_sync() {
+  if ! uv sync --project "$INSTALL_DIR" "$@"; then
+    local fallback_cache="/tmp/dfs-uv-cache"
+    if [ "${UV_CACHE_DIR:-}" != "$fallback_cache" ]; then
+      echo "[dfs] Retrying uv sync with local cache ($fallback_cache)..." >&2
+      UV_CACHE_DIR="$fallback_cache" UV_LINK_MODE=copy uv sync --project "$INSTALL_DIR" "$@"
+      return $?
+    fi
+    return 1
+  fi
+}
+
+if ! _uv_sync --extra libp2p; then
   echo "[dfs] libp2p extra failed on this environment; installing core dependencies..." >&2
-  uv sync --project "$INSTALL_DIR"
+  _uv_sync
 fi
 
 mkdir -p "$BIN_DIR"
