@@ -102,12 +102,21 @@ case "${UV_CACHE_DIR:-}" in
     ;;
 esac
 
+PYTHON_ARG=()
+if [ -n "${DFS_PYTHON:-}" ]; then
+  PYTHON_ARG=(--python "$DFS_PYTHON")
+elif command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) else 1)' 2>/dev/null; then
+  PYTHON_ARG=(--python "$(command -v python3)")
+else
+  PYTHON_ARG=(--python "3.12")
+fi
+
 _uv_sync() {
-  if ! uv sync --project "$INSTALL_DIR" "$@"; then
+  if ! uv sync --project "$INSTALL_DIR" "${PYTHON_ARG[@]}" "$@"; then
     local fallback_cache="/tmp/dfs-uv-cache"
     if [ "${UV_CACHE_DIR:-}" != "$fallback_cache" ]; then
       echo "[dfs] Retrying uv sync with local cache ($fallback_cache)..." >&2
-      UV_CACHE_DIR="$fallback_cache" UV_LINK_MODE=copy uv sync --project "$INSTALL_DIR" "$@"
+      UV_CACHE_DIR="$fallback_cache" UV_LINK_MODE=copy uv sync --project "$INSTALL_DIR" "${PYTHON_ARG[@]}" "$@"
       return $?
     fi
     return 1
