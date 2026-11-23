@@ -181,16 +181,21 @@ dfs pull ./restored-dataset
   ```
 - **別マシン / RunPod 等への 1 行共有**（`dfs share`）:
   ```bash
-  # 読み取り専用 + out サブパスへの書き戻し許可つきブートストラップコマンドを生成
-  dfs share --write-path out
+  # リモート 'local'（既定）に対し、読み取り専用 + out サブパスへの書き戻し許可つきコマンドを生成
+  dfs share local --write-path out
 
   # 参加側（トークンまたは URL で参加して同期・監視）:
   dfs join <token_or_url>
   dfs join <token_or_url> --watch
   ```
-- **FUSE マウント**（`dfs mount`）:
+  > **注意（NAT 越えと引数）:** `dfs share` の引数は `local:path` ではなく**リモート名**（例: `local`）です。自宅や NAT 裏の環境から外部のレンタル GPU へ共有する場合は、`dfs start` が自動参加する `yashiki.top` リレー（または `--hub` で指定した自前ハブ）への接続が必要です。`--no-hub` で起動した場合や `dfssvc start` を `--join` なしで起動した場合は `127.0.0.1` のみとなり、外部マシンからは接続できません。
+- **FUSE / Dokany2 マウント**（`dfs mount`）:
   ```bash
+  # macOS / Linux (FUSE)
   dfs mount ./mnt
+
+  # Windows (Dokany2)
+  dfs mount Z:
   ```
 
 ---

@@ -182,16 +182,21 @@ You can also target another remote or subpath explicitly (e.g., `dfs push ./note
   ```
 - **One-line sharing to another machine / RunPod** (`dfs share`):
   ```bash
-  # Generate a bootstrap command with read-only access + scoped write-back to 'out'
-  dfs share --write-path out
+  # Generate a bootstrap command for remote 'local' (default) with read-only access + scoped write-back to 'out'
+  dfs share local --write-path out
 
   # On the target machine (join via invite token or registry URL):
   dfs join <token_or_url>
   dfs join <token_or_url> --watch
   ```
-- **FUSE mount** (`dfs mount`):
+  > **Note (NAT traversal):** `dfs share` takes a **remote name** (not `remote:path`). When sharing across the internet from behind a NAT, your server must be joined to a relay hub—`dfs start` joins `yashiki.top` automatically so the generated token embeds relay endpoints. If you started with `--no-hub` (or `dfssvc start` without `--join`), remote GPUs won't be able to reach `127.0.0.1`.
+- **FUSE / Dokany2 mount** (`dfs mount`):
   ```bash
+  # macOS / Linux (FUSE)
   dfs mount ./mnt
+
+  # Windows (Dokany2)
+  dfs mount Z:
   ```
 
 ---
