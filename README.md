@@ -18,7 +18,7 @@
 
 1. **One-Line Cloud GPU / Ephemeral Worker Sync (RunPod, Lambda, Colab)**
    - Stop `scp`-ing tarballs or leaving your personal SSH/S3 keys on rented GPUs.
-   - Run `dfscli share mydata --write-path out` on your laptop to generate a one-line `curl | bash` bootstrap command (hosted on `raw.githubusercontent.com`, cloning and syncing via `uv`).
+   - Run `dfs share local --write-path out` on your laptop to generate a one-line `curl | bash` bootstrap command (hosted on `raw.githubusercontent.com`, cloning and syncing via `uv`).
    - For NAT traversal, `dfs start` uses the `yashiki.top` relay hub by default (zero-trust: the relay never sees your keys or plaintext), and you can disable it with `--no-hub` or self-host your own hub on a VPS with `dfssvc start --hub ...`.
    - The GPU worker pulls the dataset read-only (over direct LAN/ICE, multi-seed libp2p/QUIC, or encrypted relay) and can only write results back to the delegated `out` subpath.
 2. **Zero-Trust `rclone`-Style Sync Across Mac, Linux, and Windows**
@@ -190,6 +190,8 @@ You can also target another remote or subpath explicitly (e.g., `dfs push ./note
   dfs join <token_or_url> --watch
   ```
   > **Note (NAT traversal):** `dfs share` takes a **remote name** (not `remote:path`). When sharing across the internet from behind a NAT, your server must be joined to a relay hub—`dfs start` joins `yashiki.top` automatically so the generated token embeds relay endpoints. If you started with `--no-hub` (or `dfssvc start` without `--join`), remote GPUs won't be able to reach `127.0.0.1`.
+  >
+  > **How sync config is handed over:** The generated `bootstrap.sh` one-liner installs `dfs` automatically via `install.sh` if missing, then runs `dfscli invite join <token> --watch`. The `dfs-ro-v1:` / `dfs-rw-v1:` token embeds the L2/L3/relay endpoints, `root_pubkey` pin, `tree_secret`, and (when `--write-path out` is set) a scoped ephemeral writer key, automatically registering read-only and `local-out` remotes in `~/.config/dfs/remotes.json` without copying your master key.
 - **FUSE / Dokany2 mount** (`dfs mount`):
   ```bash
   # macOS / Linux (FUSE)

@@ -189,6 +189,8 @@ dfs pull ./restored-dataset
   dfs join <token_or_url> --watch
   ```
   > **注意（NAT 越えと引数）:** `dfs share` の引数は `local:path` ではなく**リモート名**（例: `local`）です。自宅や NAT 裏の環境から外部のレンタル GPU へ共有する場合は、`dfs start` が自動参加する `yashiki.top` リレー（または `--hub` で指定した自前ハブ）への接続が必要です。`--no-hub` で起動した場合や `dfssvc start` を `--join` なしで起動した場合は `127.0.0.1` のみとなり、外部マシンからは接続できません。
+  >
+  > **設定の引き継ぎと自動導入:** `dfs share` が出力する `bootstrap.sh` の 1 行をリモート側で実行すると、`dfscli` が未導入なら自動で `install.sh` を呼んで導入したうえで `dfscli invite join <token> --watch` を開始します。招待トークン（`dfs-ro-v1:` / `dfs-rw-v1:`）には L2/L3/リレー接続先・`root_pubkey` ピン・`tree_secret`・`out/` 専用の一時ライター秘密鍵がすべて埋め込まれており、本鍵を渡さずにリモート側の `~/.config/dfs/remotes.json` へ読み取り専用および `local-out` リモートが自動登録されます。
 - **FUSE / Dokany2 マウント**（`dfs mount`）:
   ```bash
   # macOS / Linux (FUSE)
