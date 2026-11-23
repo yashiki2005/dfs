@@ -51,7 +51,7 @@ class DokanMountTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="dfs_dokan_test_")
         self.root = Path(self._tmp.name) / "tree"
         self.root.mkdir()
-        (self.root / "hello.txt").write_text("hello dokan\n", encoding="utf-8")
+        (self.root / "hello.txt").write_bytes(b"hello dokan\n")
         (self.root / ".clayfs").mkdir()
         (self.root / ".clayfs" / "secret").write_text("hidden\n", encoding="utf-8")
         self.flushes = 0
@@ -116,7 +116,7 @@ class DokanMountTests(unittest.TestCase):
             dokan.get_file_information("\\hello.txt", ctypes.pointer(info), fi_p),
             _to_signed_ntstatus(STATUS_SUCCESS),
         )
-        self.assertEqual(info.nFileSizeLow, len("hello dokan\n"))
+        self.assertEqual(info.nFileSizeLow, len(b"hello dokan\n"))
         self.assertEqual(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY, 0)
 
         names = []
