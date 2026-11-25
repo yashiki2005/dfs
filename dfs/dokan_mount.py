@@ -75,6 +75,7 @@ FILE_CASE_PRESERVED_NAMES = 0x00000002
 FILE_UNICODE_ON_DISK = 0x00000004
 
 _WIN32_EPOCH_DIFF_SECONDS = 11644473600
+_O_BINARY = getattr(os, "O_BINARY", 0)
 _CALLBACK_FACTORY = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 _ULONG64 = ctypes.c_uint64
 _LONGLONG = ctypes.c_int64
@@ -517,7 +518,7 @@ class LocalTreeDokan:
                 overwrite = create_disposition in (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF)
                 if overwrite and self.read_only:
                     return _to_signed_ntstatus(STATUS_MEDIA_WRITE_PROTECTED)
-                flags = os.O_RDONLY if self.read_only else os.O_RDWR
+                flags = (os.O_RDONLY if self.read_only else os.O_RDWR) | _O_BINARY
                 if overwrite:
                     flags |= os.O_TRUNC
                 try:
@@ -556,7 +557,7 @@ class LocalTreeDokan:
                 return _to_signed_ntstatus(STATUS_SUCCESS)
 
             try:
-                fd = os.open(target, os.O_CREAT | os.O_RDWR | os.O_EXCL, 0o644)
+                fd = os.open(target, os.O_CREAT | os.O_RDWR | os.O_EXCL | _O_BINARY, 0o644)
             except FileExistsError:
                 return _to_signed_ntstatus(STATUS_OBJECT_NAME_COLLISION)
             except OSError:
@@ -609,7 +610,7 @@ class LocalTreeDokan:
             if fd is None:
                 try:
                     target = self._resolve(file_name)
-                    temp_fd = os.open(target, os.O_RDONLY)
+                    temp_fd = os.open(target, os.O_RDONLY | _O_BINARY)
                     fd = temp_fd
                 except (UnsafePathError, OSError):
                     return _to_signed_ntstatus(STATUS_OBJECT_NAME_NOT_FOUND)
@@ -652,7 +653,7 @@ class LocalTreeDokan:
             if fd is None:
                 try:
                     target = self._resolve(file_name)
-                    temp_fd = os.open(target, os.O_RDWR)
+                    temp_fd = os.open(target, os.O_RDWR | _O_BINARY)
                     fd = temp_fd
                 except (UnsafePathError, OSError):
                     return _to_signed_ntstatus(STATUS_OBJECT_NAME_NOT_FOUND)
@@ -877,7 +878,7 @@ class LocalTreeDokan:
             if fd is None:
                 try:
                     target = self._resolve(file_name)
-                    temp_fd = os.open(target, os.O_RDWR)
+                    temp_fd = os.open(target, os.O_RDWR | _O_BINARY)
                     fd = temp_fd
                 except (UnsafePathError, OSError):
                     return _to_signed_ntstatus(STATUS_OBJECT_NAME_NOT_FOUND)
@@ -1018,7 +1019,10 @@ def mount_dokan(
     opts = DOKAN_OPTIONS()
     opts.Version = min(drv_ver, 230) if drv_ver >= 200 else DOKAN_VERSION_DEFAULT
     opts.SingleThread = False
-    flags = DOKAN_OPTION_MOUNT_MANAGER | DOKAN_OPTION_CURRENT_SESSION
+    # DOKAN_OPTION_MOUNT_MANAGER requires elevated privileges in many Windows
+    # environments and fails with DOKAN_START_ERROR (-4 / ERROR_NO_SYSTEM_RESOURCES)
+    # when mounted by a standard user or from an SSH session.
+    flags = DOKAN_OPTION_CURRENT_SESSION
     if read_only:
         flags |= DOKAN_OPTION_WRITE_PROTECT
     if debug:
