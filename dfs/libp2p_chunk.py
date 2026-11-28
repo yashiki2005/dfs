@@ -115,6 +115,32 @@ async def _read_exact(stream: Any, n: int) -> bytes:
     return bytes(buf)
 
 
+async def _finish_server_stream(stream: Any) -> None:
+    """Half-close write side first so the client can drain without STOP_SENDING.
+
+    In py-libp2p 0.8.3+, ``QUICStream.close()`` calls ``close_read()``, which
+    sends a ``STOP_SENDING`` frame if the peer has not yet sent FIN; the client
+    QUIC implementation treats ``STOP_SENDING`` on an outbound stream as a full
+    stream close and discards buffered response data. Half-closing write first
+    and waiting briefly for the client's FIN avoids racing the response read.
+    """
+    try:
+        close_write = getattr(stream, "close_write", None)
+        if callable(close_write):
+            await close_write()
+            with trio.move_on_after(5.0):
+                while await stream.read(1024):
+                    pass
+    except Exception:
+        pass
+    finally:
+        try:
+            with trio.CancelScope(shield=True):
+                await stream.close()
+        except Exception:
+            pass
+
+
 def _pack_request(op: bytes, wire_ids: Sequence[str]) -> bytes:
     if op == b"L":
         offset = 0
@@ -248,6 +274,7 @@ class Libp2pChunkServer:
             if op == b"L":
                 body = _handle_list_frame(frame, self.store)
                 await stream.write(struct.pack(">I", len(body)) + body)
+                await _finish_server_stream(stream)
                 return
             count = struct.unpack(">I", frame[1:5])[0]
             if count > MAX_BATCH_ITEMS:
@@ -276,11 +303,12 @@ class Libp2pChunkServer:
                 await stream.reset()
             except Exception:
                 pass
-        finally:
             try:
                 await stream.close()
             except Exception:
                 pass
+            return
+        await _finish_server_stream(stream)
 
     def close(self) -> None:
         self._stop.set()
@@ -901,6 +929,7 @@ class Libp2pHostManager:
             if op == b"L":
                 body = _handle_list_frame(frame, self.store)
                 await stream.write(struct.pack(">I", len(body)) + body)
+                await _finish_server_stream(stream)
                 return
             count = struct.unpack(">I", frame[1:5])[0]
             if count > MAX_BATCH_ITEMS:
@@ -930,11 +959,12 @@ class Libp2pHostManager:
                 await stream.reset()
             except Exception:
                 pass
-        finally:
             try:
                 await stream.close()
             except Exception:
                 pass
+            return
+        await _finish_server_stream(stream)
 
     def _run_sync(self, afn: Any, *args: Any) -> Any:
         self.start()
@@ -1074,10 +1104,21 @@ class Libp2pHostManager:
             try:
                 request = _pack_request(op, wire_ids)
                 await stream.write(struct.pack(">I", len(request)) + request)
+                close_write = getattr(stream, "close_write", None)
+                if callable(close_write):
+                    await close_write()
                 frame_len = struct.unpack(">I", await _read_exact(stream, 4))[0]
                 if frame_len > MAX_FRAME_BYTES:
                     raise ChunkIntegrityError("libp2p response frame too large")
                 return await _read_exact(stream, frame_len)
+            except ChunkIntegrityError:
+                raise
+            except (OSError, ConnectionError):
+                raise
+            except Exception as e:
+                raise ServiceUnavailableError(
+                    f"libp2p stream error to {peer_id_str}: {e}"
+                ) from e
             finally:
                 try:
                     with trio.CancelScope(shield=True):
