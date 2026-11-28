@@ -4,7 +4,6 @@ include README.ja.md
 include CHANGELOG.md
 include SECURITY.md
 include CONTRIBUTING.md
-include fastecdsa-overrides.txt
 include cli
 include cli.cmd
 include dfscli

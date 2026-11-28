@@ -2,33 +2,29 @@
 
 > [English](INSTALL.md) | **日本語**
 
-このドキュメントでは、`dfs`（`dfs` / `dfscli` / `dfssvc`）のインストール方法、ビルド時の注意点（特に `gmp.h` や `fastecdsa` 周り）、および **なぜスタンドアロンバイナリを配布しているのか** を説明します。
+このドキュメントでは、`dfs`（`dfs` / `dfscli` / `dfssvc`）のインストール方法、オプション機能、および **なぜスタンドアロンバイナリを配布しているのか** を説明します。
 
 ---
 
 ## なぜバイナリを配布するのか？
 
-`dfs` は Python 製ですが、GitHub Releases では各 OS 向けのスタンドアロン実行バイナリ（`dfs` / `dfscli` / `dfssvc`）も配布しています。理由は主に次の 3 点です。
+`dfs` は Python 製ですが、GitHub Releases では各 OS 向けのスタンドアロン実行バイナリ（`dfs` / `dfscli` / `dfssvc`）も配布しています。理由は主に次の 2 点です。
 
-1. **`gmp.h` や C コンパイラなしでも `py-libp2p` 同梱版をすぐ動かせるため**
-   - P2P 分散配信（`libp2p` extra）が依存する `py-libp2p` は内部で `fastecdsa` を使用します。環境によってはソースビルド時に **`gmp.h`（GNU Multiple Precision Arithmetic Library のヘッダ）** と C コンパイラ（`gcc` / `clang`）が必須になり、`libgmp-dev` 未導入の環境では `fatal error: gmp.h: No such file or directory` で失敗します。
-   - さらに `py-libp2p 0.8.1` のメタデータが古い `fastecdsa==2.3.2` を固定しているため、Python 3.12 以降や macOS では通常の `pip` だけで依存解決が通りません。
-   - リリースバイナリは CI 上で **Miniconda（`conda-forge` の `gmp`・OpenSSL）＋ PyInstaller** を使ってビルドしており、`libgmp` / `libcrypto` / `libssl` と `py-libp2p` をすべて同梱済みです。
-2. **Python / `uv` / `git` すら無い環境への即座の導入**
+1. **Python / `uv` / `git` すら無い環境への即座の導入**
    - 新規サーバー・最小コンテナ・Windows 環境などで Python 3.11+ やパッケージマネージャを用意せず、アーカイブを展開するだけで `dfs` を実行できます。
-3. **外部 CLI 依存の最小化**
+2. **外部 CLI 依存の最小化**
    - `dfs` は `ssh-keygen`（OpenSSH）や `openssl` が入っていればそれを優先利用し、**入っていない環境では内蔵の `cryptography` 処理へ自動フォールバック**します。そのため最小コンテナ等でもバイナリ単体で鍵生成・署名・自己署名 TLS 証明書生成まで動作します。
 
 ---
 
 ## インストール方法の選び方
 
-| 方法 | おすすめの場面 | `libp2p` (P2P) | `gmp.h` 要否 |
-|---|---|---|---|
-| **1. リリースバイナリ** | 手軽に試したい / C コンパイラや Python を入れたくない | 同梱（対応環境） | **不要** |
-| **2. ワンライナー (`install.sh` / `install.ps1`)** | ソースから自動セットアップしたい / RunPod 等 | 自動試行（失敗時はコアへフォールバック） | 環境による |
-| **3. Homebrew (`dfs.rb`)** | macOS / Linuxbrew で管理したい | リリースバイナリ同等 | **不要** |
-| **4. ソース / Python wheel (`uv` / `pip`)** | 開発・カスタマイズしたい / 既存 Python 環境へ入れたい | `--extra libp2p` で選択 | ソースビルド時は要 |
+| 方法 | おすすめの場面 | `libp2p` (P2P) |
+|---|---|---|
+| **1. リリースバイナリ** | 手軽に試したい / Python を入れたくない | 同梱（対応環境） |
+| **2. ワンライナー (`install.sh` / `install.ps1`)** | ソースから自動セットアップしたい / RunPod 等 | 自動試行（失敗時はコアへフォールバック） |
+| **3. Homebrew (`dfs.rb`)** | macOS / Linuxbrew で管理したい | リリースバイナリ同等 |
+| **4. ソース / Python wheel (`uv` / `pip`)** | 開発・カスタマイズしたい / 既存 Python 環境へ入れたい | `--extra libp2p` で選択 |
 
 ---
 
@@ -100,39 +96,24 @@ brew install ./dfs.rb
 git clone https://github.com/yashiki2005/dfs.git
 cd dfs
 
-# コア機能のみ（gmp.h 不要・最も安定）
+# コア機能のみ
 uv sync
 
 # P2P (libp2p) も含める場合
 uv sync --extra libp2p
 ```
 
-wheel からインストールする場合は、リポジトリ／リリース同梱の `fastecdsa-overrides.txt` を指定してください：
+wheel からインストールする場合は、通常どおり `uv pip install` または `pip install` で導入できます：
 
 ```bash
-uv pip install --overrides fastecdsa-overrides.txt dfs-<version>-py3-none-any.whl
+uv pip install dfs-<version>-py3-none-any.whl
+# または pip の場合:
+python -m pip install dfs-<version>-py3-none-any.whl
 ```
 
-### ⚠️ 注意点 1: `gmp.h` が見つからずビルドに失敗する場合
+> 補足: `py-libp2p>=0.8.3` で `fastecdsa` 依存が廃止され `cryptography` ベースに移行したため、`gmp.h` や `fastecdsa-overrides.txt` は不要になりました。
 
-`--extra libp2p` 導入時に `fastecdsa` のホイールが環境に合わずソースコンパイルが走ると、以下のエラーが出ることがあります：
-
-```text
-fatal error: gmp.h: No such file or directory
-```
-
-**対処法**:
-- **Ubuntu / Debian**: `sudo apt-get update && sudo apt-get install -y libgmp-dev build-essential python3-dev`
-- **Fedora / RHEL**: `sudo dnf install -y gmp-devel gcc python3-devel`
-- **macOS (Homebrew)**: `brew install gmp`（必要なら `CPATH="$(brew --prefix gmp)/include" LIBRARY_PATH="$(brew --prefix gmp)/lib"` を指定）
-- **conda / Miniconda**: `conda install -c conda-forge gmp`
-- **P2P が不要な場合**: `uv sync` のみ（`--extra libp2p` なし）を使えば `gmp.h` は一切不要です。
-
-### ⚠️ 注意点 2: `pip` での `libp2p` 解決衝突
-
-`py-libp2p 0.8.1` が `fastecdsa==2.3.2` を宣言しているため、通常の `pip install 'dfs[libp2p]'` では `dfs` 側の `fastecdsa==4.0.0` 指定と衝突する場合があります。`libp2p` を含める場合は **`uv` + `fastecdsa-overrides.txt`** または **リリースバイナリ** を利用してください（コア機能だけの `pip install -e .` は通常どおり通ります）。
-
-### ⚠️ 注意点 3: オプション機能用の外部ツール
+### ⚠️ オプション機能用の外部ツール
 
 | 機能 | 必要なツール / ライブラリ | 備考 |
 |---|---|---|

@@ -4,8 +4,7 @@ dnspython>=2.6
 zstandard>=0.22
 
 # Optional extras:
-# libp2p>=0.8    # P2P / QUIC chunk distribution (pip/uv extra: .[libp2p])
-# fastecdsa==4.0.0; sys_platform != 'win32'
+# libp2p>=0.8.3  # P2P / QUIC chunk distribution (pip/uv extra: .[libp2p])
 # fusepy>=3      # dfscli mount (FUSE / FUSE-T)
 # pytest>=8      # Running the test suite
 # pytest-timeout>=2.3  # Per-test timeout guard

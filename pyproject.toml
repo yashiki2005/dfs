@@ -21,14 +21,13 @@ dependencies = [
 
 [project.optional-dependencies]
 compression = ["zstandard>=0.22"]
-libp2p = ["libp2p>=0.8", "fastecdsa==4.0.0; sys_platform != 'win32'"]
+libp2p = ["libp2p>=0.8.3"]
 fuse = ["fusepy>=3"]
 test = [
     "pytest>=8",
     "pytest-timeout>=2.3",
     "zstandard>=0.22",
-    "libp2p>=0.8",
-    "fastecdsa==4.0.0; sys_platform != 'win32'",
+    "libp2p>=0.8.3",
 ]
 
 [project.scripts]
@@ -55,9 +54,6 @@ Security = "https://github.com/yashiki2005/dfs/security/policy"
 testpaths = ["tests"]
 
 [tool.uv]
-# py-libp2p 0.8.1 still pins fastecdsa==2.3.2, but its Ed25519 code is
-# compatible with fastecdsa 4.0.0. Override that stale transitive pin.
-override-dependencies = ["fastecdsa==4.0.0"]
 required-environments = [
     "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]

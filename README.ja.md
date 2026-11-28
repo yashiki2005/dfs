@@ -117,22 +117,11 @@ Python 3.11以上で利用できます。
 
 ```bash
 python -m pip install dfs-<version>-py3-none-any.whl
+# オプションの P2P (libp2p) サポートを含める場合:
+python -m pip install "dfs-<version>-py3-none-any.whl[libp2p]"
 ```
 
-サードパーティ依存は通常のPython wheelと同様に解決します。
-`dfs`は`fastecdsa==4.0.0`を明示し、`py-libp2p 0.8.1`の古い推移依存を
-overrideするため、以前必要だったmacOSのGMPビルドは不要です。
-
-```bash
-uv pip install \
-  --overrides fastecdsa-overrides.txt \
-  dfs-<version>-py3-none-any.whl
-```
-
-`py-libp2p 0.8.1`のmetadataは引き続き`fastecdsa==2.3.2`を宣言しており、
-DFSが要求する4.0.0と衝突します。py-libp2p側でこの宣言が更新されるまでは、
-通常の`pip`では解決できません。wheelと一緒に配布するoverrideファイルを
-指定してuvでインストールしてください。
+サードパーティ依存は通常のPython wheelと同様に解決します（`libp2p>=0.8.3` では `fastecdsa` が廃止されたため、macOS での GMP ビルドや override ファイルは不要になりました）。
 
 ### 2. ローカルサーバー起動＆初期設定 (`dfs` / `./cli`)
 

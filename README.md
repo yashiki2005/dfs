@@ -118,22 +118,11 @@ CLI entry points, and localization data. It requires Python 3.11 or newer:
 
 ```bash
 python -m pip install dfs-<version>-py3-none-any.whl
+# Or with optional P2P (libp2p) support:
+python -m pip install "dfs-<version>-py3-none-any.whl[libp2p]"
 ```
 
-Third-party dependencies are resolved as usual for Python wheels. `dfs`
-requires `fastecdsa==4.0.0` and overrides the stale transitive pin in
-`py-libp2p 0.8.1`; this removes the former macOS GMP build requirement:
-
-```bash
-uv pip install \
-  --overrides fastecdsa-overrides.txt \
-  dfs-<version>-py3-none-any.whl
-```
-
-`py-libp2p 0.8.1` metadata still declares `fastecdsa==2.3.2`, which
-conflicts with the DFS-required 4.0.0 pin. Plain `pip` therefore cannot
-resolve the wheel until py-libp2p updates that declaration. Use the
-override file shipped with the wheel with uv.
+Third-party dependencies are resolved as usual for Python wheels (including `libp2p>=0.8.3`, which no longer requires `fastecdsa` or a macOS GMP build).
 
 ### 2. Start & Auto-Configure Local Server (`dfs` / `./cli`)
 

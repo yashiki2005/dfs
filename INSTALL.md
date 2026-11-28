@@ -2,33 +2,29 @@
 
 > **English** | [日本語](INSTALL.ja.md)
 
-This document covers how to install `dfs` (`dfs` / `dfscli` / `dfssvc`), common build pitfalls (such as missing `gmp.h` and `fastecdsa` conflicts), and **why standalone binaries are distributed alongside Python packages**.
+This document covers how to install `dfs` (`dfs` / `dfscli` / `dfssvc`), optional dependencies, and **why standalone binaries are distributed alongside Python packages**.
 
 ---
 
 ## Why Distribute Standalone Binaries?
 
-Even though `dfs` is written in Python, GitHub Releases ship standalone native binaries (`dfs`, `dfscli`, `dfssvc`) for three main reasons:
+Even though `dfs` is written in Python, GitHub Releases ship standalone native binaries (`dfs`, `dfscli`, `dfssvc`) for two main reasons:
 
-1. **Bundle `py-libp2p` without requiring `gmp.h` or a C compiler on user machines**
-   - The optional P2P multi-seed transport (`libp2p` extra) depends on `py-libp2p`, which pulls in `fastecdsa`. On environments without a matching prebuilt wheel, building `fastecdsa` from source requires **`gmp.h` (GNU MP headers)** and a C toolchain—failing with `fatal error: gmp.h: No such file or directory` if `libgmp-dev` is missing.
-   - In addition, `py-libp2p 0.8.1` pins `fastecdsa==2.3.2`, which conflicts with `fastecdsa==4.0.0` needed on Python 3.12+ / macOS.
-   - The GitHub Release binaries are built with **Miniconda (`conda-forge` `gmp` + OpenSSL) + PyInstaller**, bundling `libgmp`, `libcrypto`, `libssl`, and `py-libp2p` into a self-contained executable.
-2. **Zero-prerequisite setup on fresh machines**
+1. **Zero-prerequisite setup on fresh machines**
    - Works on minimal servers, containers, or Windows machines without installing Python 3.11+, `uv`, or `git`.
-3. **Minimal external CLI requirements**
+2. **Minimal external CLI requirements**
    - `dfs` prefers `ssh-keygen` (OpenSSH) and `openssl` when present, and **automatically falls back to in-process `cryptography`** when they are absent—so the binary works even in stripped-down containers.
 
 ---
 
 ## Choosing an Installation Method
 
-| Method | Best For | Includes `libp2p` (P2P) | Needs `gmp.h`? |
-|---|---|---|---|
-| **1. Release Binaries** | Quick start / no Python or C compiler | Bundled | **No** |
-| **2. One-Line Installer (`install.sh` / `install.ps1`)** | Automated setup / RunPod & cloud GPUs | Auto-attempted (falls back to core) | Depends on wheel availability |
-| **3. Homebrew (`Formula/dfs.rb`)** | macOS / Linuxbrew users | Same as release binaries | **No** |
-| **4. Source / Wheel (`uv` / `pip`)** | Development / existing Python environments | Optional via `--extra libp2p` | Only if building `fastecdsa` from source |
+| Method | Best For | Includes `libp2p` (P2P) |
+|---|---|---|
+| **1. Release Binaries** | Quick start / no Python required | Bundled |
+| **2. One-Line Installer (`install.sh` / `install.ps1`)** | Automated setup / RunPod & cloud GPUs | Auto-attempted (falls back to core) |
+| **3. Homebrew (`Formula/dfs.rb`)** | macOS / Linuxbrew users | Same as release binaries |
+| **4. Source / Wheel (`uv` / `pip`)** | Development / existing Python environments | Optional via `--extra libp2p` |
 
 ---
 
@@ -100,39 +96,24 @@ brew install ./dfs.rb
 git clone https://github.com/yashiki2005/dfs.git
 cd dfs
 
-# Core dependencies only (no gmp.h needed)
+# Core dependencies only
 uv sync
 
 # Include P2P (libp2p) transport
 uv sync --extra libp2p
 ```
 
-When installing the universal wheel (`dfs-<version>-py3-none-any.whl`), pass `fastecdsa-overrides.txt`:
+When installing the universal wheel (`dfs-<version>-py3-none-any.whl`):
 
 ```bash
-uv pip install --overrides fastecdsa-overrides.txt dfs-<version>-py3-none-any.whl
+uv pip install dfs-<version>-py3-none-any.whl
+# Or with pip:
+python -m pip install dfs-<version>-py3-none-any.whl
 ```
 
-### ⚠️ Caveat 1: Build Failure Due to Missing `gmp.h`
+> Note: `py-libp2p>=0.8.3` removed the `fastecdsa` dependency in favor of `cryptography`, so `gmp.h` and `fastecdsa-overrides.txt` are no longer required.
 
-If `--extra libp2p` compiles `fastecdsa` from source on your platform, it will fail unless GMP headers and a C compiler are installed:
-
-```text
-fatal error: gmp.h: No such file or directory
-```
-
-**How to fix**:
-- **Ubuntu / Debian**: `sudo apt-get update && sudo apt-get install -y libgmp-dev build-essential python3-dev`
-- **Fedora / RHEL**: `sudo dnf install -y gmp-devel gcc python3-devel`
-- **macOS (Homebrew)**: `brew install gmp` (and if needed, export `CPATH="$(brew --prefix gmp)/include"` and `LIBRARY_PATH="$(brew --prefix gmp)/lib"`)
-- **conda / Miniconda**: `conda install -c conda-forge gmp`
-- **If you don't need P2P**: omit `--extra libp2p` and run `uv sync` (core TLS/HTTP/relay transport works without `gmp.h`).
-
-### ⚠️ Caveat 2: `pip` Conflict on `fastecdsa`
-
-Because `py-libp2p 0.8.1` still declares `fastecdsa==2.3.2` while `dfs` requires `fastecdsa==4.0.0`, plain `pip install 'dfs[libp2p]'` may fail dependency resolution. Use **`uv` with `fastecdsa-overrides.txt`** or the **release binaries** when you want `libp2p` support (core `pip install -e .` works normally).
-
-### ⚠️ Caveat 3: Optional External Tools
+### ⚠️ Optional External Tools
 
 | Feature | Tool / Package | Notes |
 |---|---|---|
