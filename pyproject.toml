@@ -16,18 +16,18 @@ authors = [
 dependencies = [
     "cryptography>=41",
     "dnspython>=2.6",
+    "libp2p>=0.8.3",
     "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]
 compression = ["zstandard>=0.22"]
-libp2p = ["libp2p>=0.8.3"]
+libp2p = []  # Included in core dependencies; kept for backwards compatibility
 fuse = ["fusepy>=3"]
 test = [
     "pytest>=8",
     "pytest-timeout>=2.3",
     "zstandard>=0.22",
-    "libp2p>=0.8.3",
 ]
 
 [project.scripts]

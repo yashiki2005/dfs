@@ -22,9 +22,9 @@ Even though `dfs` is written in Python, GitHub Releases ship standalone native b
 | Method | Best For | Includes `libp2p` (P2P) |
 |---|---|---|
 | **1. Release Binaries** | Quick start / no Python required | Bundled |
-| **2. One-Line Installer (`install.sh` / `install.ps1`)** | Automated setup / RunPod & cloud GPUs | Auto-attempted (falls back to core) |
+| **2. One-Line Installer (`install.sh` / `install.ps1`)** | Automated setup / RunPod & cloud GPUs | Included by default |
 | **3. Homebrew (`Formula/dfs.rb`)** | macOS / Linuxbrew users | Same as release binaries |
-| **4. Source / Wheel (`uv` / `pip`)** | Development / existing Python environments | Optional via `--extra libp2p` |
+| **4. Source / Wheel (`uv` / `pip`)** | Development / existing Python environments | Included by default |
 
 ---
 
@@ -96,14 +96,11 @@ brew install ./dfs.rb
 git clone https://github.com/yashiki2005/dfs.git
 cd dfs
 
-# Core dependencies only
+# Install dependencies (includes libp2p>=0.8.3 by default)
 uv sync
-
-# Include P2P (libp2p) transport
-uv sync --extra libp2p
 ```
 
-When installing the universal wheel (`dfs-<version>-py3-none-any.whl`):
+When installing the universal wheel (`dfs-<version>-py3-none-any.whl`), run `uv pip install` or `pip install` directly:
 
 ```bash
 uv pip install dfs-<version>-py3-none-any.whl
@@ -111,7 +108,7 @@ uv pip install dfs-<version>-py3-none-any.whl
 python -m pip install dfs-<version>-py3-none-any.whl
 ```
 
-> Note: `py-libp2p>=0.8.3` removed the `fastecdsa` dependency in favor of `cryptography`, so `gmp.h` and `fastecdsa-overrides.txt` are no longer required.
+> Note: `py-libp2p>=0.8.3` removed `fastecdsa` in favor of `cryptography`, so `libp2p` is included in core dependencies by default without `gmp.h` or `fastecdsa-overrides.txt`. (`--extra libp2p` / `[libp2p]` remains as a no-op alias for backwards compatibility.)
 
 ### ⚠️ Optional External Tools
 

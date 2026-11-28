@@ -118,11 +118,9 @@ CLI entry points, and localization data. It requires Python 3.11 or newer:
 
 ```bash
 python -m pip install dfs-<version>-py3-none-any.whl
-# Or with optional P2P (libp2p) support:
-python -m pip install "dfs-<version>-py3-none-any.whl[libp2p]"
 ```
 
-Third-party dependencies are resolved as usual for Python wheels (including `libp2p>=0.8.3`, which no longer requires `fastecdsa` or a macOS GMP build).
+Third-party dependencies (including `libp2p>=0.8.3` for P2P/QUIC distribution) are installed by default and resolved as usual for Python wheels.
 
 ### 2. Start & Auto-Configure Local Server (`dfs` / `./cli`)
 

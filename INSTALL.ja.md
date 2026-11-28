@@ -22,9 +22,9 @@
 | 方法 | おすすめの場面 | `libp2p` (P2P) |
 |---|---|---|
 | **1. リリースバイナリ** | 手軽に試したい / Python を入れたくない | 同梱（対応環境） |
-| **2. ワンライナー (`install.sh` / `install.ps1`)** | ソースから自動セットアップしたい / RunPod 等 | 自動試行（失敗時はコアへフォールバック） |
+| **2. ワンライナー (`install.sh` / `install.ps1`)** | ソースから自動セットアップしたい / RunPod 等 | 標準で同梱 |
 | **3. Homebrew (`dfs.rb`)** | macOS / Linuxbrew で管理したい | リリースバイナリ同等 |
-| **4. ソース / Python wheel (`uv` / `pip`)** | 開発・カスタマイズしたい / 既存 Python 環境へ入れたい | `--extra libp2p` で選択 |
+| **4. ソース / Python wheel (`uv` / `pip`)** | 開発・カスタマイズしたい / 既存 Python 環境へ入れたい | 標準で同梱 |
 
 ---
 
@@ -96,11 +96,8 @@ brew install ./dfs.rb
 git clone https://github.com/yashiki2005/dfs.git
 cd dfs
 
-# コア機能のみ
+# 依存関係をインストール（libp2p>=0.8.3 も標準で含まれます）
 uv sync
-
-# P2P (libp2p) も含める場合
-uv sync --extra libp2p
 ```
 
 wheel からインストールする場合は、通常どおり `uv pip install` または `pip install` で導入できます：
@@ -111,7 +108,7 @@ uv pip install dfs-<version>-py3-none-any.whl
 python -m pip install dfs-<version>-py3-none-any.whl
 ```
 
-> 補足: `py-libp2p>=0.8.3` で `fastecdsa` 依存が廃止され `cryptography` ベースに移行したため、`gmp.h` や `fastecdsa-overrides.txt` は不要になりました。
+> 補足: `py-libp2p>=0.8.3` で `fastecdsa` 依存が廃止され `cryptography` ベースに移行したため、`gmp.h` や `fastecdsa-overrides.txt` なしで `libp2p` が標準の必須依存に含まれています（互換性のため `--extra libp2p` / `[libp2p]` は空の extra として残しています）。
 
 ### ⚠️ オプション機能用の外部ツール
 
